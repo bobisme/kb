@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod config;
 mod root;
 
 use clap::Parser;
