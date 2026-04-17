@@ -1,0 +1,28 @@
+[package]
+name = "kb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "kb"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+kb-compile.workspace = true
+kb-core.workspace = true
+kb-ingest.workspace = true
+kb-lint.workspace = true
+kb-llm.workspace = true
+kb-query.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

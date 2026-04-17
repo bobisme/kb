@@ -1,0 +1,41 @@
+[workspace]
+members = [
+    "crates/kb-cli",
+    "crates/kb-compile",
+    "crates/kb-core",
+    "crates/kb-ingest",
+    "crates/kb-lint",
+    "crates/kb-llm",
+    "crates/kb-query",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+
+[workspace.dependencies]
+anyhow = "1"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+kb-core = { path = "crates/kb-core" }
+kb-llm = { path = "crates/kb-llm" }
+kb-ingest = { path = "crates/kb-ingest" }
+kb-compile = { path = "crates/kb-compile" }
+kb-query = { path = "crates/kb-query" }
+kb-lint = { path = "crates/kb-lint" }
