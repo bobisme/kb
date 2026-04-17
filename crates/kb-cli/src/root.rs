@@ -71,9 +71,8 @@ fn validate_candidate(path: PathBuf) -> Result<KbRoot> {
         Ok(KbRoot { path })
     } else {
         Err(anyhow!(
-            "Provided --root '{}' does not contain '{}'. Run `kb init` to initialize a KB root.",
+            "Provided --root '{}' does not contain '{KB_DIR}/{KB_CONFIG}'. Run `kb init` to initialize a KB root.",
             path.display(),
-            format!("{KB_DIR}/{KB_CONFIG}")
         ))
     }
 }
