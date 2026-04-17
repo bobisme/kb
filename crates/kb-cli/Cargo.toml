@@ -28,3 +28,9 @@ tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2.1"
+insta = { version = "1.39", features = ["json"] }
+predicates = "3"
+regex = "1"
