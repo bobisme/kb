@@ -344,3 +344,6 @@ mod tests {
 }
 
 pub mod fs;
+pub mod hashing;
+
+pub use hashing::{hash_bytes, hash_file, hash_many, Hash};
