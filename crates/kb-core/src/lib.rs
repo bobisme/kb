@@ -343,7 +343,8 @@ mod tests {
     }
 }
 
+pub mod frontmatter;
 pub mod fs;
 pub mod hashing;
 
-pub use hashing::{hash_bytes, hash_file, hash_many, Hash};
+pub use hashing::{Hash, hash_bytes, hash_file, hash_many};
