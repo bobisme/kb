@@ -190,9 +190,21 @@ pub struct JobRun {
     pub command: String,
     pub root_path: PathBuf,
     pub started_at_millis: u64,
-    pub finished_at_millis: Option<u64>,
+    pub ended_at_millis: Option<u64>,
+    pub status: JobRunStatus,
     pub log_path: Option<PathBuf>,
+    pub affected_outputs: Vec<PathBuf>,
+    pub pid: Option<u32>,
     pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobRunStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Interrupted,
 }
 
 /// A pending machine-prepared item awaiting review.
@@ -329,8 +341,11 @@ mod tests {
             command: "kb compile".to_string(),
             root_path: PathBuf::from("/tmp/kb"),
             started_at_millis: 1_700_000_000_120,
-            finished_at_millis: Some(1_700_000_000_150),
+            ended_at_millis: Some(1_700_000_000_150),
+            status: JobRunStatus::Succeeded,
             log_path: Some(PathBuf::from("logs/job.log")),
+            affected_outputs: vec![PathBuf::from("wiki/index.md")],
+            pid: Some(12345),
             exit_code: Some(0),
         });
 

@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod jobs;
 mod root;
 
+use std::path::{Path, PathBuf};
+
+use anyhow::Result;
 use clap::Parser;
-use std::path::PathBuf;
+use kb_core::JobRunStatus;
 
 #[derive(Parser)]
 #[command(name = "kb", version, about = "Personal knowledge base compiler")]
@@ -110,33 +114,134 @@ fn main() {
 
     let cli = Cli::parse();
 
-    if let Some(cmd) = &cli.command {
-        if !matches!(cmd, Command::Init { .. }) {
-            if let Err(err) = root::discover_root(cli.root.as_deref()) {
-                eprintln!("error: {err}");
-                std::process::exit(1);
+    if let Err(err) = run(cli) {
+        eprintln!("error: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn run(cli: Cli) -> Result<()> {
+    let root = if matches!(cli.command, Some(Command::Init { .. }) | None) {
+        cli.root
+    } else {
+        Some(root::discover_root(cli.root.as_deref())?.path)
+    };
+
+    match cli.command {
+        Some(Command::Compile) => {
+            execute_mutating_command(root.as_deref(), "compile", || {
+                println!("compile is not implemented yet");
+                Ok(())
+            })
+        }
+        Some(Command::Doctor) => {
+            execute_mutating_command(root.as_deref(), "doctor", || {
+                println!("doctor is not implemented yet");
+                Ok(())
+            })
+        }
+        Some(Command::Ask { query }) => {
+            execute_mutating_command(root.as_deref(), "ask", move || {
+                println!("ask is not implemented yet: {query}");
+                Ok(())
+            })
+        }
+        Some(Command::Ingest { sources }) => {
+            execute_mutating_command(root.as_deref(), "ingest", move || {
+                println!("ingest is not implemented yet for {} sources", sources.len());
+                Ok(())
+            })
+        }
+        Some(Command::Lint { rule }) => {
+            execute_mutating_command(root.as_deref(), "lint", move || {
+                if let Some(rule) = rule {
+                    println!("lint is not implemented yet (rule: {rule})");
+                } else {
+                    println!("lint is not implemented yet");
+                }
+                Ok(())
+            })
+        }
+        Some(Command::Publish { dest }) => {
+            execute_mutating_command(root.as_deref(), "publish", move || {
+                if let Some(dest) = dest {
+                    println!("publish is not implemented yet (dest: {dest})");
+                } else {
+                    println!("publish is not implemented yet");
+                }
+                Ok(())
+            })
+        }
+        Some(Command::Status) => {
+            let root = root.as_deref().expect("root resolved for non-init commands");
+            let jobs = jobs::recent_jobs(root, 20)?;
+            if cli.json {
+                let payload = serde_json::to_string_pretty(&jobs)?;
+                println!("{payload}");
+                return Ok(());
             }
+
+            if jobs.is_empty() {
+                println!("No job runs yet in {}", root.display());
+            } else {
+                println!("Recent job runs ({})", jobs.len());
+                for job in jobs {
+                    let ended = job
+                        .ended_at_millis
+                        .map_or_else(|| "running".to_string(), |ended| format!("{ended}"));
+                    println!(
+                        "{} | {:<11} | {} | started={} | ended={ended}",
+                        job.metadata.id,
+                        format!("{:?}", job.status),
+                        job.command,
+                        job.started_at_millis
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some(Command::Init { path }) => {
+            println!(
+                "init is not implemented yet{}",
+                path.map_or(String::new(), |p| format!(" at {}", p.display()))
+            );
+            Ok(())
+        }
+        Some(Command::Search { query }) => {
+            println!("search is not implemented yet: {query}");
+            Ok(())
+        }
+        Some(Command::Inspect { target }) => {
+            println!("inspect is not implemented yet: {target}");
+            Ok(())
+        }
+        Some(Command::Review { operation }) => {
+            println!("review is not implemented yet: {operation}");
+            Ok(())
+        }
+        None => {
+            println!("kb: a personal knowledge base compiler");
+            println!("Run 'kb --help' for more information");
+            Ok(())
         }
     }
+}
 
-    if let Some(cmd) = cli.command {
-        let name = match cmd {
-            Command::Init { .. } => "init",
-            Command::Ingest { .. } => "ingest",
-            Command::Compile => "compile",
-            Command::Ask { .. } => "ask",
-            Command::Lint { .. } => "lint",
-            Command::Doctor => "doctor",
-            Command::Status => "status",
-            Command::Publish { .. } => "publish",
-            Command::Search { .. } => "search",
-            Command::Inspect { .. } => "inspect",
-            Command::Review { .. } => "review",
-        };
-        eprintln!("error: '{name}' subcommand not implemented");
-        std::process::exit(1);
-    } else {
-        println!("kb: a personal knowledge base compiler");
-        println!("Run 'kb --help' for more information");
+fn execute_mutating_command(root: Option<&Path>, command: &str, action: impl FnOnce() -> Result<()>) -> Result<()> {
+    let root = root.expect("root resolved for mutating commands");
+    jobs::check_stale_jobs(root)?;
+    let handle = jobs::start_job(root, command)?;
+
+    let result = action();
+    match result {
+        Ok(()) => {
+            handle.finish(JobRunStatus::Succeeded, Vec::new())?;
+            Ok(())
+        }
+        Err(err) => {
+            handle.finish(JobRunStatus::Failed, Vec::new())?;
+            Err(err)
+        }
     }
 }
