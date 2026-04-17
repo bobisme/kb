@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "kb", version, about = "Personal knowledge base compiler")]
+#[allow(clippy::struct_excessive_bools)]
 struct Cli {
     /// Root directory of the knowledge base
     #[arg(global = true, long)]
@@ -99,66 +100,31 @@ enum Command {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
 
-    match cli.command {
-        Some(Command::Init { path: _ }) => {
-            eprintln!("error: 'init' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Ingest { sources: _ }) => {
-            eprintln!("error: 'ingest' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Compile) => {
-            eprintln!("error: 'compile' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Ask { query: _ }) => {
-            eprintln!("error: 'ask' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Lint { rule: _ }) => {
-            eprintln!("error: 'lint' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Doctor) => {
-            eprintln!("error: 'doctor' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Status) => {
-            eprintln!("error: 'status' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Publish { dest: _ }) => {
-            eprintln!("error: 'publish' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Search { query: _ }) => {
-            eprintln!("error: 'search' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Inspect { target: _ }) => {
-            eprintln!("error: 'inspect' subcommand not implemented");
-            std::process::exit(1);
-        }
-        Some(Command::Review { operation: _ }) => {
-            eprintln!("error: 'review' subcommand not implemented");
-            std::process::exit(1);
-        }
-        None => {
-            if !cli.dry_run && !cli.force && !cli.review && cli.root.is_none() && cli.format.is_none() && cli.model.is_none() && cli.since.is_none() && !cli.json {
-                println!("kb: a personal knowledge base compiler");
-                println!("Run 'kb --help' for more information");
-                Ok(())
-            } else {
-                Ok(())
-            }
-        }
+    if let Some(cmd) = cli.command {
+        let name = match cmd {
+            Command::Init { .. } => "init",
+            Command::Ingest { .. } => "ingest",
+            Command::Compile => "compile",
+            Command::Ask { .. } => "ask",
+            Command::Lint { .. } => "lint",
+            Command::Doctor => "doctor",
+            Command::Status => "status",
+            Command::Publish { .. } => "publish",
+            Command::Search { .. } => "search",
+            Command::Inspect { .. } => "inspect",
+            Command::Review { .. } => "review",
+        };
+        eprintln!("error: '{name}' subcommand not implemented");
+        std::process::exit(1);
+    } else {
+        println!("kb: a personal knowledge base compiler");
+        println!("Run 'kb --help' for more information");
     }
 }
