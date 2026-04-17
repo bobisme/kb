@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, env, fs, path::Path};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 /// Top-level CLI configuration parsed from `kb.toml`.
@@ -17,6 +17,7 @@ pub struct Config {
     pub lint: LintConfig,
     pub publish: PublishConfig,
     pub review: ReviewConfig,
+    pub lock: LockConfig,
 }
 
 impl Config {
@@ -41,6 +42,7 @@ impl Config {
         toml::to_string_pretty(self).context("failed to serialize config to toml")
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn with_env_overrides(mut self) -> Result<Self> {
         if let Ok(default_runner) = env::var("KB_LLM_DEFAULT_RUNNER") {
             self.llm.default_runner = default_runner;
@@ -159,6 +161,10 @@ impl Config {
         if let Ok(require) = env::var("KB_REVIEW_REQUIRES_DESTRUCTIVE_APPROVAL") {
             self.review.requires_destructive_approval =
                 parse_bool_var("KB_REVIEW_REQUIRES_DESTRUCTIVE_APPROVAL", &require)?;
+        }
+
+        if let Ok(timeout_ms) = env::var("KB_LOCK_TIMEOUT_MS") {
+            self.lock.timeout_ms = parse_u64_var("KB_LOCK_TIMEOUT_MS", &timeout_ms)?;
         }
 
         Ok(self)
@@ -402,6 +408,19 @@ impl Default for ReviewConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct LockConfig {
+    pub timeout_ms: u64,
+}
+
+impl Default for LockConfig {
+    fn default() -> Self {
+        Self { timeout_ms: 5_000 }
+    }
+}
+
 fn parse_bool_var(name: &str, value: &str) -> Result<bool> {
     match value.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -457,6 +476,7 @@ token_budget = 12000
             cfg.publish.default_destination,
             Config::default().publish.default_destination
         );
+        assert_eq!(cfg.lock.timeout_ms, Config::default().lock.timeout_ms);
         Ok(())
     }
 

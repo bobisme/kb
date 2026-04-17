@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+fs2.workspace = true
 kb-compile.workspace = true
 kb-core.workspace = true
 kb-ingest.workspace = true

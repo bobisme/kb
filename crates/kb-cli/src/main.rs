@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::Parser;
+use config::Config;
 use kb_core::JobRunStatus;
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "kb", version, about = "Personal knowledge base compiler")]
@@ -129,18 +131,14 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     match cli.command {
-        Some(Command::Compile) => {
-            execute_mutating_command(root.as_deref(), "compile", || {
-                println!("compile is not implemented yet");
-                Ok(())
-            })
-        }
-        Some(Command::Doctor) => {
-            execute_mutating_command(root.as_deref(), "doctor", || {
-                println!("doctor is not implemented yet");
-                Ok(())
-            })
-        }
+        Some(Command::Compile) => execute_mutating_command(root.as_deref(), "compile", || {
+            println!("compile is not implemented yet");
+            Ok(())
+        }),
+        Some(Command::Doctor) => execute_mutating_command(root.as_deref(), "doctor", || {
+            println!("doctor is not implemented yet");
+            Ok(())
+        }),
         Some(Command::Ask { query }) => {
             execute_mutating_command(root.as_deref(), "ask", move || {
                 println!("ask is not implemented yet: {query}");
@@ -149,7 +147,10 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Ingest { sources }) => {
             execute_mutating_command(root.as_deref(), "ingest", move || {
-                println!("ingest is not implemented yet for {} sources", sources.len());
+                println!(
+                    "ingest is not implemented yet for {} sources",
+                    sources.len()
+                );
                 Ok(())
             })
         }
@@ -174,7 +175,9 @@ fn run(cli: Cli) -> Result<()> {
             })
         }
         Some(Command::Status) => {
-            let root = root.as_deref().expect("root resolved for non-init commands");
+            let root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
             let jobs = jobs::recent_jobs(root, 20)?;
             if cli.json {
                 let payload = serde_json::to_string_pretty(&jobs)?;
@@ -228,8 +231,14 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
-fn execute_mutating_command(root: Option<&Path>, command: &str, action: impl FnOnce() -> Result<()>) -> Result<()> {
+fn execute_mutating_command(
+    root: Option<&Path>,
+    command: &str,
+    action: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let root = root.expect("root resolved for mutating commands");
+    let cfg = Config::load_from_root(root, None)?;
+    let _lock = jobs::KbLock::acquire(root, command, Duration::from_millis(cfg.lock.timeout_ms))?;
     jobs::check_stale_jobs(root)?;
     let handle = jobs::start_job(root, command)?;
 
@@ -243,5 +252,76 @@ fn execute_mutating_command(root: Option<&Path>, command: &str, action: impl FnO
             handle.finish(JobRunStatus::Failed, Vec::new())?;
             Err(err)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+    use tempfile::tempdir;
+
+    fn write_kb_config(root: &Path) {
+        fs::create_dir_all(root).expect("create kb root");
+        fs::write(root.join(Config::FILE_NAME), "\n").expect("write kb config");
+    }
+
+    #[test]
+    fn status_command_does_not_block_on_root_lock() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        let lock =
+            jobs::KbLock::acquire(&root, "compile", Duration::from_secs(1)).expect("acquire lock");
+        let started = Instant::now();
+        run(Cli {
+            root: Some(root),
+            format: None,
+            model: None,
+            since: None,
+            dry_run: false,
+            json: false,
+            force: false,
+            review: false,
+            command: Some(Command::Status),
+        })
+        .expect("status command succeeds");
+        assert!(started.elapsed() < Duration::from_millis(250));
+        drop(lock);
+    }
+
+    #[test]
+    fn mutating_commands_serialize_through_root_lock() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        let first_lock =
+            jobs::KbLock::acquire(&root, "compile", Duration::from_secs(1)).expect("first lock");
+        let (tx, rx) = mpsc::channel();
+        let root_for_thread = root;
+        let worker = thread::spawn(move || {
+            execute_mutating_command(Some(root_for_thread.as_path()), "lint", || {
+                tx.send(Instant::now()).expect("send acquisition time");
+                Ok(())
+            })
+            .expect("mutating command succeeds");
+        });
+
+        thread::sleep(Duration::from_millis(200));
+        assert!(
+            rx.try_recv().is_err(),
+            "second command should still be waiting for the root lock"
+        );
+        drop(first_lock);
+        let acquired_at = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second command acquires lock");
+        assert!(acquired_at.elapsed() < Duration::from_secs(1));
+        worker.join().expect("join worker");
     }
 }
