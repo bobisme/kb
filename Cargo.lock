@@ -305,6 +305,7 @@ dependencies = [
  "kb-query",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

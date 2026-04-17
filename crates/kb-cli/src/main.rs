@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod root;
+
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -106,6 +108,15 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(cmd) = &cli.command {
+        if !matches!(cmd, Command::Init { .. }) {
+            if let Err(err) = root::discover_root(cli.root.as_deref()) {
+                eprintln!("error: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     if let Some(cmd) = cli.command {
         let name = match cmd {
