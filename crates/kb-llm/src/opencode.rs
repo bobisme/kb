@@ -323,10 +323,50 @@ impl LlmAdapter for OpencodeAdapter {
 
     fn answer_question(
         &self,
-        _request: AnswerQuestionRequest,
+        request: AnswerQuestionRequest,
     ) -> Result<(AnswerQuestionResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "opencode adapter answer_question is not implemented yet".to_string(),
+        let template =
+            Template::load("ask.md", self.config.project_root.as_deref()).map_err(|err| {
+                LlmAdapterError::Other(format!("load ask template: {err}"))
+            })?;
+
+        let mut context = HashMap::new();
+        context.insert("query".to_string(), request.question.clone());
+        context.insert("sources".to_string(), request.context.join("\n\n"));
+        context.insert(
+            "citation_manifest".to_string(),
+            request.format.unwrap_or_default(),
+        );
+
+        let rendered = template
+            .render(&context)
+            .map_err(|err| LlmAdapterError::Other(format!("render ask template: {err}")))?;
+
+        let started_at = unix_time_ms()?;
+        let answer = self.run_prompt(&rendered.content)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((
+            AnswerQuestionResponse {
+                answer,
+                references: None,
+            },
+            provenance,
         ))
     }
 

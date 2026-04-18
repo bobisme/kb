@@ -242,10 +242,75 @@ impl LlmAdapter for ClaudeCliAdapter {
 
     fn answer_question(
         &self,
-        _request: AnswerQuestionRequest,
+        request: AnswerQuestionRequest,
     ) -> Result<(AnswerQuestionResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "Claude CLI adapter answer_question is not implemented yet".to_string(),
+        let template =
+            Template::load("ask.md", self.config.project_root.as_deref()).map_err(|err| {
+                LlmAdapterError::Other(format!("load ask template: {err}"))
+            })?;
+
+        let mut context = HashMap::new();
+        context.insert("query".to_string(), request.question.clone());
+        context.insert("sources".to_string(), request.context.join("\n\n"));
+        context.insert(
+            "citation_manifest".to_string(),
+            request.format.unwrap_or_default(),
+        );
+
+        let rendered = template
+            .render(&context)
+            .map_err(|err| LlmAdapterError::Other(format!("render ask template: {err}")))?;
+
+        let prompt = RenderedPrompt {
+            template_name: template.name,
+            template_hash: template.template_hash,
+            content: rendered.content,
+            render_hash: rendered.render_hash,
+        };
+
+        let started_at = unix_time_ms()?;
+        let command = self.build_command(&prompt.content);
+
+        let output =
+            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+
+        if output.exit_code != Some(0) {
+            return Err(classify_nonzero_exit(
+                output.exit_code,
+                &output.stderr,
+                &output.stdout,
+            ));
+        }
+
+        let parsed = parse_claude_json(&output.stdout)?;
+        let ended_at = unix_time_ms()?;
+
+        let model = parsed
+            .model
+            .or_else(|| self.config.model.clone())
+            .unwrap_or_else(|| "claude".to_string());
+
+        let provenance = ProvenanceRecord {
+            harness: "claude".to_string(),
+            harness_version: None,
+            model,
+            prompt_template_name: prompt.template_name,
+            prompt_template_hash: prompt.template_hash,
+            prompt_render_hash: prompt.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: parsed.tokens,
+            cost_estimate: parsed.cost_estimate,
+        };
+
+        Ok((
+            AnswerQuestionResponse {
+                answer: parsed.text,
+                references: None,
+            },
+            provenance,
         ))
     }
 

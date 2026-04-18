@@ -193,7 +193,10 @@ fn ask_creates_question_record_and_placeholder_artifact() {
     let artifact = fs::read_to_string(&artifact_path).expect("read artifact placeholder");
     assert!(artifact.contains("question_record:"));
     assert!(artifact.contains("requested_format: md"));
-    assert!(artifact.contains("Answer generation is not implemented yet."));
+    assert!(
+        artifact.contains("LLM unavailable") || artifact.contains("type: answer_artifact"),
+        "artifact should contain LLM unavailable message or valid artifact header"
+    );
 }
 
 #[test]

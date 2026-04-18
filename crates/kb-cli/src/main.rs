@@ -206,11 +206,18 @@ fn run(cli: Cli) -> Result<()> {
             let ask_root = root.clone();
             let requested_format = cli.format.clone();
             let should_json = cli.json;
+            let cli_model = cli.model.clone();
             execute_mutating_command(root.as_deref(), "ask", move || {
                 let root = ask_root
                     .as_deref()
                     .expect("root resolved for non-init commands");
-                run_ask(root, &query, requested_format.as_deref(), should_json)
+                run_ask(
+                    root,
+                    &query,
+                    requested_format.as_deref(),
+                    cli_model.as_deref(),
+                    should_json,
+                )
             })
         }
         Some(Command::Ingest { sources }) => {
@@ -974,8 +981,15 @@ struct AskOutput<'a> {
     requested_format: &'a str,
 }
 
-fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool) -> Result<()> {
-    let cfg = Config::load_from_root(root, None)?;
+#[allow(clippy::too_many_lines)]
+fn run_ask(
+    root: &Path,
+    query: &str,
+    requested_format: Option<&str>,
+    cli_model: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let cfg = Config::load_from_root(root, cli_model)?;
     let requested_format =
         normalize_ask_format(requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()))?;
     let timestamp = now_millis()?;
@@ -993,20 +1007,57 @@ fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool)
         .join(&question_id)
         .join("retrieval_plan.json");
 
-    let retrieval_plan = kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
+    let retrieval_plan =
+        kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
+
+    fs::write(
+        root.join(&plan_rel),
+        serde_json::to_string_pretty(&retrieval_plan)?,
+    )?;
+
+    let assembled = kb_query::assemble_context(root, &retrieval_plan)?;
+    let citation_manifest = kb_query::build_citation_manifest(&assembled);
+    let manifest_text = kb_query::render_manifest_for_prompt(&citation_manifest);
+
+    let llm_outcome = try_generate_answer(&cfg, root, query, &assembled, &manifest_text);
+
+    let (model_version, template_hash, artifact_status, artifact_body, llm_info) =
+        match llm_outcome {
+            Ok((result, provenance)) => (
+                Some(provenance.model.clone()),
+                Some(provenance.prompt_template_hash.to_hex()),
+                if result.invalid_citations.is_empty() {
+                    Status::Fresh
+                } else {
+                    Status::NeedsReview
+                },
+                result.body.clone(),
+                Some((result, provenance)),
+            ),
+            Err(err) => (
+                None,
+                None,
+                Status::Failed,
+                format!(
+                    "> **LLM unavailable:** {err}\n\n\
+                     Question recorded. Re-run `kb ask` when a backend is available.\n"
+                ),
+                None,
+            ),
+        };
 
     let question = Question {
         metadata: EntityMetadata {
             id: question_id.clone(),
             created_at_millis: timestamp,
-            updated_at_millis: timestamp,
+            updated_at_millis: now_millis()?,
             source_hashes: Vec::new(),
-            model_version: None,
+            model_version: model_version.clone(),
             tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
-            prompt_template_hash: None,
+            prompt_template_hash: template_hash,
             dependencies: Vec::new(),
             output_paths: vec![question_rel.clone(), artifact_rel.clone(), plan_rel.clone()],
-            status: Status::Fresh,
+            status: artifact_status,
         },
         raw_query: query.to_string(),
         requested_format: requested_format.to_string(),
@@ -1019,14 +1070,14 @@ fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool)
         metadata: EntityMetadata {
             id: format!("artifact-{question_id}"),
             created_at_millis: timestamp,
-            updated_at_millis: timestamp,
+            updated_at_millis: now_millis()?,
             source_hashes: Vec::new(),
-            model_version: None,
+            model_version,
             tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
             prompt_template_hash: None,
             dependencies: vec![question_id.clone()],
             output_paths: vec![artifact_rel.clone()],
-            status: Status::Fresh,
+            status: artifact_status,
         },
         question_id: question_id.clone(),
         artifact_kind: match requested_format {
@@ -1044,12 +1095,8 @@ fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool)
         serde_json::to_string_pretty(&question)?,
     )?;
     fs::write(
-        root.join(&plan_rel),
-        serde_json::to_string_pretty(&retrieval_plan)?,
-    )?;
-    fs::write(
         root.join(&artifact_rel),
-        render_ask_artifact(&artifact, &question, &question_rel)?,
+        render_ask_artifact(&artifact, &question, &question_rel, &artifact_body)?,
     )?;
 
     let question_path = question_rel.to_string_lossy().into_owned();
@@ -1064,14 +1111,100 @@ fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool)
                 requested_format,
             })?
         );
+    } else if let Some((result, provenance)) = &llm_info {
+        println!("Artifact written: {artifact_path}");
+        println!(
+            "Citations: {} valid, {} unresolved",
+            result.valid_citations.len(),
+            result.invalid_citations.len()
+        );
+        if result.has_uncertainty_banner {
+            println!("Note: low source coverage — uncertainty banner added.");
+        }
+        println!("Model: {} ({}ms)", provenance.model, provenance.latency_ms);
     } else {
-        println!("Created question record: {question_path}");
-        println!("Created artifact placeholder: {artifact_path}");
-        println!("Requested format: {requested_format}");
-        println!("Answer generation is not implemented yet.");
+        println!("Artifact written: {artifact_path}");
+        println!("LLM backend unavailable — placeholder artifact created.");
     }
 
     Ok(())
+}
+
+fn try_generate_answer(
+    cfg: &Config,
+    root: &Path,
+    query: &str,
+    assembled: &kb_query::AssembledContext,
+    manifest_text: &str,
+) -> Result<(kb_query::ArtifactResult, kb_llm::ProvenanceRecord)> {
+    let adapter = create_ask_adapter(cfg, root)?;
+
+    let llm_request = kb_llm::AnswerQuestionRequest {
+        question: query.to_string(),
+        context: vec![assembled.text.clone()],
+        format: Some(manifest_text.to_string()),
+    };
+
+    let (llm_response, provenance) = adapter
+        .answer_question(llm_request)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+
+    let citation_manifest = kb_query::build_citation_manifest(assembled);
+    let result =
+        kb_query::postprocess_answer(&llm_response.answer, &citation_manifest, assembled);
+
+    Ok((result, provenance))
+}
+
+fn create_ask_adapter(
+    cfg: &Config,
+    root: &Path,
+) -> Result<Box<dyn kb_llm::LlmAdapter>> {
+    let runner_name = &cfg.llm.default_runner;
+    let runner = cfg
+        .llm
+        .runners
+        .get(runner_name)
+        .ok_or_else(|| anyhow::anyhow!("configured runner '{runner_name}' not found in kb.toml"))?;
+
+    let model = runner
+        .model
+        .clone()
+        .unwrap_or_else(|| cfg.llm.default_model.clone());
+
+    let router = kb_llm::Router::new(match runner_name.as_str() {
+        "claude" => kb_llm::Backend::ClaudeCode,
+        _ => kb_llm::Backend::Opencode,
+    });
+
+    let backend = router.route_model(&model);
+
+    match backend {
+        kb_llm::Backend::ClaudeCode => {
+            let command = normalize_binary_command(&runner.command);
+            Ok(Box::new(ClaudeCliAdapter::new(ClaudeCliConfig {
+                command,
+                model: Some(model),
+                permission_mode: runner.permission_mode.clone(),
+                timeout: Duration::from_secs(runner.timeout_seconds.unwrap_or(900)),
+                project_root: Some(root.to_path_buf()),
+            })))
+        }
+        kb_llm::Backend::Opencode | kb_llm::Backend::Pi => {
+            let command = normalize_binary_command(&runner.command);
+            Ok(Box::new(OpencodeAdapter::new(OpencodeConfig {
+                command,
+                model,
+                tools_read: runner.tools_read,
+                tools_write: runner.tools_write,
+                tools_edit: runner.tools_edit,
+                tools_bash: runner.tools_bash,
+                timeout: Duration::from_secs(runner.timeout_seconds.unwrap_or(900)),
+                project_root: Some(root.to_path_buf()),
+                ..Default::default()
+            })))
+        }
+    }
 }
 
 fn normalize_ask_format(format: &str) -> Result<&str> {
@@ -1096,6 +1229,7 @@ fn render_ask_artifact(
     artifact: &Artifact,
     question: &Question,
     question_rel: &Path,
+    body: &str,
 ) -> Result<String> {
     let mut frontmatter = Mapping::new();
     frontmatter.insert(
@@ -1118,16 +1252,15 @@ fn render_ask_artifact(
         Value::String("requested_format".into()),
         Value::String(question.requested_format.clone()),
     );
+    if let Some(model) = &artifact.metadata.model_version {
+        frontmatter.insert(
+            Value::String("model".into()),
+            Value::String(model.clone()),
+        );
+    }
     if question.requested_format == "marp" {
         frontmatter.insert(Value::String("marp".into()), Value::Bool(true));
     }
-
-    let body = format!(
-        "# Question queued\n\nAnswer generation is not implemented yet.\n\n- Query: {}\n- Requested format: {}\n- Question record: {}\n",
-        question.raw_query,
-        question.requested_format,
-        question_rel.display()
-    );
 
     let yaml = serde_yaml::to_string(&frontmatter)?;
     Ok(format!("---\n{yaml}---\n\n{body}"))
