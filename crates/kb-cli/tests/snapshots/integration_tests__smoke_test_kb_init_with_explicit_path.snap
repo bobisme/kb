@@ -1,6 +1,6 @@
 ---
 source: crates/kb-cli/tests/integration_tests.rs
-assertion_line: 64
+assertion_line: 82
 expression: normalized
 ---
-init is not implemented yet at /tmp/tmpXXXXXX/my_kb
+Initialized empty knowledge base at /tmp/tmpXXXXXX

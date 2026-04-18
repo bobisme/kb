@@ -147,11 +147,27 @@ fn run(cli: Cli) -> Result<()> {
             })
         }
         Some(Command::Ingest { sources }) => {
+            let ingest_root = root.clone();
             execute_mutating_command(root.as_deref(), "ingest", move || {
-                println!(
-                    "ingest is not implemented yet for {} sources",
-                    sources.len()
-                );
+                let root = ingest_root
+                    .as_deref()
+                    .expect("root resolved for non-init commands");
+                let ingested = kb_ingest::ingest_paths(root, &sources)?;
+
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&ingested)?);
+                } else if ingested.is_empty() {
+                    println!("No files ingested");
+                } else {
+                    for item in ingested {
+                        println!(
+                            "{} {} {}",
+                            item.document.metadata.id,
+                            item.revision.metadata.id,
+                            item.copied_path.display()
+                        );
+                    }
+                }
                 Ok(())
             })
         }
