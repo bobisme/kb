@@ -147,6 +147,13 @@ fn run(cli: Cli) -> Result<()> {
                 let entry_count = index.entries.len();
                 index.save(compile_root)?;
                 println!("compile: built lexical index ({entry_count} entries)");
+
+                let index_artifacts =
+                    kb_compile::index_page::generate_indexes(compile_root)?;
+                let index_count = index_artifacts.len();
+                kb_compile::index_page::persist_index_artifacts(&index_artifacts)?;
+                println!("compile: generated {index_count} index page(s)");
+
                 Ok(())
             })
         }
