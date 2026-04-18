@@ -1473,7 +1473,7 @@ fn print_status(status: &StatusPayload) {
             );
         }
         println!("  → Inspect the logs and rerun: kb {}",
-            status.interrupted_jobs.first().map(|j| &j.command).unwrap_or(&"compile".to_string()));
+            status.interrupted_jobs.first().map_or("compile", |j| j.command.as_str()));
         println!();
     }
 
