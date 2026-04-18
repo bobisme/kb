@@ -106,6 +106,9 @@ enum Command {
         /// Search query
         #[arg(required = true)]
         query: String,
+        /// Limit number of results (default 10)
+        #[arg(long)]
+        limit: Option<usize>,
     },
     /// Inspect a document or entity
     Inspect {
@@ -255,19 +258,29 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Init { path }) => init::init(root, path, cli.force),
-        Some(Command::Search { query }) => {
+        Some(Command::Search { query, limit }) => {
             let search_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
             let index = kb_query::LexicalIndex::load(search_root)?;
-            let results = index.search(&query, 10);
+            let limit = limit.unwrap_or(10);
+            let results = index.search(&query, limit);
             if results.is_empty() {
-                println!("No results for '{query}'");
-                println!("Tip: run 'kb compile' to build the search index.");
+                if cli.json {
+                    println!("[]");
+                } else {
+                    println!("No results for '{query}'");
+                    println!("Tip: run 'kb compile' to build the search index.");
+                }
+            } else if cli.json {
+                println!("{}", serde_json::to_string_pretty(&results)?);
             } else {
                 for result in &results {
                     println!("{} [score: {}]", result.title, result.score);
                     println!("  {}", result.id);
+                    for reason in &result.reasons {
+                        println!("    reason: {reason}");
+                    }
                 }
             }
             Ok(())

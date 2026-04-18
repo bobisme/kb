@@ -581,6 +581,116 @@ fn search_with_no_index_reports_helpful_tip() {
 }
 
 #[test]
+fn search_includes_ranking_reasons() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_concept_page(&kb_root, "borrowck", "Borrow Checker", &["borrowck"]);
+    write_source_page(
+        &kb_root,
+        "memory",
+        "Memory Safety",
+        "The borrow checker prevents memory errors.",
+    );
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    compile_cmd.output().expect("run kb compile");
+
+    let mut search_cmd = kb_cmd(&kb_root);
+    search_cmd.arg("search").arg("borrowck");
+    let output = search_cmd.output().expect("run kb search");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("reason:"),
+        "search results should include reasons: {stdout}"
+    );
+    assert!(
+        stdout.contains("alias matched") || stdout.contains("title matched"),
+        "reasons should explain which field matched: {stdout}"
+    );
+}
+
+#[test]
+fn search_with_limit_flag() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    for i in 0..5 {
+        write_source_page(
+            &kb_root,
+            &format!("rust-{i}"),
+            &format!("Rust Guide {i}"),
+            "Rust programming language.",
+        );
+    }
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    compile_cmd.output().expect("run kb compile");
+
+    let mut search_cmd = kb_cmd(&kb_root);
+    search_cmd.arg("search").arg("rust").arg("--limit").arg("2");
+    let output = search_cmd.output().expect("run kb search with limit");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line_count = stdout.lines().count();
+    assert!(
+        line_count <= 10,
+        "with --limit 2, output should have <=10 lines (title + reason lines): {stdout}"
+    );
+}
+
+#[test]
+fn search_with_json_output() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_concept_page(&kb_root, "ownership", "Rust Ownership", &[]);
+    write_source_page(
+        &kb_root,
+        "rust-intro",
+        "Rust Introduction",
+        "Introduction to Rust.",
+    );
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    compile_cmd.output().expect("run kb compile");
+
+    let mut search_cmd = kb_cmd(&kb_root);
+    search_cmd
+        .arg("search")
+        .arg("rust")
+        .arg("--json");
+    let output = search_cmd.output().expect("run kb search with --json");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Result<Vec<Value>> = serde_json::from_str(&stdout);
+    assert!(
+        parsed.is_ok(),
+        "search with --json should return valid JSON: {stdout}"
+    );
+
+    let results = parsed.expect("valid json");
+    assert!(!results.is_empty(), "should have search results");
+
+    let first = &results[0];
+    assert!(
+        first.get("id").is_some() && first.get("title").is_some() && first.get("score").is_some(),
+        "JSON results should have id, title, and score fields: {first}"
+    );
+    assert!(
+        first.get("reasons").is_some(),
+        "JSON results should include reasons field: {first}"
+    );
+}
+
+#[test]
 fn lint_reports_broken_links_with_line_numbers_and_suggestions() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);

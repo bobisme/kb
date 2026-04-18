@@ -38,13 +38,16 @@ pub struct LexicalIndex {
 }
 
 /// A ranked search result from [`LexicalIndex::search`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
     /// Page ID (relative path from KB root).
     pub id: String,
     pub title: String,
     /// Higher scores indicate better matches.
     pub score: usize,
+    /// Reasons explaining why this result ranked where it did.
+    #[serde(default)]
+    pub reasons: Vec<String>,
 }
 
 /// A persisted retrieval plan for a question.
@@ -137,6 +140,7 @@ impl LexicalIndex {
                 id: entry.id.clone(),
                 title: entry.title.clone(),
                 score: analysis.score,
+                reasons: analysis.reasons,
             })
             .collect()
     }
