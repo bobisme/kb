@@ -26,6 +26,28 @@ use kb_llm::{
 };
 use serde::Serialize;
 
+/// Top-level envelope wrapping all `--json` output (`schema_version`: 1).
+#[derive(Serialize)]
+struct JsonEnvelope {
+    schema_version: u32,
+    command: String,
+    data: serde_json::Value,
+    warnings: Vec<String>,
+    errors: Vec<String>,
+}
+
+fn emit_json<T: Serialize>(command: &str, data: T) -> Result<()> {
+    let envelope = JsonEnvelope {
+        schema_version: 1,
+        command: command.to_string(),
+        data: serde_json::to_value(data)?,
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    };
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
+}
+
 #[derive(Parser)]
 #[command(name = "kb", version, about = "Personal knowledge base compiler")]
 #[allow(clippy::struct_excessive_bools)]
@@ -184,15 +206,12 @@ fn run(cli: Cli) -> Result<()> {
                 let report = kb_compile::pipeline::run_compile(compile_root, &options)?;
 
                 if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "total_sources": report.total_sources,
-                            "stale_sources": report.stale_sources,
-                            "build_records_emitted": report.build_records_emitted,
-                            "dry_run": dry_run,
-                        })
-                    );
+                    emit_json("compile", serde_json::json!({
+                        "total_sources": report.total_sources,
+                        "stale_sources": report.stale_sources,
+                        "build_records_emitted": report.build_records_emitted,
+                        "dry_run": dry_run,
+                    }))?;
                 } else {
                     println!("{}", report.render());
                 }
@@ -274,8 +293,7 @@ fn run(cli: Cli) -> Result<()> {
             jobs::check_stale_jobs(root)?;
             let status = gather_status(root)?;
             if cli.json {
-                let payload = serde_json::to_string_pretty(&status)?;
-                println!("{payload}");
+                emit_json("status", &status)?;
                 return Ok(());
             }
             print_status(&status);
@@ -289,15 +307,11 @@ fn run(cli: Cli) -> Result<()> {
             let index = kb_query::LexicalIndex::load(search_root)?;
             let limit = limit.unwrap_or(10);
             let results = index.search(&query, limit);
-            if results.is_empty() {
-                if cli.json {
-                    println!("[]");
-                } else {
-                    println!("No results for '{query}'");
-                    println!("Tip: run 'kb compile' to build the search index.");
-                }
-            } else if cli.json {
-                println!("{}", serde_json::to_string_pretty(&results)?);
+            if cli.json {
+                emit_json("search", &results)?;
+            } else if results.is_empty() {
+                println!("No results for '{query}'");
+                println!("Tip: run 'kb compile' to build the search index.");
             } else {
                 for result in &results {
                     println!("{} [score: {}]", result.title, result.score);
@@ -464,14 +478,13 @@ fn run_doctor(root: &Path, json: bool, cli_model: Option<&str>) -> Result<()> {
     };
 
     if json {
-        let payload = DoctorPayload {
+        emit_json("doctor", DoctorPayload {
             checks: checks.clone(),
             status: severity.as_str(),
             warning_count,
             error_count,
             exit_code: severity.exit_code(),
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        })?;
     } else {
         for check in &checks {
             println!(
@@ -927,14 +940,7 @@ fn run_ingest(root: &Path, sources: &[String], json: bool, dry_run: bool) -> Res
 
     let summary = summarize_ingest(&results);
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&IngestPayload {
-                dry_run,
-                results,
-                summary,
-            })?
-        );
+        emit_json("ingest", IngestPayload { dry_run, results, summary })?;
         return Ok(());
     }
 
@@ -1013,7 +1019,7 @@ fn run_ask(
 
     if dry_run {
         if json {
-            println!("{}", serde_json::to_string_pretty(&retrieval_plan)?);
+            emit_json("ask", &retrieval_plan)?;
         } else {
             println!("Retrieval plan for: {query}");
             println!(
@@ -1160,15 +1166,12 @@ fn run_ask(
     let question_path = write_output.question_path.to_string_lossy().into_owned();
     let artifact_path = write_output.answer_path.to_string_lossy().into_owned();
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&AskOutput {
-                question_id: &question_id,
-                question_path: &question_path,
-                artifact_path: &artifact_path,
-                requested_format,
-            })?
-        );
+        emit_json("ask", AskOutput {
+            question_id: &question_id,
+            question_path: &question_path,
+            artifact_path: &artifact_path,
+            requested_format,
+        })?;
     } else if let Some((result, provenance)) = &llm_info {
         println!("Artifact written: {artifact_path}");
         println!(
@@ -1398,7 +1401,7 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
     }
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        emit_json("inspect", &report)?;
     } else {
         println!("{}", render_inspect_report(&report));
     }
@@ -1825,14 +1828,13 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>) -> Result<()> {
         });
     }
     if json {
-        let payload = LintReportPayload {
+        emit_json("lint", LintReportPayload {
             checks: reports,
             checks_ran: rules.len(),
             total_issue_count: total_warnings + total_errors,
             warning_count: total_warnings,
             error_count: total_errors,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
+        })?;
     }
 
     if total_errors > 0 {

@@ -154,7 +154,10 @@ fn ask_creates_question_record_and_placeholder_artifact() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ask");
+    let payload = &envelope["data"];
     let question_path = kb_root.join(
         payload["question_path"]
             .as_str()
@@ -233,7 +236,10 @@ fn ask_persists_ranked_retrieval_plan_after_compile() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ask");
+    let payload = &envelope["data"];
     let question_path = kb_root.join(
         payload["question_path"]
             .as_str()
@@ -287,7 +293,10 @@ fn ingest_file_registers_source_and_sidecar() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ingest");
+    let payload = &envelope["data"];
     let items = payload["results"]
         .as_array()
         .expect("ingest results should be an array");
@@ -326,7 +335,10 @@ fn ingest_directory_respects_gitignore() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ingest");
+    let payload = &envelope["data"];
     let items = payload["results"]
         .as_array()
         .expect("ingest results should be an array");
@@ -368,7 +380,10 @@ fn ingest_dry_run_makes_no_filesystem_changes() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ingest");
+    let payload = &envelope["data"];
     assert_eq!(payload["dry_run"], true);
     assert_eq!(payload["summary"]["new_sources"], 1);
 
@@ -464,7 +479,10 @@ fn inspect_json_trace_and_build_records_are_reported() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse inspect payload");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse inspect payload");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "inspect");
+    let payload = &envelope["data"];
     assert_eq!(payload["resolved_id"], "wiki/index.md");
     assert_eq!(payload["kind"], "wiki_page");
     assert_eq!(payload["freshness"], "fresh");
@@ -532,7 +550,10 @@ fn ingest_mixed_file_directory_and_url_reports_summary() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ingest");
+    let payload = &envelope["data"];
     assert_eq!(payload["summary"]["total"], 3);
     assert_eq!(payload["summary"]["new_sources"], 3);
     assert_eq!(
@@ -760,13 +781,12 @@ fn search_with_json_output() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: serde_json::Result<Vec<Value>> = serde_json::from_str(&stdout);
-    assert!(
-        parsed.is_ok(),
-        "search with --json should return valid JSON: {stdout}"
-    );
+    let envelope: Value = serde_json::from_str(&stdout)
+        .expect("search with --json should return valid JSON envelope");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "search");
 
-    let results = parsed.expect("valid json");
+    let results = envelope["data"].as_array().expect("data should be an array");
     assert!(!results.is_empty(), "should have search results");
 
     let first = &results[0];
@@ -843,7 +863,10 @@ fn lint_json_reports_clean_relative_links() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "lint");
+    let payload = &envelope["data"];
     let checks = payload["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 1);
     let broken_links = &checks[0];
@@ -876,7 +899,10 @@ fn lint_reports_orphan_pages_as_json() {
         "lint should fail when issues are found"
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "lint");
+    let payload = &envelope["data"];
     let checks = payload["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 1);
     let orphans = &checks[0];
@@ -945,7 +971,10 @@ fn lint_missing_citations_can_fail_when_configured_as_error() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "lint");
+    let payload = &envelope["data"];
     let checks = payload["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 1);
     let missing_citations = &checks[0];
@@ -973,7 +1002,10 @@ fn doctor_returns_zero_when_all_checks_pass() {
     );
     assert_eq!(output.status.code(), Some(0));
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse doctor json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse doctor json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "doctor");
+    let payload = &envelope["data"];
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["exit_code"], 0);
     assert_eq!(payload["error_count"], 0);
@@ -1040,7 +1072,10 @@ fn doctor_returns_warning_when_interrupted_jobs_exist() {
 
     assert!(!output.status.success());
     assert_eq!(output.status.code(), Some(1));
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse doctor json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse doctor json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "doctor");
+    let payload = &envelope["data"];
     assert_eq!(payload["status"], "warn");
     assert_eq!(payload["exit_code"], 1);
     assert!(
@@ -1076,7 +1111,10 @@ fn ask_dry_run_prints_retrieval_plan_without_calling_llm() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let plan: Value = serde_json::from_slice(&output.stdout).expect("parse dry-run json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse dry-run json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ask");
+    let plan = &envelope["data"];
     assert!(plan["query"].is_string());
     assert!(plan["token_budget"].is_number());
     assert!(plan["candidates"].is_array());
@@ -1118,7 +1156,10 @@ fn ask_promote_creates_review_item() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ask");
+    let payload = &envelope["data"];
     let question_id = payload["question_id"]
         .as_str()
         .expect("question_id should be a string");
@@ -1141,4 +1182,116 @@ fn ask_promote_creates_review_item() {
         .as_str()
         .expect("comment")
         .contains("What is testing?"));
+}
+
+// ── Snapshot schema tests ────────────────────────────────────────────────────
+// Each test verifies the stable envelope wrapper and the set of keys in `data`.
+// Dynamic values (timestamps, IDs, paths) are not included in the snapshot.
+
+fn sorted_object_keys(value: &Value) -> String {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .expect("expected JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    keys.join(", ")
+}
+
+#[test]
+fn json_schema_envelope_ingest() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let source = kb_root.join("example.md");
+    fs::write(&source, "# hello\n").expect("write source");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("ingest").arg(&source);
+    let output = cmd.output().expect("run kb ingest");
+    assert!(output.status.success());
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "ingest");
+    insta::assert_snapshot!("ingest_envelope_keys", sorted_object_keys(&envelope));
+    insta::assert_snapshot!("ingest_data_keys", sorted_object_keys(&envelope["data"]));
+}
+
+#[test]
+fn json_schema_envelope_compile() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_source_page(&kb_root, "a", "Title A", "Body A.");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("compile");
+    let output = cmd.output().expect("run kb compile");
+    assert!(output.status.success());
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "compile");
+    insta::assert_snapshot!("compile_envelope_keys", sorted_object_keys(&envelope));
+    insta::assert_snapshot!("compile_data_keys", sorted_object_keys(&envelope["data"]));
+}
+
+#[test]
+fn json_schema_envelope_search_empty() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("search").arg("anything");
+    let output = cmd.output().expect("run kb search");
+    assert!(output.status.success());
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "search");
+    assert!(envelope["data"].is_array(), "search data should be an array");
+    assert_eq!(
+        envelope["data"].as_array().expect("data array").len(),
+        0,
+        "empty search should have zero results in data"
+    );
+    insta::assert_snapshot!("search_empty_envelope_keys", sorted_object_keys(&envelope));
+}
+
+#[test]
+fn json_schema_envelope_inspect() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut graph = kb_compile::Graph::default();
+    graph.record(["raw/inbox/doc.md"], ["wiki/sources/doc.md"]);
+    graph.persist_to(&kb_root).expect("persist graph");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("inspect").arg("wiki/sources/doc.md");
+    let output = cmd.output().expect("run kb inspect");
+    assert!(output.status.success());
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "inspect");
+    insta::assert_snapshot!("inspect_envelope_keys", sorted_object_keys(&envelope));
+    insta::assert_snapshot!("inspect_data_keys", sorted_object_keys(&envelope["data"]));
+}
+
+#[test]
+fn json_schema_envelope_lint() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("lint").arg("--check").arg("broken-links");
+    let output = cmd.output().expect("run kb lint");
+    assert!(output.status.success());
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "lint");
+    insta::assert_snapshot!("lint_envelope_keys", sorted_object_keys(&envelope));
+    insta::assert_snapshot!("lint_data_keys", sorted_object_keys(&envelope["data"]));
 }

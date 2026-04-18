@@ -1,0 +1,5 @@
+---
+source: crates/kb-cli/tests/integration_tests.rs
+expression: "sorted_object_keys(&envelope[\"data\"])"
+---
+checks, checks_ran, error_count, total_issue_count, warning_count

@@ -1,0 +1,5 @@
+---
+source: crates/kb-cli/tests/integration_tests.rs
+expression: "sorted_object_keys(&envelope[\"data\"])"
+---
+dry_run, results, summary
