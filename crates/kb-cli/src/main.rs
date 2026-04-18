@@ -244,6 +244,7 @@ fn run(cli: Cli) -> Result<()> {
             let root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
+            jobs::check_stale_jobs(root)?;
             let status = gather_status(root)?;
             if cli.json {
                 let payload = serde_json::to_string_pretty(&status)?;
@@ -1309,6 +1310,7 @@ struct StatusPayload {
     stale_count: usize,
     recent_jobs: Vec<JobRun>,
     failed_jobs: Vec<JobRun>,
+    interrupted_jobs: Vec<JobRun>,
     changed_inputs_not_compiled: Vec<PathBuf>,
 }
 
@@ -1365,9 +1367,16 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         }
     }
 
+    let interrupted_jobs: Vec<_> = all_jobs
+        .iter()
+        .filter(|j| j.status == JobRunStatus::Interrupted)
+        .take(20)
+        .cloned()
+        .collect();
+
     let recent_jobs: Vec<_> = all_jobs
         .iter()
-        .filter(|j| j.status != JobRunStatus::Failed)
+        .filter(|j| j.status != JobRunStatus::Failed && j.status != JobRunStatus::Interrupted)
         .take(20)
         .cloned()
         .collect();
@@ -1388,6 +1397,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         stale_count,
         recent_jobs,
         failed_jobs,
+        interrupted_jobs,
         changed_inputs_not_compiled,
     })
 }
@@ -1443,6 +1453,27 @@ fn print_status(status: &StatusPayload) {
         for path in &status.changed_inputs_not_compiled {
             println!("  - {}", path.display());
         }
+        println!();
+    }
+
+    if !status.interrupted_jobs.is_empty() {
+        println!("⚠ interrupted job runs ({}):", status.interrupted_jobs.len());
+        for job in &status.interrupted_jobs {
+            let duration = job
+                .ended_at_millis
+                .map(|ended| ended - job.started_at_millis);
+            let duration_str =
+                duration.map_or_else(|| "running".to_string(), |ms| format!("{ms}ms"));
+            println!(
+                "  {} | {:<11} | {} [{}]",
+                job.metadata.id,
+                format!("{:?}", job.status),
+                job.command,
+                duration_str
+            );
+        }
+        println!("  → Inspect the logs and rerun: kb {}",
+            status.interrupted_jobs.first().map(|j| &j.command).unwrap_or(&"compile".to_string()));
         println!();
     }
 
