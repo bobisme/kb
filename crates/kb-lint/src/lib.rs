@@ -1160,7 +1160,7 @@ fn unix_time_ms() -> Result<u64> {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+mod duplicate_concept_tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
