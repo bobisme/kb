@@ -141,14 +141,25 @@ impl OpencodeAdapter {
     fn render_extract_concepts_prompt(
         &self,
         request: &ExtractConceptsRequest,
-    ) -> Result<(crate::templates::RenderedTemplate, crate::templates::Template), LlmAdapterError> {
+    ) -> Result<
+        (
+            crate::templates::RenderedTemplate,
+            crate::templates::Template,
+        ),
+        LlmAdapterError,
+    > {
         let template = Template::load("extract_concepts.md", self.config.project_root.as_deref())
-            .map_err(|err| LlmAdapterError::Other(format!("load extract concepts template: {err}")))?;
+            .map_err(|err| {
+            LlmAdapterError::Other(format!("load extract concepts template: {err}"))
+        })?;
 
         let mut context = HashMap::new();
         context.insert("title".to_string(), request.title.clone());
         context.insert("body".to_string(), request.body.clone());
-        context.insert("summary".to_string(), request.summary.clone().unwrap_or_default());
+        context.insert(
+            "summary".to_string(),
+            request.summary.clone().unwrap_or_default(),
+        );
         context.insert(
             "max_concepts".to_string(),
             request
@@ -269,11 +280,13 @@ impl LlmAdapter for OpencodeAdapter {
         &self,
         request: MergeConceptCandidatesRequest,
     ) -> Result<(MergeConceptCandidatesResponse, ProvenanceRecord), LlmAdapterError> {
-        let template =
-            Template::load("merge_concept_candidates.md", self.config.project_root.as_deref())
-                .map_err(|err| {
-                    LlmAdapterError::Other(format!("load merge_concept_candidates template: {err}"))
-                })?;
+        let template = Template::load(
+            "merge_concept_candidates.md",
+            self.config.project_root.as_deref(),
+        )
+        .map_err(|err| {
+            LlmAdapterError::Other(format!("load merge_concept_candidates template: {err}"))
+        })?;
 
         let candidates_json = serde_json::to_string_pretty(&request.candidates)
             .map_err(|err| LlmAdapterError::Other(format!("serialize candidates: {err}")))?;

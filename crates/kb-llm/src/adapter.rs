@@ -197,12 +197,16 @@ pub fn parse_extract_concepts_json(text: &str) -> Result<ExtractConceptsResponse
         .unwrap_or(trimmed);
 
     let value: serde_json::Value = serde_json::from_str(json_text).map_err(|err| {
-        LlmAdapterError::Parse(format!("extract_concepts response was not valid JSON: {err}"))
+        LlmAdapterError::Parse(format!(
+            "extract_concepts response was not valid JSON: {err}"
+        ))
     })?;
 
     if value.is_array() {
         let concepts = serde_json::from_value(value).map_err(|err| {
-            LlmAdapterError::Parse(format!("extract_concepts response had invalid candidate list: {err}"))
+            LlmAdapterError::Parse(format!(
+                "extract_concepts response had invalid candidate list: {err}"
+            ))
         })?;
         return Ok(ExtractConceptsResponse { concepts });
     }
@@ -351,7 +355,9 @@ mod tests {
         assert_eq!(parsed.concepts[0].name, "Rust ownership");
         assert_eq!(parsed.concepts[0].aliases, vec!["ownership"]);
         assert_eq!(
-            parsed.concepts[0].source_anchors[0].heading_anchor.as_deref(),
+            parsed.concepts[0].source_anchors[0]
+                .heading_anchor
+                .as_deref(),
             Some("ownership")
         );
     }

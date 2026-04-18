@@ -76,12 +76,17 @@ impl ClaudeCliAdapter {
         request: &ExtractConceptsRequest,
     ) -> Result<RenderedPrompt, LlmAdapterError> {
         let template = Template::load("extract_concepts.md", self.config.project_root.as_deref())
-            .map_err(|err| LlmAdapterError::Other(format!("load extract concepts template: {err}")))?;
+            .map_err(|err| {
+            LlmAdapterError::Other(format!("load extract concepts template: {err}"))
+        })?;
 
         let mut context = HashMap::new();
         context.insert("title".to_string(), request.title.clone());
         context.insert("body".to_string(), request.body.clone());
-        context.insert("summary".to_string(), request.summary.clone().unwrap_or_default());
+        context.insert(
+            "summary".to_string(),
+            request.summary.clone().unwrap_or_default(),
+        );
         context.insert(
             "max_concepts".to_string(),
             request

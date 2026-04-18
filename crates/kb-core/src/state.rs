@@ -70,7 +70,11 @@ pub fn find_build_records_for_output(root: &Path, output_id: &str) -> Result<Vec
             }
         }
     }
-    records.sort_by(|a, b| b.metadata.created_at_millis.cmp(&a.metadata.created_at_millis));
+    records.sort_by(|a, b| {
+        b.metadata
+            .created_at_millis
+            .cmp(&a.metadata.created_at_millis)
+    });
     Ok(records)
 }
 
@@ -125,7 +129,11 @@ impl Manifest {
                     continue;
                 }
 
-                if record.input_ids.iter().any(|input| frontier.contains(input)) {
+                if record
+                    .input_ids
+                    .iter()
+                    .any(|input| frontier.contains(input))
+                {
                     stale.insert(artifact_path.clone());
                     frontier.extend(record.output_ids.iter().cloned());
                     made_progress = true;
@@ -195,9 +203,9 @@ where
         return Ok(T::default());
     }
 
-    let raw = fs::read_to_string(path).with_context(|| format!("read {label} {}", path.display()))?;
-    serde_json::from_str(&raw)
-        .with_context(|| format!("deserialize {label} {}", path.display()))
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("read {label} {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("deserialize {label} {}", path.display()))
 }
 
 fn write_json_file<T>(path: &Path, label: &str, value: &T) -> Result<()>
@@ -396,8 +404,7 @@ mod tests {
         save_build_record(dir.path(), &rec_a).expect("save a");
         save_build_record(dir.path(), &rec_b).expect("save b");
 
-        let found =
-            find_build_records_for_output(dir.path(), "wiki/sources/a.md").expect("find");
+        let found = find_build_records_for_output(dir.path(), "wiki/sources/a.md").expect("find");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].metadata.id, "rec-a");
 
@@ -409,8 +416,7 @@ mod tests {
     #[test]
     fn find_build_records_for_output_returns_empty_when_dir_absent() {
         let dir = tempdir().expect("tempdir");
-        let result =
-            find_build_records_for_output(dir.path(), "wiki/sources/a.md").expect("find");
+        let result = find_build_records_for_output(dir.path(), "wiki/sources/a.md").expect("find");
         assert!(result.is_empty());
     }
 

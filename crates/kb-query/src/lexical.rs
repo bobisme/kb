@@ -250,8 +250,8 @@ fn scan_wiki_dir(dir: &Path, mut visit: impl FnMut(&Path)) -> Result<()> {
 }
 
 fn index_source_page(path: &Path, root: &Path) -> Result<LexicalEntry> {
-    let (frontmatter, body) = read_frontmatter(path)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let (frontmatter, body) =
+        read_frontmatter(path).with_context(|| format!("parse {}", path.display()))?;
 
     let title = frontmatter
         .get("title")
@@ -277,8 +277,8 @@ fn index_source_page(path: &Path, root: &Path) -> Result<LexicalEntry> {
 }
 
 fn index_concept_page(path: &Path, root: &Path) -> Result<LexicalEntry> {
-    let (frontmatter, body) = read_frontmatter(path)
-        .with_context(|| format!("parse {}", path.display()))?;
+    let (frontmatter, body) =
+        read_frontmatter(path).with_context(|| format!("parse {}", path.display()))?;
 
     let title = frontmatter
         .get("name")
@@ -322,7 +322,11 @@ fn extract_headings(body: &str) -> Vec<String> {
                 return None;
             }
             let text = line.trim_start_matches('#').trim();
-            if text.is_empty() { None } else { Some(text.to_string()) }
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
         })
         .collect()
 }
@@ -461,7 +465,12 @@ mod tests {
         fs::create_dir_all(&sources).unwrap();
         fs::create_dir_all(&concepts).unwrap();
 
-        write_source_page(&sources, "rust-book", "The Rust Programming Language", "Memory safety.");
+        write_source_page(
+            &sources,
+            "rust-book",
+            "The Rust Programming Language",
+            "Memory safety.",
+        );
         write_concept_page(&concepts, "borrow-checker", "Borrow checker", &["borrowck"]);
 
         let index = build_lexical_index(root).unwrap();
@@ -478,8 +487,18 @@ mod tests {
         let sources = root.join("wiki/sources");
         fs::create_dir_all(&sources).unwrap();
 
-        write_source_page(&sources, "rust-overview", "Rust Overview", "A general overview.");
-        write_source_page(&sources, "memory", "Memory Safety", "Rust enables memory safety.");
+        write_source_page(
+            &sources,
+            "rust-overview",
+            "Rust Overview",
+            "A general overview.",
+        );
+        write_source_page(
+            &sources,
+            "memory",
+            "Memory Safety",
+            "Rust enables memory safety.",
+        );
 
         let index = build_lexical_index(root).unwrap();
         let results = index.search("rust", 10);
@@ -494,7 +513,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("wiki/sources")).unwrap();
-        write_source_page(&root.join("wiki/sources"), "rust-book", "The Rust Book", "About Rust.");
+        write_source_page(
+            &root.join("wiki/sources"),
+            "rust-book",
+            "The Rust Book",
+            "About Rust.",
+        );
 
         let index = build_lexical_index(root).unwrap();
         assert!(index.search("python", 10).is_empty());
@@ -555,7 +579,12 @@ mod tests {
         let sources = root.join("wiki/sources");
         fs::create_dir_all(&sources).unwrap();
         for i in 0..5 {
-            write_source_page(&sources, &format!("rust-{i}"), &format!("Rust Guide {i}"), "Rust.");
+            write_source_page(
+                &sources,
+                &format!("rust-{i}"),
+                &format!("Rust Guide {i}"),
+                "Rust.",
+            );
         }
         let index = build_lexical_index(root).unwrap();
         let results = index.search("rust", 3);

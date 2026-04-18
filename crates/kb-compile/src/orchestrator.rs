@@ -96,10 +96,7 @@ impl OrchestratorReport {
         for (name, outcome) in &self.outcomes {
             match outcome {
                 PassOutcome::Executed { build_records } => {
-                    lines.push(format!(
-                        "  [ok] {name} — {} record(s)",
-                        build_records.len()
-                    ));
+                    lines.push(format!("  [ok] {name} — {} record(s)", build_records.len()));
                 }
                 PassOutcome::Failed { error } => {
                     lines.push(format!("  [FAIL] {name} — {error}"));
@@ -144,12 +141,7 @@ impl Orchestrator {
     }
 
     #[must_use]
-    pub fn run(
-        &self,
-        root: &Path,
-        stale: &BTreeSet<String>,
-        dry_run: bool,
-    ) -> OrchestratorReport {
+    pub fn run(&self, root: &Path, stale: &BTreeSet<String>, dry_run: bool) -> OrchestratorReport {
         let mut outcomes = Vec::new();
         let mut failed_outputs: BTreeSet<String> = BTreeSet::new();
 
@@ -358,18 +350,9 @@ mod tests {
         assert_eq!(report.outcomes[0].0, "normalize");
         assert_eq!(report.outcomes[1].0, "source_pages");
         assert_eq!(report.outcomes[2].0, "concepts");
-        assert!(matches!(
-            report.outcomes[0].1,
-            PassOutcome::Executed { .. }
-        ));
-        assert!(matches!(
-            report.outcomes[1].1,
-            PassOutcome::Executed { .. }
-        ));
-        assert!(matches!(
-            report.outcomes[2].1,
-            PassOutcome::Executed { .. }
-        ));
+        assert!(matches!(report.outcomes[0].1, PassOutcome::Executed { .. }));
+        assert!(matches!(report.outcomes[1].1, PassOutcome::Executed { .. }));
+        assert!(matches!(report.outcomes[2].1, PassOutcome::Executed { .. }));
         assert_eq!(report.executed_count(), 3);
         assert!(!report.has_failures());
     }
@@ -445,16 +428,17 @@ mod tests {
                 inputs: vec!["sources/".to_string()],
                 outputs: vec!["lint/".to_string()],
             },
-            records: vec![test_record("lint-1", &["sources/a.md"], &["lint/report.json"])],
+            records: vec![test_record(
+                "lint-1",
+                &["sources/a.md"],
+                &["lint/report.json"],
+            )],
         }));
 
         let report = orch.run(Path::new("/tmp/kb"), &stale, false);
 
         assert!(matches!(report.outcomes[0].1, PassOutcome::Failed { .. }));
-        assert!(matches!(
-            report.outcomes[1].1,
-            PassOutcome::Executed { .. }
-        ));
+        assert!(matches!(report.outcomes[1].1, PassOutcome::Executed { .. }));
     }
 
     #[test]
@@ -527,8 +511,7 @@ mod tests {
     #[test]
     fn pass_with_no_stale_nodes_is_skipped() {
         let mut orch = Orchestrator::new();
-        let stale: BTreeSet<String> =
-            BTreeSet::from(["normalized/a.json".to_string()]);
+        let stale: BTreeSet<String> = BTreeSet::from(["normalized/a.json".to_string()]);
 
         orch.register(Box::new(SuccessPass {
             decl: PassDecl {
@@ -549,10 +532,7 @@ mod tests {
 
         let report = orch.run(Path::new("/tmp/kb"), &stale, false);
 
-        assert!(matches!(
-            report.outcomes[0].1,
-            PassOutcome::Executed { .. }
-        ));
+        assert!(matches!(report.outcomes[0].1, PassOutcome::Executed { .. }));
         assert!(matches!(
             report.outcomes[1].1,
             PassOutcome::Skipped { ref reason } if reason == "no stale nodes"

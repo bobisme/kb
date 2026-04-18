@@ -313,9 +313,10 @@ mod tests {
             .expect("rust concept exists");
 
         assert!(rust.updated_markdown.contains("## Backlinks"));
-        assert!(rust
-            .updated_markdown
-            .contains("- [[wiki/concepts/borrow-checker]]"));
+        assert!(
+            rust.updated_markdown
+                .contains("- [[wiki/concepts/borrow-checker]]")
+        );
         assert!(rust.updated_markdown.contains("- [[wiki/sources/page-a]]"));
         assert!(rust.updated_markdown.contains("- [[wiki/sources/page-b]]"));
         assert!(!rust.updated_markdown.contains("- _None yet._"));

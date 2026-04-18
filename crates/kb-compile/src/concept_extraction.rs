@@ -137,13 +137,23 @@ fn build_record_for_concept_candidates(
                 prompt_render_hash,
             ],
             model_version: Some(provenance.model.clone()),
-            tool_version: Some(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))),
+            tool_version: Some(format!(
+                "{}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )),
             prompt_template_hash: Some(prompt_template_hash),
-            dependencies: vec![document.metadata.id.clone(), document.source_revision_id.clone()],
+            dependencies: vec![
+                document.metadata.id.clone(),
+                document.source_revision_id.clone(),
+            ],
             output_paths: vec![output_path.to_path_buf()],
             status: Status::Fresh,
         },
-        input_ids: vec![document.metadata.id.clone(), document.source_revision_id.clone()],
+        input_ids: vec![
+            document.metadata.id.clone(),
+            document.source_revision_id.clone(),
+        ],
         output_ids: vec![output_path.display().to_string()],
         manifest_hash,
     })
@@ -314,10 +324,17 @@ mod tests {
         assert!(artifact.output_json.contains("Borrow checker"));
         assert_eq!(artifact.output_path, output_path);
         assert_eq!(artifact.build_record.pass_name, "extract_concepts");
-        assert_eq!(artifact.build_record.output_ids, vec!["state/concept_candidates/source-1.json"]);
+        assert_eq!(
+            artifact.build_record.output_ids,
+            vec!["state/concept_candidates/source-1.json"]
+        );
         let expected_prompt_hash = Hash::from([7u8; 32]).to_hex();
         assert_eq!(
-            artifact.build_record.metadata.prompt_template_hash.as_deref(),
+            artifact
+                .build_record
+                .metadata
+                .prompt_template_hash
+                .as_deref(),
             Some(expected_prompt_hash.as_str())
         );
     }

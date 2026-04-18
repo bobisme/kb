@@ -190,13 +190,10 @@ pub fn run_compile(root: &Path, options: &CompileOptions) -> Result<CompileRepor
             let mut updated = 0;
             for artifact in &artifacts {
                 if artifact.needs_update() {
-                    kb_core::fs::atomic_write(
-                        &artifact.path,
-                        artifact.updated_markdown.as_bytes(),
-                    )
-                    .with_context(|| {
-                        format!("write backlinks for {}", artifact.path.display())
-                    })?;
+                    kb_core::fs::atomic_write(&artifact.path, artifact.updated_markdown.as_bytes())
+                        .with_context(|| {
+                            format!("write backlinks for {}", artifact.path.display())
+                        })?;
                     updated += 1;
                 }
             }
@@ -314,8 +311,7 @@ mod tests {
         let root = dir.path();
         setup_kb(root);
 
-        write_normalized_document(root, &test_doc("doc-1", "# Hello\nWorld"))
-            .expect("write doc");
+        write_normalized_document(root, &test_doc("doc-1", "# Hello\nWorld")).expect("write doc");
         write_normalized_document(root, &test_doc("doc-2", "# Second\nDocument"))
             .expect("write doc");
 
@@ -339,8 +335,7 @@ mod tests {
         let root = dir.path();
         setup_kb(root);
 
-        write_normalized_document(root, &test_doc("doc-1", "# Hello\nWorld"))
-            .expect("write doc");
+        write_normalized_document(root, &test_doc("doc-1", "# Hello\nWorld")).expect("write doc");
 
         run_compile(
             root,
@@ -371,8 +366,7 @@ mod tests {
         let root = dir.path();
         setup_kb(root);
 
-        write_normalized_document(root, &test_doc("doc-1", "# Original"))
-            .expect("write doc");
+        write_normalized_document(root, &test_doc("doc-1", "# Original")).expect("write doc");
 
         run_compile(
             root,
@@ -405,8 +399,7 @@ mod tests {
         let root = dir.path();
         setup_kb(root);
 
-        write_normalized_document(root, &test_doc("doc-1", "# Hello"))
-            .expect("write doc");
+        write_normalized_document(root, &test_doc("doc-1", "# Hello")).expect("write doc");
 
         run_compile(
             root,
@@ -436,8 +429,7 @@ mod tests {
         let root = dir.path();
         setup_kb(root);
 
-        write_normalized_document(root, &test_doc("doc-1", "# Hello"))
-            .expect("write doc");
+        write_normalized_document(root, &test_doc("doc-1", "# Hello")).expect("write doc");
 
         let report = run_compile(
             root,
@@ -474,10 +466,8 @@ mod tests {
         let root = dir.path();
         setup_kb(root);
 
-        write_normalized_document(root, &test_doc("doc-1", "# A"))
-            .expect("write doc");
-        write_normalized_document(root, &test_doc("doc-2", "# B"))
-            .expect("write doc");
+        write_normalized_document(root, &test_doc("doc-1", "# A")).expect("write doc");
+        write_normalized_document(root, &test_doc("doc-2", "# B")).expect("write doc");
 
         let dry = run_compile(
             root,

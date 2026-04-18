@@ -100,10 +100,15 @@ pub fn run_concept_merge_pass<A: LlmAdapter>(
     let (response, provenance) = adapter.merge_concept_candidates(request)?;
 
     let concept_pages = build_concept_pages(&response, root);
-    let review_records = build_review_records(&response, root, &provenance)
-        .map_err(ConceptMergeError::Serialize)?;
-    let build_record =
-        build_record_for_merge(&candidates, &response, &concept_pages, &review_records, &provenance)?;
+    let review_records =
+        build_review_records(&response, root, &provenance).map_err(ConceptMergeError::Serialize)?;
+    let build_record = build_record_for_merge(
+        &candidates,
+        &response,
+        &concept_pages,
+        &review_records,
+        &provenance,
+    )?;
 
     Ok(ConceptMergeArtifact {
         concept_pages,
@@ -459,7 +464,10 @@ mod tests {
         assert!(page.content.contains("aliases:"));
         assert!(page.content.contains("- borrowck"));
         assert!(page.content.contains("# Borrow checker"));
-        assert!(page.content.contains("Validates references at compile time."));
+        assert!(
+            page.content
+                .contains("Validates references at compile time.")
+        );
         assert_eq!(
             page.path,
             dir.path().join("wiki/concepts/borrow-checker.md")
@@ -494,7 +502,8 @@ mod tests {
         assert_eq!(review.merge_id, "merge:lifetime-elision");
         assert_eq!(
             review.path,
-            dir.path().join("reviews/merges/merge:lifetime-elision.json")
+            dir.path()
+                .join("reviews/merges/merge:lifetime-elision.json")
         );
         assert!(review.content.contains("canonical_name_proposed"));
         assert!(review.content.contains("Lifetime elision"));
@@ -549,9 +558,7 @@ mod tests {
 
         let output_ids = &artifact.build_record.output_ids;
         assert!(
-            output_ids
-                .iter()
-                .any(|id| id.contains("borrow-checker.md")),
+            output_ids.iter().any(|id| id.contains("borrow-checker.md")),
             "output_ids: {output_ids:?}"
         );
         assert!(

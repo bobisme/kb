@@ -6,7 +6,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use kb_core::{BuildRecord, EntityMetadata, Manifest, ReviewAction, ReviewItem, Status, build_records_dir, extract_managed_regions, frontmatter::read_frontmatter, load_build_record, slug_from_title};
+use kb_core::{
+    BuildRecord, EntityMetadata, Manifest, ReviewAction, ReviewItem, Status, build_records_dir,
+    extract_managed_regions, frontmatter::read_frontmatter, load_build_record, slug_from_title,
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -151,7 +154,11 @@ pub fn run_lint(root: &Path, rule: LintRule) -> Result<LintReport> {
 ///
 /// # Errors
 /// Returns an error when the lint pass cannot read KB state or wiki files.
-pub fn run_lint_with_options(root: &Path, rule: LintRule, options: &LintOptions) -> Result<LintReport> {
+pub fn run_lint_with_options(
+    root: &Path,
+    rule: LintRule,
+    options: &LintOptions,
+) -> Result<LintReport> {
     let mut issues = Vec::new();
 
     if matches!(rule, LintRule::BrokenLinks | LintRule::All) {
@@ -585,8 +592,10 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
         let (frontmatter, _) = read_frontmatter(&page)
             .with_context(|| format!("read frontmatter for {}", page.display()))?;
 
-        let doc_ids = frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
-        let rev_ids = frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
+        let doc_ids =
+            frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
+        let rev_ids =
+            frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
 
         if doc_ids.is_empty() && rev_ids.is_empty() {
             continue;
@@ -596,11 +605,19 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
         let rel_page_str = rel_page.to_string_lossy().into_owned();
         let existing_docs: Vec<_> = doc_ids
             .iter()
-            .filter(|doc_id| normalized_metadata_for_doc(root, doc_id).ok().flatten().is_some())
+            .filter(|doc_id| {
+                normalized_metadata_for_doc(root, doc_id)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
             .cloned()
             .collect();
 
-        for missing_doc in doc_ids.iter().filter(|doc_id| !existing_docs.contains(*doc_id)) {
+        for missing_doc in doc_ids
+            .iter()
+            .filter(|doc_id| !existing_docs.contains(*doc_id))
+        {
             issues.push(LintIssue {
                 severity: IssueSeverity::Error,
                 kind: IssueKind::SourceDocumentMissing,
@@ -637,7 +654,10 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
                         suggested_fix: None,
                     });
                 }
-            } else if rev_ids.iter().all(|revision_id| !live_revision_ids.contains(revision_id)) {
+            } else if rev_ids
+                .iter()
+                .all(|revision_id| !live_revision_ids.contains(revision_id))
+            {
                 issues.push(LintIssue {
                     severity: IssueSeverity::Error,
                     kind: IssueKind::SourceRevisionStale,
@@ -723,9 +743,7 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
                 referring_page: relative_to_root(root, &page).to_string_lossy().into_owned(),
                 line: 0,
                 target: build_record_id.clone(),
-                message: format!(
-                    "page references missing build record '{build_record_id}'"
-                ),
+                message: format!("page references missing build record '{build_record_id}'"),
                 suggested_fix: None,
             });
         }
@@ -829,8 +847,10 @@ fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<Lin
             .with_context(|| format!("read wiki page {}", page.display()))?;
         let (frontmatter, body) = read_frontmatter(&page)
             .with_context(|| format!("read frontmatter for {}", page.display()))?;
-        let doc_ids = frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
-        let rev_ids = frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
+        let doc_ids =
+            frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
+        let rev_ids =
+            frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
         let has_sources = !(doc_ids.is_empty() && rev_ids.is_empty());
         let has_citations = page_has_citations(&body);
 
@@ -873,9 +893,11 @@ fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<Lin
 }
 
 fn is_synthetic_region(frontmatter: &serde_yaml::Mapping, region_id: &str) -> bool {
-    let has_direct_source_ids = frontmatter.contains_key(Value::String("source_document_id".to_string()))
+    let has_direct_source_ids = frontmatter
+        .contains_key(Value::String("source_document_id".to_string()))
         || frontmatter.contains_key(Value::String("source_revision_id".to_string()));
-    let has_plural_source_ids = frontmatter.contains_key(Value::String("source_document_ids".to_string()))
+    let has_plural_source_ids = frontmatter
+        .contains_key(Value::String("source_document_ids".to_string()))
         || frontmatter.contains_key(Value::String("source_revision_ids".to_string()));
     let source_page_shape = has_direct_source_ids || has_plural_source_ids;
 
@@ -904,7 +926,11 @@ fn citations_exist(text: &str) -> bool {
 }
 
 fn line_number_at(text: &str, offset: usize) -> usize {
-    text[..offset.min(text.len())].bytes().filter(|byte| *byte == b'\n').count() + 1
+    text[..offset.min(text.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
 }
 
 fn frontmatter_string_list(
@@ -1002,10 +1028,16 @@ mod tests {
         assert_eq!(report.issue_count, 2);
         assert_eq!(report.issues[0].kind, IssueKind::MissingPage);
         assert_eq!(report.issues[0].line, 2);
-        assert_eq!(report.issues[0].suggested_fix.as_deref(), Some("wiki/concepts/rust"));
+        assert_eq!(
+            report.issues[0].suggested_fix.as_deref(),
+            Some("wiki/concepts/rust")
+        );
         assert_eq!(report.issues[1].kind, IssueKind::MissingAnchor);
         assert_eq!(report.issues[1].line, 3);
-        assert_eq!(report.issues[1].suggested_fix.as_deref(), Some("wiki/concepts/rust#summary"));
+        assert_eq!(
+            report.issues[1].suggested_fix.as_deref(),
+            Some("wiki/concepts/rust#summary")
+        );
     }
 
     #[test]
@@ -1057,14 +1089,18 @@ mod tests {
 
         let report = run_lint(root, LintRule::Orphans).expect("lint report");
         assert_eq!(report.issue_count, 2);
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| issue.kind == IssueKind::SourceDocumentMissing));
-        assert!(report
-            .issues
-            .iter()
-            .any(|issue| issue.kind == IssueKind::SourceRevisionMissing));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::SourceDocumentMissing)
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::SourceRevisionMissing)
+        );
     }
 
     #[test]
@@ -1081,8 +1117,11 @@ mod tests {
         }
         .save(root)
         .expect("save manifest");
-        save_build_record(root, &build_record("build-1", "manifest-b", "wiki/sources/doc-1.md"))
-            .expect("save build record");
+        save_build_record(
+            root,
+            &build_record("build-1", "manifest-b", "wiki/sources/doc-1.md"),
+        )
+        .expect("save build record");
 
         let report = run_lint(root, LintRule::StaleArtifacts).expect("lint report");
         assert_eq!(report.issue_count, 1);
@@ -1497,15 +1536,13 @@ mod duplicate_concept_tests {
         let strict = DuplicateConceptsConfig {
             similarity_threshold: 0.99,
         };
-        let strict_items =
-            check_duplicate_concepts(dir.path(), &strict).expect("strict check");
+        let strict_items = check_duplicate_concepts(dir.path(), &strict).expect("strict check");
 
         // At low threshold, should flag
         let lenient = DuplicateConceptsConfig {
             similarity_threshold: 0.5,
         };
-        let lenient_items =
-            check_duplicate_concepts(dir.path(), &lenient).expect("lenient check");
+        let lenient_items = check_duplicate_concepts(dir.path(), &lenient).expect("lenient check");
 
         assert!(
             lenient_items.len() >= strict_items.len(),

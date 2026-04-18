@@ -383,12 +383,12 @@ pub use managed_region::{
     ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title,
 };
 pub use normalized::{read_normalized_document, write_normalized_document};
-pub use state::{
-    Hashes, Manifest, build_records_dir, find_build_records_for_output, hashes_path,
-    load_build_record, manifest_path, save_build_record,
-};
 pub use source_identity::{
     SOURCE_DOCUMENT_ID_PREFIX, SOURCE_REVISION_ID_PREFIX, mint_source_document_id,
     mint_source_revision_id, normalize_file_stable_location, normalize_url_stable_location,
     source_document_id_for_file, source_document_id_for_url, source_revision_content_hash,
+};
+pub use state::{
+    Hashes, Manifest, build_records_dir, find_build_records_for_output, hashes_path,
+    load_build_record, manifest_path, save_build_record,
 };

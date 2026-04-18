@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 
 fn init_kb(root: &std::path::Path) {
@@ -27,6 +27,38 @@ fn normalize_temp_paths(output: &str) -> String {
         .expect("regex is valid")
         .replace_all(output, "/tmp/tmpXXXXXX")
         .to_string()
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+}
+
+fn install_fake_harnesses(root: &Path) -> PathBuf {
+    let bin_dir = root.join("fake-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    write_executable(bin_dir.join("opencode").as_path(), "#!/bin/sh\nprintf 'OK'");
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+    bin_dir
+}
+
+fn prepend_path(dir: &Path) -> String {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(std::env::split_paths(&existing));
+    std::env::join_paths(paths)
+        .expect("join PATH")
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[test]
@@ -92,8 +124,8 @@ fn init_creates_empty_state_files() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
 
-    let manifest = fs::read_to_string(kb_root.join("state/manifest.json"))
-        .expect("read manifest state file");
+    let manifest =
+        fs::read_to_string(kb_root.join("state/manifest.json")).expect("read manifest state file");
     let hashes =
         fs::read_to_string(kb_root.join("state/hashes.json")).expect("read hashes state file");
 
@@ -110,7 +142,9 @@ fn ask_creates_question_record_and_placeholder_artifact() {
     init_kb(&kb_root);
 
     let mut cmd = kb_cmd(&kb_root);
-    cmd.arg("--json").arg("ask").arg("How does the pipeline work?");
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("How does the pipeline work?");
     let output = cmd.output().expect("run kb ask");
 
     assert!(
@@ -134,10 +168,9 @@ fn ask_creates_question_record_and_placeholder_artifact() {
     assert!(question_path.is_file());
     assert!(artifact_path.is_file());
 
-    let question_record: Value = serde_json::from_str(
-        &fs::read_to_string(&question_path).expect("read question record"),
-    )
-    .expect("parse question record");
+    let question_record: Value =
+        serde_json::from_str(&fs::read_to_string(&question_path).expect("read question record"))
+            .expect("parse question record");
     assert_eq!(question_record["raw_query"], "How does the pipeline work?");
     assert_eq!(question_record["requested_format"], "md");
     assert_eq!(question_record["requesting_context"], "project_kb");
@@ -445,7 +478,11 @@ fn write_concept_page(root: &Path, slug: &str, name: &str, aliases: &[&str]) {
             writeln!(content, "  - {alias}").expect("write alias");
         }
     }
-    writeln!(content, "---\n\n# {name}\n\nThis concept page covers {name}.").expect("write body");
+    writeln!(
+        content,
+        "---\n\n# {name}\n\nThis concept page covers {name}."
+    )
+    .expect("write body");
     fs::write(dir.join(format!("{slug}.md")), content).expect("write concept page");
 }
 
@@ -454,7 +491,12 @@ fn compile_builds_lexical_index() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
 
-    write_source_page(&kb_root, "rust-book", "The Rust Programming Language", "Memory safety.");
+    write_source_page(
+        &kb_root,
+        "rust-book",
+        "The Rust Programming Language",
+        "Memory safety.",
+    );
     write_concept_page(&kb_root, "borrow-checker", "Borrow checker", &["borrowck"]);
 
     let mut cmd = kb_cmd(&kb_root);
@@ -467,7 +509,10 @@ fn compile_builds_lexical_index() {
     );
 
     let index_path = kb_root.join("state/indexes/lexical.json");
-    assert!(index_path.exists(), "lexical index should exist after compile");
+    assert!(
+        index_path.exists(),
+        "lexical index should exist after compile"
+    );
 
     let raw = fs::read_to_string(&index_path).expect("read index");
     let json: Value = serde_json::from_str(&raw).expect("parse index");
@@ -557,9 +602,18 @@ fn lint_reports_broken_links_with_line_numbers_and_suggestions() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("wiki/sources/page.md:2"), "stdout: {stdout}");
-    assert!(stdout.contains("wiki/sources/page.md:3"), "stdout: {stdout}");
-    assert!(stdout.contains("suggested fix: wiki/concepts/rust"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("wiki/sources/page.md:2"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("wiki/sources/page.md:3"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("suggested fix: wiki/concepts/rust"),
+        "stdout: {stdout}"
+    );
     assert!(
         stdout.contains("suggested fix: wiki/concepts/rust#rust")
             || stdout.contains("suggested fix: wiki/concepts/rust#summary"),
@@ -648,9 +702,18 @@ fn lint_missing_citations_warns_by_default_with_warning_exit_code() {
     cmd.arg("lint").arg("--check").arg("missing-citations");
     let output = cmd.output().expect("run kb lint");
 
-    assert_eq!(output.status.code(), Some(1), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("[warn] missing-citations"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("[warn] missing-citations"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
@@ -675,7 +738,13 @@ fn lint_missing_citations_can_fail_when_configured_as_error() {
     cmd.arg("--json").arg("lint").arg("--check").arg("missing-citations");
     let output = cmd.output().expect("run kb lint");
 
-    assert_eq!(output.status.code(), Some(2), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
     let checks = payload["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 1);
@@ -683,4 +752,102 @@ fn lint_missing_citations_can_fail_when_configured_as_error() {
     assert_eq!(missing_citations["issue_count"], 1);
     assert_eq!(missing_citations["issues"][0]["severity"], "error");
     assert_eq!(missing_citations["issues"][0]["kind"], "missing_citations");
+}
+
+#[test]
+fn doctor_returns_zero_when_all_checks_pass() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let fake_bin = install_fake_harnesses(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json").arg("doctor");
+    let output = cmd.output().expect("run kb doctor");
+
+    assert!(
+        output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.status.code(), Some(0));
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse doctor json");
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["exit_code"], 0);
+    assert_eq!(payload["error_count"], 0);
+    assert_eq!(payload["warning_count"], 0);
+}
+
+#[test]
+fn doctor_returns_error_when_harness_is_missing() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    fs::create_dir_all(kb_root.join("empty-bin")).expect("create empty bin dir");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", kb_root.join("empty-bin"));
+    cmd.arg("doctor");
+    let output = cmd.output().expect("run kb doctor");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("harness:opencode") || stdout.contains("harness:claude"));
+    assert!(stdout.contains("missing"));
+}
+
+#[test]
+fn doctor_returns_warning_when_interrupted_jobs_exist() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let fake_bin = install_fake_harnesses(&kb_root);
+
+    fs::write(
+        kb_root.join("state/jobs/interrupted-test.json"),
+        serde_json::json!({
+            "metadata": {
+                "id": "interrupted-test",
+                "created_at_millis": 1,
+                "updated_at_millis": 1,
+                "source_hashes": [],
+                "model_version": null,
+                "tool_version": "kb-cli/0.1.0",
+                "prompt_template_hash": null,
+                "dependencies": [],
+                "output_paths": [],
+                "status": "fresh"
+            },
+            "command": "compile",
+            "root_path": kb_root,
+            "started_at_millis": 1,
+            "ended_at_millis": null,
+            "status": "running",
+            "log_path": null,
+            "affected_outputs": [],
+            "pid": 999_999,
+            "exit_code": null
+        })
+        .to_string(),
+    )
+    .expect("write interrupted job manifest");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json").arg("doctor");
+    let output = cmd.output().expect("run kb doctor");
+
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(1));
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse doctor json");
+    assert_eq!(payload["status"], "warn");
+    assert_eq!(payload["exit_code"], 1);
+    assert!(
+        payload["checks"]
+            .as_array()
+            .expect("checks array")
+            .iter()
+            .any(|check| check["name"] == "interrupted_jobs" && check["status"] == "warn")
+    );
 }

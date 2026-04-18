@@ -5,19 +5,21 @@ mod init;
 mod jobs;
 mod root;
 
-use std::error::Error as StdError;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, bail};
 use clap::Parser;
 use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
-use kb_core::{Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext, Status};
+use kb_core::{
+    Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext, Status,
+};
 use kb_llm::{
     ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
-    RunHealthCheckRequest,
+    RunHealthCheckRequest, Template,
 };
 use serde::Serialize;
 use serde_yaml::{Mapping, Value};
@@ -127,34 +129,28 @@ fn main() {
     let cli = Cli::parse();
 
     if let Err(err) = run(cli) {
+        let exit_code = err
+            .downcast_ref::<ExitCodeError>()
+            .map_or(1, |err| err.exit_code);
         eprintln!("error: {err}");
-        std::process::exit(exit_code_from_error(&err));
+        std::process::exit(exit_code);
     }
-}
-
-fn exit_code_from_error(err: &anyhow::Error) -> i32 {
-    for current in err.chain() {
-        if let Some(exit_error) = current.downcast_ref::<LintExitCode>() {
-            return exit_error.code;
-        }
-    }
-
-    1
 }
 
 #[derive(Debug)]
-struct LintExitCode {
-    code: i32,
+struct ExitCodeError {
+    exit_code: i32,
     message: String,
 }
 
-impl std::fmt::Display for LintExitCode {
+impl std::fmt::Display for ExitCodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        f.write_str(&self.message)
     }
 }
 
-impl StdError for LintExitCode {}
+impl std::error::Error for ExitCodeError {}
+
 
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> Result<()> {
@@ -197,12 +193,7 @@ fn run(cli: Cli) -> Result<()> {
             let root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            let check_root = root;
-            let should_json = cli.json;
-            let cli_model = cli.model.clone();
-            execute_mutating_command(Some(check_root), "doctor", move || {
-                run_doctor(check_root, should_json, cli_model.as_deref())
-            })
+            run_doctor_command(root, cli.json, cli.model.as_deref())
         }
         Some(Command::Ask { query }) => {
             let ask_root = root.clone();
@@ -335,111 +326,336 @@ fn run(cli: Cli) -> Result<()> {
 #[derive(Debug, Serialize)]
 struct DoctorPayload {
     checks: Vec<DoctorCheck>,
-    all_healthy: bool,
-    failed_checks: usize,
+    status: &'static str,
+    warning_count: usize,
+    error_count: usize,
+    exit_code: i32,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct DoctorCheck {
-    runner: String,
-    harness: String,
-    status: String,
-    model: String,
-    harness_version: Option<String>,
-    latency_ms: u64,
-    command: String,
+    name: String,
+    status: &'static str,
+    summary: String,
+    remediation: Option<String>,
     details: Option<String>,
-    error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DoctorSeverity {
+    Ok,
+    Warn,
+    Error,
+}
+
+impl DoctorSeverity {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+
+    const fn exit_code(self) -> i32 {
+        match self {
+            Self::Ok => 0,
+            Self::Warn => 1,
+            Self::Error => 2,
+        }
+    }
+}
+
+fn run_doctor_command(root: &Path, json: bool, cli_model: Option<&str>) -> Result<()> {
+    let timeout_ms = Config::load_from_root(root, None).map_or_else(
+        |_| Config::default().lock.timeout_ms,
+        |cfg| cfg.lock.timeout_ms,
+    );
+    let _lock = jobs::KbLock::acquire(root, "doctor", Duration::from_millis(timeout_ms))?;
+    jobs::check_stale_jobs(root)?;
+    let handle = jobs::start_job(root, "doctor")?;
+
+    let result = run_doctor(root, json, cli_model);
+    match &result {
+        Ok(()) => {
+            handle.finish(JobRunStatus::Succeeded, Vec::new())?;
+        }
+        Err(_) => {
+            handle.finish(JobRunStatus::Failed, Vec::new())?;
+        }
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_lines)]
 fn run_doctor(root: &Path, json: bool, cli_model: Option<&str>) -> Result<()> {
-    let cfg = Config::load_from_root(root, cli_model)?;
     let mut checks = Vec::new();
 
+    let config_result = Config::load_from_root(root, cli_model);
+    let cfg = match config_result {
+        Ok(cfg) => {
+            checks.push(DoctorCheck {
+                name: "config".to_string(),
+                status: DoctorSeverity::Ok.as_str(),
+                summary: format!("Parsed {} successfully.", Config::FILE_NAME),
+                remediation: None,
+                details: None,
+            });
+            Some(cfg)
+        }
+        Err(err) => {
+            checks.push(DoctorCheck {
+                name: "config".to_string(),
+                status: DoctorSeverity::Error.as_str(),
+                summary: format!("Failed to parse {}.", Config::FILE_NAME),
+                remediation: Some(
+                    "Fix kb.toml syntax or unknown fields, then rerun `kb doctor`.".to_string(),
+                ),
+                details: Some(err.to_string()),
+            });
+            None
+        }
+    };
+
+    checks.push(check_root_writable(root));
+
+    if let Some(cfg) = cfg.as_ref() {
+        checks.push(check_prompt_template_directory(root, cfg));
+        checks.extend(check_prompt_templates_load(root));
+        checks.extend(check_runner_health(root, cfg));
+    } else {
+        checks.push(DoctorCheck {
+            name: "prompt_templates".to_string(),
+            status: DoctorSeverity::Warn.as_str(),
+            summary: "Skipped prompt template checks because config did not parse.".to_string(),
+            remediation: Some("Fix kb.toml so doctor can validate prompt settings.".to_string()),
+            details: None,
+        });
+        checks.push(DoctorCheck {
+            name: "llm_runners".to_string(),
+            status: DoctorSeverity::Warn.as_str(),
+            summary: "Skipped model access and harness checks because config did not parse."
+                .to_string(),
+            remediation: Some(
+                "Fix kb.toml so doctor can validate configured backends.".to_string(),
+            ),
+            details: None,
+        });
+    }
+
+    checks.push(check_interrupted_jobs(root)?);
+
+    let error_count = checks
+        .iter()
+        .filter(|check| check.status == "error")
+        .count();
+    let warning_count = checks.iter().filter(|check| check.status == "warn").count();
+    let severity = if error_count > 0 {
+        DoctorSeverity::Error
+    } else if warning_count > 0 {
+        DoctorSeverity::Warn
+    } else {
+        DoctorSeverity::Ok
+    };
+
+    if json {
+        let payload = DoctorPayload {
+            checks: checks.clone(),
+            status: severity.as_str(),
+            warning_count,
+            error_count,
+            exit_code: severity.exit_code(),
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        for check in &checks {
+            println!(
+                "[{}] {}: {}",
+                check.status.to_uppercase(),
+                check.name,
+                check.summary
+            );
+            if let Some(details) = &check.details {
+                println!("  details: {details}");
+            }
+            if let Some(remediation) = &check.remediation {
+                println!("  remediation: {remediation}");
+            }
+        }
+        println!(
+            "kb doctor: {} (warnings: {warning_count}, errors: {error_count})",
+            severity.as_str().to_uppercase()
+        );
+    }
+
+    if severity == DoctorSeverity::Ok {
+        Ok(())
+    } else {
+        Err(ExitCodeError {
+            exit_code: severity.exit_code(),
+            message: format!(
+                "doctor completed with {warning_count} warning(s) and {error_count} error(s)"
+            ),
+        }
+        .into())
+    }
+}
+
+fn check_root_writable(root: &Path) -> DoctorCheck {
+    let probe = root.join("state").join(".kb-doctor-write-test");
+    match fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            DoctorCheck {
+                name: "root_writable".to_string(),
+                status: DoctorSeverity::Ok.as_str(),
+                summary: format!("KB root is writable at {}.", root.display()),
+                remediation: None,
+                details: None,
+            }
+        }
+        Err(err) => DoctorCheck {
+            name: "root_writable".to_string(),
+            status: DoctorSeverity::Error.as_str(),
+            summary: format!("KB root is not writable at {}.", root.display()),
+            remediation: Some(
+                "Fix filesystem permissions for the KB root and its state directory.".to_string(),
+            ),
+            details: Some(err.to_string()),
+        },
+    }
+}
+
+fn check_prompt_template_directory(root: &Path, cfg: &Config) -> DoctorCheck {
+    let prompt_dir = root.join(&cfg.data.prompt_templates);
+    if prompt_dir.is_dir() {
+        DoctorCheck {
+            name: "prompt_template_dir".to_string(),
+            status: DoctorSeverity::Ok.as_str(),
+            summary: format!(
+                "Prompt template directory exists at {}.",
+                prompt_dir.display()
+            ),
+            remediation: None,
+            details: None,
+        }
+    } else {
+        DoctorCheck {
+            name: "prompt_template_dir".to_string(),
+            status: DoctorSeverity::Error.as_str(),
+            summary: format!(
+                "Prompt template directory is missing at {}.",
+                prompt_dir.display()
+            ),
+            remediation: Some(
+                "Create the prompt template directory or re-run `kb init`.".to_string(),
+            ),
+            details: None,
+        }
+    }
+}
+
+fn check_prompt_templates_load(root: &Path) -> Vec<DoctorCheck> {
+    [
+        "summarize_document.md",
+        "extract_concepts.md",
+        "merge_concept_candidates.md",
+    ]
+    .into_iter()
+    .map(
+        |template_name| match Template::load(template_name, Some(root)) {
+            Ok(_) => DoctorCheck {
+                name: format!("prompt_template:{template_name}"),
+                status: DoctorSeverity::Ok.as_str(),
+                summary: format!("Loaded prompt template {template_name}."),
+                remediation: None,
+                details: None,
+            },
+            Err(err) => DoctorCheck {
+                name: format!("prompt_template:{template_name}"),
+                status: DoctorSeverity::Error.as_str(),
+                summary: format!("Failed to load prompt template {template_name}."),
+                remediation: Some(
+                    "Restore the missing template file or rely on the bundled default template."
+                        .to_string(),
+                ),
+                details: Some(err.to_string()),
+            },
+        },
+    )
+    .collect()
+}
+
+fn check_runner_health(root: &Path, cfg: &Config) -> Vec<DoctorCheck> {
     let default_model = cfg.llm.default_model.clone();
     let mut runner_names: Vec<_> = cfg.llm.runners.keys().cloned().collect();
     runner_names.sort_unstable();
 
+    let mut checks = Vec::new();
     for name in runner_names {
         let runner = cfg
             .llm
             .runners
             .get(&name)
             .expect("runner key from keys() must exist");
+        let model = runner
+            .model
+            .clone()
+            .unwrap_or_else(|| default_model.clone());
+        let binary = normalize_binary_command(&runner.command);
 
-        match name.as_str() {
-            "opencode" => {
-                checks.push(run_opencode_health_check(
-                    &name,
-                    runner,
-                    root,
-                    &default_model,
-                ));
-            }
-            "claude" => {
-                checks.push(run_claude_health_check(&name, runner, &default_model));
-            }
-            _ => {
-                checks.push(DoctorCheck {
-                    runner: name,
-                    harness: "unsupported".to_string(),
-                    status: "skipped".to_string(),
-                    model: runner
-                        .model
-                        .clone()
-                        .unwrap_or_else(|| default_model.clone()),
-                    harness_version: None,
-                    latency_ms: 0,
-                    command: runner.command.clone(),
-                    details: Some("runner not configured for doctor checks".to_string()),
-                    error: None,
-                });
-            }
-        }
-    }
-
-    let failed_checks = checks.iter().filter(|c| c.status == "failed").count();
-    let failed_runners = checks
-        .iter()
-        .filter(|c| c.status == "failed")
-        .map(|c| c.runner.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    if json {
-        let payload = DoctorPayload {
-            checks,
-            all_healthy: failed_checks == 0,
-            failed_checks,
-        };
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-    } else {
-        for check in &checks {
-            println!(
-                "{}: {} (model: {}, latency: {}ms, harness_version: {:?})",
-                check.runner, check.status, check.model, check.latency_ms, check.harness_version
-            );
-            if let Some(details) = &check.details {
-                println!("  details: {details}");
-            }
-            if let Some(error) = &check.error {
-                println!("  error: {error}");
-            }
-            println!("  command: {}", check.command);
-        }
-        if failed_checks == 0 {
-            println!("kb doctor: all health checks passed");
+        if let Some(path) = command_on_path(&binary) {
+            checks.push(DoctorCheck {
+                name: format!("harness:{name}"),
+                status: DoctorSeverity::Ok.as_str(),
+                summary: format!("Found harness binary `{binary}` for runner `{name}`."),
+                remediation: None,
+                details: Some(format!(
+                    "command=`{}` path={}",
+                    runner.command,
+                    path.display()
+                )),
+            });
         } else {
-            println!("kb doctor: {failed_checks} health check(s) failed");
+            checks.push(DoctorCheck {
+                name: format!("harness:{name}"),
+                status: DoctorSeverity::Error.as_str(),
+                summary: format!("Harness binary `{binary}` is missing for runner `{name}`."),
+                remediation: Some(format!(
+                    "Install `{binary}` or update llm.runners.{name}.command in kb.toml."
+                )),
+                details: Some(format!("command=`{}` model={model}", runner.command)),
+            });
+            continue;
         }
+
+        checks.push(run_runner_health_check(&name, runner, root, &default_model));
     }
 
-    if failed_runners.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "health check failed for runner(s): {failed_runners}"
-        ))
+    checks
+}
+
+fn run_runner_health_check(
+    runner_name: &str,
+    runner: &LlmRunnerConfig,
+    root: &Path,
+    default_model: &str,
+) -> DoctorCheck {
+    match runner_name {
+        "opencode" => run_opencode_health_check(runner_name, runner, root, default_model),
+        "claude" => run_claude_health_check(runner_name, runner, default_model),
+        _ => DoctorCheck {
+            name: format!("model_access:{runner_name}"),
+            status: DoctorSeverity::Warn.as_str(),
+            summary: format!(
+                "Runner `{runner_name}` is configured but doctor has no backend health check for it."
+            ),
+            remediation: Some(
+                "Add doctor support for this runner or validate it manually.".to_string(),
+            ),
+            details: Some(format!("command=`{}`", runner.command)),
+        },
     }
 }
 
@@ -470,27 +686,45 @@ fn run_opencode_health_check(
     match adapter.run_health_check(RunHealthCheckRequest {
         check_details: None,
     }) {
-        Ok((response, provenance)) => DoctorCheck {
-            runner: runner_name.to_string(),
-            harness: provenance.harness,
-            status: response.status,
-            model: provenance.model,
-            harness_version: provenance.harness_version,
-            latency_ms: provenance.latency_ms,
-            command: runner.command.clone(),
-            details: response.details,
-            error: None,
-        },
+        Ok((response, provenance)) => {
+            let severity = match response.status.as_str() {
+                "healthy" => DoctorSeverity::Ok,
+                "degraded" => DoctorSeverity::Warn,
+                _ => DoctorSeverity::Error,
+            };
+            DoctorCheck {
+                name: format!("model_access:{runner_name}"),
+                status: severity.as_str(),
+                summary: format!(
+                    "Runner `{runner_name}` reported {} for model `{}`.",
+                    response.status, provenance.model
+                ),
+                remediation: (severity != DoctorSeverity::Ok).then_some(
+                    "Check authentication, selected model access, and harness configuration."
+                        .to_string(),
+                ),
+                details: Some(format!(
+                    "harness={} version={:?} latency_ms={} command=`{}`{}",
+                    provenance.harness,
+                    provenance.harness_version,
+                    provenance.latency_ms,
+                    runner.command,
+                    response
+                        .details
+                        .as_ref()
+                        .map_or(String::new(), |details| format!(" details={details}"))
+                )),
+            }
+        }
         Err(err) => DoctorCheck {
-            runner: runner_name.to_string(),
-            harness: "opencode".to_string(),
-            status: "failed".to_string(),
-            model,
-            harness_version: None,
-            latency_ms: 0,
-            command: runner.command.clone(),
-            details: None,
-            error: Some(err.to_string()),
+            name: format!("model_access:{runner_name}"),
+            status: DoctorSeverity::Error.as_str(),
+            summary: format!("Runner `{runner_name}` health check failed for model `{model}`."),
+            remediation: Some(
+                "Verify the harness can authenticate and that the configured model is available."
+                    .to_string(),
+            ),
+            details: Some(format!("command=`{}` error={err}", runner.command)),
         },
     }
 }
@@ -517,29 +751,93 @@ fn run_claude_health_check(
     match adapter.run_health_check(RunHealthCheckRequest {
         check_details: None,
     }) {
-        Ok((response, provenance)) => DoctorCheck {
-            runner: runner_name.to_string(),
-            harness: provenance.harness,
-            status: response.status,
-            model: provenance.model,
-            harness_version: provenance.harness_version,
-            latency_ms: provenance.latency_ms,
-            command: runner.command.clone(),
-            details: response.details,
-            error: None,
-        },
+        Ok((response, provenance)) => {
+            let severity = match response.status.as_str() {
+                "healthy" => DoctorSeverity::Ok,
+                "degraded" => DoctorSeverity::Warn,
+                _ => DoctorSeverity::Error,
+            };
+            DoctorCheck {
+                name: format!("model_access:{runner_name}"),
+                status: severity.as_str(),
+                summary: format!(
+                    "Runner `{runner_name}` reported {} for model `{}`.",
+                    response.status, provenance.model
+                ),
+                remediation: (severity != DoctorSeverity::Ok).then_some(
+                    "Check authentication, selected model access, and harness configuration."
+                        .to_string(),
+                ),
+                details: Some(format!(
+                    "harness={} version={:?} latency_ms={} command=`{}`{}",
+                    provenance.harness,
+                    provenance.harness_version,
+                    provenance.latency_ms,
+                    runner.command,
+                    response
+                        .details
+                        .as_ref()
+                        .map_or(String::new(), |details| format!(" details={details}"))
+                )),
+            }
+        }
         Err(err) => DoctorCheck {
-            runner: runner_name.to_string(),
-            harness: "claude".to_string(),
-            status: "failed".to_string(),
-            model,
-            harness_version: None,
-            latency_ms: 0,
-            command: runner.command.clone(),
-            details: None,
-            error: Some(err.to_string()),
+            name: format!("model_access:{runner_name}"),
+            status: DoctorSeverity::Error.as_str(),
+            summary: format!("Runner `{runner_name}` health check failed for model `{model}`."),
+            remediation: Some(
+                "Verify the harness can authenticate and that the configured model is available."
+                    .to_string(),
+            ),
+            details: Some(format!("command=`{}` error={err}", runner.command)),
         },
     }
+}
+
+fn check_interrupted_jobs(root: &Path) -> Result<DoctorCheck> {
+    let interrupted_jobs = jobs::recent_jobs(root, 100)?
+        .into_iter()
+        .filter(|job| job.status == JobRunStatus::Interrupted)
+        .collect::<Vec<_>>();
+
+    if interrupted_jobs.is_empty() {
+        Ok(DoctorCheck {
+            name: "interrupted_jobs".to_string(),
+            status: DoctorSeverity::Ok.as_str(),
+            summary: "No interrupted jobs detected.".to_string(),
+            remediation: None,
+            details: None,
+        })
+    } else {
+        let ids = interrupted_jobs
+            .iter()
+            .map(|job| job.metadata.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(DoctorCheck {
+            name: "interrupted_jobs".to_string(),
+            status: DoctorSeverity::Warn.as_str(),
+            summary: format!("Detected {} interrupted job(s).", interrupted_jobs.len()),
+            remediation: Some(
+                "Inspect `kb status` and the corresponding state/jobs logs before rerunning the failed work."
+                    .to_string(),
+            ),
+            details: Some(format!("job_ids={ids}")),
+        })
+    }
+}
+
+fn command_on_path(command: &str) -> Option<PathBuf> {
+    let candidate = Path::new(command);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|path| path.join(command))
+            .find(|path| path.is_file())
+    })
 }
 
 fn normalize_binary_command(command: &str) -> String {
@@ -694,9 +992,8 @@ struct AskOutput<'a> {
 
 fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool) -> Result<()> {
     let cfg = Config::load_from_root(root, None)?;
-    let requested_format = normalize_ask_format(
-        requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()),
-    )?;
+    let requested_format =
+        normalize_ask_format(requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()))?;
     let timestamp = now_millis()?;
     let question_id = format!("question-{}", unique_question_suffix(timestamp, query));
     let question_dir = root.join("outputs/questions").join(&question_id);
@@ -811,9 +1108,16 @@ fn unique_question_suffix(timestamp: u64, query: &str) -> String {
     format!("{timestamp}-{}", &hash[..10])
 }
 
-fn render_ask_artifact(artifact: &Artifact, question: &Question, question_rel: &Path) -> Result<String> {
+fn render_ask_artifact(
+    artifact: &Artifact,
+    question: &Question,
+    question_rel: &Path,
+) -> Result<String> {
     let mut frontmatter = Mapping::new();
-    frontmatter.insert(Value::String("id".into()), Value::String(artifact.metadata.id.clone()));
+    frontmatter.insert(
+        Value::String("id".into()),
+        Value::String(artifact.metadata.id.clone()),
+    );
     frontmatter.insert(
         Value::String("type".into()),
         Value::String("answer_artifact".into()),
@@ -906,15 +1210,15 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>) -> Result<()> {
     }
 
     if total_errors > 0 {
-        Err(anyhow!(LintExitCode {
-            code: 2,
+        Err(ExitCodeError {
+            exit_code: 2,
             message: format!("lint failed: {total_errors} error(s) and {total_warnings} warning(s)"),
-        }))
+        }.into())
     } else if total_warnings > 0 {
-        Err(anyhow!(LintExitCode {
-            code: 1,
+        Err(ExitCodeError {
+            exit_code: 1,
             message: format!("lint succeeded with {total_warnings} warning(s)"),
-        }))
+        }.into())
     } else {
         Ok(())
     }

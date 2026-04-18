@@ -64,7 +64,10 @@ pub fn render_source_page(
 
 fn build_frontmatter(input: &SourcePageInput<'_>) -> Mapping {
     let mut frontmatter = Mapping::new();
-    frontmatter.insert(Value::String("id".into()), Value::String(input.page_id.into()));
+    frontmatter.insert(
+        Value::String("id".into()),
+        Value::String(input.page_id.into()),
+    );
     frontmatter.insert(Value::String("type".into()), Value::String("source".into()));
     frontmatter.insert(
         Value::String("title".into()),
@@ -240,8 +243,14 @@ mod tests {
         let citations = vec!["[[wiki/concepts/rust]]".to_string()];
         let artifact = render_source_page(&input(&key_topics, &citations), None).expect("render");
 
-        assert_eq!(artifact.path, PathBuf::from("wiki/sources/source-document-1.md"));
-        assert_eq!(artifact.frontmatter.get("id"), Some(&Value::String("wiki-source-1".into())));
+        assert_eq!(
+            artifact.path,
+            PathBuf::from("wiki/sources/source-document-1.md")
+        );
+        assert_eq!(
+            artifact.frontmatter.get("id"),
+            Some(&Value::String("wiki-source-1".into()))
+        );
         assert_eq!(
             artifact.frontmatter.get("type"),
             Some(&Value::String("source".into()))
@@ -256,7 +265,11 @@ mod tests {
         );
         assert!(artifact.markdown.contains("<!-- kb:begin id=title -->"));
         assert!(artifact.markdown.contains("<!-- kb:begin id=summary -->"));
-        assert!(artifact.markdown.contains("<!-- kb:begin id=key_topics -->"));
+        assert!(
+            artifact
+                .markdown
+                .contains("<!-- kb:begin id=key_topics -->")
+        );
         assert!(artifact.markdown.contains("<!-- kb:begin id=citations -->"));
         assert!(artifact.markdown.contains("A concise summary."));
         assert!(artifact.markdown.contains("- topic one"));

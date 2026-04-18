@@ -66,7 +66,8 @@ pub fn run_source_summary_pass<A: LlmAdapter>(
     let key_headings = document.heading_ids.clone();
     let citations = build_citations(document, &key_headings);
     let managed_region_content = render_managed_region_content(&response.summary, &key_headings);
-    let page_body = upsert_source_summary_region(existing_page_body.unwrap_or(""), &managed_region_content);
+    let page_body =
+        upsert_source_summary_region(existing_page_body.unwrap_or(""), &managed_region_content);
     let build_record = build_record_for_summary(
         document,
         &source_page_path,
@@ -146,7 +147,8 @@ fn render_managed_region_content(summary: &str, key_headings: &[String]) -> Stri
 /// Upsert the `summary` managed region inside a source wiki page body.
 #[must_use]
 pub fn upsert_source_summary_region(page_body: &str, managed_region_content: &str) -> String {
-    if let Some(updated) = rewrite_managed_region(page_body, SUMMARY_REGION_ID, managed_region_content)
+    if let Some(updated) =
+        rewrite_managed_region(page_body, SUMMARY_REGION_ID, managed_region_content)
     {
         return updated;
     }
@@ -199,13 +201,23 @@ fn build_record_for_summary(
                 prompt_render_hash,
             ],
             model_version: Some(provenance.model.clone()),
-            tool_version: Some(format!("{}/{}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))),
+            tool_version: Some(format!(
+                "{}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )),
             prompt_template_hash: Some(prompt_template_hash),
-            dependencies: vec![document.metadata.id.clone(), document.source_revision_id.clone()],
+            dependencies: vec![
+                document.metadata.id.clone(),
+                document.source_revision_id.clone(),
+            ],
             output_paths: vec![source_page_path.to_path_buf()],
             status: Status::Fresh,
         },
-        input_ids: vec![document.metadata.id.clone(), document.source_revision_id.clone()],
+        input_ids: vec![
+            document.metadata.id.clone(),
+            document.source_revision_id.clone(),
+        ],
         output_ids: vec![source_page_id.to_string()],
         manifest_hash,
     })
@@ -268,7 +280,8 @@ mod tests {
         fn merge_concept_candidates(
             &self,
             _request: kb_llm::MergeConceptCandidatesRequest,
-        ) -> Result<(kb_llm::MergeConceptCandidatesResponse, ProvenanceRecord), LlmAdapterError> {
+        ) -> Result<(kb_llm::MergeConceptCandidatesResponse, ProvenanceRecord), LlmAdapterError>
+        {
             unreachable!("unused in source summary test")
         }
 
@@ -360,16 +373,29 @@ mod tests {
         assert_eq!(artifact.summary, "A concise source summary.");
         assert_eq!(artifact.key_headings, vec!["title", "details"]);
         assert_eq!(artifact.citations.len(), 2);
-        assert_eq!(artifact.citations[0].source_revision_id, "source-revision-1");
-        assert_eq!(artifact.citations[0].heading_anchor.as_deref(), Some("title"));
+        assert_eq!(
+            artifact.citations[0].source_revision_id,
+            "source-revision-1"
+        );
+        assert_eq!(
+            artifact.citations[0].heading_anchor.as_deref(),
+            Some("title")
+        );
         assert!(artifact.page_body.contains("<!-- kb:begin id=summary -->"));
         assert!(artifact.page_body.contains("A concise source summary."));
         assert!(artifact.page_body.contains("### Key headings"));
         assert_eq!(artifact.build_record.pass_name, "source_summary");
-        assert_eq!(artifact.build_record.metadata.model_version.as_deref(), Some("openai/gpt-5.4"));
+        assert_eq!(
+            artifact.build_record.metadata.model_version.as_deref(),
+            Some("openai/gpt-5.4")
+        );
         let expected_prompt_hash = Hash::from([2u8; 32]).to_hex();
         assert_eq!(
-            artifact.build_record.metadata.prompt_template_hash.as_deref(),
+            artifact
+                .build_record
+                .metadata
+                .prompt_template_hash
+                .as_deref(),
             Some(expected_prompt_hash.as_str())
         );
         assert_eq!(artifact.build_record.output_ids, vec!["wiki-page-1"]);
