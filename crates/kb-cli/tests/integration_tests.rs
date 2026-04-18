@@ -516,3 +516,31 @@ fn lint_json_reports_clean_relative_links() {
         0
     );
 }
+
+#[test]
+fn lint_reports_orphan_pages_as_json() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("create wiki sources");
+    fs::write(
+        kb_root.join("wiki/sources/orphan.md"),
+        "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Orphan\n",
+    )
+    .expect("write orphan page");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("lint").arg("--rule").arg("orphans");
+    let output = cmd.output().expect("run kb lint");
+
+    assert!(
+        !output.status.success(),
+        "lint should fail when issues are found"
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(payload["issue_count"], 2);
+    let issues = payload["issues"].as_array().expect("issues array");
+    assert!(issues.iter().any(|issue| issue["kind"] == "source_document_missing"));
+    assert!(issues.iter().any(|issue| issue["kind"] == "source_revision_missing"));
+}

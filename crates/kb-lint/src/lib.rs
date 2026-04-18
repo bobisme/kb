@@ -5,9 +5,10 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
-use kb_core::{Manifest, extract_managed_regions, slug_from_title};
+use kb_core::{BuildRecord, Manifest, build_records_dir, extract_managed_regions, frontmatter::read_frontmatter, load_build_record, slug_from_title};
 use regex::Regex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_yaml::Value;
 
 const WIKI_DIR: &str = "wiki";
 const MD_EXT: &str = "md";
@@ -15,6 +16,9 @@ const MD_EXT: &str = "md";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LintRule {
     BrokenLinks,
+    Orphans,
+    StaleArtifacts,
+    All,
 }
 
 impl LintRule {
@@ -24,9 +28,10 @@ impl LintRule {
     /// Returns an error when the caller requests an unsupported lint rule.
     pub fn parse(input: Option<&str>) -> Result<Self> {
         match input {
-            None | Some("broken-links" | "broken_links" | "brokenlinks") => {
-                Ok(Self::BrokenLinks)
-            }
+            None => Ok(Self::All),
+            Some("broken-links" | "broken_links" | "brokenlinks") => Ok(Self::BrokenLinks),
+            Some("orphans" | "orphan" | "orphan-pages" | "orphan_pages") => Ok(Self::Orphans),
+            Some("stale" | "stale-artifacts" | "stale_artifacts") => Ok(Self::StaleArtifacts),
             Some(other) => Err(anyhow!("unsupported lint rule: {other}")),
         }
     }
@@ -35,6 +40,9 @@ impl LintRule {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::BrokenLinks => "broken-links",
+            Self::Orphans => "orphans",
+            Self::StaleArtifacts => "stale",
+            Self::All => "all",
         }
     }
 }
@@ -68,6 +76,14 @@ pub struct LintIssue {
 pub enum IssueKind {
     MissingPage,
     MissingAnchor,
+    SourceDocumentMissing,
+    SourceRevisionMissing,
+    SourceRevisionStale,
+    OutputMissing,
+    BuildRecordMissing,
+    ManifestMismatch,
+    FrontmatterBuildRecordMissing,
+    BuildRecordOutputMissing,
 }
 
 /// Run the selected lint rule against the KB at `root`.
@@ -75,12 +91,30 @@ pub enum IssueKind {
 /// # Errors
 /// Returns an error when the lint pass cannot read KB state or wiki files.
 pub fn run_lint(root: &Path, rule: LintRule) -> Result<LintReport> {
-    match rule {
-        LintRule::BrokenLinks => run_broken_links_lint(root),
+    let mut issues = Vec::new();
+
+    if matches!(rule, LintRule::BrokenLinks | LintRule::All) {
+        issues.extend(run_broken_links(root)?);
     }
+    if matches!(rule, LintRule::Orphans | LintRule::All) {
+        issues.extend(detect_orphan_pages(root)?);
+    }
+    if matches!(rule, LintRule::StaleArtifacts | LintRule::All) {
+        issues.extend(detect_stale_artifacts(root)?);
+    }
+
+    Ok(LintReport {
+        rule: rule.as_str().to_string(),
+        issue_count: issues.len(),
+        issues,
+    })
 }
 
-fn run_broken_links_lint(root: &Path) -> Result<LintReport> {
+// ---------------------------------------------------------------------------
+// Broken-link checking
+// ---------------------------------------------------------------------------
+
+fn run_broken_links(root: &Path) -> Result<Vec<LintIssue>> {
     let pages = collect_wiki_pages(root)?;
     let registry = LinkRegistry::build(root, &pages)?;
     let mut issues = Vec::new();
@@ -93,11 +127,7 @@ fn run_broken_links_lint(root: &Path) -> Result<LintReport> {
         }
     }
 
-    Ok(LintReport {
-        rule: LintRule::BrokenLinks.as_str().to_string(),
-        issue_count: issues.len(),
-        issues,
-    })
+    Ok(issues)
 }
 
 #[derive(Debug, Clone)]
@@ -474,11 +504,320 @@ fn manifest_path_to_page_id(path: &Path) -> Option<String> {
     relative.strip_suffix(".md").map(ToOwned::to_owned)
 }
 
+// ---------------------------------------------------------------------------
+// Orphan page detection
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct NormalizedMetadata {
+    source_revision_id: String,
+}
+
+fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
+    let mut issues = Vec::new();
+    for page in markdown_files_under(&root.join("wiki"))? {
+        let (frontmatter, _) = read_frontmatter(&page)
+            .with_context(|| format!("read frontmatter for {}", page.display()))?;
+
+        let doc_ids = frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
+        let rev_ids = frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
+
+        if doc_ids.is_empty() && rev_ids.is_empty() {
+            continue;
+        }
+
+        let rel_page = relative_to_root(root, &page);
+        let rel_page_str = rel_page.to_string_lossy().into_owned();
+        let existing_docs: Vec<_> = doc_ids
+            .iter()
+            .filter(|doc_id| normalized_metadata_for_doc(root, doc_id).ok().flatten().is_some())
+            .cloned()
+            .collect();
+
+        for missing_doc in doc_ids.iter().filter(|doc_id| !existing_docs.contains(*doc_id)) {
+            issues.push(LintIssue {
+                kind: IssueKind::SourceDocumentMissing,
+                referring_page: rel_page_str.clone(),
+                line: 0,
+                target: missing_doc.clone(),
+                message: format!("referenced source document '{missing_doc}' is missing"),
+                suggested_fix: None,
+            });
+        }
+
+        if !rev_ids.is_empty() {
+            let live_revision_ids: BTreeSet<_> = existing_docs
+                .iter()
+                .filter_map(|doc_id| {
+                    normalized_metadata_for_doc(root, doc_id)
+                        .ok()
+                        .flatten()
+                        .map(|metadata| metadata.source_revision_id)
+                })
+                .collect();
+
+            if live_revision_ids.is_empty() {
+                for revision_id in &rev_ids {
+                    issues.push(LintIssue {
+                        kind: IssueKind::SourceRevisionMissing,
+                        referring_page: rel_page_str.clone(),
+                        line: 0,
+                        target: revision_id.clone(),
+                        message: format!(
+                            "referenced source revision '{revision_id}' is no longer present"
+                        ),
+                        suggested_fix: None,
+                    });
+                }
+            } else if rev_ids.iter().all(|revision_id| !live_revision_ids.contains(revision_id)) {
+                issues.push(LintIssue {
+                    kind: IssueKind::SourceRevisionStale,
+                    referring_page: rel_page_str,
+                    line: 0,
+                    target: rev_ids.join(", "),
+                    message: format!(
+                        "page references stale source revision(s): {}",
+                        rev_ids.join(", ")
+                    ),
+                    suggested_fix: None,
+                });
+            }
+        }
+    }
+    Ok(issues)
+}
+
+// ---------------------------------------------------------------------------
+// Stale artifact detection
+// ---------------------------------------------------------------------------
+
+fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
+    let manifest = Manifest::load(root)?;
+    let mut issues = Vec::new();
+
+    for (artifact_path, manifest_record) in &manifest.artifacts {
+        let output_path = root.join(artifact_path);
+        let artifact_str = artifact_path.to_string_lossy().into_owned();
+        if !output_path.exists() {
+            issues.push(LintIssue {
+                kind: IssueKind::OutputMissing,
+                referring_page: artifact_str.clone(),
+                line: 0,
+                target: artifact_str.clone(),
+                message: "manifest entry points to a file that no longer exists".to_string(),
+                suggested_fix: None,
+            });
+        }
+
+        match load_build_record(root, &manifest_record.metadata.id)? {
+            None => issues.push(LintIssue {
+                kind: IssueKind::BuildRecordMissing,
+                referring_page: artifact_str,
+                line: 0,
+                target: manifest_record.metadata.id.clone(),
+                message: format!(
+                    "manifest references missing build record '{}'",
+                    manifest_record.metadata.id
+                ),
+                suggested_fix: None,
+            }),
+            Some(current) if !same_build_fingerprint(manifest_record, &current) => {
+                issues.push(LintIssue {
+                    kind: IssueKind::ManifestMismatch,
+                    referring_page: artifact_str,
+                    line: 0,
+                    target: manifest_record.metadata.id.clone(),
+                    message: format!(
+                        "manifest build record '{}' diverges from state/build_records",
+                        manifest_record.metadata.id
+                    ),
+                    suggested_fix: None,
+                });
+            }
+            Some(_) => {}
+        }
+    }
+
+    for page in markdown_files_under(&root.join("wiki"))? {
+        let (frontmatter, _) = read_frontmatter(&page)
+            .with_context(|| format!("read frontmatter for {}", page.display()))?;
+        let Some(build_record_id) = frontmatter_string(&frontmatter, "build_record_id") else {
+            continue;
+        };
+        if load_build_record(root, &build_record_id)?.is_none() {
+            issues.push(LintIssue {
+                kind: IssueKind::FrontmatterBuildRecordMissing,
+                referring_page: relative_to_root(root, &page).to_string_lossy().into_owned(),
+                line: 0,
+                target: build_record_id.clone(),
+                message: format!(
+                    "page references missing build record '{build_record_id}'"
+                ),
+                suggested_fix: None,
+            });
+        }
+    }
+
+    for record in load_all_build_records(root)? {
+        for output_id in &record.output_ids {
+            let output_path = root.join(output_id);
+            if !output_path.exists() {
+                issues.push(LintIssue {
+                    kind: IssueKind::BuildRecordOutputMissing,
+                    referring_page: output_id.clone(),
+                    line: 0,
+                    target: record.metadata.id.clone(),
+                    message: format!(
+                        "build record '{}' points to a missing output",
+                        record.metadata.id
+                    ),
+                    suggested_fix: None,
+                });
+            }
+        }
+    }
+
+    Ok(issues)
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn markdown_files_under(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    if !root.exists() {
+        return Ok(files);
+    }
+    collect_markdown_files(root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect_markdown_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).with_context(|| format!("scan {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_markdown_files(&path, files)?;
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn load_all_build_records(root: &Path) -> Result<Vec<BuildRecord>> {
+    let dir = build_records_dir(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut records = Vec::new();
+    for entry in fs::read_dir(&dir).with_context(|| format!("scan {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read build record {}", path.display()))?;
+        let record = serde_json::from_str(&raw)
+            .with_context(|| format!("deserialize build record {}", path.display()))?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn same_build_fingerprint(left: &BuildRecord, right: &BuildRecord) -> bool {
+    left.manifest_hash == right.manifest_hash
+        && left.input_ids == right.input_ids
+        && left.output_ids == right.output_ids
+        && left.pass_name == right.pass_name
+}
+
+fn normalized_metadata_for_doc(root: &Path, doc_id: &str) -> Result<Option<NormalizedMetadata>> {
+    let path = root.join("normalized").join(doc_id).join("metadata.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read normalized metadata {}", path.display()))?;
+    let metadata = serde_json::from_str(&raw)
+        .with_context(|| format!("deserialize normalized metadata {}", path.display()))?;
+    Ok(Some(metadata))
+}
+
+fn frontmatter_string_list(
+    frontmatter: &serde_yaml::Mapping,
+    singular: &str,
+    plural: &str,
+) -> Vec<String> {
+    frontmatter
+        .get(Value::String(plural.to_string()))
+        .map_or_else(
+            || frontmatter_string(frontmatter, singular).map_or_else(Vec::new, |value| vec![value]),
+            yaml_string_list,
+        )
+}
+
+fn yaml_string_list(value: &Value) -> Vec<String> {
+    match value {
+        Value::Sequence(values) => values
+            .iter()
+            .filter_map(|value| match value {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+        Value::String(s) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+fn frontmatter_string(frontmatter: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    match frontmatter.get(Value::String(key.to_string())) {
+        Some(Value::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
+    path.strip_prefix(root)
+        .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kb_core::{BuildRecord, EntityMetadata, Manifest, Status, save_build_record};
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::tempdir;
+
+    fn metadata(id: &str) -> EntityMetadata {
+        EntityMetadata {
+            id: id.to_string(),
+            created_at_millis: 1,
+            updated_at_millis: 1,
+            source_hashes: vec![],
+            model_version: None,
+            tool_version: Some("kb/test".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec![],
+            output_paths: vec![],
+            status: Status::Fresh,
+        }
+    }
+
+    fn build_record(id: &str, manifest_hash: &str, output: &str) -> BuildRecord {
+        BuildRecord {
+            metadata: metadata(id),
+            pass_name: "test".to_string(),
+            input_ids: vec!["normalized/doc-1".to_string()],
+            output_ids: vec![output.to_string()],
+            manifest_hash: manifest_hash.to_string(),
+        }
+    }
 
     #[test]
     fn broken_link_lint_reports_missing_page_and_anchor() {
@@ -542,5 +881,51 @@ mod tests {
             parse_markdown_destination("<wiki/concepts/rust.md#summary>"),
             Some("<wiki/concepts/rust.md#summary>".to_string())
         );
+    }
+
+    #[test]
+    fn orphan_pages_are_reported_when_source_document_is_missing() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/sources/orphan.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Orphan\n",
+        )
+        .expect("write page");
+
+        let report = run_lint(root, LintRule::Orphans).expect("lint report");
+        assert_eq!(report.issue_count, 2);
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == IssueKind::SourceDocumentMissing));
+        assert!(report
+            .issues
+            .iter()
+            .any(|issue| issue.kind == IssueKind::SourceRevisionMissing));
+    }
+
+    #[test]
+    fn stale_artifacts_are_reported_when_manifest_and_build_record_diverge() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let output = root.join("wiki/sources/doc-1.md");
+        fs::create_dir_all(output.parent().expect("parent")).expect("create output dir");
+        fs::write(&output, "---\nbuild_record_id: build-1\n---\n# Doc\n").expect("write output");
+
+        let manifest_record = build_record("build-1", "manifest-a", "wiki/sources/doc-1.md");
+        Manifest {
+            artifacts: BTreeMap::from([(PathBuf::from("wiki/sources/doc-1.md"), manifest_record)]),
+        }
+        .save(root)
+        .expect("save manifest");
+        save_build_record(root, &build_record("build-1", "manifest-b", "wiki/sources/doc-1.md"))
+            .expect("save build record");
+
+        let report = run_lint(root, LintRule::StaleArtifacts).expect("lint report");
+        assert_eq!(report.issue_count, 1);
+        assert_eq!(report.issues[0].kind, IssueKind::ManifestMismatch);
     }
 }
