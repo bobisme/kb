@@ -7,11 +7,13 @@ use kb_core::{Hashes, Manifest};
 
 use crate::config::Config;
 
+// Plain placeholder body — `kb compile` rewrites this file with real index
+// content once sources are ingested. No managed region here: an empty region
+// with no source frontmatter would trip the missing-citations lint.
 const MANAGED_STUB: &str = "\
-<!-- edict:managed-start -->
 # Knowledge Base
-This is the root index of your Knowledge Base.
-<!-- edict:managed-end -->
+
+This is the root index of your knowledge base. Run `kb compile` to populate.
 ";
 
 pub fn init(root_override: Option<PathBuf>, path_arg: Option<PathBuf>, force: bool) -> Result<()> {
@@ -71,6 +73,8 @@ pub fn init(root_override: Option<PathBuf>, path_arg: Option<PathBuf>, force: bo
         "state/indexes",
         "state/jobs",
         "state/locks",
+        "state/build_records",
+        "state/concept_candidates",
         "cache",
         "logs",
         "trash",
