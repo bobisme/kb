@@ -2,7 +2,10 @@ mod common;
 
 use common::{kb_cmd, make_temp_kb};
 use kb_compile::Graph;
-use kb_core::{BuildRecord, EntityMetadata, Status, save_build_record};
+use kb_core::{
+    BuildRecord, EntityMetadata, ReviewItem, ReviewKind, ReviewStatus, Status, save_build_record,
+    save_review_item,
+};
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
@@ -1297,4 +1300,157 @@ fn json_schema_envelope_lint() {
     assert_eq!(envelope["command"], "lint");
     insta::assert_snapshot!("lint_envelope_keys", sorted_object_keys(&envelope));
     insta::assert_snapshot!("lint_data_keys", sorted_object_keys(&envelope["data"]));
+}
+
+// ── Review command tests ────────────────────────────────────────────────────
+
+fn make_review_item(id: &str, status: ReviewStatus) -> ReviewItem {
+    ReviewItem {
+        metadata: EntityMetadata {
+            id: id.to_string(),
+            created_at_millis: 1_000,
+            updated_at_millis: 1_000,
+            source_hashes: vec!["hash-1".to_string()],
+            model_version: None,
+            tool_version: Some("kb-test".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec!["artifact-q1".to_string()],
+            output_paths: vec![PathBuf::from("outputs/questions/q1/answer.md")],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::Promotion,
+        target_entity_id: "artifact-q1".to_string(),
+        proposed_destination: Some(PathBuf::from("wiki/questions/test.md")),
+        citations: vec!["src-1#intro".to_string()],
+        affected_pages: vec![PathBuf::from("wiki/questions/test.md")],
+        created_at_millis: 1_000,
+        status,
+        comment: "Promote test answer".to_string(),
+    }
+}
+
+#[test]
+fn review_list_shows_pending_items() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let item = make_review_item("review-list-1", ReviewStatus::Pending);
+    save_review_item(&kb_root, &item).expect("save review item");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("list");
+    let output = cmd.output().expect("run kb review list");
+    assert!(
+        output.status.success(),
+        "kb review list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("review-list-1"));
+    assert!(stdout.contains("promotion"));
+}
+
+#[test]
+fn review_list_json_output() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let item = make_review_item("review-json-1", ReviewStatus::Pending);
+    save_review_item(&kb_root, &item).expect("save review item");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("review").arg("list");
+    let output = cmd.output().expect("run kb review list --json");
+    assert!(output.status.success());
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "review.list");
+    let data = &envelope["data"];
+    assert_eq!(data["counts"]["pending"], 1);
+    assert_eq!(data["items"][0]["id"], "review-json-1");
+}
+
+#[test]
+fn review_show_displays_item_details() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let item = make_review_item("review-show-1", ReviewStatus::Pending);
+    save_review_item(&kb_root, &item).expect("save review item");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("show").arg("review-show-1");
+    let output = cmd.output().expect("run kb review show");
+    assert!(
+        output.status.success(),
+        "kb review show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("review-show-1"));
+    assert!(stdout.contains("pending"));
+    assert!(stdout.contains("Promote test answer"));
+}
+
+#[test]
+fn review_reject_marks_item_rejected() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let item = make_review_item("review-reject-1", ReviewStatus::Pending);
+    save_review_item(&kb_root, &item).expect("save review item");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review")
+        .arg("reject")
+        .arg("review-reject-1")
+        .arg("--reason")
+        .arg("not relevant");
+    let output = cmd.output().expect("run kb review reject");
+    assert!(
+        output.status.success(),
+        "kb review reject failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let path = kb_root.join("reviews/promotions/review-reject-1.json");
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(&path).expect("read review")).expect("parse");
+    assert_eq!(saved["status"], "rejected");
+    assert!(saved["comment"].as_str().expect("comment string").contains("not relevant"));
+}
+
+#[test]
+fn review_reject_json_output() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let item = make_review_item("review-reject-j1", ReviewStatus::Pending);
+    save_review_item(&kb_root, &item).expect("save review item");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("review")
+        .arg("reject")
+        .arg("review-reject-j1");
+    let output = cmd.output().expect("run kb review reject --json");
+    assert!(output.status.success());
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["command"], "review.reject");
+    assert_eq!(envelope["data"]["action"], "rejected");
+}
+
+#[test]
+fn review_list_empty_queue() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("list");
+    let output = cmd.output().expect("run kb review list");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No pending review items"));
 }

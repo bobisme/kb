@@ -4,6 +4,7 @@ mod config;
 mod init;
 mod jobs;
 mod publish;
+mod review;
 mod root;
 
 use std::env;
@@ -146,11 +147,37 @@ enum Command {
         #[arg(required = true)]
         target: String,
     },
-    /// Request or manage reviews
+    /// Inspect and manage review queue
     Review {
-        /// Review operation (list, approve, reject, etc.)
+        #[command(subcommand)]
+        action: ReviewAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum ReviewAction {
+    /// List pending review items with counts by kind
+    List,
+    /// Show details of a review item
+    Show {
+        /// Review item ID
         #[arg(required = true)]
-        operation: String,
+        id: String,
+    },
+    /// Approve a pending review item and execute the change
+    Approve {
+        /// Review item ID
+        #[arg(required = true)]
+        id: String,
+    },
+    /// Reject a pending review item
+    Reject {
+        /// Review item ID
+        #[arg(required = true)]
+        id: String,
+        /// Rejection reason
+        #[arg(long)]
+        reason: Option<String>,
     },
 }
 
@@ -329,9 +356,32 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             run_inspect(root, &target, cli.json, trace)
         }
-        Some(Command::Review { operation }) => {
-            println!("review is not implemented yet: {operation}");
-            Ok(())
+        Some(Command::Review { action }) => {
+            let review_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let json = cli.json;
+            let json_emitter = |cmd: &str, data: serde_json::Value| -> Result<()> {
+                emit_json(cmd, data)
+            };
+            match action {
+                ReviewAction::List => {
+                    review::run_review_list(review_root, json, &json_emitter)
+                }
+                ReviewAction::Show { id } => {
+                    review::run_review_show(review_root, &id, json, &json_emitter)
+                }
+                ReviewAction::Approve { id } => {
+                    execute_mutating_command(Some(review_root), "review.approve", move || {
+                        review::run_review_approve(review_root, &id, json, &json_emitter)
+                    })
+                }
+                ReviewAction::Reject { id, reason } => {
+                    execute_mutating_command(Some(review_root), "review.reject", move || {
+                        review::run_review_reject(review_root, &id, reason.as_deref(), json, &json_emitter)
+                    })
+                }
+            }
         }
         None => {
             println!("kb: a personal knowledge base compiler");

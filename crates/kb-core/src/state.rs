@@ -41,6 +41,68 @@ fn review_kind_dir(root: &Path, kind: ReviewKind) -> PathBuf {
     review_queue_dir(root).join(leaf)
 }
 
+/// Load a single review item by ID, scanning all kind subdirectories.
+///
+/// Returns `None` when no item with the given ID exists.
+///
+/// # Errors
+/// Returns an error when a file exists but cannot be read or decoded.
+pub fn load_review_item(root: &Path, id: &str) -> Result<Option<ReviewItem>> {
+    let filename = format!("{id}.json");
+    let base = review_queue_dir(root);
+    for kind in &[
+        ReviewKind::Promotion,
+        ReviewKind::ConceptMerge,
+        ReviewKind::AliasMerge,
+        ReviewKind::Canonicalization,
+    ] {
+        let path = review_kind_dir(root, *kind).join(&filename);
+        if path.exists() {
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("read review item {}", path.display()))?;
+            let item: ReviewItem = serde_json::from_str(&raw)
+                .with_context(|| format!("deserialize review item {}", path.display()))?;
+            return Ok(Some(item));
+        }
+    }
+    let _ = base;
+    Ok(None)
+}
+
+/// List all review items across all kind subdirectories, sorted by
+/// `created_at_millis` descending (most recent first).
+///
+/// # Errors
+/// Returns an error when a directory cannot be scanned or a file cannot be decoded.
+pub fn list_review_items(root: &Path) -> Result<Vec<ReviewItem>> {
+    let mut items = Vec::new();
+    for kind in &[
+        ReviewKind::Promotion,
+        ReviewKind::ConceptMerge,
+        ReviewKind::AliasMerge,
+        ReviewKind::Canonicalization,
+    ] {
+        let dir = review_kind_dir(root, *kind);
+        if !dir.exists() {
+            continue;
+        }
+        for entry in
+            fs::read_dir(&dir).with_context(|| format!("scan review dir {}", dir.display()))?
+        {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let raw = fs::read_to_string(&path)
+                    .with_context(|| format!("read review item {}", path.display()))?;
+                let item: ReviewItem = serde_json::from_str(&raw)
+                    .with_context(|| format!("deserialize review item {}", path.display()))?;
+                items.push(item);
+            }
+        }
+    }
+    items.sort_by(|a, b| b.created_at_millis.cmp(&a.created_at_millis));
+    Ok(items)
+}
+
 /// Persist a review item to `reviews/<kind>/<id>.json`.
 ///
 /// If an existing item is already rejected and the incoming item has the same
@@ -530,5 +592,53 @@ mod tests {
         let saved: ReviewItem = serde_json::from_str(&fs::read_to_string(path).expect("read review"))
             .expect("parse review");
         assert_eq!(saved.status, ReviewStatus::Rejected);
+    }
+
+    #[test]
+    fn load_review_item_finds_saved_item() {
+        let dir = tempdir().expect("tempdir");
+        let item = review_item("review-load-1", "hash-b", ReviewStatus::Pending);
+        save_review_item(dir.path(), &item).expect("save");
+
+        let loaded = load_review_item(dir.path(), "review-load-1")
+            .expect("load")
+            .expect("item present");
+        assert_eq!(loaded.metadata.id, "review-load-1");
+        assert_eq!(loaded.status, ReviewStatus::Pending);
+    }
+
+    #[test]
+    fn load_review_item_returns_none_when_absent() {
+        let dir = tempdir().expect("tempdir");
+        let result = load_review_item(dir.path(), "missing").expect("load");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn list_review_items_returns_all_sorted_by_created_at() {
+        let dir = tempdir().expect("tempdir");
+        let mut item1 = review_item("review-a", "hash-a", ReviewStatus::Pending);
+        item1.created_at_millis = 100;
+        let mut item2 = review_item("review-b", "hash-b", ReviewStatus::Approved);
+        item2.created_at_millis = 200;
+        let mut item3 = review_item("review-c", "hash-c", ReviewStatus::Rejected);
+        item3.created_at_millis = 50;
+
+        save_review_item(dir.path(), &item1).expect("save 1");
+        save_review_item(dir.path(), &item2).expect("save 2");
+        save_review_item(dir.path(), &item3).expect("save 3");
+
+        let items = list_review_items(dir.path()).expect("list");
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].metadata.id, "review-b");
+        assert_eq!(items[1].metadata.id, "review-a");
+        assert_eq!(items[2].metadata.id, "review-c");
+    }
+
+    #[test]
+    fn list_review_items_returns_empty_when_no_reviews() {
+        let dir = tempdir().expect("tempdir");
+        let items = list_review_items(dir.path()).expect("list");
+        assert!(items.is_empty());
     }
 }
