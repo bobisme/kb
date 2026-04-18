@@ -390,5 +390,5 @@ pub use source_identity::{
 };
 pub use state::{
     Hashes, Manifest, build_records_dir, find_build_records_for_output, hashes_path,
-    load_build_record, manifest_path, save_build_record,
+    load_build_record, manifest_path, review_queue_dir, save_build_record, save_review_item,
 };

@@ -7,6 +7,7 @@ mod root;
 
 use std::env;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +16,8 @@ use clap::Parser;
 use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
 use kb_core::{
-    Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext, Status,
+    Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext,
+    ReviewAction, ReviewItem, Status,
 };
 use kb_llm::{
     ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
@@ -80,9 +82,12 @@ enum Command {
     Compile,
     /// Query the knowledge base with natural language
     Ask {
-        /// Question to ask
-        #[arg(required = true)]
-        query: String,
+        /// Question to ask (reads from stdin if omitted or "-")
+        query: Option<String>,
+
+        /// Propose promoting the answer into the wiki
+        #[arg(long)]
+        promote: bool,
     },
     /// Lint knowledge base for issues
     Lint {
@@ -201,23 +206,20 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             run_doctor_command(root, cli.json, cli.model.as_deref())
         }
-        Some(Command::Ask { query }) => {
-            let ask_root = root.clone();
-            let requested_format = cli.format.clone();
-            let should_json = cli.json;
-            let cli_model = cli.model.clone();
-            execute_mutating_command(root.as_deref(), "ask", move || {
-                let root = ask_root
-                    .as_deref()
-                    .expect("root resolved for non-init commands");
-                run_ask(
-                    root,
-                    &query,
-                    requested_format.as_deref(),
-                    cli_model.as_deref(),
-                    should_json,
-                )
-            })
+        Some(Command::Ask { query, promote }) => {
+            let ask_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let query = resolve_query(query)?;
+            run_ask(
+                ask_root,
+                &query,
+                cli.format.as_deref(),
+                cli.model.as_deref(),
+                cli.json,
+                cli.dry_run,
+                promote,
+            )
         }
         Some(Command::Ingest { sources }) => {
             let ingest_root = root.clone();
@@ -980,17 +982,46 @@ struct AskOutput<'a> {
     requested_format: &'a str,
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 fn run_ask(
     root: &Path,
     query: &str,
     requested_format: Option<&str>,
     cli_model: Option<&str>,
     json: bool,
+    dry_run: bool,
+    promote: bool,
 ) -> Result<()> {
     let cfg = Config::load_from_root(root, cli_model)?;
     let requested_format =
         normalize_ask_format(requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()))?;
+
+    let retrieval_plan =
+        kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
+
+    if dry_run {
+        if json {
+            println!("{}", serde_json::to_string_pretty(&retrieval_plan)?);
+        } else {
+            println!("Retrieval plan for: {query}");
+            println!(
+                "Token budget: {} | Estimated tokens: {}",
+                retrieval_plan.token_budget, retrieval_plan.estimated_tokens
+            );
+            println!("Candidates ({}):", retrieval_plan.candidates.len());
+            for candidate in &retrieval_plan.candidates {
+                println!(
+                    "  {} [score: {}, ~{} tokens]",
+                    candidate.id, candidate.score, candidate.estimated_tokens
+                );
+                for reason in &candidate.reasons {
+                    println!("    reason: {reason}");
+                }
+            }
+        }
+        return Ok(());
+    }
+
     let timestamp = now_millis()?;
     let question_id = format!("question-{}", unique_question_suffix(timestamp, query));
 
@@ -1003,9 +1034,6 @@ fn run_ask(
     let plan_rel = PathBuf::from("outputs/questions")
         .join(&question_id)
         .join("retrieval_plan.json");
-
-    let retrieval_plan =
-        kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
 
     let assembled = kb_query::assemble_context(root, &retrieval_plan)?;
     let citation_manifest = kb_query::build_citation_manifest(&assembled);
@@ -1096,6 +1124,27 @@ fn run_ask(
         artifact_body: &artifact_body,
     })?;
 
+    if promote {
+        let review_item = ReviewItem {
+            metadata: EntityMetadata {
+                id: format!("review-{question_id}"),
+                created_at_millis: now_millis()?,
+                updated_at_millis: now_millis()?,
+                source_hashes: Vec::new(),
+                model_version: None,
+                tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
+                prompt_template_hash: None,
+                dependencies: vec![question_id.clone(), artifact.metadata.id.clone()],
+                output_paths: Vec::new(),
+                status: Status::NeedsReview,
+            },
+            target_entity_id: artifact.metadata.id,
+            action: ReviewAction::Promote,
+            comment: format!("Promote answer for: {query}"),
+        };
+        kb_core::save_review_item(root, &review_item)?;
+    }
+
     let question_path = write_output.question_path.to_string_lossy().into_owned();
     let artifact_path = write_output.answer_path.to_string_lossy().into_owned();
     if json {
@@ -1119,9 +1168,15 @@ fn run_ask(
             println!("Note: low source coverage — uncertainty banner added.");
         }
         println!("Model: {} ({}ms)", provenance.model, provenance.latency_ms);
+        if promote {
+            println!("ReviewItem created for promotion.");
+        }
     } else {
         println!("Artifact written: {artifact_path}");
         println!("LLM backend unavailable — placeholder artifact created.");
+        if promote {
+            println!("ReviewItem created for promotion.");
+        }
     }
 
     Ok(())
@@ -1200,6 +1255,22 @@ fn create_ask_adapter(
                 project_root: Some(root.to_path_buf()),
                 ..Default::default()
             })))
+        }
+    }
+}
+
+fn resolve_query(query: Option<String>) -> Result<String> {
+    match query {
+        Some(q) if q != "-" => Ok(q),
+        _ => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)?;
+            let trimmed = buf.trim().to_string();
+            if trimmed.is_empty() {
+                bail!("no question provided (pass as argument or pipe via stdin)");
+            }
+            Ok(trimmed)
         }
     }
 }

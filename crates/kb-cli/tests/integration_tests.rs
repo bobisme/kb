@@ -1051,3 +1051,94 @@ fn doctor_returns_warning_when_interrupted_jobs_exist() {
             .any(|check| check["name"] == "interrupted_jobs" && check["status"] == "warn")
     );
 }
+
+#[test]
+fn ask_dry_run_prints_retrieval_plan_without_calling_llm() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_source_page(&kb_root, "rust-guide", "Rust Guide", "A guide to Rust.");
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    compile_cmd.output().expect("compile");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("--dry-run")
+        .arg("ask")
+        .arg("How does Rust work?");
+    let output = cmd.output().expect("run kb ask --dry-run");
+
+    assert!(
+        output.status.success(),
+        "kb ask --dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let plan: Value = serde_json::from_slice(&output.stdout).expect("parse dry-run json");
+    assert!(plan["query"].is_string());
+    assert!(plan["token_budget"].is_number());
+    assert!(plan["candidates"].is_array());
+
+    let outputs_dir = kb_root.join("outputs/questions");
+    if outputs_dir.exists() {
+        let entries: Vec<_> = fs::read_dir(&outputs_dir)
+            .expect("read outputs/questions")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("question-")
+            })
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "dry-run should not create question output directories, found {}",
+            entries.len()
+        );
+    }
+}
+
+#[test]
+fn ask_promote_creates_review_item() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--promote")
+        .arg("What is testing?");
+    let output = cmd.output().expect("run kb ask --promote");
+
+    assert!(
+        output.status.success(),
+        "kb ask --promote failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let question_id = payload["question_id"]
+        .as_str()
+        .expect("question_id should be a string");
+
+    let review_dir = kb_root.join("state/review_queue");
+    assert!(review_dir.is_dir(), "review_queue directory should exist");
+
+    let review_path = review_dir.join(format!("review-{question_id}.json"));
+    assert!(
+        review_path.is_file(),
+        "ReviewItem file should exist at {}",
+        review_path.display()
+    );
+
+    let review: Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).expect("read review item"))
+            .expect("parse review item");
+    assert_eq!(review["action"], "promote");
+    assert!(review["comment"]
+        .as_str()
+        .expect("comment")
+        .contains("What is testing?"));
+}

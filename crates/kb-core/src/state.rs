@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::fs::atomic_write;
-use crate::{BuildRecord, EntityId, Hash, hash_file};
+use crate::{BuildRecord, EntityId, Hash, ReviewItem, hash_file};
 
 #[must_use]
 pub fn build_records_dir(root: &Path) -> PathBuf {
@@ -24,6 +24,23 @@ pub fn save_build_record(root: &Path, record: &BuildRecord) -> Result<()> {
         .with_context(|| format!("create build_records dir {}", dir.display()))?;
     let path = dir.join(format!("{}.json", record.metadata.id));
     write_json_file(&path, "build record", record)
+}
+
+#[must_use]
+pub fn review_queue_dir(root: &Path) -> PathBuf {
+    root.join("state").join("review_queue")
+}
+
+/// Persist a review item to `state/review_queue/<id>.json`.
+///
+/// # Errors
+/// Returns an error when the directory cannot be created or the file cannot be written.
+pub fn save_review_item(root: &Path, item: &ReviewItem) -> Result<()> {
+    let dir = review_queue_dir(root);
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("create review_queue dir {}", dir.display()))?;
+    let path = dir.join(format!("{}.json", item.metadata.id));
+    write_json_file(&path, "review item", item)
 }
 
 /// Load a build record by ID from `state/build_records/<id>.json`.
