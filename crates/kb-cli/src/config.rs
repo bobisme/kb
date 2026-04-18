@@ -370,6 +370,18 @@ impl Default for LintConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct PublishTargetConfig {
+    /// Destination directory (absolute or relative to KB root)
+    pub path: String,
+    /// Glob-style filter: e.g. "wiki/**" or "outputs/questions/**"
+    pub filter: Option<String>,
+    /// Output format (currently only "markdown" is supported)
+    pub format: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
@@ -378,6 +390,7 @@ pub struct PublishConfig {
     pub timeout_seconds: u64,
     pub retry_limit: u32,
     pub artifact_dir: String,
+    pub targets: HashMap<String, PublishTargetConfig>,
 }
 
 impl Default for PublishConfig {
@@ -387,6 +400,7 @@ impl Default for PublishConfig {
             timeout_seconds: 900,
             retry_limit: 2,
             artifact_dir: "outputs".to_string(),
+            targets: HashMap::new(),
         }
     }
 }

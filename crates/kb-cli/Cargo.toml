@@ -16,6 +16,7 @@ workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
+regex.workspace = true
 fs2.workspace = true
 kb-compile.workspace = true
 kb-core.workspace = true

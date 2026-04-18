@@ -3,6 +3,7 @@
 mod config;
 mod init;
 mod jobs;
+mod publish;
 mod root;
 
 use std::env;
@@ -99,11 +100,10 @@ enum Command {
     Doctor,
     /// Show status of the knowledge base
     Status,
-    /// Publish the knowledge base
+    /// Publish selected artifacts to a project notes folder
     Publish {
-        /// Destination for publishing
-        #[arg(long)]
-        dest: Option<String>,
+        /// Named target from [publish.targets] in kb.toml
+        target: String,
     },
     /// Search the knowledge base
     Search {
@@ -245,14 +245,26 @@ fn run(cli: Cli) -> Result<()> {
                 run_lint(lint_root, should_json, check.as_deref())
             })
         }
-        Some(Command::Publish { dest }) => {
-            execute_mutating_command(root.as_deref(), "publish", move || {
-                if let Some(dest) = dest {
-                    println!("publish is not implemented yet (dest: {dest})");
-                } else {
-                    println!("publish is not implemented yet");
-                }
-                Ok(())
+        Some(Command::Publish { target }) => {
+            let publish_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let dry_run = cli.dry_run;
+            let json = cli.json;
+            execute_mutating_command(Some(publish_root), "publish", move || {
+                let cfg = config::Config::load_from_root(publish_root, None)?;
+                let mut available: Vec<String> =
+                    cfg.publish.targets.keys().cloned().collect();
+                available.sort();
+                let target_cfg = cfg
+                    .publish
+                    .targets
+                    .get(&target)
+                    .ok_or_else(|| {
+                        publish::target_not_found_error(&target, &available)
+                    })?
+                    .clone();
+                publish::run_publish(publish_root, &target, &target_cfg, dry_run, json)
             })
         }
         Some(Command::Status) => {
