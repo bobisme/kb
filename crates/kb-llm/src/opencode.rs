@@ -254,8 +254,80 @@ impl LlmAdapter for OpencodeAdapter {
         &self,
         _request: RunHealthCheckRequest,
     ) -> Result<(RunHealthCheckResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "opencode adapter run_health_check is not implemented yet".to_string(),
+        let prompt = "respond with OK";
+        let timeout = Duration::from_secs(10);
+
+        let (temp_dir, config_path) = self.write_config()?;
+        let command = self.build_command(&config_path, prompt);
+
+        let started_at = unix_time_ms()?;
+        let result = run_shell_command(&command, timeout);
+        let ended_at = unix_time_ms()?;
+
+        // Clean up temp dir regardless of outcome
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let output = result.map_err(|e| match e {
+            SubprocessError::TimedOut { timeout, .. } => LlmAdapterError::Timeout(format!(
+                "opencode health check exceeded timeout of {timeout:?}"
+            )),
+            SubprocessError::Other(err) => {
+                let msg = err.to_string();
+                if msg.contains("not found") || msg.contains("No such file or directory") {
+                    LlmAdapterError::Transport(format!("opencode not on PATH: {msg}"))
+                } else {
+                    LlmAdapterError::Transport(format!("failed to invoke opencode: {msg}"))
+                }
+            }
+        })?;
+
+        if output.exit_code != Some(0) {
+            let stderr = output.stderr.trim().to_string();
+            let details = if stderr.is_empty() {
+                output.stdout.trim().to_string()
+            } else {
+                stderr
+            };
+            if details.contains("not found") || details.contains("No such file or directory") {
+                return Err(LlmAdapterError::Transport(format!(
+                    "opencode not on PATH: {details}"
+                )));
+            }
+
+            return Err(LlmAdapterError::Other(format!(
+                "opencode health check exited with error: {details}"
+            )));
+        }
+
+        let response_text = strip_ansi_header(&output.stdout);
+
+        let status = if response_text.contains("OK") {
+            "healthy".to_string()
+        } else {
+            "degraded".to_string()
+        };
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: "health_check".to_string(),
+            prompt_template_hash: kb_core::Hash::from([0u8; 32]),
+            prompt_render_hash: kb_core::hash_bytes(prompt.as_bytes()),
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((
+            RunHealthCheckResponse {
+                status,
+                details: Some(response_text),
+            },
+            provenance,
         ))
     }
 }
@@ -472,11 +544,43 @@ mod tests {
     }
 
     #[test]
-    fn summarize_document_maps_timeouts() {
-        let (adapter, _tmp) = test_adapter_with_script("#!/bin/sh\nsleep 100\n");
+    fn run_health_check_returns_healthy_when_output_contains_ok() {
+        let (adapter, _tmp) = test_adapter_with_script("#!/bin/sh\nprintf 'OK'");
+
+        let (response, _provenance) = adapter
+            .run_health_check(RunHealthCheckRequest {
+                check_details: None,
+            })
+            .expect("health check");
+
+        assert_eq!(response.status, "healthy");
+        assert_eq!(response.details, Some("OK".to_string()));
+    }
+
+    #[test]
+    fn run_health_check_returns_degraded_when_output_does_not_contain_ok() {
+        let (adapter, _tmp) =
+            test_adapter_with_script("#!/bin/sh\nprintf 'Error: something went wrong'");
+
+        let (response, _provenance) = adapter
+            .run_health_check(RunHealthCheckRequest {
+                check_details: None,
+            })
+            .expect("health check");
+
+        assert_eq!(response.status, "degraded");
+        assert_eq!(
+            response.details,
+            Some("Error: something went wrong".to_string())
+        );
+    }
+
+    #[test]
+    fn run_prompt_returns_timeout_error() {
+        let (adapter, _tmp) = test_adapter_with_script("#!/bin/sh\nsleep 100");
         let adapter = OpencodeAdapter::new(OpencodeConfig {
             command: adapter.config.command,
-            timeout: Duration::from_millis(100),
+            timeout: Duration::from_millis(50),
             ..Default::default()
         });
 
@@ -485,5 +589,44 @@ mod tests {
             matches!(err, LlmAdapterError::Timeout(_)),
             "expected Timeout, got {err:?}"
         );
+    }
+
+    #[test]
+    fn run_health_check_returns_timeout_error() {
+        let (adapter, _tmp) = test_adapter_with_script("#!/bin/sh\nsleep 100");
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: adapter.config.command,
+            timeout: Duration::from_millis(50),
+            ..Default::default()
+        });
+
+        let err = adapter
+            .run_health_check(RunHealthCheckRequest {
+                check_details: None,
+            })
+            .expect_err("should time out");
+
+        assert!(matches!(err, LlmAdapterError::Timeout(_)));
+    }
+
+    #[test]
+    fn run_health_check_returns_path_error_when_binary_missing() {
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: "/nonexistent/opencode".to_string(),
+            ..Default::default()
+        });
+
+        let err = adapter
+            .run_health_check(RunHealthCheckRequest {
+                check_details: None,
+            })
+            .expect_err("should fail");
+
+        match err {
+            LlmAdapterError::Transport(msg) => {
+                assert!(msg.contains("opencode not on PATH"));
+            }
+            other => panic!("expected Transport error with PATH message, got {other:?}"),
+        }
     }
 }

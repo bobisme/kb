@@ -7,10 +7,14 @@ mod root;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
-use config::Config;
+use config::{Config, LlmRunnerConfig};
 use kb_core::JobRunStatus;
+use kb_llm::{
+    ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
+    RunHealthCheckRequest,
+};
 use serde::Serialize;
 use std::time::Duration;
 
@@ -137,10 +141,17 @@ fn run(cli: Cli) -> Result<()> {
             println!("compile is not implemented yet");
             Ok(())
         }),
-        Some(Command::Doctor) => execute_mutating_command(root.as_deref(), "doctor", || {
-            println!("doctor is not implemented yet");
-            Ok(())
-        }),
+        Some(Command::Doctor) => {
+            let root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let check_root = root;
+            let should_json = cli.json;
+            let cli_model = cli.model.clone();
+            execute_mutating_command(Some(check_root), "doctor", move || {
+                run_doctor(check_root, should_json, cli_model.as_deref())
+            })
+        }
         Some(Command::Ask { query }) => {
             execute_mutating_command(root.as_deref(), "ask", move || {
                 println!("ask is not implemented yet: {query}");
@@ -231,6 +242,224 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorPayload {
+    checks: Vec<DoctorCheck>,
+    all_healthy: bool,
+    failed_checks: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorCheck {
+    runner: String,
+    harness: String,
+    status: String,
+    model: String,
+    harness_version: Option<String>,
+    latency_ms: u64,
+    command: String,
+    details: Option<String>,
+    error: Option<String>,
+}
+
+fn run_doctor(root: &Path, json: bool, cli_model: Option<&str>) -> Result<()> {
+    let cfg = Config::load_from_root(root, cli_model)?;
+    let mut checks = Vec::new();
+
+    let default_model = cfg.llm.default_model.clone();
+    let mut runner_names: Vec<_> = cfg.llm.runners.keys().cloned().collect();
+    runner_names.sort_unstable();
+
+    for name in runner_names {
+        let runner = cfg
+            .llm
+            .runners
+            .get(&name)
+            .expect("runner key from keys() must exist");
+
+        match name.as_str() {
+            "opencode" => {
+                checks.push(run_opencode_health_check(
+                    &name,
+                    runner,
+                    root,
+                    &default_model,
+                ));
+            }
+            "claude" => {
+                checks.push(run_claude_health_check(&name, runner, &default_model));
+            }
+            _ => {
+                checks.push(DoctorCheck {
+                    runner: name,
+                    harness: "unsupported".to_string(),
+                    status: "skipped".to_string(),
+                    model: runner
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| default_model.clone()),
+                    harness_version: None,
+                    latency_ms: 0,
+                    command: runner.command.clone(),
+                    details: Some("runner not configured for doctor checks".to_string()),
+                    error: None,
+                });
+            }
+        }
+    }
+
+    let failed_checks = checks.iter().filter(|c| c.status == "failed").count();
+    let failed_runners = checks
+        .iter()
+        .filter(|c| c.status == "failed")
+        .map(|c| c.runner.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if json {
+        let payload = DoctorPayload {
+            checks,
+            all_healthy: failed_checks == 0,
+            failed_checks,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        for check in &checks {
+            println!(
+                "{}: {} (model: {}, latency: {}ms, harness_version: {:?})",
+                check.runner, check.status, check.model, check.latency_ms, check.harness_version
+            );
+            if let Some(details) = &check.details {
+                println!("  details: {details}");
+            }
+            if let Some(error) = &check.error {
+                println!("  error: {error}");
+            }
+            println!("  command: {}", check.command);
+        }
+        if failed_checks == 0 {
+            println!("kb doctor: all health checks passed");
+        } else {
+            println!("kb doctor: {failed_checks} health check(s) failed");
+        }
+    }
+
+    if failed_runners.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "health check failed for runner(s): {failed_runners}"
+        ))
+    }
+}
+
+fn run_opencode_health_check(
+    runner_name: &str,
+    runner: &LlmRunnerConfig,
+    root: &Path,
+    default_model: &str,
+) -> DoctorCheck {
+    let model = runner
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model.to_string());
+
+    let command = normalize_binary_command(&runner.command);
+    let adapter = OpencodeAdapter::new(OpencodeConfig {
+        command,
+        model: model.clone(),
+        tools_read: runner.tools_read,
+        tools_write: runner.tools_write,
+        tools_edit: runner.tools_edit,
+        tools_bash: runner.tools_bash,
+        timeout: Duration::from_secs(runner.timeout_seconds.unwrap_or(900)),
+        project_root: Some(root.to_path_buf()),
+        ..Default::default()
+    });
+
+    match adapter.run_health_check(RunHealthCheckRequest {
+        check_details: None,
+    }) {
+        Ok((response, provenance)) => DoctorCheck {
+            runner: runner_name.to_string(),
+            harness: provenance.harness,
+            status: response.status,
+            model: provenance.model,
+            harness_version: provenance.harness_version,
+            latency_ms: provenance.latency_ms,
+            command: runner.command.clone(),
+            details: response.details,
+            error: None,
+        },
+        Err(err) => DoctorCheck {
+            runner: runner_name.to_string(),
+            harness: "opencode".to_string(),
+            status: "failed".to_string(),
+            model,
+            harness_version: None,
+            latency_ms: 0,
+            command: runner.command.clone(),
+            details: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn run_claude_health_check(
+    runner_name: &str,
+    runner: &LlmRunnerConfig,
+    default_model: &str,
+) -> DoctorCheck {
+    let model = runner
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model.to_string());
+
+    let command = normalize_binary_command(&runner.command);
+    let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+        command,
+        model: runner.model.clone(),
+        permission_mode: runner.permission_mode.clone(),
+        timeout: Duration::from_secs(runner.timeout_seconds.unwrap_or(900)),
+        project_root: None,
+    });
+
+    match adapter.run_health_check(RunHealthCheckRequest {
+        check_details: None,
+    }) {
+        Ok((response, provenance)) => DoctorCheck {
+            runner: runner_name.to_string(),
+            harness: provenance.harness,
+            status: response.status,
+            model: provenance.model,
+            harness_version: provenance.harness_version,
+            latency_ms: provenance.latency_ms,
+            command: runner.command.clone(),
+            details: response.details,
+            error: None,
+        },
+        Err(err) => DoctorCheck {
+            runner: runner_name.to_string(),
+            harness: "claude".to_string(),
+            status: "failed".to_string(),
+            model,
+            harness_version: None,
+            latency_ms: 0,
+            command: runner.command.clone(),
+            details: None,
+            error: Some(err.to_string()),
+        },
+    }
+}
+
+fn normalize_binary_command(command: &str) -> String {
+    command
+        .split_whitespace()
+        .next()
+        .unwrap_or(command)
+        .to_string()
 }
 
 #[derive(Debug, Serialize)]

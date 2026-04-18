@@ -194,8 +194,82 @@ impl LlmAdapter for ClaudeCliAdapter {
         &self,
         _request: RunHealthCheckRequest,
     ) -> Result<(RunHealthCheckResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "Claude CLI adapter run_health_check is not implemented yet".to_string(),
+        let prompt = "respond with OK";
+        let timeout = Duration::from_secs(10);
+        let command = self.build_command(prompt);
+
+        let started_at = unix_time_ms()?;
+        let result = run_shell_command(&command, timeout);
+        let ended_at = unix_time_ms()?;
+
+        let output = result.map_err(|e| match e {
+            SubprocessError::TimedOut { timeout, .. } => LlmAdapterError::Timeout(format!(
+                "Claude CLI health check exceeded timeout of {timeout:?}"
+            )),
+            SubprocessError::Other(err) => {
+                let msg = err.to_string();
+                if msg.contains("not found") || msg.contains("No such file or directory") {
+                    LlmAdapterError::Transport(format!("claude not on PATH: {msg}"))
+                } else {
+                    LlmAdapterError::Transport(format!("Failed to invoke Claude CLI: {msg}"))
+                }
+            }
+        })?;
+
+        if output.exit_code != Some(0) {
+            let stderr = output.stderr.trim();
+            let details = if stderr.is_empty() {
+                output.stdout.trim()
+            } else {
+                stderr
+            };
+            if details.contains("not found") || details.contains("No such file or directory") {
+                return Err(LlmAdapterError::Transport(format!(
+                    "claude not on PATH: {details}"
+                )));
+            }
+
+            return Err(classify_nonzero_exit(
+                output.exit_code,
+                &output.stderr,
+                &output.stdout,
+            ));
+        }
+
+        let parsed = parse_claude_json(&output.stdout)?;
+
+        let status = if parsed.text.contains("OK") {
+            "healthy".to_string()
+        } else {
+            "degraded".to_string()
+        };
+
+        let model = parsed
+            .model
+            .or_else(|| self.config.model.clone())
+            .unwrap_or_else(|| "claude".to_string());
+
+        let provenance = ProvenanceRecord {
+            harness: "claude".to_string(),
+            harness_version: None,
+            model,
+            prompt_template_name: "health_check".to_string(),
+            prompt_template_hash: kb_core::Hash::from([0u8; 32]),
+            prompt_render_hash: kb_core::hash_bytes(prompt.as_bytes()),
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: parsed.tokens,
+            cost_estimate: parsed.cost_estimate,
+        };
+
+        Ok((
+            RunHealthCheckResponse {
+                status,
+                details: Some(parsed.text),
+            },
+            provenance,
         ))
     }
 }
@@ -383,7 +457,12 @@ fn map_subprocess_error(error: SubprocessError) -> LlmAdapterError {
             LlmAdapterError::Timeout(format!("Claude CLI exceeded timeout of {timeout:?}"))
         }
         SubprocessError::Other(err) => {
-            LlmAdapterError::Transport(format!("Failed to invoke Claude CLI: {err}"))
+            let msg = err.to_string();
+            if msg.contains("not found") || msg.contains("No such file or directory") {
+                LlmAdapterError::Transport(format!("claude not on PATH: {msg}"))
+            } else {
+                LlmAdapterError::Transport(format!("Failed to invoke Claude CLI: {msg}"))
+            }
         }
     }
 }
@@ -526,24 +605,83 @@ mod tests {
     }
 
     #[test]
-    fn summarize_document_maps_timeouts() {
+    fn run_health_check_returns_healthy_when_output_contains_ok() {
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-claude.sh");
+        fs::write(&script_path, "#!/bin/sh\nprintf '{\"result\":\"OK\"}'")
+            .expect("write fake claude script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).expect("chmod");
+        }
+
         let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
-            command: "sh -c 'sleep 100'".to_string(),
-            model: None,
-            permission_mode: None,
-            timeout: Duration::from_millis(50),
-            project_root: None,
+            command: script_path.display().to_string(),
+            ..Default::default()
+        });
+
+        let (response, _provenance) = adapter
+            .run_health_check(RunHealthCheckRequest {
+                check_details: None,
+            })
+            .expect("health check");
+
+        assert_eq!(response.status, "healthy");
+        assert_eq!(response.details, Some("OK".to_string()));
+    }
+
+    #[test]
+    fn run_health_check_returns_degraded_when_output_does_not_contain_ok() {
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-claude.sh");
+        fs::write(&script_path, "#!/bin/sh\nprintf '{\"result\":\"Error\"}'")
+            .expect("write fake claude script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).expect("chmod");
+        }
+
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+            command: script_path.display().to_string(),
+            ..Default::default()
+        });
+
+        let (response, _provenance) = adapter
+            .run_health_check(RunHealthCheckRequest {
+                check_details: None,
+            })
+            .expect("health check");
+
+        assert_eq!(response.status, "degraded");
+        assert_eq!(response.details, Some("Error".to_string()));
+    }
+
+    #[test]
+    fn run_health_check_returns_path_error_when_binary_missing() {
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+            command: "/nonexistent/claude".to_string(),
+            ..Default::default()
         });
 
         let err = adapter
-            .summarize_with_rendered_prompt(RenderedPrompt {
-                template_name: "summarize_document.md".to_string(),
-                template_hash: kb_core::hash_bytes(b"template"),
-                content: "100".to_string(),
-                render_hash: kb_core::hash_bytes(b"rendered"),
+            .run_health_check(RunHealthCheckRequest {
+                check_details: None,
             })
-            .expect_err("sleep 100 should time out");
+            .expect_err("should fail");
 
-        assert!(matches!(err, LlmAdapterError::Timeout(_)));
+        match err {
+            LlmAdapterError::Transport(msg) => {
+                assert!(msg.contains("claude not on PATH"));
+            }
+            other => panic!("expected Transport error with PATH message, got {other:?}"),
+        }
     }
 }
