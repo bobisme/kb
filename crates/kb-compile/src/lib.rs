@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod orchestrator;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
@@ -281,6 +283,49 @@ impl Graph {
             node.outputs.sort_unstable();
             node.outputs.dedup();
         }
+    }
+
+    /// Return all nodes in topological order (dependencies before dependents).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the graph contains a cycle.
+    pub fn topological_order(&self) -> Result<Vec<NodeId>> {
+        let mut in_degree: BTreeMap<&str, usize> = BTreeMap::new();
+        for (id, node) in &self.nodes {
+            in_degree.entry(id.as_str()).or_insert(0);
+            for output in &node.outputs {
+                *in_degree.entry(output.as_str()).or_insert(0) += 1;
+            }
+        }
+
+        let mut queue: VecDeque<String> = in_degree
+            .iter()
+            .filter(|&(_, &deg)| deg == 0)
+            .map(|(&id, _)| id.to_string())
+            .collect();
+
+        let mut order = Vec::with_capacity(self.nodes.len());
+
+        while let Some(id) = queue.pop_front() {
+            if let Some(node) = self.nodes.get(&id) {
+                for output in &node.outputs {
+                    if let Some(deg) = in_degree.get_mut(output.as_str()) {
+                        *deg -= 1;
+                        if *deg == 0 {
+                            queue.push_back(output.clone());
+                        }
+                    }
+                }
+            }
+            order.push(id);
+        }
+
+        if order.len() != self.nodes.len() {
+            bail!("dependency graph contains a cycle (topological sort incomplete)");
+        }
+
+        Ok(order)
     }
 
     fn upstream_closure(&self, start: &str) -> Vec<NodeId> {
