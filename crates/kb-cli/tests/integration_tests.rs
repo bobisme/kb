@@ -142,10 +142,91 @@ fn ask_creates_question_record_and_placeholder_artifact() {
     assert_eq!(question_record["requested_format"], "md");
     assert_eq!(question_record["requesting_context"], "project_kb");
 
+    let retrieval_plan_path = kb_root.join(
+        question_record["retrieval_plan"]
+            .as_str()
+            .expect("retrieval_plan should be a string"),
+    );
+    assert!(retrieval_plan_path.is_file());
+
+    let retrieval_plan: Value = serde_json::from_str(
+        &fs::read_to_string(&retrieval_plan_path).expect("read retrieval plan"),
+    )
+    .expect("parse retrieval plan");
+    assert_eq!(retrieval_plan["query"], "How does the pipeline work?");
+    assert_eq!(retrieval_plan["token_budget"], 20_000);
+
     let artifact = fs::read_to_string(&artifact_path).expect("read artifact placeholder");
     assert!(artifact.contains("question_record:"));
     assert!(artifact.contains("requested_format: md"));
     assert!(artifact.contains("Answer generation is not implemented yet."));
+}
+
+#[test]
+fn ask_persists_ranked_retrieval_plan_after_compile() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_source_page(
+        &kb_root,
+        "rust-overview",
+        "Rust Overview",
+        "Rust ownership and borrowing basics.",
+    );
+    write_concept_page(&kb_root, "borrow-checker", "Borrow checker", &["borrowck"]);
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    let compile_output = compile_cmd.output().expect("run kb compile");
+    assert!(
+        compile_output.status.success(),
+        "kb compile failed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let mut ask_cmd = kb_cmd(&kb_root);
+    ask_cmd.arg("--json").arg("ask").arg("borrowck rust checker");
+    let output = ask_cmd.output().expect("run kb ask");
+    assert!(
+        output.status.success(),
+        "kb ask failed with stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let question_path = kb_root.join(
+        payload["question_path"]
+            .as_str()
+            .expect("question_path should be a string"),
+    );
+    let question_record: Value = serde_json::from_str(
+        &fs::read_to_string(&question_path).expect("read question record"),
+    )
+    .expect("parse question record");
+    let retrieval_plan_path = kb_root.join(
+        question_record["retrieval_plan"]
+            .as_str()
+            .expect("retrieval_plan should be a string"),
+    );
+    let retrieval_plan: Value = serde_json::from_str(
+        &fs::read_to_string(&retrieval_plan_path).expect("read retrieval plan"),
+    )
+    .expect("parse retrieval plan");
+
+    let candidates = retrieval_plan["candidates"]
+        .as_array()
+        .expect("candidates array");
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0]["id"], "wiki/concepts/borrow-checker.md");
+    let first_score = candidates[0]["score"].as_u64().expect("first score");
+    let second_score = candidates[1]["score"].as_u64().expect("second score");
+    assert!(first_score >= second_score);
+    let reasons = candidates[0]["reasons"].as_array().expect("reasons array");
+    assert!(reasons.iter().any(|reason| {
+        reason
+            .as_str()
+            .is_some_and(|text| text.contains("alias matched 'borrowck'"))
+    }));
 }
 
 #[test]

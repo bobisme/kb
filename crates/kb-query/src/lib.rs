@@ -2,4 +2,7 @@
 
 pub mod lexical;
 
-pub use lexical::{LexicalEntry, LexicalIndex, SearchResult, build_lexical_index};
+pub use lexical::{
+    LexicalEntry, LexicalIndex, RetrievalCandidate, RetrievalPlan, SearchResult,
+    build_lexical_index,
+};

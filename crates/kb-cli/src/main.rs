@@ -725,6 +725,11 @@ fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool)
     let question_rel = PathBuf::from("outputs/questions")
         .join(&question_id)
         .join("question.json");
+    let plan_rel = PathBuf::from("outputs/questions")
+        .join(&question_id)
+        .join("retrieval_plan.json");
+
+    let retrieval_plan = kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
 
     let question = Question {
         metadata: EntityMetadata {
@@ -736,13 +741,13 @@ fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool)
             tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
             prompt_template_hash: None,
             dependencies: Vec::new(),
-            output_paths: vec![question_rel.clone(), artifact_rel.clone()],
+            output_paths: vec![question_rel.clone(), artifact_rel.clone(), plan_rel.clone()],
             status: Status::Fresh,
         },
         raw_query: query.to_string(),
         requested_format: requested_format.to_string(),
         requesting_context: QuestionContext::ProjectKb,
-        retrieval_plan: String::new(),
+        retrieval_plan: plan_rel.to_string_lossy().into_owned(),
         token_budget: Some(cfg.ask.token_budget),
     };
 
@@ -773,6 +778,10 @@ fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool)
     fs::write(
         root.join(&question_rel),
         serde_json::to_string_pretty(&question)?,
+    )?;
+    fs::write(
+        root.join(&plan_rel),
+        serde_json::to_string_pretty(&retrieval_plan)?,
     )?;
     fs::write(
         root.join(&artifact_rel),
