@@ -11,6 +11,7 @@ use anyhow::Result;
 use clap::Parser;
 use config::Config;
 use kb_core::JobRunStatus;
+use serde::Serialize;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -148,52 +149,18 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Ingest { sources }) => {
             let ingest_root = root.clone();
-            execute_mutating_command(root.as_deref(), "ingest", move || {
+            let action = move || {
                 let root = ingest_root
                     .as_deref()
                     .expect("root resolved for non-init commands");
+                run_ingest(root, &sources, cli.json, cli.dry_run)
+            };
 
-                let mut urls = Vec::new();
-                let mut local_paths = Vec::new();
-                for source in &sources {
-                    if source.starts_with("http://") || source.starts_with("https://") {
-                        urls.push(source.as_str());
-                    } else {
-                        local_paths.push(std::path::PathBuf::from(source));
-                    }
-                }
-
-                let ingested = kb_ingest::ingest_paths(root, &local_paths)?;
-
-                if !urls.is_empty() {
-                    let rt = tokio::runtime::Runtime::new()?;
-                    rt.block_on(async {
-                        for url in &urls {
-                            kb_ingest::ingest_url(root, url).await?;
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    })?;
-                }
-
-                if cli.json {
-                    println!("{}", serde_json::to_string_pretty(&ingested)?);
-                } else if ingested.is_empty() && urls.is_empty() {
-                    println!("No files ingested");
-                } else {
-                    for item in &ingested {
-                        println!(
-                            "{} {} {}",
-                            item.document.metadata.id,
-                            item.revision.metadata.id,
-                            item.copied_path.display()
-                        );
-                    }
-                    for url in &urls {
-                        println!("ingested URL: {url}");
-                    }
-                }
-                Ok(())
-            })
+            if cli.dry_run {
+                action()
+            } else {
+                execute_mutating_command(root.as_deref(), "ingest", action)
+            }
         }
         Some(Command::Lint { rule }) => {
             execute_mutating_command(root.as_deref(), "lint", move || {
@@ -263,6 +230,140 @@ fn run(cli: Cli) -> Result<()> {
             println!("Run 'kb --help' for more information");
             Ok(())
         }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct IngestPayload {
+    dry_run: bool,
+    results: Vec<IngestResult>,
+    summary: IngestSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct IngestResult {
+    input: String,
+    source_kind: &'static str,
+    outcome: kb_ingest::IngestOutcome,
+    source_document_id: String,
+    source_revision_id: String,
+    content_path: PathBuf,
+    metadata_path: PathBuf,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct IngestSummary {
+    total: usize,
+    new_sources: usize,
+    new_revisions: usize,
+    skipped: usize,
+}
+
+fn run_ingest(root: &Path, sources: &[String], json: bool, dry_run: bool) -> Result<()> {
+    let mut urls = Vec::new();
+    let mut local_paths = Vec::new();
+    for source in sources {
+        if source.starts_with("http://") || source.starts_with("https://") {
+            urls.push(source.as_str());
+        } else {
+            local_paths.push(PathBuf::from(source));
+        }
+    }
+
+    let mut results = Vec::new();
+    for report in kb_ingest::ingest_paths_with_options(root, &local_paths, dry_run)? {
+        results.push(IngestResult {
+            input: report.source_path.display().to_string(),
+            source_kind: "file",
+            outcome: report.outcome,
+            source_document_id: report.ingested.document.metadata.id,
+            source_revision_id: report.ingested.revision.metadata.id,
+            content_path: report.ingested.copied_path,
+            metadata_path: report.ingested.metadata_sidecar_path,
+        });
+    }
+
+    if !urls.is_empty() {
+        let rt = tokio::runtime::Runtime::new()?;
+        let url_results = rt.block_on(async {
+            let mut collected = Vec::with_capacity(urls.len());
+            for url in &urls {
+                collected.push(kb_ingest::ingest_url_with_options(root, url, dry_run).await?);
+            }
+            Ok::<Vec<kb_ingest::UrlIngestReport>, anyhow::Error>(collected)
+        })?;
+
+        for report in url_results {
+            results.push(IngestResult {
+                input: report.source_url,
+                source_kind: "url",
+                outcome: report.outcome,
+                source_document_id: report.source_document_id,
+                source_revision_id: report.source_revision_id,
+                content_path: report.normalized_path,
+                metadata_path: report.metadata_path,
+            });
+        }
+    }
+
+    let summary = summarize_ingest(&results);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&IngestPayload {
+                dry_run,
+                results,
+                summary,
+            })?
+        );
+        return Ok(());
+    }
+
+    if results.is_empty() {
+        println!("No sources ingested");
+        return Ok(());
+    }
+
+    for item in &results {
+        let prefix = if dry_run { "would" } else { "status" };
+        println!(
+            "{prefix} {} {} {} {} {} {}",
+            outcome_label(item.outcome),
+            item.source_kind,
+            item.input,
+            item.source_document_id,
+            item.source_revision_id,
+            item.content_path.display()
+        );
+    }
+    println!(
+        "Summary: {} total | {} new sources | {} new revisions | {} skipped",
+        summary.total, summary.new_sources, summary.new_revisions, summary.skipped
+    );
+
+    Ok(())
+}
+
+fn summarize_ingest(results: &[IngestResult]) -> IngestSummary {
+    let mut summary = IngestSummary {
+        total: results.len(),
+        ..IngestSummary::default()
+    };
+    for item in results {
+        match item.outcome {
+            kb_ingest::IngestOutcome::NewSource => summary.new_sources += 1,
+            kb_ingest::IngestOutcome::NewRevision => summary.new_revisions += 1,
+            kb_ingest::IngestOutcome::Skipped => summary.skipped += 1,
+        }
+    }
+    summary
+}
+
+fn outcome_label(outcome: kb_ingest::IngestOutcome) -> &'static str {
+    match outcome {
+        kb_ingest::IngestOutcome::NewSource => "new_source",
+        kb_ingest::IngestOutcome::NewRevision => "new_revision",
+        kb_ingest::IngestOutcome::Skipped => "skipped",
     }
 }
 

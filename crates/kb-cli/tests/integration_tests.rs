@@ -4,6 +4,9 @@ use common::{kb_cmd, make_temp_kb};
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::thread;
 
 fn init_kb(root: &std::path::Path) {
     let mut cmd = kb_cmd(root);
@@ -29,12 +32,10 @@ fn smoke_test_kb_init_creates_directory() {
     let (_temp_dir, kb_root) = make_temp_kb();
 
     // The kb root directory should be empty initially
-    assert!(
-        fs::read_dir(&kb_root)
-            .expect("failed to read kb root directory")
-            .next()
-            .is_none()
-    );
+    assert!(fs::read_dir(&kb_root)
+        .expect("failed to read kb root directory")
+        .next()
+        .is_none());
 }
 
 #[test]
@@ -101,15 +102,18 @@ fn ingest_file_registers_source_and_sidecar() {
     );
 
     let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
-    let items = payload.as_array().expect("ingest output should be an array");
+    let items = payload["results"]
+        .as_array()
+        .expect("ingest results should be an array");
     assert_eq!(items.len(), 1);
+    assert_eq!(payload["summary"]["new_sources"], 1);
 
-    let copied_path = items[0]["copied_path"]
+    let copied_path = items[0]["content_path"]
         .as_str()
-        .expect("copied_path should be a string");
-    let sidecar_path = items[0]["metadata_sidecar_path"]
+        .expect("content_path should be a string");
+    let sidecar_path = items[0]["metadata_path"]
         .as_str()
-        .expect("metadata_sidecar_path should be a string");
+        .expect("metadata_path should be a string");
 
     assert!(kb_root.join(copied_path).is_file());
     assert!(kb_root.join(sidecar_path).is_file());
@@ -137,15 +141,111 @@ fn ingest_directory_respects_gitignore() {
     );
 
     let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
-    let items = payload.as_array().expect("ingest output should be an array");
+    let items = payload["results"]
+        .as_array()
+        .expect("ingest results should be an array");
     assert_eq!(items.len(), 1);
     assert_eq!(
-        items[0]["copied_path"]
+        items[0]["content_path"]
             .as_str()
-            .expect("copied_path should be a string")
+            .expect("content_path should be a string")
             .rsplit('/')
             .next()
-            .expect("copied_path should have a filename"),
+            .expect("content_path should have a filename"),
         "kept.md"
+    );
+}
+
+#[test]
+fn ingest_dry_run_makes_no_filesystem_changes() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("example.md");
+    fs::write(&source, "# hello\n").expect("write source");
+
+    let before: Vec<_> = fs::read_dir(&kb_root)
+        .expect("read kb root")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .collect();
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run")
+        .arg("--json")
+        .arg("ingest")
+        .arg(&source);
+    let output = cmd.output().expect("run kb ingest dry run");
+
+    assert!(
+        output.status.success(),
+        "dry run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    assert_eq!(payload["dry_run"], true);
+    assert_eq!(payload["summary"]["new_sources"], 1);
+
+    let after: Vec<_> = fs::read_dir(&kb_root)
+        .expect("read kb root")
+        .map(|entry| entry.expect("dir entry").file_name())
+        .collect();
+    assert_eq!(before, after);
+}
+
+#[test]
+fn ingest_mixed_file_directory_and_url_reports_summary() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let file = kb_root.join("single.md");
+    fs::write(&file, "# file\n").expect("write file");
+
+    let corpus = kb_root.join("corpus");
+    fs::create_dir_all(&corpus).expect("create corpus dir");
+    fs::write(corpus.join("nested.md"), "# nested\n").expect("write nested");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let address = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept connection");
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer).expect("read request");
+        let body = "<html><head><title>Example</title></head><body><article><h1>hello</h1><p>world</p></article></body></html>";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+    });
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ingest")
+        .arg(&file)
+        .arg(format!("http://{address}/article"))
+        .arg(&corpus);
+    let output = cmd.output().expect("run mixed ingest");
+    server.join().expect("join server");
+
+    assert!(
+        output.status.success(),
+        "mixed ingest failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    assert_eq!(payload["summary"]["total"], 3);
+    assert_eq!(payload["summary"]["new_sources"], 3);
+    assert_eq!(
+        payload["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .filter(|item| item["source_kind"] == "url")
+            .count(),
+        1
     );
 }

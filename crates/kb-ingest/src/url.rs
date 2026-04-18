@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -9,17 +9,18 @@ use kb_core::{
 };
 use regex::Regex;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 use url::Url;
+
+use crate::IngestOutcome;
 
 const FETCH_UA: &str = "Mozilla/5.0 (compatible; kb-ingest/0.1)";
 const TIMEOUT_SECS: u64 = 30;
 const BACKOFF_DELAYS_MS: [u64; 3] = [500, 1_000, 2_000];
 
-static IMG_SRC_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<img[^>]*\bsrc="([^"]+)""#).expect("hard-coded regex is valid")
-});
+static IMG_SRC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"<img[^>]*\bsrc="([^"]+)""#).expect("hard-coded regex is valid"));
 
 #[derive(Serialize)]
 struct FetchRecord {
@@ -28,7 +29,18 @@ struct FetchRecord {
     content_type: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UrlIngestReport {
+    pub source_url: String,
+    pub source_document_id: String,
+    pub source_revision_id: String,
+    pub outcome: IngestOutcome,
+    pub raw_snapshot_path: PathBuf,
+    pub normalized_path: PathBuf,
+    pub metadata_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NormalizedMetadata {
     title: String,
     original_url: String,
@@ -39,19 +51,25 @@ struct NormalizedMetadata {
 
 /// Fetches `raw_url`, stores a raw HTML snapshot, and writes a normalized markdown document.
 ///
-/// Produces under `root`:
-/// - `raw/web/<source-id>/page.html` — raw HTML bytes
-/// - `raw/web/<source-id>/page.headers.json` — fetch metadata
-/// - `normalized/<source-id>/source.md` — readability-extracted markdown
-/// - `normalized/<source-id>/metadata.json` — structured provenance metadata
-/// - `normalized/<source-id>/assets/<hash>_<name>` — downloaded images
+/// # Errors
+/// Returns an error if the fetch fails after all retries, readability extraction fails,
+/// or any file write fails.
+pub async fn ingest_url(root: &Path, raw_url: &str) -> Result<UrlIngestReport> {
+    ingest_url_with_options(root, raw_url, false).await
+}
+
+/// Fetches `raw_url`, computes the ingest outcome, and optionally persists fetched output.
 ///
 /// # Errors
 /// Returns an error if the fetch fails after all retries, readability extraction fails,
 /// or any file write fails.
-pub async fn ingest_url(root: &Path, raw_url: &str) -> Result<()> {
-    let source_id = source_document_id_for_url(raw_url)
-        .context("failed to derive source document ID")?;
+pub async fn ingest_url_with_options(
+    root: &Path,
+    raw_url: &str,
+    dry_run: bool,
+) -> Result<UrlIngestReport> {
+    let source_id =
+        source_document_id_for_url(raw_url).context("failed to derive source document ID")?;
 
     let client = Client::builder()
         .user_agent(FETCH_UA)
@@ -59,47 +77,91 @@ pub async fn ingest_url(root: &Path, raw_url: &str) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let (final_url, html_bytes, status, content_type) =
-        fetch_with_retry(&client, raw_url).await?;
+    let (final_url, html_bytes, status, content_type) = fetch_with_retry(&client, raw_url).await?;
+    let source_revision_id = mint_source_revision_id(&html_bytes);
+    let content_hash = source_revision_content_hash(&html_bytes);
 
-    // Persist raw snapshot
-    let raw_dir = root.join("raw").join("web").join(&source_id);
-    atomic_write(raw_dir.join("page.html"), &html_bytes)
-        .context("failed to write raw HTML")?;
-    atomic_write(
-        raw_dir.join("page.headers.json"),
-        serde_json::to_vec_pretty(&FetchRecord { final_url: final_url.to_string(), status, content_type })?.as_slice(),
-    )
-    .context("failed to write fetch record")?;
+    let raw_snapshot_path = PathBuf::from("raw")
+        .join("web")
+        .join(&source_id)
+        .join("page.html");
+    let normalized_path = PathBuf::from("normalized")
+        .join(&source_id)
+        .join("source.md");
+    let metadata_path = PathBuf::from("normalized")
+        .join(&source_id)
+        .join("metadata.json");
 
-    // Extract readable content (readability takes a sync reader over the already-fetched bytes)
-    let mut html_reader = html_bytes.as_slice();
-    let product = readability::extractor::extract(&mut html_reader, &final_url)
-        .context("readability extraction failed")?;
+    let existing_metadata = read_existing_metadata(&root.join(&metadata_path))?;
+    let outcome = match existing_metadata {
+        None => IngestOutcome::NewSource,
+        Some(metadata) if metadata.source_revision_id == source_revision_id => {
+            IngestOutcome::Skipped
+        }
+        Some(_) => IngestOutcome::NewRevision,
+    };
 
-    // Download images, rewrite src references, convert to markdown
-    let assets_dir = root.join("normalized").join(&source_id).join("assets");
-    let processed_html = rewrite_images(&product.content, &final_url, &assets_dir, &client).await?;
-    let markdown = html2md::parse_html(&processed_html);
+    if !dry_run && outcome != IngestOutcome::Skipped {
+        let raw_dir = root.join("raw").join("web").join(&source_id);
+        atomic_write(raw_dir.join("page.html"), &html_bytes).context("failed to write raw HTML")?;
+        atomic_write(
+            raw_dir.join("page.headers.json"),
+            serde_json::to_vec_pretty(&FetchRecord {
+                final_url: final_url.to_string(),
+                status,
+                content_type,
+            })?
+            .as_slice(),
+        )
+        .context("failed to write fetch record")?;
 
-    // Persist normalized document
-    let normalized_dir = root.join("normalized").join(&source_id);
-    atomic_write(normalized_dir.join("source.md"), markdown.as_bytes())
-        .context("failed to write normalized markdown")?;
-    atomic_write(
-        normalized_dir.join("metadata.json"),
-        serde_json::to_vec_pretty(&NormalizedMetadata {
-            title: product.title,
-            original_url: raw_url.to_string(),
-            fetched_at_millis: epoch_millis(),
-            content_hash: source_revision_content_hash(&html_bytes),
-            source_revision_id: mint_source_revision_id(&html_bytes),
-        })?
-        .as_slice(),
-    )
-    .context("failed to write metadata")?;
+        let mut html_reader = html_bytes.as_slice();
+        let product = readability::extractor::extract(&mut html_reader, &final_url)
+            .context("readability extraction failed")?;
 
-    Ok(())
+        let assets_dir = root.join("normalized").join(&source_id).join("assets");
+        let processed_html =
+            rewrite_images(&product.content, &final_url, &assets_dir, &client).await?;
+        let markdown = html2md::parse_html(&processed_html);
+
+        let normalized_dir = root.join("normalized").join(&source_id);
+        atomic_write(normalized_dir.join("source.md"), markdown.as_bytes())
+            .context("failed to write normalized markdown")?;
+        atomic_write(
+            normalized_dir.join("metadata.json"),
+            serde_json::to_vec_pretty(&NormalizedMetadata {
+                title: product.title,
+                original_url: raw_url.to_string(),
+                fetched_at_millis: epoch_millis(),
+                content_hash,
+                source_revision_id: source_revision_id.clone(),
+            })?
+            .as_slice(),
+        )
+        .context("failed to write metadata")?;
+    }
+
+    Ok(UrlIngestReport {
+        source_url: raw_url.to_string(),
+        source_document_id: source_id,
+        source_revision_id,
+        outcome,
+        raw_snapshot_path,
+        normalized_path,
+        metadata_path,
+    })
+}
+
+fn read_existing_metadata(path: &Path) -> Result<Option<NormalizedMetadata>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    let metadata = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse JSON {}", path.display()))?;
+    Ok(Some(metadata))
 }
 
 /// Fetches `url`, retrying up to `BACKOFF_DELAYS_MS.len()` times on transient failures.
@@ -116,13 +178,20 @@ async fn fetch_with_retry(
             }
         }
     }
-    do_fetch(client, url)
-        .await
-        .with_context(|| format!("fetch failed after {} attempts", BACKOFF_DELAYS_MS.len() + 1))
+    do_fetch(client, url).await.with_context(|| {
+        format!(
+            "fetch failed after {} attempts",
+            BACKOFF_DELAYS_MS.len() + 1
+        )
+    })
 }
 
 async fn do_fetch(client: &Client, url: &str) -> Result<(Url, Vec<u8>, u16, Option<String>)> {
-    let resp = client.get(url).send().await.context("HTTP request failed")?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .context("HTTP request failed")?;
     let status = resp.status();
     if status.is_server_error() {
         bail!("server error {status}");
@@ -137,7 +206,11 @@ async fn do_fetch(client: &Client, url: &str) -> Result<(Url, Vec<u8>, u16, Opti
         .and_then(|v| v.to_str().ok())
         .map(ToOwned::to_owned);
     let status_u16 = status.as_u16();
-    let bytes = resp.bytes().await.context("failed to read response body")?.to_vec();
+    let bytes = resp
+        .bytes()
+        .await
+        .context("failed to read response body")?
+        .to_vec();
     Ok((final_url, bytes, status_u16, content_type))
 }
 
@@ -206,7 +279,13 @@ fn derive_asset_name(url: &Url, src: &str) -> String {
     let prefix = &hash_bytes(src.as_bytes()).to_hex()[..8];
     let safe: String = raw
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     format!("{prefix}_{safe}")
 }
