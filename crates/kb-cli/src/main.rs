@@ -112,6 +112,10 @@ enum Command {
     },
     /// Inspect a document or entity
     Inspect {
+        /// Walk the full provenance chain recursively
+        #[arg(long)]
+        trace: bool,
+
         /// Document or entity to inspect
         #[arg(required = true)]
         target: String,
@@ -285,45 +289,11 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Inspect { target }) => {
+        Some(Command::Inspect { trace, target }) => {
             let root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            let graph = Graph::load_from(root)?;
-            let inspection = graph.inspect(&target)?;
-            println!("{}", inspection.render());
-
-            let records = kb_core::find_build_records_for_output(root, &inspection.id)?;
-            if !records.is_empty() {
-                println!("\nbuild records:");
-                for record in &records {
-                    println!("  id: {}", record.metadata.id);
-                    println!("  pass: {}", record.pass_name);
-                    if let Some(model) = &record.metadata.model_version {
-                        println!("  model: {model}");
-                    }
-                    if let Some(tmpl) = &record.metadata.prompt_template_hash {
-                        println!("  prompt_template_hash: {tmpl}");
-                    }
-                    println!("  started_at_millis: {}", record.metadata.created_at_millis);
-                    if record.metadata.updated_at_millis != record.metadata.created_at_millis {
-                        println!("  ended_at_millis: {}", record.metadata.updated_at_millis);
-                    }
-                    if !record.input_ids.is_empty() {
-                        println!("  inputs:");
-                        for input in &record.input_ids {
-                            println!("    - {input}");
-                        }
-                    }
-                    if !record.output_ids.is_empty() {
-                        println!("  outputs:");
-                        for output in &record.output_ids {
-                            println!("    - {output}");
-                        }
-                    }
-                }
-            }
-            Ok(())
+            run_inspect(root, &target, cli.json, trace)
         }
         Some(Command::Review { operation }) => {
             println!("review is not implemented yet: {operation}");
@@ -1161,6 +1131,475 @@ fn render_ask_artifact(
 
     let yaml = serde_yaml::to_string(&frontmatter)?;
     Ok(format!("---\n{yaml}---\n\n{body}"))
+}
+
+#[derive(Debug, Serialize)]
+struct InspectReport {
+    target: String,
+    resolved_id: String,
+    kind: String,
+    metadata: InspectMetadata,
+    freshness: String,
+    graph: Option<InspectGraph>,
+    citations: Vec<String>,
+    build_records: Vec<InspectBuildRecord>,
+    generating_jobs: Vec<InspectJob>,
+    trace: Option<Vec<InspectTraceNode>>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectMetadata {
+    file_path: Option<String>,
+    exists_on_disk: bool,
+    size_bytes: Option<u64>,
+    modified_at_millis: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectGraph {
+    direct_inputs: Vec<String>,
+    direct_outputs: Vec<String>,
+    upstream: Vec<String>,
+    downstream: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectBuildRecord {
+    id: String,
+    pass_name: String,
+    model: Option<String>,
+    prompt_template_hash: Option<String>,
+    started_at_millis: u64,
+    ended_at_millis: u64,
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectJob {
+    id: String,
+    command: String,
+    status: String,
+    started_at_millis: u64,
+    ended_at_millis: Option<u64>,
+    affected_outputs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct InspectTraceNode {
+    id: String,
+    kind: String,
+    inputs: Vec<Self>,
+}
+
+fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()> {
+    let graph = Graph::load_from(root)?;
+    let hashes = kb_core::Hashes::load(root)?;
+    let changed_inputs = find_changed_inputs(root, &hashes)?;
+    let jobs = jobs::recent_jobs(root, 1_000)?;
+
+    let mut report = if let Some(id) = graph.resolve_node_id(target) {
+        build_graph_inspect_report(root, &graph, target, &id, &changed_inputs, &jobs)?
+    } else if let Some(record) = kb_core::load_build_record(root, target)? {
+        build_build_record_report(root, target, &record, &jobs)?
+    } else if let Some(job) = jobs.iter().find(|job| job.metadata.id == target) {
+        build_job_report(target, job)
+    } else {
+        let candidate = root.join(target);
+        if candidate.exists() {
+            build_file_report(root, target, &candidate, &jobs)?
+        } else {
+            bail!(
+                "'{target}' was not found. Try an exact ID, a unique graph suffix, a build record ID, a job ID, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
+            );
+        }
+    };
+
+    if trace {
+        if let Some(graph_data) = &report.graph {
+            let _ = graph_data;
+            report.trace = Some(build_trace(&graph, &report.resolved_id, &mut std::collections::BTreeSet::new()));
+        } else {
+            report.trace = Some(Vec::new());
+        }
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("{}", render_inspect_report(&report));
+    }
+
+    Ok(())
+}
+
+fn build_graph_inspect_report(
+    root: &Path,
+    graph: &Graph,
+    target: &str,
+    id: &str,
+    changed_inputs: &[PathBuf],
+    jobs: &[JobRun],
+) -> Result<InspectReport> {
+    let inspection = graph.inspect(id)?;
+    let path = root.join(id);
+    let metadata = file_metadata(root, path.exists().then_some(path.as_path()))?;
+    let citations = if metadata.exists_on_disk {
+        extract_citations(&fs::read_to_string(&path).unwrap_or_default())
+    } else {
+        Vec::new()
+    };
+    let records = kb_core::find_build_records_for_output(root, id)?;
+    let generating_jobs = find_jobs_for_output(jobs, id);
+    let freshness = inspect_freshness(graph, id, changed_inputs, metadata.exists_on_disk);
+
+    Ok(InspectReport {
+        target: target.to_string(),
+        resolved_id: id.to_string(),
+        kind: inspect_kind(id),
+        metadata,
+        freshness,
+        graph: Some(InspectGraph {
+            direct_inputs: inspection.direct_inputs,
+            direct_outputs: inspection.direct_outputs,
+            upstream: inspection.upstream,
+            downstream: inspection.downstream,
+        }),
+        citations,
+        build_records: records.into_iter().map(summarize_build_record).collect(),
+        generating_jobs,
+        trace: None,
+    })
+}
+
+fn build_build_record_report(
+    root: &Path,
+    target: &str,
+    record: &kb_core::BuildRecord,
+    jobs: &[JobRun],
+) -> Result<InspectReport> {
+    Ok(InspectReport {
+        target: target.to_string(),
+        resolved_id: record.metadata.id.clone(),
+        kind: "build_record".to_string(),
+        metadata: file_metadata(
+            root,
+            Some(&kb_core::build_records_dir(root).join(format!("{}.json", record.metadata.id))),
+        )?,
+        freshness: format!("{:?}", record.metadata.status).to_lowercase(),
+        graph: None,
+        citations: Vec::new(),
+        build_records: vec![summarize_build_record(record.clone())],
+        generating_jobs: jobs
+            .iter()
+            .filter(|job| job.command == "compile")
+            .map(summarize_job)
+            .collect(),
+        trace: None,
+    })
+}
+
+fn build_job_report(target: &str, job: &JobRun) -> InspectReport {
+    InspectReport {
+        target: target.to_string(),
+        resolved_id: job.metadata.id.clone(),
+        kind: "job_run".to_string(),
+        metadata: InspectMetadata {
+            file_path: job.log_path.as_ref().map(|path| path.to_string_lossy().into_owned()),
+            exists_on_disk: true,
+            size_bytes: None,
+            modified_at_millis: Some(job.metadata.updated_at_millis),
+        },
+        freshness: format!("{:?}", job.metadata.status).to_lowercase(),
+        graph: None,
+        citations: Vec::new(),
+        build_records: Vec::new(),
+        generating_jobs: vec![summarize_job(job)],
+        trace: None,
+    }
+}
+
+fn build_file_report(root: &Path, target: &str, path: &Path, jobs: &[JobRun]) -> Result<InspectReport> {
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    let body = fs::read_to_string(path).unwrap_or_default();
+    Ok(InspectReport {
+        target: target.to_string(),
+        resolved_id: rel.clone(),
+        kind: inspect_kind(&rel),
+        metadata: file_metadata(root, Some(path))?,
+        freshness: "unknown".to_string(),
+        graph: None,
+        citations: extract_citations(&body),
+        build_records: kb_core::find_build_records_for_output(root, &rel)?
+            .into_iter()
+            .map(summarize_build_record)
+            .collect(),
+        generating_jobs: find_jobs_for_output(jobs, &rel),
+        trace: None,
+    })
+}
+
+fn file_metadata(root: &Path, path: Option<&Path>) -> Result<InspectMetadata> {
+    let Some(path) = path else {
+        return Ok(InspectMetadata {
+            file_path: None,
+            exists_on_disk: false,
+            size_bytes: None,
+            modified_at_millis: None,
+        });
+    };
+
+    let stat = fs::metadata(path)?;
+    let modified_at_millis = stat
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
+
+    Ok(InspectMetadata {
+        file_path: Some(
+            path.strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        exists_on_disk: true,
+        size_bytes: Some(stat.len()),
+        modified_at_millis,
+    })
+}
+
+fn extract_citations(body: &str) -> Vec<String> {
+    let mut citations = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed == "- _None yet._" {
+            continue;
+        }
+        if trimmed.contains("[[") || (trimmed.contains('[') && trimmed.contains("](")) {
+            citations.push(trimmed.to_string());
+        }
+    }
+    citations.sort();
+    citations.dedup();
+    citations
+}
+
+fn inspect_freshness(graph: &Graph, id: &str, changed_inputs: &[PathBuf], exists_on_disk: bool) -> String {
+    if !exists_on_disk {
+        return "missing".to_string();
+    }
+
+    let changed: std::collections::BTreeSet<_> = changed_inputs
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    if changed.contains(id) {
+        return "stale".to_string();
+    }
+
+    if let Ok(inspection) = graph.inspect(id) {
+        if inspection.upstream.iter().any(|upstream| changed.contains(upstream)) {
+            return "stale".to_string();
+        }
+    }
+
+    "fresh".to_string()
+}
+
+fn inspect_kind(id: &str) -> String {
+    if id.starts_with("wiki/") {
+        "wiki_page".to_string()
+    } else if id.starts_with("normalized/") {
+        "normalized_document".to_string()
+    } else if id.starts_with("raw/") {
+        "source_revision".to_string()
+    } else if id.starts_with("outputs/questions/") {
+        "artifact".to_string()
+    } else if id.starts_with("question-") {
+        "question".to_string()
+    } else if id.starts_with("artifact-") {
+        "artifact".to_string()
+    } else {
+        "entity".to_string()
+    }
+}
+
+fn summarize_build_record(record: kb_core::BuildRecord) -> InspectBuildRecord {
+    InspectBuildRecord {
+        id: record.metadata.id,
+        pass_name: record.pass_name,
+        model: record.metadata.model_version,
+        prompt_template_hash: record.metadata.prompt_template_hash,
+        started_at_millis: record.metadata.created_at_millis,
+        ended_at_millis: record.metadata.updated_at_millis,
+        inputs: record.input_ids,
+        outputs: record.output_ids,
+    }
+}
+
+fn summarize_job(job: &JobRun) -> InspectJob {
+    InspectJob {
+        id: job.metadata.id.clone(),
+        command: job.command.clone(),
+        status: format!("{:?}", job.status).to_lowercase(),
+        started_at_millis: job.started_at_millis,
+        ended_at_millis: job.ended_at_millis,
+        affected_outputs: job
+            .affected_outputs
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect(),
+    }
+}
+
+fn find_jobs_for_output(jobs: &[JobRun], output_id: &str) -> Vec<InspectJob> {
+    jobs.iter()
+        .filter(|job| {
+            job.affected_outputs.iter().any(|path| {
+                let output = path.to_string_lossy();
+                output == output_id || output.ends_with(output_id)
+            })
+        })
+        .map(summarize_job)
+        .collect()
+}
+
+fn build_trace(
+    graph: &Graph,
+    id: &str,
+    visited: &mut std::collections::BTreeSet<String>,
+) -> Vec<InspectTraceNode> {
+    let Some(node) = graph.node(id) else {
+        return Vec::new();
+    };
+
+    node.inputs
+        .iter()
+        .map(|input| {
+            let inputs = if visited.insert(input.clone()) {
+                build_trace(graph, input, visited)
+            } else {
+                Vec::new()
+            };
+            InspectTraceNode {
+                id: input.clone(),
+                kind: inspect_kind(input),
+                inputs,
+            }
+        })
+        .collect()
+}
+
+fn render_inspect_report(report: &InspectReport) -> String {
+    fn render_list(label: &str, values: &[String]) -> String {
+        if values.is_empty() {
+            format!("{label}:\n  (none)")
+        } else {
+            format!(
+                "{label}:\n{}",
+                values
+                    .iter()
+                    .map(|value| format!("  - {value}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
+    }
+
+    fn render_trace(nodes: &[InspectTraceNode], depth: usize, out: &mut Vec<String>) {
+        for node in nodes {
+            out.push(format!("{}- {} [{}]", "  ".repeat(depth), node.id, node.kind));
+            render_trace(&node.inputs, depth + 1, out);
+        }
+    }
+
+    let mut sections = vec![
+        format!("target: {}", report.target),
+        format!("resolved_id: {}", report.resolved_id),
+        format!("kind: {}", report.kind),
+        format!("freshness: {}", report.freshness),
+        format!(
+            "metadata:\n  file_path: {}\n  exists_on_disk: {}\n  size_bytes: {}\n  modified_at_millis: {}",
+            report.metadata.file_path.as_deref().unwrap_or("(none)"),
+            report.metadata.exists_on_disk,
+            report.metadata
+                .size_bytes
+                .map_or_else(|| "(none)".to_string(), |value| value.to_string()),
+            report.metadata
+                .modified_at_millis
+                .map_or_else(|| "(none)".to_string(), |value| value.to_string())
+        ),
+    ];
+
+    if let Some(graph) = &report.graph {
+        sections.push(render_list("direct inputs", &graph.direct_inputs));
+        sections.push(render_list("direct outputs", &graph.direct_outputs));
+        sections.push(render_list("all upstream dependencies", &graph.upstream));
+        sections.push(render_list("all downstream dependents", &graph.downstream));
+    }
+
+    sections.push(render_list("citations", &report.citations));
+
+    if report.build_records.is_empty() {
+        sections.push("build records:\n  (none)".to_string());
+    } else {
+        let records = report
+            .build_records
+            .iter()
+            .map(|record| {
+                format!(
+                    "  - id: {}\n    pass: {}\n    model: {}\n    prompt_template_hash: {}\n    started_at_millis: {}\n    ended_at_millis: {}",
+                    record.id,
+                    record.pass_name,
+                    record.model.as_deref().unwrap_or("(none)"),
+                    record.prompt_template_hash.as_deref().unwrap_or("(none)"),
+                    record.started_at_millis,
+                    record.ended_at_millis,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("build records:\n{records}"));
+    }
+
+    if report.generating_jobs.is_empty() {
+        sections.push("generating jobs:\n  (none)".to_string());
+    } else {
+        let jobs = report
+            .generating_jobs
+            .iter()
+            .map(|job| {
+                format!(
+                    "  - id: {}\n    command: {}\n    status: {}\n    started_at_millis: {}\n    ended_at_millis: {}",
+                    job.id,
+                    job.command,
+                    job.status,
+                    job.started_at_millis,
+                    job.ended_at_millis
+                        .map_or_else(|| "(none)".to_string(), |value| value.to_string())
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("generating jobs:\n{jobs}"));
+    }
+
+    if let Some(trace) = &report.trace {
+        let mut lines = Vec::new();
+        render_trace(trace, 1, &mut lines);
+        sections.push(if lines.is_empty() {
+            "trace:\n  (none)".to_string()
+        } else {
+            format!("trace:\n{}", lines.join("\n"))
+        });
+    }
+
+    sections.join("\n\n")
 }
 
 fn run_lint(root: &Path, json: bool, check: Option<&str>) -> Result<()> {
