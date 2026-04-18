@@ -64,6 +64,9 @@ pub fn run_backlinks_pass(root: &Path) -> Result<Vec<BacklinksArtifact>> {
 }
 
 /// Persist backlink artifacts to disk using atomic writes.
+///
+/// # Errors
+/// Returns an error if any atomic write fails.
 pub fn persist_backlinks_artifacts(artifacts: &[BacklinksArtifact]) -> Result<()> {
     for artifact in artifacts {
         atomic_write(&artifact.path, artifact.updated_markdown.as_bytes())
@@ -189,7 +192,10 @@ fn normalize_wiki_link(raw: &str) -> Option<String> {
 
     let mut target = without_anchor.trim_start_matches("./");
     target = target.trim_start_matches('/');
-    if target.ends_with(".md") {
+    if std::path::Path::new(target)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
         target = target.trim_end_matches(".md");
     }
     if target.ends_with('/') {
