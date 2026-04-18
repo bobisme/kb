@@ -62,7 +62,7 @@ pub fn persist_concept_candidates(output_path: &Path, output_json: &str) -> Resu
 ///
 /// Returns [`ConceptExtractionError`] when the adapter call fails, the candidate payload cannot
 /// be serialized, or the system clock cannot be converted into build-record timestamps.
-pub fn run_concept_extraction_pass<A: LlmAdapter>(
+pub fn run_concept_extraction_pass<A: LlmAdapter + ?Sized>(
     adapter: &A,
     document: &NormalizedDocument,
     title: &str,

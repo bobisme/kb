@@ -4,7 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use kb_core::fs::atomic_write;
-use kb_core::{BuildRecord, EntityMetadata, Status, hash_many, slug_from_title};
+use kb_core::{
+    BuildRecord, EntityMetadata, ReviewItem, ReviewKind, ReviewStatus, Status, hash_many,
+    save_review_item, slug_from_title,
+};
 use kb_llm::{
     ConceptCandidate, LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest,
     MergeConceptCandidatesResponse, MergeGroup, ProvenanceRecord, SourceAnchor,
@@ -27,13 +30,21 @@ pub struct ConceptPage {
 }
 
 /// An uncertain merge queued for human review.
+///
+/// Wraps a [`ReviewItem`] so the record shares the canonical review-queue schema
+/// with every other reviewer-facing item (e.g. the duplicate-concepts check in
+/// `kb-lint`). `kb review list/show/approve/reject` consume this through
+/// `list_review_items` / `load_review_item` without special-casing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeReviewRecord {
-    pub merge_id: String,
-    /// Destination path under `reviews/merges/`.
-    pub path: PathBuf,
-    /// JSON payload to persist.
-    pub content: String,
+    pub item: ReviewItem,
+}
+
+impl MergeReviewRecord {
+    #[must_use]
+    pub fn merge_id(&self) -> &str {
+        &self.item.metadata.id
+    }
 }
 
 /// Output emitted by the concept merge pass.
@@ -67,12 +78,16 @@ pub fn persist_concept_page(page: &ConceptPage) -> Result<()> {
 
 /// Persist a merge review record produced by [`run_concept_merge_pass`].
 ///
+/// Delegates to `kb_core::save_review_item` so the on-disk format matches other
+/// review-queue producers and so the built-in rejected-item de-dup (same source
+/// hashes → skip rewrite) prevents re-queueing work the user already declined.
+///
 /// # Errors
 ///
 /// Returns an error when the target file cannot be written atomically.
-pub fn persist_merge_review(record: &MergeReviewRecord) -> Result<()> {
-    atomic_write(&record.path, record.content.as_bytes())
-        .with_context(|| format!("write merge review {}", record.path.display()))
+pub fn persist_merge_review(root: &Path, record: &MergeReviewRecord) -> Result<()> {
+    save_review_item(root, &record.item)
+        .with_context(|| format!("write merge review {}", record.item.metadata.id))
 }
 
 /// Cluster concept candidates into canonical concept pages and review items.
@@ -87,7 +102,7 @@ pub fn persist_merge_review(record: &MergeReviewRecord) -> Result<()> {
 ///
 /// Returns [`ConceptMergeError`] when the LLM call fails, the response cannot be
 /// serialized, or the system clock cannot be read for build-record timestamps.
-pub fn run_concept_merge_pass<A: LlmAdapter>(
+pub fn run_concept_merge_pass<A: LlmAdapter + ?Sized>(
     adapter: &A,
     mut candidates: Vec<ConceptCandidate>,
     root: &Path,
@@ -200,41 +215,83 @@ fn render_concept_page(group: &MergeGroup, root: &Path) -> ConceptPage {
 
 fn render_review_record(
     group: &MergeGroup,
-    root: &Path,
+    _root: &Path,
     provenance: &ProvenanceRecord,
 ) -> Result<MergeReviewRecord, String> {
     let slug = slug_from_title(&group.canonical_name);
     let merge_id = format!("merge:{slug}");
-    let path = root
-        .join(MERGE_REVIEWS_DIR)
-        .join(format!("{merge_id}.json"));
+    let destination_rel = PathBuf::from(WIKI_CONCEPTS_DIR).join(format!("{slug}.md"));
 
-    let affected_pages = vec![
-        root.join(WIKI_CONCEPTS_DIR).join(format!("{slug}.md")),
-    ];
+    // Hash the candidate members so save_review_item's dedup correctly skips
+    // re-queuing the same merge after the user has rejected it.
+    let member_fingerprint = hash_many(
+        &group
+            .members
+            .iter()
+            .map(|m| m.name.as_bytes())
+            .collect::<Vec<_>>(),
+    )
+    .to_hex();
 
-    let payload = serde_json::json!({
-        "id": merge_id,
-        "kind": "concept_merge",
-        "status": "pending",
-        "proposed_destination": format!("wiki/concepts/{slug}.md"),
-        "affected_pages": affected_pages,
-        "canonical_name_proposed": group.canonical_name,
-        "aliases_proposed": group.aliases,
-        "rationale": group.rationale,
-        "members": group.members,
-        "provenance_model": provenance.model,
-        "provenance_template": provenance.prompt_template_name,
-    });
+    let now = unix_time_ms().map_err(|err| format!("read system time: {err}"))?;
 
-    let content = serde_json::to_string_pretty(&payload)
-        .map_err(|err| format!("serialize merge review record: {err}"))?;
+    let mut comment = String::new();
+    writeln!(comment, "Proposed canonical: {}", group.canonical_name)
+        .map_err(|err| format!("render review comment: {err}"))?;
+    if !group.aliases.is_empty() {
+        writeln!(comment, "Aliases: {}", group.aliases.join(", "))
+            .map_err(|err| format!("render review comment: {err}"))?;
+    }
+    writeln!(
+        comment,
+        "Members: {}",
+        group
+            .members
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+    .map_err(|err| format!("render review comment: {err}"))?;
+    if let Some(rationale) = &group.rationale {
+        writeln!(comment, "Rationale: {rationale}")
+            .map_err(|err| format!("render review comment: {err}"))?;
+    }
+    writeln!(
+        comment,
+        "Produced by {} via {}",
+        provenance.model, provenance.prompt_template_name
+    )
+    .map_err(|err| format!("render review comment: {err}"))?;
 
-    Ok(MergeReviewRecord {
-        merge_id,
-        path,
-        content,
-    })
+    let item = ReviewItem {
+        metadata: EntityMetadata {
+            id: merge_id.clone(),
+            created_at_millis: now,
+            updated_at_millis: now,
+            source_hashes: vec![member_fingerprint],
+            model_version: Some(provenance.model.clone()),
+            tool_version: Some(format!(
+                "{}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )),
+            prompt_template_hash: Some(provenance.prompt_template_hash.to_hex()),
+            dependencies: group.members.iter().map(|m| m.name.clone()).collect(),
+            output_paths: vec![destination_rel.clone()],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::ConceptMerge,
+        target_entity_id: merge_id,
+        proposed_destination: Some(destination_rel.clone()),
+        citations: Vec::new(),
+        affected_pages: vec![destination_rel],
+        created_at_millis: now,
+        status: ReviewStatus::Pending,
+        comment: comment.trim_end().to_string(),
+    };
+
+    Ok(MergeReviewRecord { item })
 }
 
 fn build_record_for_merge(
@@ -275,16 +332,22 @@ fn build_record_for_merge(
 
     let input_ids: Vec<String> = candidates.iter().map(|c| c.name.clone()).collect();
 
+    // Review records are addressed by their review id (`merge:<slug>`) rather than
+    // a filesystem path since `save_review_item` picks the concrete directory.
     let output_ids: Vec<String> = concept_pages
         .iter()
         .map(|p| p.path.display().to_string())
-        .chain(review_records.iter().map(|r| r.path.display().to_string()))
+        .chain(review_records.iter().map(|r| r.item.metadata.id.clone()))
         .collect();
 
     let output_paths: Vec<PathBuf> = concept_pages
         .iter()
         .map(|p| p.path.clone())
-        .chain(review_records.iter().map(|r| r.path.clone()))
+        .chain(
+            review_records
+                .iter()
+                .filter_map(|r| r.item.proposed_destination.clone()),
+        )
         .collect();
 
     Ok(BuildRecord {
@@ -507,15 +570,24 @@ mod tests {
         assert_eq!(artifact.review_records.len(), 1);
 
         let review = &artifact.review_records[0];
-        assert_eq!(review.merge_id, "merge:lifetime-elision");
+        assert_eq!(review.merge_id(), "merge:lifetime-elision");
+        assert_eq!(review.item.kind, kb_core::ReviewKind::ConceptMerge);
+        assert_eq!(review.item.status, kb_core::ReviewStatus::Pending);
         assert_eq!(
-            review.path,
-            dir.path()
-                .join("reviews/merges/merge:lifetime-elision.json")
+            review.item.proposed_destination.as_deref(),
+            Some(std::path::Path::new("wiki/concepts/lifetime-elision.md"))
         );
-        assert!(review.content.contains("canonical_name_proposed"));
-        assert!(review.content.contains("Lifetime elision"));
-        assert!(review.content.contains("Ambiguous"));
+        assert!(review.item.comment.contains("Lifetime elision"));
+        assert!(review.item.comment.contains("Ambiguous"));
+
+        // Verify the persisted record can round-trip through `load_review_item`,
+        // which is how `kb review show/approve` will consume it.
+        persist_merge_review(dir.path(), review).expect("persist");
+        let loaded = kb_core::load_review_item(dir.path(), review.merge_id())
+            .expect("load")
+            .expect("item present");
+        assert_eq!(loaded.metadata.id, review.merge_id());
+        assert_eq!(loaded.kind, kb_core::ReviewKind::ConceptMerge);
     }
 
     #[test]
@@ -569,10 +641,12 @@ mod tests {
             output_ids.iter().any(|id| id.contains("borrow-checker.md")),
             "output_ids: {output_ids:?}"
         );
+        // Uncertain merges now appear in output_ids by their review id, not
+        // a filesystem path — `save_review_item` picks the concrete location.
         assert!(
             output_ids
                 .iter()
-                .any(|id| id.contains("lifetime-elision.json")),
+                .any(|id| id == "merge:lifetime-elision"),
             "output_ids: {output_ids:?}"
         );
     }

@@ -228,19 +228,61 @@ fn run(cli: Cli) -> Result<()> {
             let force = cli.force;
             let dry_run = cli.dry_run;
             let json = cli.json;
+            let cli_model = cli.model.clone();
             execute_mutating_command(Some(compile_root), "compile", move || {
                 let options = kb_compile::pipeline::CompileOptions { force, dry_run };
-                let report = kb_compile::pipeline::run_compile(compile_root, &options)?;
+
+                // Dry-run does not call the LLM; skip adapter construction so users can
+                // preview the stale set without needing a configured backend.
+                let report = if dry_run {
+                    kb_compile::pipeline::run_compile(compile_root, &options)?
+                } else {
+                    match build_compile_adapter(compile_root, cli_model.as_deref()) {
+                        Ok(adapter) => kb_compile::pipeline::run_compile_with_llm(
+                            compile_root,
+                            &options,
+                            Some(adapter.as_ref()),
+                        )?,
+                        Err(err) => {
+                            tracing::warn!(
+                                "LLM adapter unavailable — running compile without per-document passes: {err}"
+                            );
+                            kb_compile::pipeline::run_compile(compile_root, &options)?
+                        }
+                    }
+                };
+
+                // Near-duplicate concept detection as a safety net after merge:
+                // emits review items for concept pairs that slipped past the LLM merge.
+                // Dry-run skips this (no writes).
+                let duplicate_review_items = if dry_run {
+                    0
+                } else {
+                    let review_items = kb_lint::check_duplicate_concepts(
+                        compile_root,
+                        &kb_lint::DuplicateConceptsConfig::default(),
+                    )?;
+                    for item in &review_items {
+                        kb_core::save_review_item(compile_root, item)?;
+                    }
+                    review_items.len()
+                };
 
                 if json {
                     emit_json("compile", serde_json::json!({
                         "total_sources": report.total_sources,
                         "stale_sources": report.stale_sources,
                         "build_records_emitted": report.build_records_emitted,
+                        "duplicate_review_items": duplicate_review_items,
                         "dry_run": dry_run,
                     }))?;
                 } else {
                     println!("{}", report.render());
+                    if duplicate_review_items > 0 {
+                        println!(
+                            "  [ok] duplicate_concepts ({duplicate_review_items} review item(s) queued)"
+                        );
+                    }
                 }
 
                 Ok(())

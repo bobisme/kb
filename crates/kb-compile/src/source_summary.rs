@@ -46,7 +46,7 @@ pub enum SourceSummaryError {
 ///
 /// Returns [`SourceSummaryError`] when the LLM adapter fails or when system time cannot
 /// be converted into the build record timestamp.
-pub fn run_source_summary_pass<A: LlmAdapter>(
+pub fn run_source_summary_pass<A: LlmAdapter + ?Sized>(
     adapter: &A,
     document: &NormalizedDocument,
     title: &str,
