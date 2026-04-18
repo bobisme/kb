@@ -1030,7 +1030,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
 
     for node_id in graph.nodes.keys() {
         if node_id.starts_with("source-document-") {
-            let kind = extract_source_kind(node_id).unwrap_or("other");
+            let kind = extract_source_kind(node_id);
             *source_counts.by_kind.entry(kind.to_string()).or_insert(0) += 1;
             source_counts.total += 1;
         } else if node_id.starts_with("wiki-page-") {
@@ -1088,19 +1088,19 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     })
 }
 
-fn extract_source_kind(node_id: &str) -> Option<&str> {
+fn extract_source_kind(node_id: &str) -> &str {
     if node_id.contains("url") {
-        Some("url")
+        "url"
     } else if node_id.contains("file") {
-        Some("file")
+        "file"
     } else if node_id.contains("repo") {
-        Some("repo")
+        "repo"
     } else if node_id.contains("image") {
-        Some("image")
+        "image"
     } else if node_id.contains("dataset") {
-        Some("dataset")
+        "dataset"
     } else {
-        Some("other")
+        "other"
     }
 }
 
@@ -1125,7 +1125,7 @@ fn print_status(status: &StatusPayload) {
 
     println!("sources: {} total", status.sources.total);
     for (kind, count) in &status.sources.by_kind {
-        println!("  {}: {}", kind, count);
+        println!("  {kind}: {count}");
     }
     println!();
 
@@ -1147,9 +1147,7 @@ fn print_status(status: &StatusPayload) {
         let duration = job
             .ended_at_millis
             .map(|ended| ended - job.started_at_millis);
-        let duration_str = duration
-            .map(|ms| format!("{}ms", ms))
-            .unwrap_or_else(|| "running".to_string());
+        let duration_str = duration.map_or_else(|| "running".to_string(), |ms| format!("{ms}ms"));
         println!(
             "  {} | {:<11} | {} [{}]",
             job.metadata.id,
@@ -1166,9 +1164,8 @@ fn print_status(status: &StatusPayload) {
             let duration = job
                 .ended_at_millis
                 .map(|ended| ended - job.started_at_millis);
-            let duration_str = duration
-                .map(|ms| format!("{}ms", ms))
-                .unwrap_or_else(|| "running".to_string());
+            let duration_str =
+                duration.map_or_else(|| "running".to_string(), |ms| format!("{ms}ms"));
             println!(
                 "  {} | {:<11} | {} [{}]",
                 job.metadata.id,
