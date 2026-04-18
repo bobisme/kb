@@ -62,9 +62,9 @@ enum Command {
     },
     /// Ingest documents into the knowledge base
     Ingest {
-        /// Files or directories to ingest
+        /// Files, directories, or URLs to ingest
         #[arg(required = true)]
-        sources: Vec<PathBuf>,
+        sources: Vec<String>,
     },
     /// Compile the knowledge base
     Compile,
@@ -152,20 +152,44 @@ fn run(cli: Cli) -> Result<()> {
                 let root = ingest_root
                     .as_deref()
                     .expect("root resolved for non-init commands");
-                let ingested = kb_ingest::ingest_paths(root, &sources)?;
+
+                let mut urls = Vec::new();
+                let mut local_paths = Vec::new();
+                for source in &sources {
+                    if source.starts_with("http://") || source.starts_with("https://") {
+                        urls.push(source.as_str());
+                    } else {
+                        local_paths.push(std::path::PathBuf::from(source));
+                    }
+                }
+
+                let ingested = kb_ingest::ingest_paths(root, &local_paths)?;
+
+                if !urls.is_empty() {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    rt.block_on(async {
+                        for url in &urls {
+                            kb_ingest::ingest_url(root, url).await?;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    })?;
+                }
 
                 if cli.json {
                     println!("{}", serde_json::to_string_pretty(&ingested)?);
-                } else if ingested.is_empty() {
+                } else if ingested.is_empty() && urls.is_empty() {
                     println!("No files ingested");
                 } else {
-                    for item in ingested {
+                    for item in &ingested {
                         println!(
                             "{} {} {}",
                             item.document.metadata.id,
                             item.revision.metadata.id,
                             item.copied_path.display()
                         );
+                    }
+                    for url in &urls {
+                        println!("ingested URL: {url}");
                     }
                 }
                 Ok(())

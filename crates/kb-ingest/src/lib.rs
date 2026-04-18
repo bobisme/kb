@@ -339,3 +339,7 @@ mod tests {
         assert!(ingested[0].copied_path.ends_with("kept.md"));
     }
 }
+
+mod url;
+
+pub use url::ingest_url;
