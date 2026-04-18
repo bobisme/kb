@@ -219,21 +219,52 @@ pub enum JobRunStatus {
 
 /// A pending machine-prepared item awaiting review.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReviewItem {
     pub metadata: EntityMetadata,
+    pub kind: ReviewKind,
     pub target_entity_id: EntityId,
-    pub action: ReviewAction,
+    pub proposed_destination: Option<PathBuf>,
+    pub citations: Vec<String>,
+    pub affected_pages: Vec<PathBuf>,
+    pub created_at_millis: u64,
+    pub status: ReviewStatus,
     pub comment: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+impl Default for ReviewItem {
+    fn default() -> Self {
+        Self {
+            metadata: EntityMetadata::default(),
+            kind: ReviewKind::Promotion,
+            target_entity_id: String::new(),
+            proposed_destination: None,
+            citations: Vec::new(),
+            affected_pages: Vec::new(),
+            created_at_millis: 0,
+            status: ReviewStatus::Pending,
+            comment: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum ReviewAction {
-    Promote,
-    Merge,
-    Canonicalize,
-    Archive,
-    Retry,
+pub enum ReviewKind {
+    #[default]
+    Promotion,
+    ConceptMerge,
+    AliasMerge,
+    Canonicalization,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewStatus {
+    #[default]
+    Pending,
+    Approved,
+    Rejected,
 }
 
 #[cfg(test)]
@@ -363,8 +394,13 @@ mod tests {
 
         round_trip(&ReviewItem {
             metadata: metadata("review-item-1"),
+            kind: ReviewKind::Promotion,
             target_entity_id: "artifact-1".to_string(),
-            action: ReviewAction::Promote,
+            proposed_destination: Some(PathBuf::from("wiki/reports/testing.md")),
+            citations: vec!["citation-1".to_string()],
+            affected_pages: vec![PathBuf::from("wiki/index.md")],
+            created_at_millis: 1_700_000_000_120,
+            status: ReviewStatus::Pending,
             comment: "Looks good for promotion".to_string(),
         });
     }

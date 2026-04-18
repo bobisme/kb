@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::fs::atomic_write;
-use crate::{BuildRecord, EntityId, Hash, ReviewItem, hash_file};
+use crate::{BuildRecord, EntityId, Hash, ReviewItem, ReviewKind, ReviewStatus, hash_file};
 
 #[must_use]
 pub fn build_records_dir(root: &Path) -> PathBuf {
@@ -28,18 +28,45 @@ pub fn save_build_record(root: &Path, record: &BuildRecord) -> Result<()> {
 
 #[must_use]
 pub fn review_queue_dir(root: &Path) -> PathBuf {
-    root.join("state").join("review_queue")
+    root.join("reviews")
 }
 
-/// Persist a review item to `state/review_queue/<id>.json`.
+fn review_kind_dir(root: &Path, kind: ReviewKind) -> PathBuf {
+    let leaf = match kind {
+        ReviewKind::Promotion => "promotions",
+        ReviewKind::ConceptMerge => "merges",
+        ReviewKind::AliasMerge => "aliases",
+        ReviewKind::Canonicalization => "canonicalization",
+    };
+    review_queue_dir(root).join(leaf)
+}
+
+/// Persist a review item to `reviews/<kind>/<id>.json`.
+///
+/// If an existing item is already rejected and the incoming item has the same
+/// source hashes, the rejected record is preserved so unchanged inputs do not
+/// re-queue the same review work.
 ///
 /// # Errors
 /// Returns an error when the directory cannot be created or the file cannot be written.
 pub fn save_review_item(root: &Path, item: &ReviewItem) -> Result<()> {
-    let dir = review_queue_dir(root);
+    let dir = review_kind_dir(root, item.kind);
     fs::create_dir_all(&dir)
-        .with_context(|| format!("create review_queue dir {}", dir.display()))?;
+        .with_context(|| format!("create review dir {}", dir.display()))?;
     let path = dir.join(format!("{}.json", item.metadata.id));
+
+    if path.exists() {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read existing review item {}", path.display()))?;
+        let existing: ReviewItem = serde_json::from_str(&raw)
+            .with_context(|| format!("deserialize existing review item {}", path.display()))?;
+        if existing.status == ReviewStatus::Rejected
+            && existing.metadata.source_hashes == item.metadata.source_hashes
+        {
+            return Ok(());
+        }
+    }
+
     write_json_file(&path, "review item", item)
 }
 
@@ -243,7 +270,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BuildRecord, EntityMetadata, Status};
+    use crate::{BuildRecord, EntityMetadata, ReviewItem, ReviewKind, ReviewStatus, Status};
     use tempfile::tempdir;
 
     fn metadata(id: &str) -> EntityMetadata {
@@ -453,5 +480,55 @@ mod tests {
             .expect("load")
             .expect("present");
         assert_eq!(loaded, rec);
+    }
+
+    fn review_item(id: &str, hash: &str, status: ReviewStatus) -> ReviewItem {
+        ReviewItem {
+            metadata: EntityMetadata {
+                id: id.to_string(),
+                created_at_millis: 10,
+                updated_at_millis: 10,
+                source_hashes: vec![hash.to_string()],
+                model_version: None,
+                tool_version: Some("kb-test".to_string()),
+                prompt_template_hash: None,
+                dependencies: vec!["artifact-1".to_string()],
+                output_paths: vec![PathBuf::from("outputs/questions/q1/answer.md")],
+                status: Status::NeedsReview,
+            },
+            kind: ReviewKind::Promotion,
+            target_entity_id: "artifact-1".to_string(),
+            proposed_destination: Some(PathBuf::from("wiki/questions/example.md")),
+            citations: vec!["src-1#intro".to_string()],
+            affected_pages: vec![PathBuf::from("wiki/questions/example.md")],
+            created_at_millis: 10,
+            status,
+            comment: "Promote answer".to_string(),
+        }
+    }
+
+    #[test]
+    fn save_review_item_writes_under_kind_directory() {
+        let dir = tempdir().expect("tempdir");
+        let item = review_item("review-1", "hash-a", ReviewStatus::Pending);
+        save_review_item(dir.path(), &item).expect("save review item");
+
+        let path = dir.path().join("reviews/promotions/review-1.json");
+        assert!(path.is_file(), "expected {}", path.display());
+    }
+
+    #[test]
+    fn rejected_review_item_is_preserved_for_unchanged_inputs() {
+        let dir = tempdir().expect("tempdir");
+        let rejected = review_item("review-1", "hash-a", ReviewStatus::Rejected);
+        save_review_item(dir.path(), &rejected).expect("save rejected");
+
+        let pending = review_item("review-1", "hash-a", ReviewStatus::Pending);
+        save_review_item(dir.path(), &pending).expect("save pending");
+
+        let path = dir.path().join("reviews/promotions/review-1.json");
+        let saved: ReviewItem = serde_json::from_str(&fs::read_to_string(path).expect("read review"))
+            .expect("parse review");
+        assert_eq!(saved.status, ReviewStatus::Rejected);
     }
 }

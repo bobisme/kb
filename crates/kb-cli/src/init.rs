@@ -65,6 +65,8 @@ pub fn init(root_override: Option<PathBuf>, path_arg: Option<PathBuf>, force: bo
         "outputs/figures",
         "reviews/promotions",
         "reviews/merges",
+        "reviews/aliases",
+        "reviews/canonicalization",
         "prompts",
         "state/indexes",
         "state/jobs",

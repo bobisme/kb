@@ -209,8 +209,16 @@ fn render_review_record(
         .join(MERGE_REVIEWS_DIR)
         .join(format!("{merge_id}.json"));
 
+    let affected_pages = vec![
+        root.join(WIKI_CONCEPTS_DIR).join(format!("{slug}.md")),
+    ];
+
     let payload = serde_json::json!({
-        "merge_id": merge_id,
+        "id": merge_id,
+        "kind": "concept_merge",
+        "status": "pending",
+        "proposed_destination": format!("wiki/concepts/{slug}.md"),
+        "affected_pages": affected_pages,
         "canonical_name_proposed": group.canonical_name,
         "aliases_proposed": group.aliases,
         "rationale": group.rationale,

@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use kb_core::{
-    BuildRecord, EntityMetadata, Manifest, ReviewAction, ReviewItem, Status, build_records_dir,
-    extract_managed_regions, frontmatter::read_frontmatter, load_build_record, slug_from_title,
+    BuildRecord, EntityMetadata, Manifest, ReviewItem, ReviewKind, ReviewStatus, Status,
+    build_records_dir, extract_managed_regions, frontmatter::read_frontmatter,
+    load_build_record, slug_from_title,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1378,6 +1379,12 @@ fn build_review_item(
     score: f64,
     now: u64,
 ) -> ReviewItem {
+    let review_path = PathBuf::from("reviews/merges").join(format!(
+        "lint-duplicate-concepts-{}-{}.json",
+        slug_from_title(&a.id),
+        slug_from_title(&b.id)
+    ));
+
     ReviewItem {
         metadata: EntityMetadata {
             id: format!("lint:duplicate-concepts:{}:{}", a.id, b.id),
@@ -1392,11 +1399,19 @@ fn build_review_item(
             )),
             prompt_template_hash: None,
             dependencies: vec![a.id.clone(), b.id.clone()],
-            output_paths: vec![],
+            output_paths: vec![review_path.clone()],
             status: Status::NeedsReview,
         },
+        kind: ReviewKind::ConceptMerge,
         target_entity_id: a.id.clone(),
-        action: ReviewAction::Merge,
+        proposed_destination: Some(review_path),
+        citations: Vec::new(),
+        affected_pages: vec![
+            PathBuf::from(WIKI_CONCEPTS_DIR).join(format!("{}.md", slug_from_title(&a.name))),
+            PathBuf::from(WIKI_CONCEPTS_DIR).join(format!("{}.md", slug_from_title(&b.name))),
+        ],
+        created_at_millis: now,
+        status: ReviewStatus::Pending,
         comment: format!(
             "Near-duplicate of '{}' (similarity: {score:.2}; matched: '{}' \u{2248} '{}')",
             b.id, term_a, term_b
@@ -1472,7 +1487,7 @@ mod duplicate_concept_tests {
         let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
             .expect("check duplicates");
         assert_eq!(items.len(), 1, "expected one duplicate pair");
-        assert_eq!(items[0].action, ReviewAction::Merge);
+        assert_eq!(items[0].kind, ReviewKind::ConceptMerge);
         assert!(items[0].comment.contains("similarity: 1.00"));
     }
 
@@ -1567,7 +1582,7 @@ mod duplicate_concept_tests {
 
         let item = &items[0];
         assert!(item.metadata.id.starts_with("lint:duplicate-concepts:"));
-        assert_eq!(item.action, ReviewAction::Merge);
+        assert_eq!(item.kind, ReviewKind::ConceptMerge);
         assert!(!item.target_entity_id.is_empty());
         assert!(item.comment.contains("similarity:"));
         assert!(item.comment.contains("matched:"));

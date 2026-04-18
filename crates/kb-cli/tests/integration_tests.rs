@@ -1164,8 +1164,8 @@ fn ask_promote_creates_review_item() {
         .as_str()
         .expect("question_id should be a string");
 
-    let review_dir = kb_root.join("state/review_queue");
-    assert!(review_dir.is_dir(), "review_queue directory should exist");
+    let review_dir = kb_root.join("reviews/promotions");
+    assert!(review_dir.is_dir(), "reviews/promotions directory should exist");
 
     let review_path = review_dir.join(format!("review-{question_id}.json"));
     assert!(
@@ -1177,7 +1177,10 @@ fn ask_promote_creates_review_item() {
     let review: Value =
         serde_json::from_str(&fs::read_to_string(&review_path).expect("read review item"))
             .expect("parse review item");
-    assert_eq!(review["action"], "promote");
+    assert_eq!(review["kind"], "promotion");
+    assert_eq!(review["status"], "pending");
+    assert_eq!(review["proposed_destination"], "wiki/questions/what-is-testing.md");
+    assert!(review["affected_pages"].as_array().is_some_and(|pages| !pages.is_empty()));
     assert!(review["comment"]
         .as_str()
         .expect("comment")

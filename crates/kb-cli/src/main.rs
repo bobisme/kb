@@ -18,7 +18,7 @@ use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
 use kb_core::{
     Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext,
-    ReviewAction, ReviewItem, Status,
+    ReviewItem, ReviewKind, ReviewStatus, Status, hash_many, slug_from_title,
 };
 use kb_llm::{
     ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
@@ -1143,21 +1143,47 @@ fn run_ask(
     })?;
 
     if promote {
+        let proposed_destination = PathBuf::from("wiki/questions")
+            .join(format!("{}.md", slug_from_title(query)));
+        let citations = llm_info
+            .as_ref()
+            .map(|(result, _)| {
+                result
+                    .valid_citations
+                    .iter()
+                    .filter_map(|key| citation_manifest.entries.get(key))
+                    .map(|entry| entry.label.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let review_input_hash = hash_many(&[
+            query.as_bytes(),
+            b"\0",
+            artifact_body.as_bytes(),
+            b"\0",
+            artifact.output_path.to_string_lossy().as_bytes(),
+        ])
+        .to_hex();
         let review_item = ReviewItem {
             metadata: EntityMetadata {
                 id: format!("review-{question_id}"),
                 created_at_millis: now_millis()?,
                 updated_at_millis: now_millis()?,
-                source_hashes: Vec::new(),
+                source_hashes: vec![review_input_hash],
                 model_version: None,
                 tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
                 prompt_template_hash: None,
                 dependencies: vec![question_id.clone(), artifact.metadata.id.clone()],
-                output_paths: Vec::new(),
+                output_paths: vec![artifact.output_path.clone(), proposed_destination.clone()],
                 status: Status::NeedsReview,
             },
+            kind: ReviewKind::Promotion,
             target_entity_id: artifact.metadata.id,
-            action: ReviewAction::Promote,
+            proposed_destination: Some(proposed_destination.clone()),
+            citations,
+            affected_pages: vec![proposed_destination],
+            created_at_millis: now_millis()?,
+            status: ReviewStatus::Pending,
             comment: format!("Promote answer for: {query}"),
         };
         kb_core::save_review_item(root, &review_item)?;
