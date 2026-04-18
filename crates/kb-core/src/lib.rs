@@ -65,7 +65,7 @@ pub struct SourceDocument {
     pub discovered_at_millis: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     File,
@@ -362,6 +362,12 @@ pub mod frontmatter;
 pub mod fs;
 pub mod hashing;
 pub mod managed_region;
+pub mod source_identity;
 
 pub use hashing::{Hash, hash_bytes, hash_file, hash_many};
 pub use managed_region::{ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title};
+pub use source_identity::{
+    SOURCE_DOCUMENT_ID_PREFIX, SOURCE_REVISION_ID_PREFIX, mint_source_document_id,
+    mint_source_revision_id, normalize_file_stable_location, normalize_url_stable_location,
+    source_document_id_for_file, source_document_id_for_url, source_revision_content_hash,
+};

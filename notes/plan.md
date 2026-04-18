@@ -199,7 +199,12 @@ Identity and citation rules matter more than pretty file layout. The plan should
 these rules explicit:
 
 - `SourceDocument` IDs should be stable across refetches of the same logical source
+  - files: hash the canonicalized absolute path
+  - URLs: hash a normalized URL with lowercase scheme+host, sorted query params, and no fragment
+  - use short-form IDs like `src-<8hex>` derived from BLAKE3, with collision checks at persistence time
 - `SourceRevision` IDs should change whenever fetched content changes materially
+  - compute a full BLAKE3 hash of fetched content bytes for provenance
+  - derive a short revision ID like `rev-<8hex>` from that hash for human-friendly references
 - citations should point at revision-level evidence, not floating URLs or mutable titles
 - source locators should support at least heading anchors, line/character spans, page
   numbers, and asset references where applicable
