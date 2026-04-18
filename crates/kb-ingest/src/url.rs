@@ -164,7 +164,27 @@ fn read_existing_metadata(path: &Path) -> Result<Option<NormalizedMetadata>> {
     Ok(Some(metadata))
 }
 
+/// A fetch error, classified for retry decisions.
+///
+/// Transport errors and 5xx responses are transient and retried; 4xx responses are
+/// fatal and surfaced immediately so we don't burn 3-4s retrying a 404.
+enum FetchError {
+    Transient(anyhow::Error),
+    Fatal(anyhow::Error),
+}
+
+impl FetchError {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Transient(e) | Self::Fatal(e) => e,
+        }
+    }
+}
+
 /// Fetches `url`, retrying up to `BACKOFF_DELAYS_MS.len()` times on transient failures.
+///
+/// 4xx responses short-circuit the retry loop: repeating a `GET` on a 404 or 401 is a
+/// waste of time and user latency.
 async fn fetch_with_retry(
     client: &Client,
     url: &str,
@@ -172,32 +192,49 @@ async fn fetch_with_retry(
     for delay_ms in BACKOFF_DELAYS_MS {
         match do_fetch(client, url).await {
             Ok(result) => return Ok(result),
-            Err(e) => {
+            Err(FetchError::Fatal(e)) => {
+                return Err(e).context("fetch failed (non-retryable)");
+            }
+            Err(FetchError::Transient(e)) => {
                 warn!("fetch failed ({e}); retrying in {delay_ms}ms");
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
         }
     }
-    do_fetch(client, url).await.with_context(|| {
-        format!(
-            "fetch failed after {} attempts",
-            BACKOFF_DELAYS_MS.len() + 1
-        )
-    })
+    do_fetch(client, url)
+        .await
+        .map_err(FetchError::into_error)
+        .with_context(|| {
+            format!(
+                "fetch failed after {} attempts",
+                BACKOFF_DELAYS_MS.len() + 1
+            )
+        })
 }
 
-async fn do_fetch(client: &Client, url: &str) -> Result<(Url, Vec<u8>, u16, Option<String>)> {
+async fn do_fetch(
+    client: &Client,
+    url: &str,
+) -> std::result::Result<(Url, Vec<u8>, u16, Option<String>), FetchError> {
     let resp = client
         .get(url)
         .send()
         .await
-        .context("HTTP request failed")?;
+        .context("HTTP request failed")
+        .map_err(FetchError::Transient)?;
     let status = resp.status();
     if status.is_server_error() {
-        bail!("server error {status}");
+        return Err(FetchError::Transient(anyhow::anyhow!(
+            "server error {status}"
+        )));
+    }
+    if status.is_client_error() {
+        return Err(FetchError::Fatal(anyhow::anyhow!("HTTP {status}")));
     }
     if !status.is_success() {
-        bail!("HTTP {status}");
+        // Treat other unexpected non-success statuses (e.g. 3xx that reqwest didn't
+        // follow) as fatal to avoid confusing retry storms.
+        return Err(FetchError::Fatal(anyhow::anyhow!("HTTP {status}")));
     }
     let final_url = resp.url().clone();
     let content_type = resp
@@ -209,7 +246,8 @@ async fn do_fetch(client: &Client, url: &str) -> Result<(Url, Vec<u8>, u16, Opti
     let bytes = resp
         .bytes()
         .await
-        .context("failed to read response body")?
+        .context("failed to read response body")
+        .map_err(FetchError::Transient)?
         .to_vec();
     Ok((final_url, bytes, status_u16, content_type))
 }
