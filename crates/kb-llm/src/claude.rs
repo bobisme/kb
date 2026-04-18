@@ -54,14 +54,9 @@ impl ClaudeCliAdapter {
             .map_err(|err| LlmAdapterError::Other(format!("load summarize template: {err}")))?;
 
         let mut context = HashMap::new();
-        context.insert("document_text".to_string(), request.document_text.clone());
-        context.insert(
-            "style".to_string(),
-            request
-                .style
-                .clone()
-                .unwrap_or_else(|| "Provide a concise prose summary.".to_string()),
-        );
+        context.insert("title".to_string(), request.title.clone());
+        context.insert("body".to_string(), request.body.clone());
+        context.insert("max_words".to_string(), request.max_words.to_string());
 
         let rendered = template
             .render(&context)
@@ -575,8 +570,9 @@ mod tests {
 
         let (response, provenance) = adapter
             .summarize_document(SummarizeDocumentRequest {
-                document_text: "A long source document.".to_string(),
-                style: Some("bullet points".to_string()),
+                title: "Example Source".to_string(),
+                body: "A long source document.".to_string(),
+                max_words: 80,
             })
             .expect("summarize document");
 
@@ -600,8 +596,9 @@ mod tests {
         assert!(args.contains("ask"));
         assert!(args.contains("--model"));
         assert!(args.contains("claude-haiku"));
+        assert!(args.contains("Example Source"));
         assert!(args.contains("A long source document."));
-        assert!(args.contains("bullet points"));
+        assert!(args.contains("80 words"));
     }
 
     #[test]

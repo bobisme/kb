@@ -2,12 +2,16 @@
 
 You are summarizing a source document for a knowledge base workflow.
 
-## Style
-{{style}}
+## Title
+{{title}}
+
+## Maximum length
+{{max_words}} words
 
 ## Document
-{{document_text}}
+{{body}}
 
 ## Task
 Produce a faithful summary of the document. Prefer concrete details over vague generalities.
+Keep the response within the requested word budget.
 Return only the summary text.

@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod orchestrator;
+pub mod source_summary;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};

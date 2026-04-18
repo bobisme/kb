@@ -180,13 +180,9 @@ impl LlmAdapter for OpencodeAdapter {
             .map_err(|err| LlmAdapterError::Other(format!("load summarize template: {err}")))?;
 
         let mut context = HashMap::new();
-        context.insert("document_text".to_string(), request.document_text.clone());
-        context.insert(
-            "style".to_string(),
-            request
-                .style
-                .unwrap_or_else(|| "Provide a concise prose summary.".to_string()),
-        );
+        context.insert("title".to_string(), request.title.clone());
+        context.insert("body".to_string(), request.body.clone());
+        context.insert("max_words".to_string(), request.max_words.to_string());
 
         let rendered = template
             .render(&context)
@@ -461,8 +457,9 @@ mod tests {
 
         let (response, provenance) = adapter
             .summarize_document(SummarizeDocumentRequest {
-                document_text: "A long source document.".to_string(),
-                style: Some("concise bullet points".to_string()),
+                title: "Example Source".to_string(),
+                body: "A long source document.".to_string(),
+                max_words: 80,
             })
             .expect("summarize document");
 
@@ -483,12 +480,16 @@ mod tests {
             "args should contain agent name: {args}"
         );
         assert!(
+            args.contains("Example Source"),
+            "args should contain source title: {args}"
+        );
+        assert!(
             args.contains("A long source document."),
             "args should contain document text: {args}"
         );
         assert!(
-            args.contains("concise bullet points"),
-            "args should contain style: {args}"
+            args.contains("80 words"),
+            "args should contain max word budget: {args}"
         );
     }
 

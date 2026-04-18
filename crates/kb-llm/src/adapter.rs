@@ -34,10 +34,12 @@ pub enum LlmAdapterError {
 /// Request to summarize a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummarizeDocumentRequest {
-    /// The document text to summarize.
-    pub document_text: String,
-    /// Optional instruction for summarization style (e.g. "bullet points", "paragraph").
-    pub style: Option<String>,
+    /// Display title for the source document being summarized.
+    pub title: String,
+    /// Canonical body text to summarize.
+    pub body: String,
+    /// Maximum target length for the returned summary.
+    pub max_words: usize,
 }
 
 /// Response containing the document summary.
