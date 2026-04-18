@@ -602,6 +602,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "rand",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
