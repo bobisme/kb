@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use kb_core::{hash_bytes, read_normalized_document};
+use kb_core::{hash_bytes, hash_many, read_normalized_document};
 
 use crate::{HashState, StaleNode, detect_stale};
 
@@ -88,7 +88,32 @@ fn discover_normalized_ids(root: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-fn build_input_nodes(root: &Path, doc_ids: &[String]) -> Result<Vec<StaleNode>> {
+/// Compute a combined hash of all compile-time prompt templates.
+/// A change to any template invalidates all cached LLM outputs.
+fn compile_template_hash(root: &Path) -> String {
+    let templates = [
+        "summarize_document.md",
+        "extract_concepts.md",
+        "merge_concept_candidates.md",
+    ];
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for name in &templates {
+        let tmpl = kb_llm::Template::load(name, Some(root)).ok();
+        let hash = tmpl
+            .map(|t| t.template_hash.to_hex())
+            .unwrap_or_default();
+        parts.push(hash.into_bytes());
+        parts.push(b"\0".to_vec());
+    }
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    hash_many(&refs).to_hex()
+}
+
+fn build_input_nodes(
+    root: &Path,
+    doc_ids: &[String],
+    template_hash: &str,
+) -> Result<Vec<StaleNode>> {
     let mut nodes = Vec::with_capacity(doc_ids.len());
     for id in doc_ids {
         let doc = read_normalized_document(root, id)
@@ -97,7 +122,7 @@ fn build_input_nodes(root: &Path, doc_ids: &[String]) -> Result<Vec<StaleNode>> 
             id: format!("normalized/{id}"),
             dependencies: vec![],
             content_hash: hash_bytes(doc.canonical_text.as_bytes()).to_hex(),
-            prompt_template_hash: None,
+            prompt_template_hash: Some(template_hash.to_string()),
             model_version: None,
         });
     }
@@ -125,7 +150,8 @@ pub fn run_compile(root: &Path, options: &CompileOptions) -> Result<CompileRepor
         (0, None)
     } else {
         let previous = HashState::load_from_root(root)?;
-        let nodes = build_input_nodes(root, &doc_ids)?;
+        let tmpl_hash = compile_template_hash(root);
+        let nodes = build_input_nodes(root, &doc_ids, &tmpl_hash)?;
 
         let report = if options.force {
             let all: BTreeSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
@@ -515,5 +541,55 @@ mod tests {
         assert!(rendered.contains("3 source(s), 1 stale"));
         assert!(rendered.contains("[ok] backlinks (2 affected)"));
         assert!(rendered.contains("[skip] lexical_index"));
+    }
+
+    #[test]
+    fn template_change_triggers_rebuild() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-1", "# Hello")).expect("write doc");
+
+        run_compile(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+            },
+        )
+        .expect("first compile");
+
+        let report = run_compile(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+            },
+        )
+        .expect("second compile — no changes");
+        assert_eq!(report.stale_sources, 0);
+
+        // Write a custom template override to simulate a template change
+        let prompts_dir = root.join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        std::fs::write(
+            prompts_dir.join("summarize_document.md"),
+            "Updated template: {{title}}\n{{body}}",
+        )
+        .expect("write template");
+
+        let report = run_compile(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+            },
+        )
+        .expect("third compile — template changed");
+        assert_eq!(
+            report.stale_sources, 1,
+            "template change should mark all sources stale"
+        );
     }
 }

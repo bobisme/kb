@@ -485,9 +485,25 @@ fn extract_headings(body: &str) -> Vec<String> {
 
 fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
-        .map(str::to_lowercase)
+        .flat_map(split_camel_case)
+        .map(|s| s.to_lowercase())
         .filter(|s| s.len() > 1)
         .collect()
+}
+
+/// Split a word on `CamelCase` boundaries, e.g. `SourceDocument` → `Source`, `Document`.
+fn split_camel_case(word: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let chars: Vec<char> = word.chars().collect();
+    for i in 1..chars.len() {
+        if chars[i].is_uppercase() && chars[i - 1].is_lowercase() {
+            parts.push(chars[start..i].iter().collect());
+            start = i;
+        }
+    }
+    parts.push(chars[start..].iter().collect());
+    parts
 }
 
 fn count_occurrences(tokens: &[String], target: &str) -> usize {
@@ -1111,5 +1127,44 @@ mod tests {
         assert_eq!(assembled.manifest[1].anchor.as_deref(), Some("borrowing"));
         assert!(assembled.manifest[0].end_offset <= assembled.manifest[1].start_offset);
         assert!(assembled.estimated_tokens <= assembled.token_budget);
+    }
+
+    #[test]
+    fn tokenize_splits_camel_case() {
+        let tokens = tokenize("SourceDocument");
+        assert_eq!(tokens, vec!["source", "document"]);
+    }
+
+    #[test]
+    fn tokenize_splits_multi_part_camel_case() {
+        let tokens = tokenize("SourceRevisionId");
+        assert_eq!(tokens, vec!["source", "revision", "id"]);
+    }
+
+    #[test]
+    fn tokenize_preserves_lowercase_words() {
+        let tokens = tokenize("hello world");
+        assert_eq!(tokens, vec!["hello", "world"]);
+    }
+
+    #[test]
+    fn search_finds_doc_with_camel_case_query() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+
+        write_source_page(
+            &sources,
+            "ingest",
+            "Source Ingestion",
+            "How ingestion works.",
+        );
+
+        let index = build_lexical_index(root).unwrap();
+        let results = index.search("SourceDocument ID vs SourceRevision ID", 10);
+
+        assert!(!results.is_empty(), "should find Source Ingestion doc");
+        assert_eq!(results[0].id, "wiki/sources/ingest.md");
     }
 }

@@ -1,7 +1,7 @@
 {
-  "date": "2026-04-18T02:48:20Z",
-  "git_ref": "090c116",
-  "mean_retrieval_coverage": 0.96875,
+  "date": "2026-04-18T03:11:57Z",
+  "git_ref": "953ed41",
+  "mean_retrieval_coverage": 1.0,
   "mean_llm_citation_coverage": null,
   "mean_hallucination_rate": null,
   "questions": [
@@ -101,10 +101,11 @@
     {
       "id": "q007",
       "query": "What is the difference between a SourceDocument ID and a SourceRevision ID?",
-      "retrieval_coverage": 0.0,
-      "retrieved_expected": 0,
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
       "total_expected": 1,
       "retrieved_titles": [
+        "Source Ingestion",
         "CLI Commands",
         "Provenance and Citations",
         "Question and Retrieval",
@@ -171,6 +172,7 @@
         "Question and Retrieval",
         "kb Architecture Overview",
         "Incremental Compilation",
+        "Provenance and Citations",
         "Testing Strategy"
       ],
       "valid_citations": 0,
@@ -222,6 +224,7 @@
         "CLI Commands",
         "Question and Retrieval",
         "kb Architecture Overview",
+        "Provenance and Citations",
         "Testing Strategy"
       ],
       "valid_citations": 0,
@@ -249,8 +252,8 @@
       "total_expected": 1,
       "retrieved_titles": [
         "CLI Commands",
-        "kb Architecture Overview",
         "Provenance and Citations",
+        "kb Architecture Overview",
         "Question and Retrieval",
         "Review and Promotion Workflow"
       ],
@@ -393,8 +396,8 @@
       "total_expected": 1,
       "retrieved_titles": [
         "CLI Commands",
-        "kb Architecture Overview",
         "Review and Promotion Workflow",
+        "kb Architecture Overview",
         "Provenance and Citations",
         "Question and Retrieval"
       ],
