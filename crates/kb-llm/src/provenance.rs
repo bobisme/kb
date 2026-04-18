@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use kb_core::Hash;
 
 /// Detailed token accounting reported by an LLM backend.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct TokenUsage {
     /// Number of tokens in the input prompt.
