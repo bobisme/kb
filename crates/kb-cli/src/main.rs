@@ -5,19 +5,21 @@ mod init;
 mod jobs;
 mod root;
 
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
-use kb_core::JobRunStatus;
+use kb_core::{Artifact, ArtifactKind, EntityMetadata, JobRunStatus, Question, QuestionContext, Status};
 use kb_llm::{
     ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
     RunHealthCheckRequest,
 };
 use serde::Serialize;
-use std::time::Duration;
+use serde_yaml::{Mapping, Value};
 
 #[derive(Parser)]
 #[command(name = "kb", version, about = "Personal knowledge base compiler")]
@@ -178,9 +180,14 @@ fn run(cli: Cli) -> Result<()> {
             })
         }
         Some(Command::Ask { query }) => {
+            let ask_root = root.clone();
+            let requested_format = cli.format.clone();
+            let should_json = cli.json;
             execute_mutating_command(root.as_deref(), "ask", move || {
-                println!("ask is not implemented yet: {query}");
-                Ok(())
+                let root = ask_root
+                    .as_deref()
+                    .expect("root resolved for non-init commands");
+                run_ask(root, &query, requested_format.as_deref(), should_json)
             })
         }
         Some(Command::Ingest { sources }) => {
@@ -668,6 +675,158 @@ const fn outcome_label(outcome: kb_ingest::IngestOutcome) -> &'static str {
         kb_ingest::IngestOutcome::NewRevision => "new_revision",
         kb_ingest::IngestOutcome::Skipped => "skipped",
     }
+}
+
+#[derive(Serialize)]
+struct AskOutput<'a> {
+    question_id: &'a str,
+    question_path: &'a str,
+    artifact_path: &'a str,
+    requested_format: &'a str,
+}
+
+fn run_ask(root: &Path, query: &str, requested_format: Option<&str>, json: bool) -> Result<()> {
+    let cfg = Config::load_from_root(root, None)?;
+    let requested_format = normalize_ask_format(
+        requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()),
+    )?;
+    let timestamp = now_millis()?;
+    let question_id = format!("question-{}", unique_question_suffix(timestamp, query));
+    let question_dir = root.join("outputs/questions").join(&question_id);
+    fs::create_dir_all(&question_dir)?;
+
+    let artifact_rel = PathBuf::from("outputs/questions")
+        .join(&question_id)
+        .join("artifact.md");
+    let question_rel = PathBuf::from("outputs/questions")
+        .join(&question_id)
+        .join("question.json");
+
+    let question = Question {
+        metadata: EntityMetadata {
+            id: question_id.clone(),
+            created_at_millis: timestamp,
+            updated_at_millis: timestamp,
+            source_hashes: Vec::new(),
+            model_version: None,
+            tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
+            prompt_template_hash: None,
+            dependencies: Vec::new(),
+            output_paths: vec![question_rel.clone(), artifact_rel.clone()],
+            status: Status::Fresh,
+        },
+        raw_query: query.to_string(),
+        requested_format: requested_format.to_string(),
+        requesting_context: QuestionContext::ProjectKb,
+        retrieval_plan: String::new(),
+        token_budget: Some(cfg.ask.token_budget),
+    };
+
+    let artifact = Artifact {
+        metadata: EntityMetadata {
+            id: format!("artifact-{question_id}"),
+            created_at_millis: timestamp,
+            updated_at_millis: timestamp,
+            source_hashes: Vec::new(),
+            model_version: None,
+            tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
+            prompt_template_hash: None,
+            dependencies: vec![question_id.clone()],
+            output_paths: vec![artifact_rel.clone()],
+            status: Status::Fresh,
+        },
+        question_id: question_id.clone(),
+        artifact_kind: match requested_format {
+            "png" => ArtifactKind::Figure,
+            "marp" => ArtifactKind::SlideDeck,
+            "json" => ArtifactKind::JsonSpec,
+            _ => ArtifactKind::AnswerNote,
+        },
+        format: requested_format.to_string(),
+        output_path: artifact_rel.clone(),
+    };
+
+    fs::write(
+        root.join(&question_rel),
+        serde_json::to_string_pretty(&question)?,
+    )?;
+    fs::write(
+        root.join(&artifact_rel),
+        render_ask_artifact(&artifact, &question, &question_rel)?,
+    )?;
+
+    let question_path = question_rel.to_string_lossy().into_owned();
+    let artifact_path = artifact_rel.to_string_lossy().into_owned();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&AskOutput {
+                question_id: &question_id,
+                question_path: &question_path,
+                artifact_path: &artifact_path,
+                requested_format,
+            })?
+        );
+    } else {
+        println!("Created question record: {question_path}");
+        println!("Created artifact placeholder: {artifact_path}");
+        println!("Requested format: {requested_format}");
+        println!("Answer generation is not implemented yet.");
+    }
+
+    Ok(())
+}
+
+fn normalize_ask_format(format: &str) -> Result<&str> {
+    match format {
+        "markdown" => Ok("md"),
+        "md" | "marp" | "json" | "png" => Ok(format),
+        other => bail!("unsupported ask format: {other}"),
+    }
+}
+
+fn now_millis() -> Result<u64> {
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    Ok(u64::try_from(millis)?)
+}
+
+fn unique_question_suffix(timestamp: u64, query: &str) -> String {
+    let hash = blake3::hash(query.as_bytes()).to_hex();
+    format!("{timestamp}-{}", &hash[..10])
+}
+
+fn render_ask_artifact(artifact: &Artifact, question: &Question, question_rel: &Path) -> Result<String> {
+    let mut frontmatter = Mapping::new();
+    frontmatter.insert(Value::String("id".into()), Value::String(artifact.metadata.id.clone()));
+    frontmatter.insert(
+        Value::String("type".into()),
+        Value::String("answer_artifact".into()),
+    );
+    frontmatter.insert(
+        Value::String("question_id".into()),
+        Value::String(question.metadata.id.clone()),
+    );
+    frontmatter.insert(
+        Value::String("question_record".into()),
+        Value::String(question_rel.to_string_lossy().into_owned()),
+    );
+    frontmatter.insert(
+        Value::String("requested_format".into()),
+        Value::String(question.requested_format.clone()),
+    );
+    if question.requested_format == "marp" {
+        frontmatter.insert(Value::String("marp".into()), Value::Bool(true));
+    }
+
+    let body = format!(
+        "# Question queued\n\nAnswer generation is not implemented yet.\n\n- Query: {}\n- Requested format: {}\n- Question record: {}\n",
+        question.raw_query,
+        question.requested_format,
+        question_rel.display()
+    );
+
+    let yaml = serde_yaml::to_string(&frontmatter)?;
+    Ok(format!("---\n{yaml}---\n\n{body}"))
 }
 
 fn execute_mutating_command(

@@ -105,6 +105,50 @@ fn init_creates_empty_state_files() {
 }
 
 #[test]
+fn ask_creates_question_record_and_placeholder_artifact() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("ask").arg("How does the pipeline work?");
+    let output = cmd.output().expect("run kb ask");
+
+    assert!(
+        output.status.success(),
+        "kb ask failed with stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let question_path = kb_root.join(
+        payload["question_path"]
+            .as_str()
+            .expect("question_path should be a string"),
+    );
+    let artifact_path = kb_root.join(
+        payload["artifact_path"]
+            .as_str()
+            .expect("artifact_path should be a string"),
+    );
+
+    assert!(question_path.is_file());
+    assert!(artifact_path.is_file());
+
+    let question_record: Value = serde_json::from_str(
+        &fs::read_to_string(&question_path).expect("read question record"),
+    )
+    .expect("parse question record");
+    assert_eq!(question_record["raw_query"], "How does the pipeline work?");
+    assert_eq!(question_record["requested_format"], "md");
+    assert_eq!(question_record["requesting_context"], "project_kb");
+
+    let artifact = fs::read_to_string(&artifact_path).expect("read artifact placeholder");
+    assert!(artifact.contains("question_record:"));
+    assert!(artifact.contains("requested_format: md"));
+    assert!(artifact.contains("Answer generation is not implemented yet."));
+}
+
+#[test]
 fn ingest_file_registers_source_and_sidecar() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);

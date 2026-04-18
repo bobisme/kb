@@ -118,14 +118,22 @@ pub struct Concept {
     pub backlinks: Vec<EntityId>,
 }
 
-/// A question asked by a user, with retrieval plan metadata persisted.
+/// A question asked by a user, with execution context metadata persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     pub metadata: EntityMetadata,
-    pub prompt: String,
+    pub raw_query: String,
     pub requested_format: String,
+    pub requesting_context: QuestionContext,
     pub retrieval_plan: String,
     pub token_budget: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionContext {
+    ProjectKb,
+    Global,
 }
 
 /// Any generated output artifact.
@@ -300,8 +308,9 @@ mod tests {
 
         round_trip(&Question {
             metadata: metadata("question-1"),
-            prompt: "How does this work?".to_string(),
+            raw_query: "How does this work?".to_string(),
             requested_format: "markdown".to_string(),
+            requesting_context: QuestionContext::ProjectKb,
             retrieval_plan: "top-k: 10".to_string(),
             token_budget: Some(1024),
         });

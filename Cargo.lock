@@ -1128,6 +1128,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "blake3",
  "clap",
  "fs2",
  "insta",
@@ -1141,6 +1142,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tempfile",
  "tokio",
  "toml",
