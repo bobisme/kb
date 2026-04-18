@@ -22,7 +22,6 @@ use kb_llm::{
     RunHealthCheckRequest, Template,
 };
 use serde::Serialize;
-use serde_yaml::{Mapping, Value};
 
 #[derive(Parser)]
 #[command(name = "kb", version, about = "Personal knowledge base compiler")]
@@ -994,12 +993,10 @@ fn run_ask(
         normalize_ask_format(requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()))?;
     let timestamp = now_millis()?;
     let question_id = format!("question-{}", unique_question_suffix(timestamp, query));
-    let question_dir = root.join("outputs/questions").join(&question_id);
-    fs::create_dir_all(&question_dir)?;
 
-    let artifact_rel = PathBuf::from("outputs/questions")
+    let answer_rel = PathBuf::from("outputs/questions")
         .join(&question_id)
-        .join("artifact.md");
+        .join("answer.md");
     let question_rel = PathBuf::from("outputs/questions")
         .join(&question_id)
         .join("question.json");
@@ -1009,11 +1006,6 @@ fn run_ask(
 
     let retrieval_plan =
         kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
-
-    fs::write(
-        root.join(&plan_rel),
-        serde_json::to_string_pretty(&retrieval_plan)?,
-    )?;
 
     let assembled = kb_query::assemble_context(root, &retrieval_plan)?;
     let citation_manifest = kb_query::build_citation_manifest(&assembled);
@@ -1056,13 +1048,15 @@ fn run_ask(
             tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
             prompt_template_hash: template_hash,
             dependencies: Vec::new(),
-            output_paths: vec![question_rel.clone(), artifact_rel.clone(), plan_rel.clone()],
+            output_paths: vec![question_rel, answer_rel.clone(), plan_rel],
             status: artifact_status,
         },
         raw_query: query.to_string(),
         requested_format: requested_format.to_string(),
         requesting_context: QuestionContext::ProjectKb,
-        retrieval_plan: plan_rel.to_string_lossy().into_owned(),
+        retrieval_plan: format!(
+            "outputs/questions/{question_id}/retrieval_plan.json"
+        ),
         token_budget: Some(cfg.ask.token_budget),
     };
 
@@ -1076,7 +1070,7 @@ fn run_ask(
             tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
             prompt_template_hash: None,
             dependencies: vec![question_id.clone()],
-            output_paths: vec![artifact_rel.clone()],
+            output_paths: vec![answer_rel],
             status: artifact_status,
         },
         question_id: question_id.clone(),
@@ -1087,20 +1081,23 @@ fn run_ask(
             _ => ArtifactKind::AnswerNote,
         },
         format: requested_format.to_string(),
-        output_path: artifact_rel.clone(),
+        output_path: PathBuf::from(format!(
+            "outputs/questions/{question_id}/answer.md"
+        )),
     };
 
-    fs::write(
-        root.join(&question_rel),
-        serde_json::to_string_pretty(&question)?,
-    )?;
-    fs::write(
-        root.join(&artifact_rel),
-        render_ask_artifact(&artifact, &question, &question_rel, &artifact_body)?,
-    )?;
+    let write_output = kb_query::write_artifact(&kb_query::WriteArtifactInput {
+        root,
+        question: &question,
+        artifact: &artifact,
+        retrieval_plan: &retrieval_plan,
+        artifact_result: llm_info.as_ref().map(|(r, _)| r),
+        provenance: llm_info.as_ref().map(|(_, p)| p),
+        artifact_body: &artifact_body,
+    })?;
 
-    let question_path = question_rel.to_string_lossy().into_owned();
-    let artifact_path = artifact_rel.to_string_lossy().into_owned();
+    let question_path = write_output.question_path.to_string_lossy().into_owned();
+    let artifact_path = write_output.answer_path.to_string_lossy().into_owned();
     if json {
         println!(
             "{}",
@@ -1225,46 +1222,6 @@ fn unique_question_suffix(timestamp: u64, query: &str) -> String {
     format!("{timestamp}-{}", &hash[..10])
 }
 
-fn render_ask_artifact(
-    artifact: &Artifact,
-    question: &Question,
-    question_rel: &Path,
-    body: &str,
-) -> Result<String> {
-    let mut frontmatter = Mapping::new();
-    frontmatter.insert(
-        Value::String("id".into()),
-        Value::String(artifact.metadata.id.clone()),
-    );
-    frontmatter.insert(
-        Value::String("type".into()),
-        Value::String("answer_artifact".into()),
-    );
-    frontmatter.insert(
-        Value::String("question_id".into()),
-        Value::String(question.metadata.id.clone()),
-    );
-    frontmatter.insert(
-        Value::String("question_record".into()),
-        Value::String(question_rel.to_string_lossy().into_owned()),
-    );
-    frontmatter.insert(
-        Value::String("requested_format".into()),
-        Value::String(question.requested_format.clone()),
-    );
-    if let Some(model) = &artifact.metadata.model_version {
-        frontmatter.insert(
-            Value::String("model".into()),
-            Value::String(model.clone()),
-        );
-    }
-    if question.requested_format == "marp" {
-        frontmatter.insert(Value::String("marp".into()), Value::Bool(true));
-    }
-
-    let yaml = serde_yaml::to_string(&frontmatter)?;
-    Ok(format!("---\n{yaml}---\n\n{body}"))
-}
 
 #[derive(Debug, Serialize)]
 struct InspectReport {

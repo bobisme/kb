@@ -191,12 +191,15 @@ fn ask_creates_question_record_and_placeholder_artifact() {
     assert_eq!(retrieval_plan["token_budget"], 20_000);
 
     let artifact = fs::read_to_string(&artifact_path).expect("read artifact placeholder");
-    assert!(artifact.contains("question_record:"));
+    assert!(artifact.contains("question_id:"));
     assert!(artifact.contains("requested_format: md"));
     assert!(
-        artifact.contains("LLM unavailable") || artifact.contains("type: answer_artifact"),
+        artifact.contains("LLM unavailable") || artifact.contains("type: question_answer"),
         "artifact should contain LLM unavailable message or valid artifact header"
     );
+
+    let metadata_path = artifact_path.with_file_name("metadata.json");
+    assert!(metadata_path.is_file(), "metadata.json sidecar should exist");
 }
 
 #[test]
