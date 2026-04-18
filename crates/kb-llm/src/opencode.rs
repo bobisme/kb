@@ -4,6 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use regex::Regex;
 use serde_json::json;
+use tempfile::TempDir;
 
 use crate::adapter::{
     AnswerQuestionRequest, AnswerQuestionResponse, ExtractConceptsRequest, ExtractConceptsResponse,
@@ -74,15 +75,16 @@ impl OpencodeAdapter {
         Self { config }
     }
 
-    /// Write a per-call `opencode.json` config to a unique temp directory.
-    /// Returns `(temp_dir, config_file_path)`.
-    fn write_config(&self) -> Result<(PathBuf, PathBuf), LlmAdapterError> {
-        let dir = std::env::temp_dir().join(format!(
-            "kb-opencode-{}-{}",
-            std::process::id(),
-            unix_time_ms()?
-        ));
-        std::fs::create_dir_all(&dir)
+    /// Write a per-call `opencode.json` config into a new RAII temp directory.
+    ///
+    /// The returned [`TempDir`] must be kept alive until the subprocess finishes;
+    /// dropping it (including on panic) removes the directory. This replaces an
+    /// earlier manual `remove_dir_all` call that could leak the directory if the
+    /// process was killed between config write and cleanup.
+    fn write_config(&self) -> Result<(TempDir, PathBuf), LlmAdapterError> {
+        let dir = tempfile::Builder::new()
+            .prefix("kb-opencode-")
+            .tempdir()
             .map_err(|e| LlmAdapterError::Other(format!("create config dir: {e}")))?;
 
         let agent_config = json!({
@@ -101,7 +103,7 @@ impl OpencodeAdapter {
             "agent": agent_map,
         });
 
-        let config_path = dir.join("opencode.json");
+        let config_path = dir.path().join("opencode.json");
         let json_str = serde_json::to_string_pretty(&config)
             .map_err(|e| LlmAdapterError::Other(format!("serialize opencode config: {e}")))?;
         std::fs::write(&config_path, json_str)
@@ -176,12 +178,12 @@ impl OpencodeAdapter {
 
     /// Generate config, invoke opencode, and return the stripped response text.
     fn run_prompt(&self, prompt: &str) -> Result<String, LlmAdapterError> {
-        let (temp_dir, config_path) = self.write_config()?;
+        // `_temp_dir` is held for the duration of the subprocess; its Drop removes
+        // the config directory even if we panic or unwind here.
+        let (_temp_dir, config_path) = self.write_config()?;
         let command = self.build_command(&config_path, prompt);
 
         let result = run_shell_command(&command, self.config.timeout);
-        // Clean up temp dir regardless of outcome
-        let _ = std::fs::remove_dir_all(&temp_dir);
 
         let output = result.map_err(|e| match e {
             SubprocessError::TimedOut { timeout, .. } => {
