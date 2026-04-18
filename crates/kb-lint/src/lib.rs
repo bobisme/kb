@@ -19,6 +19,7 @@ pub enum LintRule {
     BrokenLinks,
     Orphans,
     StaleArtifacts,
+    MissingCitations,
     All,
 }
 
@@ -33,6 +34,9 @@ impl LintRule {
             Some("broken-links" | "broken_links" | "brokenlinks") => Ok(Self::BrokenLinks),
             Some("orphans" | "orphan" | "orphan-pages" | "orphan_pages") => Ok(Self::Orphans),
             Some("stale" | "stale-artifacts" | "stale_artifacts") => Ok(Self::StaleArtifacts),
+            Some("missing-citations" | "missing_citations" | "missingcitations") => {
+                Ok(Self::MissingCitations)
+            }
             Some(other) => Err(anyhow!("unsupported lint rule: {other}")),
         }
     }
@@ -43,6 +47,7 @@ impl LintRule {
             Self::BrokenLinks => "broken-links",
             Self::Orphans => "orphans",
             Self::StaleArtifacts => "stale",
+            Self::MissingCitations => "missing-citations",
             Self::All => "all",
         }
     }
@@ -60,16 +65,31 @@ impl LintReport {
     pub fn is_clean(&self) -> bool {
         self.issues.is_empty()
     }
+
+    #[must_use]
+    pub fn has_errors(&self) -> bool {
+        self.issues
+            .iter()
+            .any(|issue| issue.severity == IssueSeverity::Error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LintIssue {
+    pub severity: IssueSeverity,
     pub kind: IssueKind,
     pub referring_page: String,
     pub line: usize,
     pub target: String,
     pub message: String,
     pub suggested_fix: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueSeverity {
+    Warning,
+    Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -85,6 +105,38 @@ pub enum IssueKind {
     ManifestMismatch,
     FrontmatterBuildRecordMissing,
     BuildRecordOutputMissing,
+    MissingCitations,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingCitationsLevel {
+    Warn,
+    Error,
+}
+
+impl MissingCitationsLevel {
+    #[must_use]
+    pub const fn severity(self) -> IssueSeverity {
+        match self {
+            Self::Warn => IssueSeverity::Warning,
+            Self::Error => IssueSeverity::Error,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LintOptions {
+    pub require_citations: bool,
+    pub missing_citations_level: MissingCitationsLevel,
+}
+
+impl Default for LintOptions {
+    fn default() -> Self {
+        Self {
+            require_citations: true,
+            missing_citations_level: MissingCitationsLevel::Warn,
+        }
+    }
 }
 
 /// Run the selected lint rule against the KB at `root`.
@@ -92,6 +144,14 @@ pub enum IssueKind {
 /// # Errors
 /// Returns an error when the lint pass cannot read KB state or wiki files.
 pub fn run_lint(root: &Path, rule: LintRule) -> Result<LintReport> {
+    run_lint_with_options(root, rule, &LintOptions::default())
+}
+
+/// Run the selected lint rule with caller-supplied options.
+///
+/// # Errors
+/// Returns an error when the lint pass cannot read KB state or wiki files.
+pub fn run_lint_with_options(root: &Path, rule: LintRule, options: &LintOptions) -> Result<LintReport> {
     let mut issues = Vec::new();
 
     if matches!(rule, LintRule::BrokenLinks | LintRule::All) {
@@ -102,6 +162,9 @@ pub fn run_lint(root: &Path, rule: LintRule) -> Result<LintReport> {
     }
     if matches!(rule, LintRule::StaleArtifacts | LintRule::All) {
         issues.extend(detect_stale_artifacts(root)?);
+    }
+    if options.require_citations && matches!(rule, LintRule::MissingCitations | LintRule::All) {
+        issues.extend(detect_missing_citations(root, *options)?);
     }
 
     Ok(LintReport {
@@ -308,6 +371,7 @@ fn validate_link(
     if !registry.has_page(&target.page_id) {
         let suggestion = registry.suggest_page(&target.page_id);
         return Some(LintIssue {
+            severity: IssueSeverity::Error,
             kind: IssueKind::MissingPage,
             referring_page: format!("{}.md", page.page_id),
             line,
@@ -327,6 +391,7 @@ fn validate_link(
     {
         let suggestion = registry.suggest_anchor(&target.page_id, anchor);
         return Some(LintIssue {
+            severity: IssueSeverity::Error,
             kind: IssueKind::MissingAnchor,
             referring_page: format!("{}.md", page.page_id),
             line,
@@ -537,6 +602,7 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
 
         for missing_doc in doc_ids.iter().filter(|doc_id| !existing_docs.contains(*doc_id)) {
             issues.push(LintIssue {
+                severity: IssueSeverity::Error,
                 kind: IssueKind::SourceDocumentMissing,
                 referring_page: rel_page_str.clone(),
                 line: 0,
@@ -560,6 +626,7 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
             if live_revision_ids.is_empty() {
                 for revision_id in &rev_ids {
                     issues.push(LintIssue {
+                        severity: IssueSeverity::Error,
                         kind: IssueKind::SourceRevisionMissing,
                         referring_page: rel_page_str.clone(),
                         line: 0,
@@ -572,6 +639,7 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
                 }
             } else if rev_ids.iter().all(|revision_id| !live_revision_ids.contains(revision_id)) {
                 issues.push(LintIssue {
+                    severity: IssueSeverity::Error,
                     kind: IssueKind::SourceRevisionStale,
                     referring_page: rel_page_str,
                     line: 0,
@@ -601,6 +669,7 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
         let artifact_str = artifact_path.to_string_lossy().into_owned();
         if !output_path.exists() {
             issues.push(LintIssue {
+                severity: IssueSeverity::Error,
                 kind: IssueKind::OutputMissing,
                 referring_page: artifact_str.clone(),
                 line: 0,
@@ -612,6 +681,7 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
 
         match load_build_record(root, &manifest_record.metadata.id)? {
             None => issues.push(LintIssue {
+                severity: IssueSeverity::Error,
                 kind: IssueKind::BuildRecordMissing,
                 referring_page: artifact_str,
                 line: 0,
@@ -624,6 +694,7 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
             }),
             Some(current) if !same_build_fingerprint(manifest_record, &current) => {
                 issues.push(LintIssue {
+                    severity: IssueSeverity::Error,
                     kind: IssueKind::ManifestMismatch,
                     referring_page: artifact_str,
                     line: 0,
@@ -647,6 +718,7 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
         };
         if load_build_record(root, &build_record_id)?.is_none() {
             issues.push(LintIssue {
+                severity: IssueSeverity::Error,
                 kind: IssueKind::FrontmatterBuildRecordMissing,
                 referring_page: relative_to_root(root, &page).to_string_lossy().into_owned(),
                 line: 0,
@@ -664,6 +736,7 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
             let output_path = root.join(output_id);
             if !output_path.exists() {
                 issues.push(LintIssue {
+                    severity: IssueSeverity::Error,
                     kind: IssueKind::BuildRecordOutputMissing,
                     referring_page: output_id.clone(),
                     line: 0,
@@ -746,6 +819,92 @@ fn normalized_metadata_for_doc(root: &Path, doc_id: &str) -> Result<Option<Norma
     let metadata = serde_json::from_str(&raw)
         .with_context(|| format!("deserialize normalized metadata {}", path.display()))?;
     Ok(Some(metadata))
+}
+
+fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<LintIssue>> {
+    let mut issues = Vec::new();
+
+    for page in markdown_files_under(&root.join(WIKI_DIR))? {
+        let raw = fs::read_to_string(&page)
+            .with_context(|| format!("read wiki page {}", page.display()))?;
+        let (frontmatter, body) = read_frontmatter(&page)
+            .with_context(|| format!("read frontmatter for {}", page.display()))?;
+        let doc_ids = frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
+        let rev_ids = frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
+        let has_sources = !(doc_ids.is_empty() && rev_ids.is_empty());
+        let has_citations = page_has_citations(&body);
+
+        if has_sources && has_citations {
+            continue;
+        }
+
+        let rel_page = relative_to_root(root, &page).to_string_lossy().into_owned();
+        let body_offset = raw.len().saturating_sub(body.len());
+
+        for region in extract_managed_regions(&body)
+            .into_iter()
+            .filter(|region| is_synthetic_region(&frontmatter, region.id))
+        {
+            let target = format!("{rel_page}#{}", region.id);
+            let line = line_number_at(&raw, body_offset + region.full_start);
+            let message = match (has_sources, has_citations) {
+                (false, false) => "synthetic region is missing source ids in frontmatter and citations in the page body".to_string(),
+                (false, true) => "synthetic region is missing source ids in frontmatter".to_string(),
+                (true, false) => "synthetic region is missing citations in the page body".to_string(),
+                (true, true) => continue,
+            };
+
+            issues.push(LintIssue {
+                severity: options.missing_citations_level.severity(),
+                kind: IssueKind::MissingCitations,
+                referring_page: rel_page.clone(),
+                line,
+                target,
+                message,
+                suggested_fix: Some(
+                    "add source_* frontmatter ids and at least one citation link in the page body"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    Ok(issues)
+}
+
+fn is_synthetic_region(frontmatter: &serde_yaml::Mapping, region_id: &str) -> bool {
+    let has_direct_source_ids = frontmatter.contains_key(Value::String("source_document_id".to_string()))
+        || frontmatter.contains_key(Value::String("source_revision_id".to_string()));
+    let has_plural_source_ids = frontmatter.contains_key(Value::String("source_document_ids".to_string()))
+        || frontmatter.contains_key(Value::String("source_revision_ids".to_string()));
+    let source_page_shape = has_direct_source_ids || has_plural_source_ids;
+
+    if source_page_shape {
+        !matches!(region_id, "title" | "citations")
+    } else {
+        !matches!(region_id, "citations")
+    }
+}
+
+fn page_has_citations(body: &str) -> bool {
+    extract_managed_regions(body)
+        .into_iter()
+        .find(|region| region.id == "citations")
+        .is_some_and(|region| citations_exist(region.body(body)))
+        || citations_exist(body)
+}
+
+fn citations_exist(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && trimmed != "- _None yet._"
+            && (trimmed.contains("[[") || (trimmed.contains('[') && trimmed.contains("](")))
+    })
+}
+
+fn line_number_at(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())].bytes().filter(|byte| *byte == b'\n').count() + 1
 }
 
 fn frontmatter_string_list(
@@ -928,6 +1087,64 @@ mod tests {
         let report = run_lint(root, LintRule::StaleArtifacts).expect("lint report");
         assert_eq!(report.issue_count, 1);
         assert_eq!(report.issues[0].kind, IssueKind::ManifestMismatch);
+    }
+
+    #[test]
+    fn missing_citations_warns_for_synthetic_regions_without_links() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/sources")).expect("create wiki dir");
+        fs::write(
+            root.join("wiki/sources/doc.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Source\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert_eq!(report.issue_count, 1);
+        assert_eq!(report.issues[0].kind, IssueKind::MissingCitations);
+        assert_eq!(report.issues[0].severity, IssueSeverity::Warning);
+        assert!(!report.has_errors());
+    }
+
+    #[test]
+    fn missing_citations_allows_extractive_regions_without_links() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/sources")).expect("create wiki dir");
+        fs::write(
+            root.join("wiki/sources/doc.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Source\n\n<!-- kb:begin id=title -->\nDocument title\n<!-- kb:end id=title -->\n\n## Citations\n<!-- kb:begin id=citations -->\n- _None yet._\n<!-- kb:end id=citations -->\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert!(report.is_clean(), "expected no issues: {report:?}");
+    }
+
+    #[test]
+    fn missing_citations_can_be_promoted_to_error() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create wiki dir");
+        fs::write(
+            root.join("wiki/concepts/rust.md"),
+            "---\nsource_revision_ids:\n  - rev-1\ngenerated_by: builder\n---\n# Rust\n\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write concept page");
+
+        let report = run_lint_with_options(
+            root,
+            LintRule::MissingCitations,
+            &LintOptions {
+                require_citations: true,
+                missing_citations_level: MissingCitationsLevel::Error,
+            },
+        )
+        .expect("lint report");
+        assert_eq!(report.issue_count, 1);
+        assert_eq!(report.issues[0].severity, IssueSeverity::Error);
+        assert!(report.has_errors());
     }
 }
 

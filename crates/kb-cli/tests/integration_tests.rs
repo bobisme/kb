@@ -544,3 +544,53 @@ fn lint_reports_orphan_pages_as_json() {
     assert!(issues.iter().any(|issue| issue["kind"] == "source_document_missing"));
     assert!(issues.iter().any(|issue| issue["kind"] == "source_revision_missing"));
 }
+
+#[test]
+fn lint_missing_citations_warns_by_default_without_failing() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("create wiki sources");
+    fs::write(
+        kb_root.join("wiki/sources/page.md"),
+        "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Page\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+    )
+    .expect("write page");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint").arg("--rule").arg("missing-citations");
+    let output = cmd.output().expect("run kb lint");
+
+    assert!(output.status.success(), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("[warn] missing-citations"), "stdout: {stdout}");
+}
+
+#[test]
+fn lint_missing_citations_can_fail_when_configured_as_error() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    fs::write(
+        kb_root.join("kb.toml"),
+        "[llm]\ndefault_model = \"test-model\"\n\n[compile]\ntoken_budget = 12000\n\n[lint]\nmissing_citations_level = \"error\"\n",
+    )
+    .expect("rewrite kb.toml");
+
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("create wiki sources");
+    fs::write(
+        kb_root.join("wiki/sources/page.md"),
+        "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Page\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+    )
+    .expect("write page");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("lint").arg("--rule").arg("missing-citations");
+    let output = cmd.output().expect("run kb lint");
+
+    assert!(!output.status.success(), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(payload["issue_count"], 1);
+    assert_eq!(payload["issues"][0]["severity"], "error");
+    assert_eq!(payload["issues"][0]["kind"], "missing_citations");
+}

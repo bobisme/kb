@@ -829,19 +829,42 @@ fn render_ask_artifact(artifact: &Artifact, question: &Question, question_rel: &
 }
 
 fn run_lint(root: &Path, json: bool, rule: Option<&str>) -> Result<()> {
+    let cfg = Config::load_from_root(root, None)?;
     let rule = kb_lint::LintRule::parse(rule)?;
-    let report = kb_lint::run_lint(root, rule)?;
+    let missing_citations_level = match cfg.lint.missing_citations_level.as_str() {
+        "warn" | "warning" => kb_lint::MissingCitationsLevel::Warn,
+        "error" => kb_lint::MissingCitationsLevel::Error,
+        other => bail!(
+            "invalid lint.missing_citations_level in kb.toml: {other} (expected warn or error)"
+        ),
+    };
+    let options = kb_lint::LintOptions {
+        require_citations: cfg.lint.require_citations,
+        missing_citations_level,
+    };
+    let report = kb_lint::run_lint_with_options(root, rule, &options)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if report.is_clean() {
         println!("[ok] {}: no issues found", report.rule);
-    } else {
+    } else if report.has_errors() {
         println!("[fail] {}: {} issue(s)", report.rule, report.issue_count);
         for issue in &report.issues {
             println!(
-                "- {}:{} {} ({})",
-                issue.referring_page, issue.line, issue.message, issue.target
+                "- [{:?}] {}:{} {} ({})",
+                issue.severity, issue.referring_page, issue.line, issue.message, issue.target
+            );
+            if let Some(suggested_fix) = &issue.suggested_fix {
+                println!("  suggested fix: {suggested_fix}");
+            }
+        }
+    } else {
+        println!("[warn] {}: {} warning(s)", report.rule, report.issue_count);
+        for issue in &report.issues {
+            println!(
+                "- [{:?}] {}:{} {} ({})",
+                issue.severity, issue.referring_page, issue.line, issue.message, issue.target
             );
             if let Some(suggested_fix) = &issue.suggested_fix {
                 println!("  suggested fix: {suggested_fix}");
@@ -849,14 +872,14 @@ fn run_lint(root: &Path, json: bool, rule: Option<&str>) -> Result<()> {
         }
     }
 
-    if report.is_clean() {
-        Ok(())
-    } else {
+    if report.has_errors() {
         Err(anyhow!(
             "lint failed: {} issue(s) in {}",
             report.issue_count,
             report.rule
         ))
+    } else {
+        Ok(())
     }
 }
 fn execute_mutating_command(

@@ -354,6 +354,7 @@ pub struct LintConfig {
     pub retry_limit: u32,
     pub max_broken_links: u32,
     pub require_citations: bool,
+    pub missing_citations_level: String,
 }
 
 impl Default for LintConfig {
@@ -364,6 +365,7 @@ impl Default for LintConfig {
             retry_limit: 1,
             max_broken_links: 100,
             require_citations: true,
+            missing_citations_level: "warn".to_string(),
         }
     }
 }
