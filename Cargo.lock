@@ -1153,8 +1153,10 @@ name = "kb-compile"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ignore",
  "kb-core",
  "kb-llm",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",

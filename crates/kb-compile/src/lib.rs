@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod backlinks;
 pub mod concept_extraction;
 pub mod concept_merge;
 pub mod orchestrator;
