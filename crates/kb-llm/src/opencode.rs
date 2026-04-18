@@ -10,7 +10,7 @@ use crate::adapter::{
     GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
     MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
     RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
-    parse_extract_concepts_json,
+    parse_extract_concepts_json, parse_merge_concept_candidates_json,
 };
 use crate::provenance::ProvenanceRecord;
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -267,11 +267,45 @@ impl LlmAdapter for OpencodeAdapter {
 
     fn merge_concept_candidates(
         &self,
-        _request: MergeConceptCandidatesRequest,
+        request: MergeConceptCandidatesRequest,
     ) -> Result<(MergeConceptCandidatesResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "opencode adapter merge_concept_candidates is not implemented yet".to_string(),
-        ))
+        let template =
+            Template::load("merge_concept_candidates.md", self.config.project_root.as_deref())
+                .map_err(|err| {
+                    LlmAdapterError::Other(format!("load merge_concept_candidates template: {err}"))
+                })?;
+
+        let candidates_json = serde_json::to_string_pretty(&request.candidates)
+            .map_err(|err| LlmAdapterError::Other(format!("serialize candidates: {err}")))?;
+
+        let mut context = HashMap::new();
+        context.insert("candidates_json".to_string(), candidates_json);
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render merge_concept_candidates template: {err}"))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        let raw = self.run_prompt(&rendered.content)?;
+        let response = parse_merge_concept_candidates_json(&raw)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((response, provenance))
     }
 
     fn answer_question(

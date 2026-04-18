@@ -11,9 +11,9 @@ mod templates;
 pub use adapter::{
     AnswerQuestionRequest, AnswerQuestionResponse, ConceptCandidate, ExtractConceptsRequest,
     ExtractConceptsResponse, GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter,
-    LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse,
+    LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, MergeGroup,
     RunHealthCheckRequest, RunHealthCheckResponse, SourceAnchor, SummarizeDocumentRequest,
-    SummarizeDocumentResponse,
+    SummarizeDocumentResponse, parse_merge_concept_candidates_json,
 };
 pub use claude::{ClaudeCliAdapter, ClaudeCliConfig};
 pub use opencode::{OpencodeAdapter, OpencodeConfig};

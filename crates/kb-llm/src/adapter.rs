@@ -91,20 +91,33 @@ pub struct ExtractConceptsResponse {
     pub concepts: Vec<ConceptCandidate>,
 }
 
+/// One cluster of candidates merged into a single canonical concept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeGroup {
+    /// Proposed canonical name for this concept.
+    pub canonical_name: String,
+    /// Alternate names, abbreviations, or spellings collapsed into this concept.
+    pub aliases: Vec<String>,
+    /// Original candidates clustered into this group.
+    pub members: Vec<ConceptCandidate>,
+    /// True when the merge is unambiguous; false routes the group to human review.
+    pub confident: bool,
+    /// Explanation for uncertain merges.
+    pub rationale: Option<String>,
+}
+
 /// Request to merge concept candidates into a canonical list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeConceptCandidatesRequest {
-    /// Multiple lists of candidate concepts to merge.
-    pub candidate_lists: Vec<Vec<ConceptCandidate>>,
-    /// Strategy for merging (e.g. "union", "intersection").
-    pub merge_strategy: String,
+    /// Flat list of all candidates to cluster, sorted deterministically by the caller.
+    pub candidates: Vec<ConceptCandidate>,
 }
 
 /// Response containing the merged concept list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeConceptCandidatesResponse {
-    /// The merged and deduplicated list of concepts.
-    pub merged_concepts: Vec<String>,
+    /// Grouped and deduplicated concept clusters.
+    pub groups: Vec<MergeGroup>,
 }
 
 /// Request to answer a user question.
@@ -197,6 +210,37 @@ pub fn parse_extract_concepts_json(text: &str) -> Result<ExtractConceptsResponse
     serde_json::from_value(value).map_err(|err| {
         LlmAdapterError::Parse(format!(
             "extract_concepts response had invalid envelope shape: {err}"
+        ))
+    })
+}
+
+/// Parse a `MergeConceptCandidatesResponse` from LLM text output.
+///
+/// Accepts raw JSON or a fenced code block.
+///
+/// # Errors
+///
+/// Returns [`LlmAdapterError::Parse`] when the text is empty, not valid JSON, or does not
+/// match the expected merge-response schema.
+pub fn parse_merge_concept_candidates_json(
+    text: &str,
+) -> Result<MergeConceptCandidatesResponse, LlmAdapterError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(LlmAdapterError::Parse(
+            "merge_concept_candidates response was empty".to_string(),
+        ));
+    }
+
+    let json_text = trimmed
+        .strip_prefix("```")
+        .and_then(|body| body.split_once('\n').map(|(_, rest)| rest))
+        .and_then(|body| body.rsplit_once("```").map(|(json, _)| json.trim()))
+        .unwrap_or(trimmed);
+
+    serde_json::from_str(json_text).map_err(|err| {
+        LlmAdapterError::Parse(format!(
+            "merge_concept_candidates response had invalid shape: {err}"
         ))
     })
 }
