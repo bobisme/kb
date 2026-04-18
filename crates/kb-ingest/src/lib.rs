@@ -237,6 +237,7 @@ fn build_document(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_revision(
     document: &SourceDocument,
     source_revision_id: String,
@@ -274,6 +275,7 @@ fn build_revision(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_new_revision(
     canonical_source: &Path,
     copied_path: &Path,

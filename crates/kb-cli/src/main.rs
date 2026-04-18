@@ -359,7 +359,7 @@ fn summarize_ingest(results: &[IngestResult]) -> IngestSummary {
     summary
 }
 
-fn outcome_label(outcome: kb_ingest::IngestOutcome) -> &'static str {
+const fn outcome_label(outcome: kb_ingest::IngestOutcome) -> &'static str {
     match outcome {
         kb_ingest::IngestOutcome::NewSource => "new_source",
         kb_ingest::IngestOutcome::NewRevision => "new_revision",
