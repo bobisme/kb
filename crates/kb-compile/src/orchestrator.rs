@@ -3,7 +3,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use kb_core::BuildRecord;
+use kb_core::{BuildRecord, save_build_record};
 
 #[derive(Debug, Clone)]
 pub struct PassDecl {
@@ -74,6 +74,20 @@ impl OrchestratorReport {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    /// Persist all build records emitted by executed passes to `state/build_records/`.
+    ///
+    /// Records are written as `<id>.json` under the `build_records` directory. Existing
+    /// records are overwritten (idempotent); records from previous runs are never deleted.
+    ///
+    /// # Errors
+    /// Returns an error when any record cannot be written to disk.
+    pub fn persist_build_records(&self, root: &Path) -> Result<()> {
+        for record in self.all_build_records() {
+            save_build_record(root, record)?;
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -257,6 +271,7 @@ mod tests {
     fn test_record(id: &str, inputs: &[&str], outputs: &[&str]) -> BuildRecord {
         BuildRecord {
             metadata: test_metadata(id),
+            pass_name: "test_pass".to_string(),
             input_ids: inputs.iter().map(|s| (*s).to_string()).collect(),
             output_ids: outputs.iter().map(|s| (*s).to_string()).collect(),
             manifest_hash: format!("hash-{id}"),
@@ -566,5 +581,37 @@ mod tests {
         let rendered = report.render();
         assert!(rendered.contains("[ok] normalize"));
         assert!(rendered.contains("[skip] concepts"));
+    }
+
+    #[test]
+    fn persist_build_records_writes_to_build_records_dir() {
+        use kb_core::load_build_record;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let mut orch = Orchestrator::new();
+        let stale: BTreeSet<String> = BTreeSet::from(["normalized/a.json".to_string()]);
+
+        orch.register(Box::new(SuccessPass {
+            decl: PassDecl {
+                name: "normalize".to_string(),
+                inputs: vec!["raw/".to_string()],
+                outputs: vec!["normalized/".to_string()],
+            },
+            records: vec![test_record("norm-a", &["raw/a.md"], &["normalized/a.json"])],
+        }));
+
+        let report = orch.run(dir.path(), &stale, false);
+        report
+            .persist_build_records(dir.path())
+            .expect("persist build records");
+
+        let loaded = load_build_record(dir.path(), "norm-a")
+            .expect("load")
+            .expect("record present");
+        assert_eq!(loaded.metadata.id, "norm-a");
+        assert_eq!(loaded.pass_name, "test_pass");
+        assert_eq!(loaded.input_ids, vec!["raw/a.md"]);
+        assert_eq!(loaded.output_ids, vec!["normalized/a.json"]);
     }
 }

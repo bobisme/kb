@@ -178,6 +178,8 @@ pub struct CharSpan {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildRecord {
     pub metadata: EntityMetadata,
+    /// Name of the pass that produced this record.
+    pub pass_name: String,
     pub input_ids: Vec<EntityId>,
     pub output_ids: Vec<EntityId>,
     pub manifest_hash: ContentHash,
@@ -331,6 +333,7 @@ mod tests {
 
         round_trip(&BuildRecord {
             metadata: metadata("build-record-1"),
+            pass_name: "normalize".to_string(),
             input_ids: vec!["normalized-doc-1".to_string()],
             output_ids: vec!["wiki-page-1".to_string()],
             manifest_hash: "build-manifest-hash".to_string(),
@@ -371,7 +374,10 @@ pub use managed_region::{
     ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title,
 };
 pub use normalized::{read_normalized_document, write_normalized_document};
-pub use state::{Hashes, Manifest, hashes_path, manifest_path};
+pub use state::{
+    Hashes, Manifest, build_records_dir, find_build_records_for_output, hashes_path,
+    load_build_record, manifest_path, save_build_record,
+};
 pub use source_identity::{
     SOURCE_DOCUMENT_ID_PREFIX, SOURCE_REVISION_ID_PREFIX, mint_source_document_id,
     mint_source_revision_id, normalize_file_stable_location, normalize_url_stable_location,

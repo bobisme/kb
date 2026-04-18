@@ -236,6 +236,37 @@ fn run(cli: Cli) -> Result<()> {
             let graph = Graph::load_from(root)?;
             let inspection = graph.inspect(&target)?;
             println!("{}", inspection.render());
+
+            let records = kb_core::find_build_records_for_output(root, &inspection.id)?;
+            if !records.is_empty() {
+                println!("\nbuild records:");
+                for record in &records {
+                    println!("  id: {}", record.metadata.id);
+                    println!("  pass: {}", record.pass_name);
+                    if let Some(model) = &record.metadata.model_version {
+                        println!("  model: {model}");
+                    }
+                    if let Some(tmpl) = &record.metadata.prompt_template_hash {
+                        println!("  prompt_template_hash: {tmpl}");
+                    }
+                    println!("  started_at_millis: {}", record.metadata.created_at_millis);
+                    if record.metadata.updated_at_millis != record.metadata.created_at_millis {
+                        println!("  ended_at_millis: {}", record.metadata.updated_at_millis);
+                    }
+                    if !record.input_ids.is_empty() {
+                        println!("  inputs:");
+                        for input in &record.input_ids {
+                            println!("    - {input}");
+                        }
+                    }
+                    if !record.output_ids.is_empty() {
+                        println!("  outputs:");
+                        for output in &record.output_ids {
+                            println!("    - {output}");
+                        }
+                    }
+                }
+            }
             Ok(())
         }
         Some(Command::Review { operation }) => {

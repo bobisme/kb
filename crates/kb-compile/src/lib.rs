@@ -698,6 +698,7 @@ mod tests {
                 prompt_template_hash,
                 ..metadata(id)
             },
+            pass_name: "test_pass".to_string(),
             input_ids: input_ids.iter().map(|id| (*id).to_string()).collect(),
             output_ids: output_ids.iter().map(|id| (*id).to_string()).collect(),
             manifest_hash: manifest_hash.to_string(),
