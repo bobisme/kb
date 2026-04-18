@@ -3,9 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
-use kb_core::{BuildRecord, Manifest, build_records_dir, extract_managed_regions, frontmatter::read_frontmatter, load_build_record, slug_from_title};
+use kb_core::{BuildRecord, EntityMetadata, Manifest, ReviewAction, ReviewItem, Status, build_records_dir, extract_managed_regions, frontmatter::read_frontmatter, load_build_record, slug_from_title};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
@@ -927,5 +928,439 @@ mod tests {
         let report = run_lint(root, LintRule::StaleArtifacts).expect("lint report");
         assert_eq!(report.issue_count, 1);
         assert_eq!(report.issues[0].kind, IssueKind::ManifestMismatch);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate concept detection
+// ---------------------------------------------------------------------------
+
+const WIKI_CONCEPTS_DIR: &str = "wiki/concepts";
+const DEFAULT_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+/// Configuration for the duplicate-concepts lint check.
+#[derive(Debug, Clone)]
+pub struct DuplicateConceptsConfig {
+    /// Similarity threshold for flagging pairs (0.0–1.0). Default: 0.85.
+    pub similarity_threshold: f64,
+}
+
+impl Default for DuplicateConceptsConfig {
+    fn default() -> Self {
+        Self {
+            similarity_threshold: DEFAULT_SIMILARITY_THRESHOLD,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConceptRecord {
+    id: String,
+    name: String,
+    aliases: Vec<String>,
+}
+
+/// Scan concept pages under `wiki/concepts/` and return a `ReviewItem` for every
+/// near-duplicate pair.
+///
+/// Two concepts are near-duplicates when the highest bigram-similarity score
+/// across all pairwise comparisons of their names and aliases meets or exceeds
+/// `config.similarity_threshold`.
+///
+/// # Errors
+///
+/// Returns an error when the concept directory cannot be scanned, a concept page
+/// cannot be parsed, or the system clock cannot be queried for timestamps.
+pub fn check_duplicate_concepts(
+    root: &Path,
+    config: &DuplicateConceptsConfig,
+) -> Result<Vec<ReviewItem>> {
+    let concepts = load_concepts(root)?;
+    let now = unix_time_ms()?;
+    let mut items = Vec::new();
+
+    for (i, a) in concepts.iter().enumerate() {
+        for b in concepts.iter().skip(i + 1) {
+            if let Some((term_a, term_b, score)) = best_term_pair(a, b) {
+                if score >= config.similarity_threshold {
+                    items.push(build_review_item(a, b, &term_a, &term_b, score, now));
+                }
+            }
+        }
+    }
+
+    Ok(items)
+}
+
+fn load_concepts(root: &Path) -> Result<Vec<ConceptRecord>> {
+    let dir = root.join(WIKI_CONCEPTS_DIR);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("scan concept pages directory {}", dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("read directory entry in {}", dir.display()))?
+            .path();
+
+        if path.extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        if path.file_name().is_some_and(|n| n == "index.md") {
+            continue;
+        }
+
+        match parse_concept_page(&path) {
+            Ok(record) if !record.name.is_empty() => records.push(record),
+            Ok(_) => {}
+            Err(err) => tracing::warn!("skipping {}: {err}", path.display()),
+        }
+    }
+
+    records.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(records)
+}
+
+fn parse_concept_page(path: &Path) -> Result<ConceptRecord> {
+    let (frontmatter, _body) = read_frontmatter(path)
+        .with_context(|| format!("read frontmatter from {}", path.display()))?;
+
+    let id = frontmatter
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let name = frontmatter
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let aliases = frontmatter
+        .get("aliases")
+        .and_then(Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(ConceptRecord { id, name, aliases })
+}
+
+fn all_terms(concept: &ConceptRecord) -> Vec<String> {
+    let mut terms = vec![concept.name.clone()];
+    terms.extend(concept.aliases.iter().cloned());
+    terms
+}
+
+fn best_term_pair(a: &ConceptRecord, b: &ConceptRecord) -> Option<(String, String, f64)> {
+    let a_terms = all_terms(a);
+    let b_terms = all_terms(b);
+
+    let mut best: Option<(String, String, f64)> = None;
+    for ta in &a_terms {
+        for tb in &b_terms {
+            let score = bigram_similarity(&normalize_term(ta), &normalize_term(tb));
+            let is_better = best.as_ref().is_none_or(|entry| score > entry.2);
+            if is_better {
+                best = Some((ta.clone(), tb.clone(), score));
+            }
+        }
+    }
+
+    best
+}
+
+fn normalize_term(s: &str) -> String {
+    s.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Dice coefficient over character bigrams for two pre-normalized strings.
+#[allow(clippy::cast_precision_loss)]
+fn bigram_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+
+    if a_chars.len() < 2 || b_chars.len() < 2 {
+        return 0.0;
+    }
+
+    let a_bigrams: Vec<(char, char)> = a_chars.windows(2).map(|w| (w[0], w[1])).collect();
+    let mut b_remaining: Vec<(char, char)> = b_chars.windows(2).map(|w| (w[0], w[1])).collect();
+
+    let total = a_bigrams.len() + b_remaining.len();
+    let mut intersection: usize = 0;
+    for bg in &a_bigrams {
+        if let Some(pos) = b_remaining.iter().position(|x| x == bg) {
+            intersection += 1;
+            b_remaining.swap_remove(pos);
+        }
+    }
+
+    2.0 * intersection as f64 / total as f64
+}
+
+fn build_review_item(
+    a: &ConceptRecord,
+    b: &ConceptRecord,
+    term_a: &str,
+    term_b: &str,
+    score: f64,
+    now: u64,
+) -> ReviewItem {
+    ReviewItem {
+        metadata: EntityMetadata {
+            id: format!("lint:duplicate-concepts:{}:{}", a.id, b.id),
+            created_at_millis: now,
+            updated_at_millis: now,
+            source_hashes: vec![],
+            model_version: None,
+            tool_version: Some(format!(
+                "{}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )),
+            prompt_template_hash: None,
+            dependencies: vec![a.id.clone(), b.id.clone()],
+            output_paths: vec![],
+            status: Status::NeedsReview,
+        },
+        target_entity_id: a.id.clone(),
+        action: ReviewAction::Merge,
+        comment: format!(
+            "Near-duplicate of '{}' (similarity: {score:.2}; matched: '{}' \u{2248} '{}')",
+            b.id, term_a, term_b
+        ),
+    }
+}
+
+fn unix_time_ms() -> Result<u64> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system time is before Unix epoch")?;
+    duration
+        .as_millis()
+        .try_into()
+        .context("system time exceeds u64 millisecond range")
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn write_concept(dir: &Path, slug: &str, name: &str, aliases: &[&str]) -> PathBuf {
+        use std::fmt::Write as _;
+        let path = dir.join(format!("{slug}.md"));
+        let mut content = format!("---\nid: concept:{slug}\nname: {name}\n");
+        if !aliases.is_empty() {
+            content.push_str("aliases:\n");
+            for alias in aliases {
+                writeln!(content, "  - {alias}").unwrap();
+            }
+        }
+        content.push_str("---\n\n");
+        writeln!(content, "# {name}").unwrap();
+        fs::write(&path, &content).unwrap();
+        path
+    }
+
+    fn setup_kb(root: &TempDir) -> PathBuf {
+        let concepts_dir = root.path().join("wiki/concepts");
+        fs::create_dir_all(&concepts_dir).unwrap();
+        concepts_dir
+    }
+
+    #[test]
+    fn empty_dir_returns_no_items() {
+        let dir = TempDir::new().unwrap();
+        setup_kb(&dir);
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn missing_concepts_dir_returns_no_items() {
+        let dir = TempDir::new().unwrap();
+        // Don't create the wiki/concepts directory
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn exact_duplicate_names_flagged() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept(&concepts_dir, "borrow-checker-a", "Borrow checker", &[]);
+        write_concept(&concepts_dir, "borrow-checker-b", "Borrow checker", &[]);
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert_eq!(items.len(), 1, "expected one duplicate pair");
+        assert_eq!(items[0].action, ReviewAction::Merge);
+        assert!(items[0].comment.contains("similarity: 1.00"));
+    }
+
+    #[test]
+    fn near_duplicate_names_flagged() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept(&concepts_dir, "borrow-check", "Borrow Check", &[]);
+        write_concept(&concepts_dir, "borrow-checker", "Borrow checker", &[]);
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert_eq!(items.len(), 1, "near-duplicate names should be flagged");
+        let comment = &items[0].comment;
+        assert!(comment.contains("Borrow Check") || comment.contains("Borrow checker"));
+    }
+
+    #[test]
+    fn distinct_concepts_not_flagged() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept(&concepts_dir, "borrow-checker", "Borrow checker", &[]);
+        write_concept(&concepts_dir, "lifetime", "Lifetime", &[]);
+        write_concept(&concepts_dir, "ownership", "Ownership", &[]);
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert!(
+            items.is_empty(),
+            "distinct concepts should produce no review items, got: {items:?}"
+        );
+    }
+
+    #[test]
+    fn alias_overlap_flagged() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        // Concept A's name matches concept B's alias
+        write_concept(&concepts_dir, "borrowck", "borrowck", &[]);
+        write_concept(
+            &concepts_dir,
+            "borrow-checker",
+            "Borrow checker",
+            &["borrowck"],
+        );
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert_eq!(items.len(), 1, "alias overlap should be flagged");
+        assert!(items[0].comment.contains("similarity: 1.00"));
+    }
+
+    #[test]
+    fn threshold_controls_sensitivity() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept(&concepts_dir, "concept-a", "Rust language", &[]);
+        write_concept(&concepts_dir, "concept-b", "Rust lang", &[]);
+
+        // At high threshold, should not flag
+        let strict = DuplicateConceptsConfig {
+            similarity_threshold: 0.99,
+        };
+        let strict_items =
+            check_duplicate_concepts(dir.path(), &strict).expect("strict check");
+
+        // At low threshold, should flag
+        let lenient = DuplicateConceptsConfig {
+            similarity_threshold: 0.5,
+        };
+        let lenient_items =
+            check_duplicate_concepts(dir.path(), &lenient).expect("lenient check");
+
+        assert!(
+            lenient_items.len() >= strict_items.len(),
+            "lower threshold should produce at least as many items as higher threshold"
+        );
+        assert!(
+            !lenient_items.is_empty(),
+            "similar names should be flagged at low threshold"
+        );
+    }
+
+    #[test]
+    fn review_item_has_correct_structure() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept(&concepts_dir, "borrow-check", "Borrow Check", &[]);
+        write_concept(&concepts_dir, "borrow-checker", "Borrow checker", &[]);
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert_eq!(items.len(), 1);
+
+        let item = &items[0];
+        assert!(item.metadata.id.starts_with("lint:duplicate-concepts:"));
+        assert_eq!(item.action, ReviewAction::Merge);
+        assert!(!item.target_entity_id.is_empty());
+        assert!(item.comment.contains("similarity:"));
+        assert!(item.comment.contains("matched:"));
+        assert!(item.metadata.tool_version.is_some());
+        assert_eq!(item.metadata.status, Status::NeedsReview);
+    }
+
+    #[test]
+    fn index_page_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        // Write an index page that should be ignored
+        fs::write(
+            concepts_dir.join("index.md"),
+            "---\ntitle: Concepts Index\n---\n\n# Index\n",
+        )
+        .unwrap();
+        write_concept(&concepts_dir, "ownership", "Ownership", &[]);
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert!(items.is_empty(), "single concept should produce no items");
+    }
+
+    #[test]
+    fn bigram_similarity_exact_match_is_one() {
+        assert!((bigram_similarity("borrow checker", "borrow checker") - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn bigram_similarity_unrelated_strings_is_low() {
+        let score = bigram_similarity("borrow checker", "lifetime");
+        assert!(score < 0.3, "unrelated strings: {score}");
+    }
+
+    #[test]
+    fn bigram_similarity_near_duplicate_is_high() {
+        let score = bigram_similarity("borrow checker", "borrow check");
+        assert!(score > 0.85, "near-duplicate strings: {score}");
+    }
+
+    #[test]
+    fn bigram_similarity_short_strings() {
+        // Exact match shortcut fires before length check
+        assert!((bigram_similarity("a", "a") - 1.0).abs() < 1e-10);
+        // One side too short → no bigrams possible → 0
+        assert!(bigram_similarity("ab", "a") < f64::EPSILON);
+        assert!(bigram_similarity("a", "ab") < f64::EPSILON);
     }
 }
