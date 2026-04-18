@@ -33,6 +33,8 @@ pub struct IngestedSource {
     pub metadata_sidecar_path: PathBuf,
 }
 
+/// # Errors
+/// Returns an error if any source path cannot be read, walked, or ingested.
 pub fn ingest_paths(root: &Path, sources: &[PathBuf]) -> Result<Vec<IngestedSource>> {
     let mut files = Vec::new();
     for source in sources {
@@ -112,7 +114,7 @@ fn ingest_file(root: &Path, source_path: &Path) -> Result<IngestedSource> {
         read_json::<SourceDocument>(&document_record_path)?
     } else {
         let metadata = EntityMetadata {
-            id: source_document_id.clone(),
+            id: source_document_id,
             created_at_millis: imported_at_millis,
             updated_at_millis: imported_at_millis,
             source_hashes: vec![content_hash.clone()],
@@ -120,7 +122,7 @@ fn ingest_file(root: &Path, source_path: &Path) -> Result<IngestedSource> {
             tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             prompt_template_hash: None,
             dependencies: Vec::new(),
-            output_paths: vec![relative_document_record_path.clone()],
+            output_paths: vec![relative_document_record_path],
             status: Status::Fresh,
         };
 
@@ -137,51 +139,14 @@ fn ingest_file(root: &Path, source_path: &Path) -> Result<IngestedSource> {
     let revision = if revision_record_path.exists() {
         read_json::<SourceRevision>(&revision_record_path)?
     } else {
-        fs::create_dir_all(
-            copied_path
-                .parent()
-                .context("copied path should have a parent directory")?,
-        )
-        .with_context(|| format!("failed to create directory for {}", copied_path.display()))?;
-        fs::write(&copied_path, &content)
-            .with_context(|| format!("failed to copy {} to {}", canonical_source.display(), copied_path.display()))?;
-
-        let sidecar = LocalFileMetadata {
-            original_path: canonical_source.to_string_lossy().into_owned(),
-            size_bytes: fs_metadata.len(),
-            modified_at_millis,
-            content_hash: content_hash.clone(),
-            imported_at_millis,
-        };
-        write_json(&metadata_sidecar_path, &sidecar)?;
-
-        let metadata = EntityMetadata {
-            id: source_revision_id.clone(),
-            created_at_millis: imported_at_millis,
-            updated_at_millis: imported_at_millis,
-            source_hashes: vec![content_hash.clone()],
-            model_version: None,
-            tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            prompt_template_hash: None,
-            dependencies: vec![document.metadata.id.clone()],
-            output_paths: vec![
-                relative_copied_path.clone(),
-                relative_metadata_sidecar_path.clone(),
-                relative_revision_record_path.clone(),
-            ],
-            status: Status::Fresh,
-        };
-
-        let revision = SourceRevision {
-            metadata,
-            source_document_id: document.metadata.id.clone(),
-            fetched_revision_hash: content_hash,
-            fetched_path: relative_copied_path.clone(),
-            fetched_size_bytes: fs_metadata.len(),
-            fetched_at_millis: imported_at_millis,
-        };
-        write_json(&revision_record_path, &revision)?;
-        revision
+        write_new_revision(
+            &canonical_source, &copied_path, &content, &fs_metadata,
+            &metadata_sidecar_path, &revision_record_path,
+            source_revision_id, &content_hash, imported_at_millis,
+            modified_at_millis, &document,
+            &relative_copied_path, &relative_metadata_sidecar_path,
+            &relative_revision_record_path,
+        )?
     };
 
     Ok(IngestedSource {
@@ -190,6 +155,68 @@ fn ingest_file(root: &Path, source_path: &Path) -> Result<IngestedSource> {
         copied_path: relative_copied_path,
         metadata_sidecar_path: relative_metadata_sidecar_path,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_new_revision(
+    canonical_source: &Path,
+    copied_path: &Path,
+    content: &[u8],
+    fs_metadata: &fs::Metadata,
+    metadata_sidecar_path: &Path,
+    revision_record_path: &Path,
+    source_revision_id: String,
+    content_hash: &str,
+    imported_at_millis: u64,
+    modified_at_millis: Option<u64>,
+    document: &SourceDocument,
+    relative_copied_path: &Path,
+    relative_metadata_sidecar_path: &Path,
+    relative_revision_record_path: &Path,
+) -> Result<SourceRevision> {
+    fs::create_dir_all(
+        copied_path.parent().context("copied path should have a parent directory")?,
+    )
+    .with_context(|| format!("failed to create directory for {}", copied_path.display()))?;
+    fs::write(copied_path, content)
+        .with_context(|| format!("failed to copy {} to {}", canonical_source.display(), copied_path.display()))?;
+
+    let sidecar = LocalFileMetadata {
+        original_path: canonical_source.to_string_lossy().into_owned(),
+        size_bytes: fs_metadata.len(),
+        modified_at_millis,
+        content_hash: content_hash.to_owned(),
+        imported_at_millis,
+    };
+    write_json(metadata_sidecar_path, &sidecar)?;
+
+    let metadata = EntityMetadata {
+        id: source_revision_id,
+        created_at_millis: imported_at_millis,
+        updated_at_millis: imported_at_millis,
+        source_hashes: vec![content_hash.to_owned()],
+        model_version: None,
+        tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        prompt_template_hash: None,
+        dependencies: vec![document.metadata.id.clone()],
+        output_paths: vec![
+            relative_copied_path.to_path_buf(),
+            relative_metadata_sidecar_path.to_path_buf(),
+            relative_revision_record_path.to_path_buf(),
+        ],
+        status: Status::Fresh,
+    };
+
+    let revision = SourceRevision {
+        metadata,
+        source_document_id: document.metadata.id.clone(),
+        fetched_revision_hash: content_hash.to_owned(),
+        fetched_path: relative_copied_path.to_path_buf(),
+        fetched_size_bytes: fs_metadata.len(),
+        fetched_at_millis: imported_at_millis,
+    };
+    write_json(revision_record_path, &revision)?;
+    Ok(revision)
 }
 
 fn read_json<T>(path: &Path) -> Result<T>
@@ -217,12 +244,12 @@ where
 }
 
 fn now_millis() -> Result<u64> {
-    Ok(SystemTime::now()
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before Unix epoch")?
         .as_millis()
         .try_into()
-        .context("timestamp overflow converting to u64")?)
+        .context("timestamp overflow converting to u64")
 }
 
 fn system_time_to_millis(value: SystemTime) -> Option<u64> {
