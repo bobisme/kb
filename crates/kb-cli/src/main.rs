@@ -138,10 +138,18 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     match cli.command {
-        Some(Command::Compile) => execute_mutating_command(root.as_deref(), "compile", || {
-            println!("compile is not implemented yet");
-            Ok(())
-        }),
+        Some(Command::Compile) => {
+            let compile_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            execute_mutating_command(Some(compile_root), "compile", move || {
+                let index = kb_query::build_lexical_index(compile_root)?;
+                let entry_count = index.entries.len();
+                index.save(compile_root)?;
+                println!("compile: built lexical index ({entry_count} entries)");
+                Ok(())
+            })
+        }
         Some(Command::Doctor) => {
             let root = root
                 .as_deref()
@@ -226,7 +234,20 @@ fn run(cli: Cli) -> Result<()> {
         }
         Some(Command::Init { path }) => init::init(root, path, cli.force),
         Some(Command::Search { query }) => {
-            println!("search is not implemented yet: {query}");
+            let search_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let index = kb_query::LexicalIndex::load(search_root)?;
+            let results = index.search(&query, 10);
+            if results.is_empty() {
+                println!("No results for '{query}'");
+                println!("Tip: run 'kb compile' to build the search index.");
+            } else {
+                for result in &results {
+                    println!("{} [score: {}]", result.title, result.score);
+                    println!("  {}", result.id);
+                }
+            }
             Ok(())
         }
         Some(Command::Inspect { target }) => {

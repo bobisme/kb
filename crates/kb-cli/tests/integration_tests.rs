@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::Path;
 use std::thread;
 
 fn init_kb(root: &std::path::Path) {
@@ -294,5 +295,117 @@ fn ingest_mixed_file_directory_and_url_reports_summary() {
             .filter(|item| item["source_kind"] == "url")
             .count(),
         1
+    );
+}
+
+fn write_source_page(root: &Path, slug: &str, title: &str, summary: &str) {
+    let dir = root.join("wiki/sources");
+    fs::create_dir_all(&dir).expect("create wiki/sources");
+    let content = format!(
+        "---\nid: wiki-source-{slug}\ntype: source\ntitle: {title}\n---\n\
+         \n# Source\n<!-- kb:begin id=title -->\n{title}\n<!-- kb:end id=title -->\n\
+         \n## Summary\n<!-- kb:begin id=summary -->\n{summary}\n<!-- kb:end id=summary -->\n"
+    );
+    fs::write(dir.join(format!("{slug}.md")), content).expect("write source page");
+}
+
+fn write_concept_page(root: &Path, slug: &str, name: &str, aliases: &[&str]) {
+    use std::fmt::Write as _;
+    let dir = root.join("wiki/concepts");
+    fs::create_dir_all(&dir).expect("create wiki/concepts");
+    let mut content = format!("---\nid: concept:{slug}\nname: {name}\n");
+    if !aliases.is_empty() {
+        content.push_str("aliases:\n");
+        for alias in aliases {
+            writeln!(content, "  - {alias}").expect("write alias");
+        }
+    }
+    writeln!(content, "---\n\n# {name}\n\nThis concept page covers {name}.").expect("write body");
+    fs::write(dir.join(format!("{slug}.md")), content).expect("write concept page");
+}
+
+#[test]
+fn compile_builds_lexical_index() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_source_page(&kb_root, "rust-book", "The Rust Programming Language", "Memory safety.");
+    write_concept_page(&kb_root, "borrow-checker", "Borrow checker", &["borrowck"]);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("compile");
+    let output = cmd.output().expect("run kb compile");
+    assert!(
+        output.status.success(),
+        "kb compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let index_path = kb_root.join("state/indexes/lexical.json");
+    assert!(index_path.exists(), "lexical index should exist after compile");
+
+    let raw = fs::read_to_string(&index_path).expect("read index");
+    let json: Value = serde_json::from_str(&raw).expect("parse index");
+    let entries = json["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2, "should index 2 pages");
+}
+
+#[test]
+fn search_returns_ranked_results_after_compile() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_source_page(
+        &kb_root,
+        "rust-overview",
+        "Rust Overview",
+        "An introduction to the Rust programming language.",
+    );
+    write_source_page(
+        &kb_root,
+        "python-intro",
+        "Python Introduction",
+        "Getting started with Python.",
+    );
+    write_concept_page(&kb_root, "ownership", "Rust Ownership", &["borrow"]);
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    compile_cmd.output().expect("run kb compile");
+
+    let mut search_cmd = kb_cmd(&kb_root);
+    search_cmd.arg("search").arg("rust");
+    let output = search_cmd.output().expect("run kb search");
+    assert!(
+        output.status.success(),
+        "kb search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Rust"),
+        "search results should contain 'Rust' pages: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Python"),
+        "Python page should not appear in 'rust' search: {stdout}"
+    );
+}
+
+#[test]
+fn search_with_no_index_reports_helpful_tip() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("search").arg("anything");
+    let output = cmd.output().expect("run kb search with no index");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("compile"),
+        "should suggest running compile: {stdout}"
     );
 }
