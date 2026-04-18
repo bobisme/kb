@@ -1,6 +1,7 @@
 mod common;
 
 use common::{kb_cmd, make_temp_kb};
+use kb_compile::Graph;
 use regex::Regex;
 use serde_json::Value;
 use std::fs;
@@ -210,6 +211,33 @@ fn ingest_dry_run_makes_no_filesystem_changes() {
         .map(|entry| entry.expect("dir entry").file_name())
         .collect();
     assert_eq!(before, after);
+}
+
+#[test]
+fn inspect_reads_dependency_graph() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut graph = Graph::default();
+    graph.record(["raw/inbox/example.md"], ["normalized/example.json"]);
+    graph.record(["normalized/example.json"], ["wiki/sources/example.md"]);
+    graph.record(["wiki/sources/example.md"], ["wiki/index.md"]);
+    graph.persist_to(&kb_root).expect("persist graph");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("wiki/index.md");
+    let output = cmd.output().expect("run kb inspect");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("node: wiki/index.md"));
+    assert!(stdout.contains("- wiki/sources/example.md"));
+    assert!(stdout.contains("- raw/inbox/example.md"));
 }
 
 #[test]

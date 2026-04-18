@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use config::{Config, LlmRunnerConfig};
+use kb_compile::Graph;
 use kb_core::JobRunStatus;
 use kb_llm::{
     ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
@@ -229,7 +230,12 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Some(Command::Inspect { target }) => {
-            println!("inspect is not implemented yet: {target}");
+            let root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let graph = Graph::load_from(root)?;
+            let inspection = graph.inspect(&target)?;
+            println!("{}", inspection.render());
             Ok(())
         }
         Some(Command::Review { operation }) => {
