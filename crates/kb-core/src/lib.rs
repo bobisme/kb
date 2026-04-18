@@ -361,5 +361,7 @@ mod tests {
 pub mod frontmatter;
 pub mod fs;
 pub mod hashing;
+pub mod managed_region;
 
 pub use hashing::{Hash, hash_bytes, hash_file, hash_many};
+pub use managed_region::{ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title};
