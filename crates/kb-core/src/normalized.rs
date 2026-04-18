@@ -41,12 +41,16 @@ impl NormalizedDocumentMetadata {
     }
 }
 
-/// Writes a NormalizedDocument to the standard storage layout.
+/// Writes a `NormalizedDocument` to the standard storage layout.
 ///
 /// Layout under `root`:
 /// - `normalized/<doc-id>/source.md`
 /// - `normalized/<doc-id>/metadata.json`
 /// - `normalized/<doc-id>/assets/` (directory created if needed)
+///
+/// # Errors
+/// Returns an error if directories cannot be created, assets are missing or
+/// duplicated, or file writes fail.
 pub fn write_normalized_document(
     root: impl AsRef<Path>,
     doc: &NormalizedDocument,
@@ -77,7 +81,10 @@ pub fn write_normalized_document(
     Ok(())
 }
 
-/// Reads a NormalizedDocument from the standard storage layout.
+/// Reads a `NormalizedDocument` from the standard storage layout.
+///
+/// # Errors
+/// Returns an error if the metadata or source files cannot be read or parsed.
 pub fn read_normalized_document(root: impl AsRef<Path>, id: &str) -> io::Result<NormalizedDocument> {
     let base_dir = root.as_ref().join("normalized").join(id);
     let metadata_path = base_dir.join(METADATA_FILE_NAME);
@@ -99,20 +106,17 @@ fn copy_and_validate_assets(doc: &NormalizedDocument, assets_dir: &Path) -> io::
     let mut written: HashSet<&std::ffi::OsStr> = HashSet::new();
 
     for asset_path in &doc.normalized_assets {
-        let file_name = match asset_path.file_name() {
-            Some(name) => name,
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "normalized asset path must include a filename",
-                ));
-            }
+        let Some(file_name) = asset_path.file_name() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "normalized asset path must include a filename",
+            ));
         };
 
         if !written.insert(file_name) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("duplicate asset filename: {}", file_name.display()),
+                format!("duplicate asset filename: {}", file_name.to_string_lossy()),
             ));
         }
 
@@ -169,8 +173,7 @@ fn extract_referenced_assets(source_text: &str) -> Vec<String> {
 
     for capture in re.captures_iter(source_text) {
         let raw_path = match (capture.get(1), capture.get(2)) {
-            (Some(path), _) => path.as_str(),
-            (_, Some(path)) => path.as_str(),
+            (Some(path), _) | (_, Some(path)) => path.as_str(),
             _ => continue,
         };
 
@@ -189,7 +192,7 @@ fn normalize_asset_reference(raw_path: &str) -> Option<String> {
         || normalized.starts_with("http://")
         || normalized.starts_with("https://")
         || normalized.starts_with("mailto:")
-        || normalized.starts_with("#")
+        || normalized.starts_with('#')
     {
         return None;
     }
@@ -231,7 +234,7 @@ mod tests {
             },
             source_revision_id: "rev-001".to_string(),
             canonical_text: "# Title\n![logo](assets/img.png)\n".to_string(),
-            normalized_assets: vec![asset_path.clone()],
+            normalized_assets: vec![asset_path],
             heading_ids: vec!["title".to_string()],
         };
 
