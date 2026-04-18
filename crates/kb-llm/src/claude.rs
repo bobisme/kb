@@ -9,7 +9,7 @@ use crate::adapter::{
     GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
     MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
     RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
-    parse_extract_concepts_json,
+    parse_extract_concepts_json, parse_merge_concept_candidates_json,
 };
 use crate::provenance::{ProvenanceRecord, TokenUsage};
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -233,11 +233,66 @@ impl LlmAdapter for ClaudeCliAdapter {
 
     fn merge_concept_candidates(
         &self,
-        _request: MergeConceptCandidatesRequest,
+        request: MergeConceptCandidatesRequest,
     ) -> Result<(MergeConceptCandidatesResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "Claude CLI adapter merge_concept_candidates is not implemented yet".to_string(),
-        ))
+        let template = Template::load(
+            "merge_concept_candidates.md",
+            self.config.project_root.as_deref(),
+        )
+        .map_err(|err| {
+            LlmAdapterError::Other(format!("load merge_concept_candidates template: {err}"))
+        })?;
+
+        let candidates_json = serde_json::to_string_pretty(&request.candidates)
+            .map_err(|err| LlmAdapterError::Other(format!("serialize candidates: {err}")))?;
+
+        let mut context = HashMap::new();
+        context.insert("candidates_json".to_string(), candidates_json);
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render merge_concept_candidates template: {err}"))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        let command = self.build_command(&rendered.content);
+        let output =
+            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+
+        if output.exit_code != Some(0) {
+            return Err(classify_nonzero_exit(
+                output.exit_code,
+                &output.stderr,
+                &output.stdout,
+            ));
+        }
+
+        // Claude wraps responses in JSON ({"result": "...", "usage": {...}}). Parse the
+        // envelope first, then parse the assistant text as the merge response payload.
+        let parsed = parse_claude_json(&output.stdout)?;
+        let response = parse_merge_concept_candidates_json(&parsed.text)?;
+        let ended_at = unix_time_ms()?;
+
+        let model = parsed
+            .model
+            .or_else(|| self.config.model.clone())
+            .unwrap_or_else(|| "claude".to_string());
+
+        let provenance = ProvenanceRecord {
+            harness: "claude".to_string(),
+            harness_version: None,
+            model,
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: parsed.tokens,
+            cost_estimate: parsed.cost_estimate,
+        };
+
+        Ok((response, provenance))
     }
 
     fn answer_question(
