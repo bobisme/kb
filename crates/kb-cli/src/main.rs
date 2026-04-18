@@ -257,15 +257,27 @@ fn run(cli: Cli) -> Result<()> {
                 .as_deref()
                 .expect("root resolved for non-init commands");
             let query = resolve_query(query)?;
-            run_ask(
-                ask_root,
-                &query,
-                cli.format.as_deref(),
-                cli.model.as_deref(),
-                cli.json,
-                cli.dry_run,
-                promote,
-            )
+            let format = cli.format.clone();
+            let model = cli.model.clone();
+            let dry_run = cli.dry_run;
+            let json = cli.json;
+            let action = move || {
+                run_ask(
+                    ask_root,
+                    &query,
+                    format.as_deref(),
+                    model.as_deref(),
+                    json,
+                    dry_run,
+                    promote,
+                )
+            };
+            if dry_run {
+                // Dry-run doesn't write anything; no lock needed.
+                action()
+            } else {
+                execute_mutating_command(Some(ask_root), "ask", action)
+            }
         }
         Some(Command::Ingest { sources }) => {
             let ingest_root = root.clone();
@@ -283,13 +295,12 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Lint { check }) => {
+            // Lint is read-only: it walks generated artifacts and surfaces findings.
+            // It must not take the root lock, so users can `kb lint` during a compile.
             let lint_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            let should_json = cli.json;
-            execute_mutating_command(Some(lint_root), "lint", move || {
-                run_lint(lint_root, should_json, check.as_deref())
-            })
+            run_lint(lint_root, cli.json, check.as_deref())
         }
         Some(Command::Publish { target }) => {
             let publish_root = root
@@ -435,25 +446,10 @@ impl DoctorSeverity {
 }
 
 fn run_doctor_command(root: &Path, json: bool, cli_model: Option<&str>) -> Result<()> {
-    let timeout_ms = Config::load_from_root(root, None).map_or_else(
-        |_| Config::default().lock.timeout_ms,
-        |cfg| cfg.lock.timeout_ms,
-    );
-    let _lock = jobs::KbLock::acquire(root, "doctor", Duration::from_millis(timeout_ms))?;
+    // Doctor is a read-only diagnostic — it must not take the root lock, so that users
+    // can run `kb doctor` while a long compile is in flight to investigate.
     jobs::check_stale_jobs(root)?;
-    let handle = jobs::start_job(root, "doctor")?;
-
-    let result = run_doctor(root, json, cli_model);
-    match &result {
-        Ok(()) => {
-            handle.finish(JobRunStatus::Succeeded, Vec::new())?;
-        }
-        Err(_) => {
-            handle.finish(JobRunStatus::Failed, Vec::new())?;
-        }
-    }
-
-    result
+    run_doctor(root, json, cli_model)
 }
 
 #[allow(clippy::too_many_lines)]
