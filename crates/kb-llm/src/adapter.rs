@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::ProvenanceRecord;
 
-/// Error type for LlmAdapter operations with classification by error class.
+/// Error type for `LlmAdapter` operations with classification by error class.
 #[derive(Debug, Error)]
 pub enum LlmAdapterError {
     /// Transport-level failures (connection refused, DNS resolution, etc.).
