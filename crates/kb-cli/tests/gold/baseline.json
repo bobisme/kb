@@ -1,0 +1,515 @@
+{
+  "date": "2026-04-18T02:48:20Z",
+  "git_ref": "090c116",
+  "mean_retrieval_coverage": 0.96875,
+  "mean_llm_citation_coverage": null,
+  "mean_hallucination_rate": null,
+  "questions": [
+    {
+      "id": "q001",
+      "query": "What are the crates in the kb workspace and what does each one do?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q002",
+      "query": "What is the difference between a global KB and a project KB in kb?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q003",
+      "query": "What directories does a KB root contain and what is each one for?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q004",
+      "query": "How does kb generate a stable source document ID for a local file?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Source Ingestion",
+        "Incremental Compilation"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q005",
+      "query": "How does kb normalize URLs when computing source document IDs?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Source Ingestion",
+        "Incremental Compilation"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q006",
+      "query": "What does kb ingest store in the raw/ directory?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Configuration",
+        "Source Ingestion"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q007",
+      "query": "What is the difference between a SourceDocument ID and a SourceRevision ID?",
+      "retrieval_coverage": 0.0,
+      "retrieved_expected": 0,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q008",
+      "query": "How does kb decide which files need recompilation after a source changes?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Source Ingestion",
+        "Incremental Compilation"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q009",
+      "query": "In what order does kb compile run its compilation passes?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Incremental Compilation",
+        "kb Architecture Overview",
+        "Configuration",
+        "Question and Retrieval"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q010",
+      "query": "What happens when a prompt template changes in kb compile?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Incremental Compilation",
+        "Configuration",
+        "LLM Backends"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q011",
+      "query": "How does kb build a retrieval plan when answering a question?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Question and Retrieval",
+        "kb Architecture Overview",
+        "Incremental Compilation",
+        "Testing Strategy"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q012",
+      "query": "What is the token budget in kb ask and how does it limit context?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Question and Retrieval",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Review and Promotion Workflow",
+        "Incremental Compilation",
+        "Configuration"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q013",
+      "query": "What is a citation manifest and how does kb use it to validate LLM citations?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "kb Architecture Overview",
+        "LLM Backends",
+        "Review and Promotion Workflow",
+        "Incremental Compilation"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q014",
+      "query": "What fields does a Question record contain in kb?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Question and Retrieval",
+        "kb Architecture Overview",
+        "Testing Strategy"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q015",
+      "query": "What provenance metadata does kb store in generated wiki pages?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q016",
+      "query": "What is a BuildRecord in kb and what information does it capture?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q017",
+      "query": "How does kb enforce citation requirements in generated pages?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Incremental Compilation",
+        "Question and Retrieval"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q018",
+      "query": "What configuration sections does kb.toml support?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Configuration"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q019",
+      "query": "How do you configure the token budget for kb ask in kb.toml?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Question and Retrieval",
+        "Incremental Compilation",
+        "Configuration"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q020",
+      "query": "What LLM backends does kb support and which is the default?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "LLM Backends",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q021",
+      "query": "Why does kb use the claude CLI instead of the Anthropic SDK directly?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "LLM Backends",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q022",
+      "query": "How does kb invoke the opencode backend and pass the prompt?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Incremental Compilation",
+        "LLM Backends",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q023",
+      "query": "What commands does the kb CLI provide and what does each one do?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow",
+        "LLM Backends"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q024",
+      "query": "What does kb lint check for?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Configuration",
+        "Provenance and Citations"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q025",
+      "query": "What is a ReviewItem in kb and when is one created?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Review and Promotion Workflow",
+        "Provenance and Citations",
+        "Question and Retrieval"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q026",
+      "query": "How does the kb review approve workflow work step by step?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Review and Promotion Workflow",
+        "kb Architecture Overview",
+        "Incremental Compilation"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q027",
+      "query": "Why does kb require review gates before promoting artifacts to wiki pages?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Review and Promotion Workflow",
+        "kb Architecture Overview"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q028",
+      "query": "What types of tests does the kb project use and what does each cover?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Testing Strategy",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q029",
+      "query": "What does the gold question set benchmark measure in kb?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Question and Retrieval",
+        "Testing Strategy"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q030",
+      "query": "How do snapshot tests work in the kb CLI test suite?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 1,
+      "total_expected": 1,
+      "retrieved_titles": [
+        "CLI Commands",
+        "Testing Strategy",
+        "kb Architecture Overview",
+        "Incremental Compilation",
+        "LLM Backends"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q031",
+      "query": "How does kb ensure that generated content can be reproduced and audited?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 2,
+      "total_expected": 2,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "Provenance and Citations",
+        "Question and Retrieval",
+        "Review and Promotion Workflow",
+        "Incremental Compilation"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    },
+    {
+      "id": "q032",
+      "query": "How does the default LLM backend selection interact with the configuration in kb.toml?",
+      "retrieval_coverage": 1.0,
+      "retrieved_expected": 2,
+      "total_expected": 2,
+      "retrieved_titles": [
+        "CLI Commands",
+        "kb Architecture Overview",
+        "LLM Backends",
+        "Configuration",
+        "Incremental Compilation"
+      ],
+      "valid_citations": 0,
+      "invalid_citations": 0
+    }
+  ]
+}

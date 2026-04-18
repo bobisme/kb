@@ -1,0 +1,229 @@
+# Gold question set for kb citation coverage benchmarking.
+#
+# Each question has:
+#   id              — stable identifier for tracking regression over time
+#   query           — the exact string passed to `kb ask`
+#   expected_sources — titles of wiki pages that SHOULD appear in the retrieval plan
+#   notes           — explanation of what this question is testing
+#
+# Scoring:
+#   retrieval_coverage = |expected_sources ∩ retrieved_titles| / |expected_sources|
+#   A score of 1.0 means every expected source was retrieved.
+#   A score of 0.0 means none were.
+#
+# The harness matches expected_sources by checking whether any candidate title
+# contains the expected string (case-insensitive substring match).
+
+# ── Architecture ─────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q001"
+query = "What are the crates in the kb workspace and what does each one do?"
+expected_sources = ["kb Architecture Overview"]
+notes = "Core crate structure — single-source, title match"
+
+[[questions]]
+id = "q002"
+query = "What is the difference between a global KB and a project KB in kb?"
+expected_sources = ["kb Architecture Overview"]
+notes = "KB root types — tests retrieval of architecture doc"
+
+[[questions]]
+id = "q003"
+query = "What directories does a KB root contain and what is each one for?"
+expected_sources = ["kb Architecture Overview"]
+notes = "Filesystem layout — architecture doc covers this specifically"
+
+# ── Ingest ───────────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q004"
+query = "How does kb generate a stable source document ID for a local file?"
+expected_sources = ["Source Ingestion"]
+notes = "Source identity — ingest doc covers stable location and hashing"
+
+[[questions]]
+id = "q005"
+query = "How does kb normalize URLs when computing source document IDs?"
+expected_sources = ["Source Ingestion"]
+notes = "URL normalization for stable IDs — ingest doc"
+
+[[questions]]
+id = "q006"
+query = "What does kb ingest store in the raw/ directory?"
+expected_sources = ["Source Ingestion"]
+notes = "Raw storage layout — ingest doc"
+
+[[questions]]
+id = "q007"
+query = "What is the difference between a SourceDocument ID and a SourceRevision ID?"
+expected_sources = ["Source Ingestion"]
+notes = "src- vs rev- IDs — ingest doc explains both"
+
+# ── Compile ──────────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q008"
+query = "How does kb decide which files need recompilation after a source changes?"
+expected_sources = ["Incremental Compilation"]
+notes = "Stale detection via dependency graph — compile doc"
+
+[[questions]]
+id = "q009"
+query = "In what order does kb compile run its compilation passes?"
+expected_sources = ["Incremental Compilation"]
+notes = "Pass order — compile doc lists all seven passes"
+
+[[questions]]
+id = "q010"
+query = "What happens when a prompt template changes in kb compile?"
+expected_sources = ["Incremental Compilation"]
+notes = "Prompt invalidation — compile doc covers this specifically"
+
+# ── Query / Ask ──────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q011"
+query = "How does kb build a retrieval plan when answering a question?"
+expected_sources = ["Question and Retrieval"]
+notes = "Retrieval plan construction — query doc"
+
+[[questions]]
+id = "q012"
+query = "What is the token budget in kb ask and how does it limit context?"
+expected_sources = ["Question and Retrieval"]
+notes = "Token budget mechanics — query doc"
+
+[[questions]]
+id = "q013"
+query = "What is a citation manifest and how does kb use it to validate LLM citations?"
+expected_sources = ["Question and Retrieval"]
+notes = "Citation manifest and validation — query doc"
+
+[[questions]]
+id = "q014"
+query = "What fields does a Question record contain in kb?"
+expected_sources = ["Question and Retrieval"]
+notes = "Question record schema — query doc"
+
+# ── Provenance ───────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q015"
+query = "What provenance metadata does kb store in generated wiki pages?"
+expected_sources = ["Provenance and Citations"]
+notes = "Provenance frontmatter requirements — provenance doc"
+
+[[questions]]
+id = "q016"
+query = "What is a BuildRecord in kb and what information does it capture?"
+expected_sources = ["Provenance and Citations"]
+notes = "BuildRecord schema — provenance doc"
+
+[[questions]]
+id = "q017"
+query = "How does kb enforce citation requirements in generated pages?"
+expected_sources = ["Provenance and Citations"]
+notes = "Lint enforcement of citations — provenance doc covers lint.missing_citations_level"
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q018"
+query = "What configuration sections does kb.toml support?"
+expected_sources = ["Configuration"]
+notes = "Config sections overview — config doc"
+
+[[questions]]
+id = "q019"
+query = "How do you configure the token budget for kb ask in kb.toml?"
+expected_sources = ["Configuration"]
+notes = "ask.token_budget config — config doc"
+
+# ── LLM Backends ─────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q020"
+query = "What LLM backends does kb support and which is the default?"
+expected_sources = ["LLM Backends"]
+notes = "Backend overview — llm-backends doc"
+
+[[questions]]
+id = "q021"
+query = "Why does kb use the claude CLI instead of the Anthropic SDK directly?"
+expected_sources = ["LLM Backends"]
+notes = "Claude routing rule rationale — llm-backends doc"
+
+[[questions]]
+id = "q022"
+query = "How does kb invoke the opencode backend and pass the prompt?"
+expected_sources = ["LLM Backends"]
+notes = "opencode invocation contract — llm-backends doc"
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q023"
+query = "What commands does the kb CLI provide and what does each one do?"
+expected_sources = ["CLI Commands"]
+notes = "CLI surface overview — cli doc"
+
+[[questions]]
+id = "q024"
+query = "What does kb lint check for?"
+expected_sources = ["CLI Commands"]
+notes = "lint command description — cli doc"
+
+# ── Review Workflow ───────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q025"
+query = "What is a ReviewItem in kb and when is one created?"
+expected_sources = ["Review and Promotion Workflow"]
+notes = "ReviewItem schema and creation — review doc"
+
+[[questions]]
+id = "q026"
+query = "How does the kb review approve workflow work step by step?"
+expected_sources = ["Review and Promotion Workflow"]
+notes = "Promotion approval steps — review doc"
+
+[[questions]]
+id = "q027"
+query = "Why does kb require review gates before promoting artifacts to wiki pages?"
+expected_sources = ["Review and Promotion Workflow"]
+notes = "Review rationale — review doc covers trust model"
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q028"
+query = "What types of tests does the kb project use and what does each cover?"
+expected_sources = ["Testing Strategy"]
+notes = "Test type overview — testing doc"
+
+[[questions]]
+id = "q029"
+query = "What does the gold question set benchmark measure in kb?"
+expected_sources = ["Testing Strategy"]
+notes = "Gold harness metrics — testing doc defines retrieval and citation metrics"
+
+[[questions]]
+id = "q030"
+query = "How do snapshot tests work in the kb CLI test suite?"
+expected_sources = ["Testing Strategy"]
+notes = "Snapshot testing with insta — testing doc"
+
+# ── Cross-topic ───────────────────────────────────────────────────────────────
+
+[[questions]]
+id = "q031"
+query = "How does kb ensure that generated content can be reproduced and audited?"
+expected_sources = ["Provenance and Citations", "Incremental Compilation"]
+notes = "Multi-source: provenance + compile docs both cover reproducibility"
+
+[[questions]]
+id = "q032"
+query = "How does the default LLM backend selection interact with the configuration in kb.toml?"
+expected_sources = ["LLM Backends", "Configuration"]
+notes = "Multi-source: backend routing + config docs"
