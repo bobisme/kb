@@ -4,7 +4,6 @@ pub mod backlinks;
 pub mod concept_extraction;
 pub mod concept_merge;
 pub mod index_page;
-pub mod orchestrator;
 pub mod pipeline;
 pub mod promotion;
 pub mod source_page;
