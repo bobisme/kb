@@ -206,13 +206,12 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Lint { rule }) => {
-            execute_mutating_command(root.as_deref(), "lint", move || {
-                if let Some(rule) = rule {
-                    println!("lint is not implemented yet (rule: {rule})");
-                } else {
-                    println!("lint is not implemented yet");
-                }
-                Ok(())
+            let lint_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let should_json = cli.json;
+            execute_mutating_command(Some(lint_root), "lint", move || {
+                run_lint(lint_root, should_json, rule.as_deref())
             })
         }
         Some(Command::Publish { dest }) => {
@@ -829,6 +828,37 @@ fn render_ask_artifact(artifact: &Artifact, question: &Question, question_rel: &
     Ok(format!("---\n{yaml}---\n\n{body}"))
 }
 
+fn run_lint(root: &Path, json: bool, rule: Option<&str>) -> Result<()> {
+    let rule = kb_lint::LintRule::parse(rule)?;
+    let report = kb_lint::run_lint(root, rule)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.is_clean() {
+        println!("[ok] {}: no issues found", report.rule);
+    } else {
+        println!("[fail] {}: {} issue(s)", report.rule, report.issue_count);
+        for issue in &report.issues {
+            println!(
+                "- {}:{} {} ({})",
+                issue.referring_page, issue.line, issue.message, issue.target
+            );
+            if let Some(suggested_fix) = &issue.suggested_fix {
+                println!("  suggested fix: {suggested_fix}");
+            }
+        }
+    }
+
+    if report.is_clean() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "lint failed: {} issue(s) in {}",
+            report.issue_count,
+            report.rule
+        ))
+    }
+}
 fn execute_mutating_command(
     root: Option<&Path>,
     command: &str,

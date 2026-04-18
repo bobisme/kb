@@ -453,3 +453,66 @@ fn search_with_no_index_reports_helpful_tip() {
         "should suggest running compile: {stdout}"
     );
 }
+
+#[test]
+fn lint_reports_broken_links_with_line_numbers_and_suggestions() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_concept_page(&kb_root, "rust", "Rust", &[]);
+    fs::write(
+        kb_root.join("wiki/sources/page.md"),
+        "# Page\nSee [[wiki/concepts/rsut]].\nSee [[wiki/concepts/rust#summry]].\n",
+    )
+    .expect("write page with broken links");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint");
+    let output = cmd.output().expect("run kb lint");
+
+    assert!(
+        !output.status.success(),
+        "kb lint should fail when broken links exist"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("wiki/sources/page.md:2"), "stdout: {stdout}");
+    assert!(stdout.contains("wiki/sources/page.md:3"), "stdout: {stdout}");
+    assert!(stdout.contains("suggested fix: wiki/concepts/rust"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("suggested fix: wiki/concepts/rust#rust")
+            || stdout.contains("suggested fix: wiki/concepts/rust#summary"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn lint_json_reports_clean_relative_links() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_concept_page(&kb_root, "borrow-checker", "Borrow checker", &[]);
+    fs::write(
+        kb_root.join("wiki/sources/page.md"),
+        "# Page\nSee [borrow checker](../concepts/borrow-checker.md).\n",
+    )
+    .expect("write page with relative link");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("lint").arg("--rule").arg("broken-links");
+    let output = cmd.output().expect("run kb lint json");
+
+    assert!(
+        output.status.success(),
+        "kb lint should pass for valid relative links: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(payload["rule"], "broken-links");
+    assert_eq!(payload["issue_count"], 0);
+    assert_eq!(
+        payload["issues"].as_array().expect("issues array").len(),
+        0
+    );
+}

@@ -11,7 +11,11 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 kb-core.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
