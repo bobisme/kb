@@ -14,7 +14,7 @@ use anyhow::{Result, anyhow, bail};
 use clap::Parser;
 use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
-use kb_core::{Artifact, ArtifactKind, EntityMetadata, JobRunStatus, Question, QuestionContext, Status};
+use kb_core::{Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext, Status};
 use kb_llm::{
     ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
     RunHealthCheckRequest,
@@ -253,30 +253,13 @@ fn run(cli: Cli) -> Result<()> {
             let root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            let jobs = jobs::recent_jobs(root, 20)?;
+            let status = gather_status(root)?;
             if cli.json {
-                let payload = serde_json::to_string_pretty(&jobs)?;
+                let payload = serde_json::to_string_pretty(&status)?;
                 println!("{payload}");
                 return Ok(());
             }
-
-            if jobs.is_empty() {
-                println!("No job runs yet in {}", root.display());
-            } else {
-                println!("Recent job runs ({})", jobs.len());
-                for job in jobs {
-                    let ended = job
-                        .ended_at_millis
-                        .map_or_else(|| "running".to_string(), |ended| format!("{ended}"));
-                    println!(
-                        "{} | {:<11} | {} | started={} | ended={ended}",
-                        job.metadata.id,
-                        format!("{:?}", job.status),
-                        job.command,
-                        job.started_at_millis
-                    );
-                }
-            }
+            print_status(&status);
             Ok(())
         }
         Some(Command::Init { path }) => init::init(root, path, cli.force),
@@ -936,7 +919,6 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>) -> Result<()> {
         Ok(())
     }
 }
-
 fn lint_rules_for_root(require_citations: bool) -> Vec<kb_lint::LintRule> {
     let mut rules = vec![
         kb_lint::LintRule::BrokenLinks,
@@ -1014,6 +996,188 @@ struct LintCheckReport {
     warning_count: usize,
     error_count: usize,
     issues: Vec<kb_lint::LintIssue>,
+}
+#[derive(Debug, Serialize)]
+struct StatusPayload {
+    sources: SourceCounts,
+    wiki_pages: usize,
+    concepts: usize,
+    stale_count: usize,
+    recent_jobs: Vec<JobRun>,
+    failed_jobs: Vec<JobRun>,
+    changed_inputs_not_compiled: Vec<PathBuf>,
+}
+
+#[derive(Debug, Serialize)]
+struct SourceCounts {
+    total: usize,
+    by_kind: std::collections::BTreeMap<String, usize>,
+}
+
+fn gather_status(root: &Path) -> Result<StatusPayload> {
+    let graph = Graph::load_from(root)?;
+    let manifest = kb_core::Manifest::load(root)?;
+    let hashes = kb_core::Hashes::load(root)?;
+    let all_jobs = jobs::recent_jobs(root, 1000)?;
+
+    let mut source_counts = SourceCounts {
+        total: 0,
+        by_kind: std::collections::BTreeMap::new(),
+    };
+    let mut wiki_pages = 0;
+    let mut concepts = 0;
+    let mut stale_count = 0;
+
+    for node_id in graph.nodes.keys() {
+        if node_id.starts_with("source-document-") {
+            let kind = extract_source_kind(node_id).unwrap_or("other");
+            *source_counts.by_kind.entry(kind.to_string()).or_insert(0) += 1;
+            source_counts.total += 1;
+        } else if node_id.starts_with("wiki-page-") {
+            wiki_pages += 1;
+        } else if node_id.starts_with("concept-") {
+            concepts += 1;
+        }
+    }
+
+    for artifact_record in manifest.artifacts.values() {
+        for output_id in &artifact_record.output_ids {
+            if let Ok(inspection) = graph.inspect(output_id) {
+                if let Some(entity) = graph.node(&inspection.id) {
+                    if entity.outputs.is_empty() && !entity.inputs.is_empty() {
+                        if let Some(node) = graph.nodes.get(&inspection.id) {
+                            if node.inputs.iter().any(|input| {
+                                graph.nodes.get(input).is_some_and(|n| {
+                                    n.inputs.is_empty()
+                                })
+                            }) {
+                                continue;
+                            }
+                        }
+                        stale_count += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let recent_jobs: Vec<_> = all_jobs
+        .iter()
+        .filter(|j| j.status != JobRunStatus::Failed)
+        .take(20)
+        .cloned()
+        .collect();
+
+    let failed_jobs: Vec<_> = all_jobs
+        .iter()
+        .filter(|j| j.status == JobRunStatus::Failed)
+        .take(20)
+        .cloned()
+        .collect();
+
+    let changed_inputs_not_compiled = find_changed_inputs(root, &hashes)?;
+
+    Ok(StatusPayload {
+        sources: source_counts,
+        wiki_pages,
+        concepts,
+        stale_count,
+        recent_jobs,
+        failed_jobs,
+        changed_inputs_not_compiled,
+    })
+}
+
+fn extract_source_kind(node_id: &str) -> Option<&str> {
+    if node_id.contains("url") {
+        Some("url")
+    } else if node_id.contains("file") {
+        Some("file")
+    } else if node_id.contains("repo") {
+        Some("repo")
+    } else if node_id.contains("image") {
+        Some("image")
+    } else if node_id.contains("dataset") {
+        Some("dataset")
+    } else {
+        Some("other")
+    }
+}
+
+fn find_changed_inputs(_root: &Path, hashes: &kb_core::Hashes) -> Result<Vec<PathBuf>> {
+    let mut changed = Vec::new();
+    for path in hashes.inputs.keys() {
+        if path.exists() {
+            let current_hash = kb_core::hash_file(path)?;
+            if hashes.inputs.get(path) != Some(&current_hash) {
+                changed.push(path.clone());
+            }
+        } else {
+            changed.push(path.clone());
+        }
+    }
+    Ok(changed)
+}
+
+fn print_status(status: &StatusPayload) {
+    println!("kb status");
+    println!();
+
+    println!("sources: {} total", status.sources.total);
+    for (kind, count) in &status.sources.by_kind {
+        println!("  {}: {}", kind, count);
+    }
+    println!();
+
+    println!("wiki pages: {}", status.wiki_pages);
+    println!("concepts: {}", status.concepts);
+    println!("stale artifacts: {}", status.stale_count);
+    println!();
+
+    if !status.changed_inputs_not_compiled.is_empty() {
+        println!("changed inputs not yet compiled:");
+        for path in &status.changed_inputs_not_compiled {
+            println!("  - {}", path.display());
+        }
+        println!();
+    }
+
+    println!("recent job runs ({}):", status.recent_jobs.len());
+    for job in &status.recent_jobs {
+        let duration = job
+            .ended_at_millis
+            .map(|ended| ended - job.started_at_millis);
+        let duration_str = duration
+            .map(|ms| format!("{}ms", ms))
+            .unwrap_or_else(|| "running".to_string());
+        println!(
+            "  {} | {:<11} | {} [{}]",
+            job.metadata.id,
+            format!("{:?}", job.status),
+            job.command,
+            duration_str
+        );
+    }
+    println!();
+
+    if !status.failed_jobs.is_empty() {
+        println!("failed job runs ({}):", status.failed_jobs.len());
+        for job in &status.failed_jobs {
+            let duration = job
+                .ended_at_millis
+                .map(|ended| ended - job.started_at_millis);
+            let duration_str = duration
+                .map(|ms| format!("{}ms", ms))
+                .unwrap_or_else(|| "running".to_string());
+            println!(
+                "  {} | {:<11} | {} [{}]",
+                job.metadata.id,
+                format!("{:?}", job.status),
+                job.command,
+                duration_str
+            );
+        }
+    }
 }
 fn execute_mutating_command(
     root: Option<&Path>,
