@@ -1220,6 +1220,48 @@ fn run_ask(
         )),
     };
 
+    // Emit a BuildRecord for this ask, when the LLM actually produced something.
+    // Placeholder artifacts (backend unavailable) get no BuildRecord — there's no
+    // real input-to-output mapping to record.
+    let build_record_id: Option<String> = if let Some((_, provenance)) = llm_info.as_ref() {
+        let record_id = format!("build:ask:{question_id}");
+        let source_ids: Vec<String> = retrieval_plan
+            .candidates
+            .iter()
+            .map(|c| c.id.clone())
+            .collect();
+        let manifest_hash = hash_many(&[
+            question_id.as_bytes(),
+            b"\0",
+            artifact_body.as_bytes(),
+            b"\0",
+            provenance.prompt_render_hash.to_hex().as_bytes(),
+        ])
+        .to_hex();
+        let record = kb_core::BuildRecord {
+            pass_name: "ask".to_string(),
+            metadata: EntityMetadata {
+                id: record_id.clone(),
+                created_at_millis: timestamp,
+                updated_at_millis: now_millis()?,
+                source_hashes: vec![provenance.prompt_render_hash.to_hex()],
+                model_version: Some(provenance.model.clone()),
+                tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
+                prompt_template_hash: Some(provenance.prompt_template_hash.to_hex()),
+                dependencies: source_ids.clone(),
+                output_paths: vec![artifact.output_path.clone()],
+                status: artifact_status,
+            },
+            input_ids: source_ids,
+            output_ids: vec![artifact.output_path.to_string_lossy().into_owned()],
+            manifest_hash,
+        };
+        kb_core::save_build_record(root, &record)?;
+        Some(record_id)
+    } else {
+        None
+    };
+
     let write_output = kb_query::write_artifact(&kb_query::WriteArtifactInput {
         root,
         question: &question,
@@ -1228,6 +1270,7 @@ fn run_ask(
         artifact_result: llm_info.as_ref().map(|(r, _)| r),
         provenance: llm_info.as_ref().map(|(_, p)| p),
         artifact_body: &artifact_body,
+        build_record_id: build_record_id.as_deref(),
     })?;
 
     if promote {
@@ -1335,6 +1378,17 @@ fn try_generate_answer(
         kb_query::postprocess_answer(&llm_response.answer, &citation_manifest, assembled);
 
     Ok((result, provenance))
+}
+
+/// Build an adapter for use by `kb compile`. Shares construction logic with `ask`
+/// (so routing, timeouts, and config resolution match), but loads the config for
+/// the given root with an optional CLI `--model` override.
+fn build_compile_adapter(
+    root: &Path,
+    cli_model: Option<&str>,
+) -> Result<Box<dyn kb_llm::LlmAdapter>> {
+    let cfg = Config::load_from_root(root, cli_model)?;
+    create_ask_adapter(&cfg, root)
 }
 
 fn create_ask_adapter(

@@ -21,6 +21,10 @@ pub struct ArtifactSidecar {
     pub valid_citations: Vec<u32>,
     pub invalid_citations: Vec<u32>,
     pub has_uncertainty_banner: bool,
+    /// ID of the [`kb_core::BuildRecord`] that produced this artifact, when the
+    /// LLM pass succeeded. `None` for placeholder artifacts written when the
+    /// backend was unavailable.
+    pub build_record_id: Option<String>,
 }
 
 pub struct WriteArtifactInput<'a> {
@@ -31,6 +35,10 @@ pub struct WriteArtifactInput<'a> {
     pub artifact_result: Option<&'a ArtifactResult>,
     pub provenance: Option<&'a ProvenanceRecord>,
     pub artifact_body: &'a str,
+    /// [`kb_core::BuildRecord`] identifier for this generation, when one was
+    /// emitted. The writer mirrors it into the answer frontmatter so `kb inspect`
+    /// can walk the provenance chain from the artifact back to its record.
+    pub build_record_id: Option<&'a str>,
 }
 
 pub struct WriteArtifactOutput {
@@ -88,6 +96,7 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
         valid_citations,
         invalid_citations,
         has_uncertainty_banner,
+        build_record_id: input.build_record_id.map(str::to_string),
     };
 
     let sidecar_json = serde_json::to_string_pretty(&sidecar).map_err(json_io_err)?;
@@ -129,6 +138,12 @@ fn render_answer_frontmatter(input: &WriteArtifactInput<'_>) -> Result<String, s
         fm.insert(
             Value::String("tool_version".into()),
             Value::String(tool.clone()),
+        );
+    }
+    if let Some(build_id) = input.build_record_id {
+        fm.insert(
+            Value::String("build_record_id".into()),
+            Value::String(build_id.to_string()),
         );
     }
 
@@ -272,6 +287,7 @@ mod tests {
             artifact_result: Some(&result),
             provenance: None,
             artifact_body: &result.body,
+            build_record_id: None,
         })
         .unwrap();
 
@@ -298,6 +314,7 @@ mod tests {
             artifact_result: None,
             provenance: None,
             artifact_body: body,
+            build_record_id: None,
         })
         .unwrap();
 
@@ -348,6 +365,7 @@ mod tests {
             artifact_result: Some(&result),
             provenance: Some(&prov),
             artifact_body: &result.body,
+            build_record_id: None,
         })
         .unwrap();
 
@@ -376,6 +394,7 @@ mod tests {
             artifact_result: None,
             provenance: None,
             artifact_body: "body",
+            build_record_id: None,
         })
         .unwrap();
 
@@ -425,10 +444,42 @@ mod tests {
             artifact_result: None,
             provenance: Some(&prov),
             artifact_body: "body",
+            build_record_id: None,
         })
         .unwrap();
 
         let content = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
         assert!(content.contains("generated_by: claude/claude-3-5-sonnet"));
+    }
+
+    #[test]
+    fn frontmatter_and_sidecar_include_build_record_id() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let question = sample_question("q6");
+        let artifact = sample_artifact("q6");
+        let plan = sample_plan();
+
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &question,
+            artifact: &artifact,
+            retrieval_plan: &plan,
+            artifact_result: None,
+            provenance: None,
+            artifact_body: "body",
+            build_record_id: Some("build:ask:q6"),
+        })
+        .unwrap();
+
+        let content = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
+        assert!(
+            content.contains("build_record_id: build:ask:q6"),
+            "frontmatter should include build_record_id"
+        );
+
+        let sidecar_str = std::fs::read_to_string(root.join(&output.metadata_path)).unwrap();
+        let sidecar: ArtifactSidecar = serde_json::from_str(&sidecar_str).unwrap();
+        assert_eq!(sidecar.build_record_id.as_deref(), Some("build:ask:q6"));
     }
 }
