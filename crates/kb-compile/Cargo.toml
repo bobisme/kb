@@ -12,6 +12,7 @@ workspace = true
 anyhow.workspace = true
 kb-core.workspace = true
 kb-llm.workspace = true
+kb-query.workspace = true
 regex.workspace = true
 ignore.workspace = true
 serde.workspace = true

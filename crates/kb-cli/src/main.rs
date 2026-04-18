@@ -142,17 +142,26 @@ fn run(cli: Cli) -> Result<()> {
             let compile_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
+            let force = cli.force;
+            let dry_run = cli.dry_run;
+            let json = cli.json;
             execute_mutating_command(Some(compile_root), "compile", move || {
-                let index = kb_query::build_lexical_index(compile_root)?;
-                let entry_count = index.entries.len();
-                index.save(compile_root)?;
-                println!("compile: built lexical index ({entry_count} entries)");
+                let options = kb_compile::pipeline::CompileOptions { force, dry_run };
+                let report = kb_compile::pipeline::run_compile(compile_root, &options)?;
 
-                let index_artifacts =
-                    kb_compile::index_page::generate_indexes(compile_root)?;
-                let index_count = index_artifacts.len();
-                kb_compile::index_page::persist_index_artifacts(&index_artifacts)?;
-                println!("compile: generated {index_count} index page(s)");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "total_sources": report.total_sources,
+                            "stale_sources": report.stale_sources,
+                            "build_records_emitted": report.build_records_emitted,
+                            "dry_run": dry_run,
+                        })
+                    );
+                } else {
+                    println!("{}", report.render());
+                }
 
                 Ok(())
             })

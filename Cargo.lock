@@ -1156,6 +1156,7 @@ dependencies = [
  "ignore",
  "kb-core",
  "kb-llm",
+ "kb-query",
  "regex",
  "serde",
  "serde_json",
