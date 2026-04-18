@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 
-mod provenance;
 pub mod adapter;
+mod provenance;
+pub mod subprocess;
 mod templates;
 
 pub use adapter::{
-    LlmAdapter, LlmAdapterError, SummarizeDocumentRequest, SummarizeDocumentResponse,
-    ExtractConceptsRequest, ExtractConceptsResponse, MergeConceptCandidatesRequest,
-    MergeConceptCandidatesResponse, AnswerQuestionRequest, AnswerQuestionResponse,
-    GenerateSlidesRequest, GenerateSlidesResponse, RunHealthCheckRequest, RunHealthCheckResponse,
+    AnswerQuestionRequest, AnswerQuestionResponse, ExtractConceptsRequest, ExtractConceptsResponse,
+    GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
+    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
+    RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
 };
 pub use provenance::{BackendResponse, ProvenanceRecord, TokenUsage};
-pub use templates::{Template, RenderedTemplate};
+pub use subprocess::{run_shell_command, SubprocessError, SubprocessOutput};
+pub use templates::{RenderedTemplate, Template};
