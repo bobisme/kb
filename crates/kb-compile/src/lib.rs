@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use kb_core::fs::atomic_write;
 use serde::{Deserialize, Serialize};
 
+use kb_core::{BuildRecord, Hash, hash_many};
+
 pub type NodeId = String;
 
 const GRAPH_PATH: [&str; 2] = ["state", "graph.json"];
+const STATE_HASHES_PATH: &str = "state/hashes.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Graph {
@@ -338,10 +341,184 @@ impl GraphInspection {
     }
 }
 
+/// Persistent snapshot of per-node fingerprints used for incremental stale detection.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HashState {
+    pub hashes: BTreeMap<String, String>,
+}
+
+impl HashState {
+    /// Load a previously persisted hash state from disk.
+    ///
+    /// Missing files are treated as an empty state.
+    ///
+    /// # Errors
+    /// Returns an error if the file exists but cannot be read or parsed as JSON.
+    pub fn load(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read hash state {}", path.display()))?;
+        serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse hash state {}", path.display()))
+    }
+
+    /// Load `state/hashes.json` from a KB root.
+    ///
+    /// # Errors
+    /// Returns an error if the state file exists but cannot be read or parsed.
+    pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self> {
+        Self::load(root.as_ref().join(STATE_HASHES_PATH))
+    }
+
+    /// Persist the hash state to disk.
+    ///
+    /// # Errors
+    /// Returns an error if the parent directory cannot be created, the state cannot
+    /// be serialized, or the file cannot be written.
+    pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("failed to create hash state directory {}", parent.display())
+            })?;
+        }
+
+        let json = serde_json::to_string_pretty(self).context("failed to serialize hash state")?;
+        std::fs::write(path, format!("{json}\n"))
+            .with_context(|| format!("failed to write hash state {}", path.display()))
+    }
+
+    /// Persist to `state/hashes.json` under a KB root.
+    ///
+    /// # Errors
+    /// Returns an error if the state cannot be serialized or written.
+    pub fn save_to_root(&self, root: impl AsRef<Path>) -> Result<()> {
+        self.save(root.as_ref().join(STATE_HASHES_PATH))
+    }
+}
+
+/// Current fingerprint inputs for a build node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleNode {
+    pub id: String,
+    pub dependencies: Vec<String>,
+    pub content_hash: String,
+    pub prompt_template_hash: Option<String>,
+    pub model_version: Option<String>,
+}
+
+impl StaleNode {
+    #[must_use]
+    pub fn fingerprint(&self) -> Hash {
+        let prompt_template_hash = self.prompt_template_hash.as_deref().unwrap_or("");
+        let model_version = self.model_version.as_deref().unwrap_or("");
+
+        hash_many(&[
+            self.id.as_bytes(),
+            b"\0",
+            self.content_hash.as_bytes(),
+            b"\0",
+            prompt_template_hash.as_bytes(),
+            b"\0",
+            model_version.as_bytes(),
+        ])
+    }
+}
+
+/// Result of stale detection for a compile graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleReport {
+    pub changed_nodes: BTreeSet<String>,
+    pub stale_nodes: BTreeSet<String>,
+    pub current_state: HashState,
+}
+
+/// Detect changed node fingerprints by comparing the current graph against a previous state.
+#[must_use]
+pub fn detect_stale(previous: &HashState, nodes: &[StaleNode]) -> StaleReport {
+    let current_state = HashState {
+        hashes: nodes
+            .iter()
+            .map(|node| (node.id.clone(), node.fingerprint().to_hex()))
+            .collect(),
+    };
+
+    let changed_nodes = changed_nodes(previous, &current_state);
+    let stale_nodes = propagate_stale(&changed_nodes, nodes);
+
+    StaleReport {
+        changed_nodes,
+        stale_nodes,
+        current_state,
+    }
+}
+
+/// Build a stale-detection node from a recorded build artifact.
+#[must_use]
+pub fn stale_node_from_build_record(record: &BuildRecord) -> StaleNode {
+    let mut dependencies = record.input_ids.clone();
+    dependencies.extend(record.output_ids.clone());
+    dependencies.sort();
+    dependencies.dedup();
+
+    StaleNode {
+        id: record.metadata.id.clone(),
+        dependencies,
+        content_hash: record.manifest_hash.clone(),
+        prompt_template_hash: record.metadata.prompt_template_hash.clone(),
+        model_version: record.metadata.model_version.clone(),
+    }
+}
+
+fn changed_nodes(previous: &HashState, current: &HashState) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    ids.extend(previous.hashes.keys().cloned());
+    ids.extend(current.hashes.keys().cloned());
+
+    ids.into_iter()
+        .filter(|id| previous.hashes.get(id) != current.hashes.get(id))
+        .collect()
+}
+
+fn propagate_stale(changed: &BTreeSet<String>, nodes: &[StaleNode]) -> BTreeSet<String> {
+    let mut reverse_edges: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for node in nodes {
+        for dependency in &node.dependencies {
+            reverse_edges
+                .entry(dependency.as_str())
+                .or_default()
+                .push(node.id.as_str());
+        }
+    }
+
+    let mut stale = changed.clone();
+    let mut queue = changed.iter().cloned().collect::<VecDeque<_>>();
+
+    while let Some(id) = queue.pop_front() {
+        if let Some(dependents) = reverse_edges.get(id.as_str()) {
+            for dependent in dependents {
+                if stale.insert((*dependent).to_string()) {
+                    queue.push_back((*dependent).to_string());
+                }
+            }
+        }
+    }
+
+    stale
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use kb_core::{ContentHash, EntityMetadata, Status};
+    use tempfile::{TempDir, tempdir};
+
+    // --- Graph tests ---
 
     #[test]
     fn graph_captures_source_to_page_to_index_chain() {
@@ -426,5 +603,281 @@ mod tests {
 
         let suffix = graph.inspect("sources/doc.md").expect("suffix match");
         assert_eq!(suffix.id, "wiki/sources/doc.md");
+    }
+
+    // --- Stale detection tests ---
+
+    fn stale_node(
+        id: &str,
+        content_hash: &str,
+        dependencies: &[&str],
+        prompt_template_hash: Option<&str>,
+        model_version: Option<&str>,
+    ) -> StaleNode {
+        StaleNode {
+            id: id.to_string(),
+            dependencies: dependencies.iter().map(|id| (*id).to_string()).collect(),
+            content_hash: content_hash.to_string(),
+            prompt_template_hash: prompt_template_hash.map(ToString::to_string),
+            model_version: model_version.map(ToString::to_string),
+        }
+    }
+
+    fn metadata(id: &str) -> EntityMetadata {
+        EntityMetadata {
+            id: id.to_string(),
+            created_at_millis: 1,
+            updated_at_millis: 1,
+            source_hashes: vec![],
+            model_version: None,
+            tool_version: Some("kb/0.1.0".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec![],
+            output_paths: vec![],
+            status: Status::Fresh,
+        }
+    }
+
+    fn build_record(
+        id: &str,
+        input_ids: &[&str],
+        output_ids: &[&str],
+        manifest_hash: &str,
+        prompt_template_hash: Option<ContentHash>,
+        model_version: Option<&str>,
+    ) -> BuildRecord {
+        BuildRecord {
+            metadata: EntityMetadata {
+                model_version: model_version.map(ToString::to_string),
+                prompt_template_hash,
+                ..metadata(id)
+            },
+            input_ids: input_ids.iter().map(|id| (*id).to_string()).collect(),
+            output_ids: output_ids.iter().map(|id| (*id).to_string()).collect(),
+            manifest_hash: manifest_hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn second_compile_with_no_changes_rebuilds_nothing() {
+        let nodes = vec![
+            stale_node("source-a", "hash-source-a", &[], None, None),
+            stale_node(
+                "page-a",
+                "hash-page-a",
+                &["source-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "concept-a",
+                "hash-concept-a",
+                &["page-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+        ];
+
+        let first = detect_stale(&HashState::default(), &nodes);
+        let second = detect_stale(&first.current_state, &nodes);
+
+        assert!(second.changed_nodes.is_empty());
+        assert!(second.stale_nodes.is_empty());
+    }
+
+    #[test]
+    fn changing_one_source_only_rebuilds_its_downstream_dependents() {
+        let previous_nodes = vec![
+            stale_node("source-a", "hash-source-a-v1", &[], None, None),
+            stale_node("source-b", "hash-source-b-v1", &[], None, None),
+            stale_node(
+                "page-a",
+                "hash-page-a",
+                &["source-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "page-b",
+                "hash-page-b",
+                &["source-b"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "concept-shared",
+                "hash-concept-shared",
+                &["page-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+        ];
+        let previous = detect_stale(&HashState::default(), &previous_nodes).current_state;
+
+        let current_nodes = vec![
+            stale_node("source-a", "hash-source-a-v2", &[], None, None),
+            stale_node("source-b", "hash-source-b-v1", &[], None, None),
+            stale_node(
+                "page-a",
+                "hash-page-a",
+                &["source-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "page-b",
+                "hash-page-b",
+                &["source-b"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "concept-shared",
+                "hash-concept-shared",
+                &["page-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+        ];
+
+        let report = detect_stale(&previous, &current_nodes);
+
+        assert_eq!(
+            report.changed_nodes,
+            BTreeSet::from(["source-a".to_string()])
+        );
+        assert_eq!(
+            report.stale_nodes,
+            BTreeSet::from([
+                "source-a".to_string(),
+                "page-a".to_string(),
+                "concept-shared".to_string(),
+            ])
+        );
+        assert!(!report.stale_nodes.contains("source-b"));
+        assert!(!report.stale_nodes.contains("page-b"));
+    }
+
+    #[test]
+    fn prompt_template_changes_only_invalidate_artifacts_that_used_it() {
+        let previous_nodes = vec![
+            stale_node(
+                "page-a",
+                "hash-page-a",
+                &["source-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "page-b",
+                "hash-page-b",
+                &["source-b"],
+                Some("template-2"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "concept-a",
+                "hash-concept-a",
+                &["page-a"],
+                Some("template-1"),
+                Some("gpt-4o-mini"),
+            ),
+        ];
+        let previous = detect_stale(&HashState::default(), &previous_nodes).current_state;
+
+        let current_nodes = vec![
+            stale_node(
+                "page-a",
+                "hash-page-a",
+                &["source-a"],
+                Some("template-1-updated"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "page-b",
+                "hash-page-b",
+                &["source-b"],
+                Some("template-2"),
+                Some("gpt-4o-mini"),
+            ),
+            stale_node(
+                "concept-a",
+                "hash-concept-a",
+                &["page-a"],
+                Some("template-1-updated"),
+                Some("gpt-4o-mini"),
+            ),
+        ];
+
+        let report = detect_stale(&previous, &current_nodes);
+
+        assert_eq!(
+            report.stale_nodes,
+            BTreeSet::from(["page-a".to_string(), "concept-a".to_string()])
+        );
+        assert!(!report.stale_nodes.contains("page-b"));
+    }
+
+    #[test]
+    fn model_version_changes_mark_outputs_stale() {
+        let previous_nodes = vec![stale_node(
+            "page-a",
+            "hash-page-a",
+            &["source-a"],
+            Some("template-1"),
+            Some("gpt-4o-mini"),
+        )];
+        let previous = detect_stale(&HashState::default(), &previous_nodes).current_state;
+
+        let current_nodes = vec![stale_node(
+            "page-a",
+            "hash-page-a",
+            &["source-a"],
+            Some("template-1"),
+            Some("gpt-5-mini"),
+        )];
+
+        let report = detect_stale(&previous, &current_nodes);
+        assert_eq!(report.stale_nodes, BTreeSet::from(["page-a".to_string()]));
+    }
+
+    #[test]
+    fn hash_state_round_trips_on_disk() {
+        let temp = TempDir::new().expect("tempdir");
+        let path = temp.path().join("state/hashes.json");
+        let state = HashState {
+            hashes: BTreeMap::from([
+                ("page-a".to_string(), "hash-a".to_string()),
+                ("page-b".to_string(), "hash-b".to_string()),
+            ]),
+        };
+
+        state.save(&path).expect("save hash state");
+        let loaded = HashState::load(&path).expect("load hash state");
+
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn build_record_conversion_uses_manifest_prompt_and_model_metadata() {
+        let record = build_record(
+            "build-1",
+            &["source-a"],
+            &["page-a"],
+            "manifest-1",
+            Some("template-1".to_string()),
+            Some("gpt-4o-mini"),
+        );
+
+        let node = stale_node_from_build_record(&record);
+
+        assert_eq!(node.id, "build-1");
+        assert_eq!(
+            node.dependencies,
+            vec!["page-a".to_string(), "source-a".to_string()]
+        );
+        assert_eq!(node.content_hash, "manifest-1");
+        assert_eq!(node.prompt_template_hash.as_deref(), Some("template-1"));
+        assert_eq!(node.model_version.as_deref(), Some("gpt-4o-mini"));
     }
 }
