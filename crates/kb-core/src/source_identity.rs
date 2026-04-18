@@ -82,7 +82,10 @@ pub fn source_revision_content_hash(content: &[u8]) -> String {
 /// Mints a short source revision ID from fetched content bytes.
 #[must_use]
 pub fn mint_source_revision_id(content: &[u8]) -> String {
-    mint_short_id(SOURCE_REVISION_ID_PREFIX, &source_revision_content_hash(content))
+    mint_short_id(
+        SOURCE_REVISION_ID_PREFIX,
+        &source_revision_content_hash(content),
+    )
 }
 
 /// Canonicalizes a file path and mints the corresponding source document ID.
@@ -125,7 +128,8 @@ mod tests {
         fs::write(&file, b"hello world").unwrap();
 
         let via_direct = source_document_id_for_file(&file).unwrap();
-        let via_relative_segments = source_document_id_for_file(nested.join("../nested/source.txt")).unwrap();
+        let via_relative_segments =
+            source_document_id_for_file(nested.join("../nested/source.txt")).unwrap();
 
         assert_eq!(via_direct, via_relative_segments);
         assert_eq!(
@@ -136,10 +140,9 @@ mod tests {
 
     #[test]
     fn url_normalization_lowercases_host_and_sorts_query_params() {
-        let normalized = normalize_url_stable_location(
-            "HTTPS://Example.COM/a/path?z=last&b=two&a=one#section",
-        )
-        .unwrap();
+        let normalized =
+            normalize_url_stable_location("HTTPS://Example.COM/a/path?z=last&b=two&a=one#section")
+                .unwrap();
 
         assert_eq!(normalized, "https://example.com/a/path?a=one&b=two&z=last");
     }

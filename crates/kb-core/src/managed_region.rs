@@ -69,13 +69,16 @@ pub fn extract_managed_regions(text: &str) -> Vec<ManagedRegion<'_>> {
 #[must_use]
 pub fn rewrite_managed_region(text: &str, target_id: &str, new_content: &str) -> Option<String> {
     let regions = extract_managed_regions(text);
-    regions.into_iter().find(|r| r.id == target_id).map(|region| {
-        let mut new_text = String::with_capacity(text.len() + new_content.len());
-        new_text.push_str(&text[..region.content_start]);
-        new_text.push_str(new_content);
-        new_text.push_str(&text[region.content_end..]);
-        new_text
-    })
+    regions
+        .into_iter()
+        .find(|r| r.id == target_id)
+        .map(|region| {
+            let mut new_text = String::with_capacity(text.len() + new_content.len());
+            new_text.push_str(&text[..region.content_start]);
+            new_text.push_str(new_content);
+            new_text.push_str(&text[region.content_end..]);
+            new_text
+        })
 }
 
 /// Derives a stable slug from a section title on first assignment.
@@ -124,7 +127,10 @@ Suffix text.";
         assert_eq!(regions.len(), 2);
 
         assert_eq!(regions[0].id, "summary");
-        assert_eq!(regions[0].body(text), "\nThis is the summary.\nIt has multiple lines.\n");
+        assert_eq!(
+            regions[0].body(text),
+            "\nThis is the summary.\nIt has multiple lines.\n"
+        );
 
         assert_eq!(regions[1].id, "details");
         assert_eq!(regions[1].body(text), "\nDetails go here.\n");
@@ -161,7 +167,10 @@ Middle text."
     #[test]
     fn test_slug_from_title() {
         assert_eq!(slug_from_title("Executive Summary"), "executive-summary");
-        assert_eq!(slug_from_title("Background & Context"), "background-context");
+        assert_eq!(
+            slug_from_title("Background & Context"),
+            "background-context"
+        );
         assert_eq!(slug_from_title("  Trimmed  "), "trimmed");
         assert_eq!(slug_from_title("Multi---Dash"), "multi-dash");
         assert_eq!(slug_from_title("v1.0 Release Notes"), "v1-0-release-notes");

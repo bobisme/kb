@@ -32,10 +32,12 @@ fn smoke_test_kb_init_creates_directory() {
     let (_temp_dir, kb_root) = make_temp_kb();
 
     // The kb root directory should be empty initially
-    assert!(fs::read_dir(&kb_root)
-        .expect("failed to read kb root directory")
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(&kb_root)
+            .expect("failed to read kb root directory")
+            .next()
+            .is_none()
+    );
 }
 
 #[test]

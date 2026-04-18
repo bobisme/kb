@@ -1,6 +1,9 @@
-use std::{env, fs, path::{Path, PathBuf}};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 const KB_DIR: &str = "kb";
 const KB_CONFIG: &str = "kb.toml";
@@ -32,9 +35,7 @@ fn discover_root_in(explicit_root: Option<&Path>, cwd: &Path, home: &Path) -> Re
     for ancestor in cwd.ancestors() {
         let candidate = ancestor.join(KB_DIR);
         if is_kb_root(&candidate) {
-            return Ok(KbRoot {
-                path: candidate,
-            });
+            return Ok(KbRoot { path: candidate });
         }
     }
 
@@ -102,8 +103,7 @@ mod tests {
         let cwd = repo.join("work");
         fs::create_dir_all(&cwd).expect("create cwd");
 
-        let result =
-            discover_root_in(Some(explicit.as_path()), &cwd, Path::new("/home/missing"));
+        let result = discover_root_in(Some(explicit.as_path()), &cwd, Path::new("/home/missing"));
 
         assert_eq!(
             result.expect("discover root").path,

@@ -113,7 +113,10 @@ impl OpencodeAdapter {
     fn build_command(&self, config_path: &Path, prompt: &str) -> String {
         // OPENCODE_CONFIG env var is set inline before the command (sh -c handles this)
         let mut parts = vec![
-            format!("OPENCODE_CONFIG={}", shell_quote(&config_path.display().to_string())),
+            format!(
+                "OPENCODE_CONFIG={}",
+                shell_quote(&config_path.display().to_string())
+            ),
             self.config.command.clone(),
             "run".to_string(),
             "--agent".to_string(),
@@ -321,7 +324,10 @@ mod tests {
     #[test]
     fn strip_ansi_header_passes_through_plain_text() {
         let input = "Plain text response without header.";
-        assert_eq!(strip_ansi_header(input), "Plain text response without header.");
+        assert_eq!(
+            strip_ansi_header(input),
+            "Plain text response without header."
+        );
     }
 
     #[test]
@@ -343,10 +349,12 @@ mod tests {
         assert_eq!(config["agent"]["kb"]["tools"]["write"], false);
         assert_eq!(config["agent"]["kb"]["tools"]["edit"], false);
         assert_eq!(config["agent"]["kb"]["tools"]["bash"], false);
-        assert!(config["$schema"]
-            .as_str()
-            .expect("$schema should be a string")
-            .contains("opencode.ai"));
+        assert!(
+            config["$schema"]
+                .as_str()
+                .expect("$schema should be a string")
+                .contains("opencode.ai")
+        );
     }
 
     #[test]
@@ -394,8 +402,14 @@ mod tests {
 
         let args = fs::read_to_string(&args_path).expect("read captured args");
         assert!(args.contains("run"), "args should contain 'run': {args}");
-        assert!(args.contains("--agent"), "args should contain '--agent': {args}");
-        assert!(args.contains("kb"), "args should contain agent name: {args}");
+        assert!(
+            args.contains("--agent"),
+            "args should contain '--agent': {args}"
+        );
+        assert!(
+            args.contains("kb"),
+            "args should contain agent name: {args}"
+        );
         assert!(
             args.contains("A long source document."),
             "args should contain document text: {args}"
@@ -467,6 +481,9 @@ mod tests {
         });
 
         let err = adapter.run_prompt("hello").expect_err("should time out");
-        assert!(matches!(err, LlmAdapterError::Timeout(_)), "expected Timeout, got {err:?}");
+        assert!(
+            matches!(err, LlmAdapterError::Timeout(_)),
+            "expected Timeout, got {err:?}"
+        );
     }
 }

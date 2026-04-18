@@ -366,7 +366,9 @@ pub mod normalized;
 pub mod source_identity;
 
 pub use hashing::{Hash, hash_bytes, hash_file, hash_many};
-pub use managed_region::{ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title};
+pub use managed_region::{
+    ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title,
+};
 pub use normalized::{read_normalized_document, write_normalized_document};
 pub use source_identity::{
     SOURCE_DOCUMENT_ID_PREFIX, SOURCE_REVISION_ID_PREFIX, mint_source_document_id,

@@ -120,8 +120,8 @@ pub fn hash_many(parts: &[&[u8]]) -> Hash {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_hash_bytes() {
@@ -144,7 +144,7 @@ mod tests {
     fn test_hash_file() -> io::Result<()> {
         let mut tmp = NamedTempFile::new()?;
         tmp.write_all(b"hello world")?;
-        
+
         let h1 = hash_file(tmp.path())?;
         let h2 = hash_bytes(b"hello world");
         assert_eq!(h1, h2);
@@ -157,7 +157,7 @@ mod tests {
         let h = hash_bytes(data);
         let json = serde_json::to_string(&h).expect("serialize Hash to JSON");
         assert_eq!(json, format!("\"{}\"", h.to_hex()));
-        
+
         let h2: Hash = serde_json::from_str(&json).expect("deserialize JSON to Hash");
         assert_eq!(h, h2);
     }

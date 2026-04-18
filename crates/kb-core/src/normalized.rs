@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::{EntityMetadata, NormalizedDocument};
 use crate::fs::atomic_write;
+use crate::{EntityMetadata, NormalizedDocument};
 
 const METADATA_FILE_NAME: &str = "metadata.json";
 const SOURCE_MARKDOWN_FILE_NAME: &str = "source.md";
@@ -85,18 +85,22 @@ pub fn write_normalized_document(
 ///
 /// # Errors
 /// Returns an error if the metadata or source files cannot be read or parsed.
-pub fn read_normalized_document(root: impl AsRef<Path>, id: &str) -> io::Result<NormalizedDocument> {
+pub fn read_normalized_document(
+    root: impl AsRef<Path>,
+    id: &str,
+) -> io::Result<NormalizedDocument> {
     let base_dir = root.as_ref().join("normalized").join(id);
     let metadata_path = base_dir.join(METADATA_FILE_NAME);
     let source_path = base_dir.join(SOURCE_MARKDOWN_FILE_NAME);
 
     let metadata_bytes = std::fs::read(metadata_path)?;
-    let metadata: NormalizedDocumentMetadata = serde_json::from_slice(&metadata_bytes).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("failed to deserialize normalized metadata: {err}"),
-        )
-    })?;
+    let metadata: NormalizedDocumentMetadata =
+        serde_json::from_slice(&metadata_bytes).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("failed to deserialize normalized metadata: {err}"),
+            )
+        })?;
 
     let canonical_text = std::fs::read_to_string(source_path)?;
     Ok(metadata.into_document(canonical_text))
@@ -168,8 +172,10 @@ fn validate_asset_references(
 
 fn extract_referenced_assets(source_text: &str) -> Vec<String> {
     let mut references = Vec::new();
-    let re = Regex::new(r#"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)|\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?"#)
-        .expect("asset regex compile");
+    let re = Regex::new(
+        r#"!?\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)|\[[^\]]*\]\(([^)\s]+)(?:\s+\"[^\"]*\")?"#,
+    )
+    .expect("asset regex compile");
 
     for capture in re.captures_iter(source_text) {
         let raw_path = match (capture.get(1), capture.get(2)) {
@@ -244,17 +250,19 @@ mod tests {
         assert_eq!(written_doc.source_revision_id, document.source_revision_id);
         assert_eq!(written_doc.canonical_text, document.canonical_text);
         assert_eq!(written_doc.normalized_assets, document.normalized_assets);
-        assert!(root
-            .join("normalized")
-            .join(document.metadata.id.clone())
-            .join("source.md")
-            .is_file());
-        assert!(root
-            .join("normalized")
-            .join(document.metadata.id.clone())
-            .join("assets")
-            .join("img.png")
-            .is_file());
+        assert!(
+            root.join("normalized")
+                .join(document.metadata.id.clone())
+                .join("source.md")
+                .is_file()
+        );
+        assert!(
+            root.join("normalized")
+                .join(document.metadata.id.clone())
+                .join("assets")
+                .join("img.png")
+                .is_file()
+        );
         let metadata_path = root
             .join("normalized")
             .join(&document.metadata.id)
@@ -292,7 +300,11 @@ mod tests {
 
         write_normalized_document(root, &document)?;
 
-        let metadata = fs::read_to_string(root.join("normalized").join("doc-no-body").join("metadata.json"))?;
+        let metadata = fs::read_to_string(
+            root.join("normalized")
+                .join("doc-no-body")
+                .join("metadata.json"),
+        )?;
         assert!(metadata.contains("\"heading_ids\""));
         assert!(!metadata.contains("\"canonical_text\""));
         Ok(())

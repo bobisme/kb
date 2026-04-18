@@ -28,7 +28,11 @@ pub fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
             fs::create_dir_all(parent).map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    format!("failed to create parent directory for {}: {}", path.display(), e),
+                    format!(
+                        "failed to create parent directory for {}: {}",
+                        path.display(),
+                        e
+                    ),
                 )
             })?;
         }
@@ -44,14 +48,22 @@ pub fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
     let mut file = fs::File::create(tmp_path).map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("failed to create temporary file {}: {}", tmp_path.display(), e),
+            format!(
+                "failed to create temporary file {}: {}",
+                tmp_path.display(),
+                e
+            ),
         )
     })?;
 
     file.write_all(contents).map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("failed to write to temporary file {}: {}", tmp_path.display(), e),
+            format!(
+                "failed to write to temporary file {}: {}",
+                tmp_path.display(),
+                e
+            ),
         )
     })?;
 
@@ -59,7 +71,11 @@ pub fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
     file.sync_all().map_err(|e| {
         io::Error::new(
             e.kind(),
-            format!("failed to sync temporary file {}: {}", tmp_path.display(), e),
+            format!(
+                "failed to sync temporary file {}: {}",
+                tmp_path.display(),
+                e
+            ),
         )
     })?;
 
@@ -70,7 +86,12 @@ pub fn atomic_write(path: impl AsRef<Path>, contents: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(tmp_path);
         io::Error::new(
             e.kind(),
-            format!("failed to rename {} to {}: {}", tmp_path.display(), path.display(), e),
+            format!(
+                "failed to rename {} to {}: {}",
+                tmp_path.display(),
+                path.display(),
+                e
+            ),
         )
     })
 }

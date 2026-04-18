@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use thiserror::Error;
 
 /// Captured subprocess result.
@@ -21,9 +21,7 @@ pub struct SubprocessOutput {
 #[derive(Debug, Error)]
 pub enum SubprocessError {
     /// The subprocess exceeded its allotted timeout.
-    #[error(
-        "command timed out after {timeout:?}: {command}\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    )]
+    #[error("command timed out after {timeout:?}: {command}\nstdout:\n{stdout}\nstderr:\n{stderr}")]
     TimedOut {
         /// Human-readable command string.
         command: String,
