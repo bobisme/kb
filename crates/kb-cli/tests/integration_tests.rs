@@ -86,6 +86,23 @@ fn smoke_test_kb_init_with_explicit_path() {
 }
 
 #[test]
+fn init_creates_empty_state_files() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let manifest = fs::read_to_string(kb_root.join("state/manifest.json"))
+        .expect("read manifest state file");
+    let hashes =
+        fs::read_to_string(kb_root.join("state/hashes.json")).expect("read hashes state file");
+
+    let manifest_json: Value = serde_json::from_str(&manifest).expect("parse manifest json");
+    let hashes_json: Value = serde_json::from_str(&hashes).expect("parse hashes json");
+
+    assert_eq!(manifest_json, serde_json::json!({ "artifacts": {} }));
+    assert_eq!(hashes_json, serde_json::json!({ "inputs": {} }));
+}
+
+#[test]
 fn ingest_file_registers_source_and_sidecar() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);

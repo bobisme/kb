@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use kb_core::{Hashes, Manifest};
 
 use crate::config::Config;
 
@@ -78,6 +79,9 @@ pub fn init(root_override: Option<PathBuf>, path_arg: Option<PathBuf>, force: bo
         fs::create_dir_all(&dir_path)
             .with_context(|| format!("failed to create directory {}", dir_path.display()))?;
     }
+
+    Manifest::default().save(&target)?;
+    Hashes::default().save(&target)?;
 
     let index_path = target.join("wiki/index.md");
     if !index_path.exists() || force {

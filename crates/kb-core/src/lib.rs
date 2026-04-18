@@ -364,12 +364,14 @@ pub mod hashing;
 pub mod managed_region;
 pub mod normalized;
 pub mod source_identity;
+pub mod state;
 
 pub use hashing::{Hash, hash_bytes, hash_file, hash_many};
 pub use managed_region::{
     ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title,
 };
 pub use normalized::{read_normalized_document, write_normalized_document};
+pub use state::{Hashes, Manifest, hashes_path, manifest_path};
 pub use source_identity::{
     SOURCE_DOCUMENT_ID_PREFIX, SOURCE_REVISION_ID_PREFIX, mint_source_document_id,
     mint_source_revision_id, normalize_file_stable_location, normalize_url_stable_location,
