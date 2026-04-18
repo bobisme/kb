@@ -237,6 +237,11 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
             }
         }
         other => {
+            // Non-Promotion approvals (concept_merge, alias_merge, canonicalization)
+            // flip the status so the queue moves on, but v1 does not execute the
+            // proposed change automatically — the reviewer is expected to make the
+            // corresponding edit (rename a concept page, adjust aliases, etc.) by
+            // hand. Be explicit about this rather than silently implying success.
             let mut approved = item;
             approved.status = ReviewStatus::Approved;
             approved.metadata.updated_at_millis = now;
@@ -248,9 +253,14 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
                     "id": id,
                     "action": "approved",
                     "kind": kind_label(other),
+                    "requires_manual_followup": true,
                 }))?;
             } else {
                 println!("Approved: {id} ({})", kind_label(other));
+                println!(
+                    "  note: the proposed change is not applied automatically — \
+                     perform the edit manually, then run 'kb compile'."
+                );
             }
         }
     }
