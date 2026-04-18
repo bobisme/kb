@@ -10,6 +10,7 @@ use crate::adapter::{
     GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
     MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
     RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
+    parse_extract_concepts_json,
 };
 use crate::provenance::ProvenanceRecord;
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -137,6 +138,31 @@ impl OpencodeAdapter {
         parts.join(" ")
     }
 
+    fn render_extract_concepts_prompt(
+        &self,
+        request: &ExtractConceptsRequest,
+    ) -> Result<(crate::templates::RenderedTemplate, crate::templates::Template), LlmAdapterError> {
+        let template = Template::load("extract_concepts.md", self.config.project_root.as_deref())
+            .map_err(|err| LlmAdapterError::Other(format!("load extract concepts template: {err}")))?;
+
+        let mut context = HashMap::new();
+        context.insert("title".to_string(), request.title.clone());
+        context.insert("body".to_string(), request.body.clone());
+        context.insert("summary".to_string(), request.summary.clone().unwrap_or_default());
+        context.insert(
+            "max_concepts".to_string(),
+            request
+                .max_concepts
+                .map_or_else(|| "no limit".to_string(), |value| value.to_string()),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render extract concepts template: {err}"))
+        })?;
+
+        Ok((rendered, template))
+    }
+
     /// Generate config, invoke opencode, and return the stripped response text.
     fn run_prompt(&self, prompt: &str) -> Result<String, LlmAdapterError> {
         let (temp_dir, config_path) = self.write_config()?;
@@ -212,11 +238,31 @@ impl LlmAdapter for OpencodeAdapter {
 
     fn extract_concepts(
         &self,
-        _request: ExtractConceptsRequest,
+        request: ExtractConceptsRequest,
     ) -> Result<(ExtractConceptsResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "opencode adapter extract_concepts is not implemented yet".to_string(),
-        ))
+        let (rendered, template) = self.render_extract_concepts_prompt(&request)?;
+
+        let started_at = unix_time_ms()?;
+        let raw = self.run_prompt(&rendered.content)?;
+        let response = parse_extract_concepts_json(&raw)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((response, provenance))
     }
 
     fn merge_concept_candidates(
@@ -491,6 +537,56 @@ mod tests {
             args.contains("80 words"),
             "args should contain max word budget: {args}"
         );
+    }
+
+    #[test]
+    fn extract_concepts_invokes_opencode_run_and_parses_json_payload() {
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-opencode.sh");
+        let args_path = tmp.path().join("args.txt");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"concepts\":[{{\"name\":\"Borrow checker\",\"aliases\":[\"borrowck\"],\"definition_hint\":\"Rust''s reference safety analysis.\",\"source_anchors\":[{{\"heading_anchor\":\"ownership\",\"quote\":\"The borrow checker validates references.\"}}]}}]}}'\n",
+                args_path.display(),
+            ),
+        )
+        .expect("write fake opencode script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: script_path.display().to_string(),
+            model: "openai/gpt-5.4".to_string(),
+            agent_name: "kb".to_string(),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+
+        let (response, provenance) = adapter
+            .extract_concepts(ExtractConceptsRequest {
+                title: "Ownership Notes".to_string(),
+                body: "The borrow checker validates references.".to_string(),
+                summary: Some("Rust ownership overview".to_string()),
+                max_concepts: Some(5),
+            })
+            .expect("extract concepts");
+
+        assert_eq!(response.concepts.len(), 1);
+        assert_eq!(response.concepts[0].name, "Borrow checker");
+        assert_eq!(response.concepts[0].aliases, vec!["borrowck"]);
+        assert_eq!(provenance.prompt_template_name, "extract_concepts.md");
+
+        let args = fs::read_to_string(&args_path).expect("read captured args");
+        assert!(args.contains("Ownership Notes"));
+        assert!(args.contains("Rust ownership overview"));
+        assert!(args.contains('5'));
     }
 
     #[test]

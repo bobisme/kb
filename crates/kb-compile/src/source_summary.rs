@@ -188,6 +188,7 @@ fn build_record_for_summary(
     .to_hex();
 
     Ok(BuildRecord {
+        pass_name: "source_summary".to_string(),
         metadata: EntityMetadata {
             id: format!("build:source-summary:{}", document.metadata.id),
             created_at_millis: now,
@@ -365,6 +366,7 @@ mod tests {
         assert!(artifact.page_body.contains("<!-- kb:begin id=summary -->"));
         assert!(artifact.page_body.contains("A concise source summary."));
         assert!(artifact.page_body.contains("### Key headings"));
+        assert_eq!(artifact.build_record.pass_name, "source_summary");
         assert_eq!(artifact.build_record.metadata.model_version.as_deref(), Some("openai/gpt-5.4"));
         let expected_prompt_hash = Hash::from([2u8; 32]).to_hex();
         assert_eq!(

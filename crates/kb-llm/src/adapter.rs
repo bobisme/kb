@@ -49,27 +49,53 @@ pub struct SummarizeDocumentResponse {
     pub summary: String,
 }
 
-/// Request to extract concepts from a document.
+/// Anchor back into the source that supports an extracted concept candidate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceAnchor {
+    /// Optional stable heading/section anchor within the source.
+    pub heading_anchor: Option<String>,
+    /// Optional exact quote or short supporting snippet from the source.
+    pub quote: Option<String>,
+}
+
+/// Candidate concept emitted by the extraction pass before canonicalization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConceptCandidate {
+    /// Preferred concept label for this candidate.
+    pub name: String,
+    /// Alternate labels or spellings observed in the source.
+    pub aliases: Vec<String>,
+    /// Short definition or gloss for the concept.
+    pub definition_hint: Option<String>,
+    /// Source-backed anchors supporting this extraction.
+    pub source_anchors: Vec<SourceAnchor>,
+}
+
+/// Request to extract concept candidates from a document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractConceptsRequest {
-    /// The document text to analyze.
-    pub document_text: String,
+    /// Display title for the source document being analyzed.
+    pub title: String,
+    /// Canonical body text to analyze.
+    pub body: String,
+    /// Optional precomputed source summary to give the extractor more context.
+    pub summary: Option<String>,
     /// Maximum number of concepts to extract (None for no limit).
     pub max_concepts: Option<usize>,
 }
 
-/// Response containing extracted concepts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response containing extracted concept candidates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExtractConceptsResponse {
-    /// List of extracted concept names.
-    pub concepts: Vec<String>,
+    /// Candidate concepts found in the source.
+    pub concepts: Vec<ConceptCandidate>,
 }
 
 /// Request to merge concept candidates into a canonical list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergeConceptCandidatesRequest {
     /// Multiple lists of candidate concepts to merge.
-    pub candidate_lists: Vec<Vec<String>>,
+    pub candidate_lists: Vec<Vec<ConceptCandidate>>,
     /// Strategy for merging (e.g. "union", "intersection").
     pub merge_strategy: String,
 }
@@ -137,10 +163,44 @@ pub struct RunHealthCheckResponse {
     pub details: Option<String>,
 }
 
-/// Adapter trait for interacting with LLM backends.
+/// Extract JSON candidate payloads from LLM text output.
 ///
-/// All methods are synchronous and return a response payload along with provenance metadata.
-/// Each operation is independent and may be retried independently.
+/// # Errors
+///
+/// Returns [`LlmAdapterError::Parse`] when the text is empty, not valid JSON, or does not
+/// match the expected concept-candidate response schema.
+pub fn parse_extract_concepts_json(text: &str) -> Result<ExtractConceptsResponse, LlmAdapterError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(LlmAdapterError::Parse(
+            "extract_concepts response was empty".to_string(),
+        ));
+    }
+
+    let json_text = trimmed
+        .strip_prefix("```")
+        .and_then(|body| body.split_once('\n').map(|(_, rest)| rest))
+        .and_then(|body| body.rsplit_once("```").map(|(json, _)| json.trim()))
+        .unwrap_or(trimmed);
+
+    let value: serde_json::Value = serde_json::from_str(json_text).map_err(|err| {
+        LlmAdapterError::Parse(format!("extract_concepts response was not valid JSON: {err}"))
+    })?;
+
+    if value.is_array() {
+        let concepts = serde_json::from_value(value).map_err(|err| {
+            LlmAdapterError::Parse(format!("extract_concepts response had invalid candidate list: {err}"))
+        })?;
+        return Ok(ExtractConceptsResponse { concepts });
+    }
+
+    serde_json::from_value(value).map_err(|err| {
+        LlmAdapterError::Parse(format!(
+            "extract_concepts response had invalid envelope shape: {err}"
+        ))
+    })
+}
+
 pub trait LlmAdapter: Send + Sync {
     /// Summarize a document.
     ///
@@ -219,4 +279,51 @@ pub trait LlmAdapter: Send + Sync {
         &self,
         request: RunHealthCheckRequest,
     ) -> Result<(RunHealthCheckResponse, ProvenanceRecord), LlmAdapterError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_extract_concepts_accepts_enveloped_object() {
+        let parsed = parse_extract_concepts_json(
+            r#"{
+                "concepts": [
+                    {
+                        "name": "Rust ownership",
+                        "aliases": ["ownership"],
+                        "definition_hint": "Rules that govern value moves and borrowing.",
+                        "source_anchors": [
+                            {"heading_anchor": "ownership", "quote": "Ownership is Rust's most unique feature."}
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse candidate envelope");
+
+        assert_eq!(parsed.concepts.len(), 1);
+        assert_eq!(parsed.concepts[0].name, "Rust ownership");
+        assert_eq!(parsed.concepts[0].aliases, vec!["ownership"]);
+        assert_eq!(
+            parsed.concepts[0].source_anchors[0].heading_anchor.as_deref(),
+            Some("ownership")
+        );
+    }
+
+    #[test]
+    fn parse_extract_concepts_accepts_fenced_array() {
+        let parsed = parse_extract_concepts_json(
+            "```json\n[{\"name\":\"Borrow checker\",\"aliases\":[],\"definition_hint\":null,\"source_anchors\":[{\"heading_anchor\":null,\"quote\":\"The borrow checker validates references.\"}]}]\n```",
+        )
+        .expect("parse fenced candidate list");
+
+        assert_eq!(parsed.concepts.len(), 1);
+        assert_eq!(parsed.concepts[0].name, "Borrow checker");
+        assert_eq!(
+            parsed.concepts[0].source_anchors[0].quote.as_deref(),
+            Some("The borrow checker validates references.")
+        );
+    }
 }

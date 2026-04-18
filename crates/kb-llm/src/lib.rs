@@ -9,10 +9,11 @@ pub mod subprocess;
 mod templates;
 
 pub use adapter::{
-    AnswerQuestionRequest, AnswerQuestionResponse, ExtractConceptsRequest, ExtractConceptsResponse,
-    GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
-    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
-    RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
+    AnswerQuestionRequest, AnswerQuestionResponse, ConceptCandidate, ExtractConceptsRequest,
+    ExtractConceptsResponse, GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter,
+    LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse,
+    RunHealthCheckRequest, RunHealthCheckResponse, SourceAnchor, SummarizeDocumentRequest,
+    SummarizeDocumentResponse,
 };
 pub use claude::{ClaudeCliAdapter, ClaudeCliConfig};
 pub use opencode::{OpencodeAdapter, OpencodeConfig};

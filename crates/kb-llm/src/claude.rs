@@ -9,6 +9,7 @@ use crate::adapter::{
     GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
     MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
     RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
+    parse_extract_concepts_json,
 };
 use crate::provenance::{ProvenanceRecord, TokenUsage};
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -61,6 +62,36 @@ impl ClaudeCliAdapter {
         let rendered = template
             .render(&context)
             .map_err(|err| LlmAdapterError::Other(format!("render summarize template: {err}")))?;
+
+        Ok(RenderedPrompt {
+            template_name: template.name,
+            template_hash: template.template_hash,
+            content: rendered.content,
+            render_hash: rendered.render_hash,
+        })
+    }
+
+    fn render_extract_concepts_prompt(
+        &self,
+        request: &ExtractConceptsRequest,
+    ) -> Result<RenderedPrompt, LlmAdapterError> {
+        let template = Template::load("extract_concepts.md", self.config.project_root.as_deref())
+            .map_err(|err| LlmAdapterError::Other(format!("load extract concepts template: {err}")))?;
+
+        let mut context = HashMap::new();
+        context.insert("title".to_string(), request.title.clone());
+        context.insert("body".to_string(), request.body.clone());
+        context.insert("summary".to_string(), request.summary.clone().unwrap_or_default());
+        context.insert(
+            "max_concepts".to_string(),
+            request
+                .max_concepts
+                .map_or_else(|| "no limit".to_string(), |value| value.to_string()),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render extract concepts template: {err}"))
+        })?;
 
         Ok(RenderedPrompt {
             template_name: template.name,
@@ -151,11 +182,48 @@ impl LlmAdapter for ClaudeCliAdapter {
 
     fn extract_concepts(
         &self,
-        _request: ExtractConceptsRequest,
+        request: ExtractConceptsRequest,
     ) -> Result<(ExtractConceptsResponse, ProvenanceRecord), LlmAdapterError> {
-        Err(LlmAdapterError::Other(
-            "Claude CLI adapter extract_concepts is not implemented yet".to_string(),
-        ))
+        let rendered = self.render_extract_concepts_prompt(&request)?;
+        let started_at = unix_time_ms()?;
+        let command = self.build_command(&rendered.content);
+
+        let output =
+            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+
+        if output.exit_code != Some(0) {
+            return Err(classify_nonzero_exit(
+                output.exit_code,
+                &output.stderr,
+                &output.stdout,
+            ));
+        }
+
+        let parsed = parse_claude_json(&output.stdout)?;
+        let response = parse_extract_concepts_json(&parsed.text)?;
+        let ended_at = unix_time_ms()?;
+
+        let model = parsed
+            .model
+            .or_else(|| self.config.model.clone())
+            .unwrap_or_else(|| "claude".to_string());
+
+        let provenance = ProvenanceRecord {
+            harness: "claude".to_string(),
+            harness_version: None,
+            model,
+            prompt_template_name: rendered.template_name,
+            prompt_template_hash: rendered.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: parsed.tokens,
+            cost_estimate: parsed.cost_estimate,
+        };
+
+        Ok((response, provenance))
     }
 
     fn merge_concept_candidates(
@@ -599,6 +667,57 @@ mod tests {
         assert!(args.contains("Example Source"));
         assert!(args.contains("A long source document."));
         assert!(args.contains("80 words"));
+    }
+
+    #[test]
+    fn extract_concepts_invokes_claude_cli_and_parses_json_payload() {
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-claude.sh");
+        let args_path = tmp.path().join("args.txt");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\n' \"$@\" > '{}'\ncat <<'EOF'\n{}\nEOF\n",
+                args_path.display(),
+                r#"{"result":"{\"concepts\":[{\"name\":\"Borrow checker\",\"aliases\":[\"borrowck\"],\"definition_hint\":\"Rust's reference safety analysis.\",\"source_anchors\":[{\"heading_anchor\":\"ownership\",\"quote\":\"The borrow checker validates references.\"}]}]}","model":"claude-haiku","usage":{"input_tokens":30,"output_tokens":9}}"#
+            ),
+        )
+        .expect("write fake claude script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script_path, permissions).expect("chmod");
+        }
+
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+            command: script_path.display().to_string(),
+            model: Some("claude-haiku".to_string()),
+            permission_mode: Some("ask".to_string()),
+            timeout: Duration::from_secs(5),
+            project_root: None,
+        });
+
+        let (response, provenance) = adapter
+            .extract_concepts(ExtractConceptsRequest {
+                title: "Ownership Notes".to_string(),
+                body: "The borrow checker validates references.".to_string(),
+                summary: Some("Rust ownership overview".to_string()),
+                max_concepts: Some(5),
+            })
+            .expect("extract concepts");
+
+        assert_eq!(response.concepts.len(), 1);
+        assert_eq!(response.concepts[0].name, "Borrow checker");
+        assert_eq!(response.concepts[0].aliases, vec!["borrowck"]);
+        assert_eq!(provenance.prompt_template_name, "extract_concepts.md");
+
+        let args = fs::read_to_string(&args_path).expect("read fake claude args");
+        assert!(args.contains("Ownership Notes"));
+        assert!(args.contains("Rust ownership overview"));
+        assert!(args.contains('5'));
     }
 
     #[test]

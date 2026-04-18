@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod concept_extraction;
 pub mod orchestrator;
 pub mod source_summary;
 
