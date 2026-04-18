@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod artifact;
+pub mod grounding;
 pub mod lexical;
 pub mod writer;
 

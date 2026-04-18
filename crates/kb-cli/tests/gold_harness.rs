@@ -1,6 +1,9 @@
 mod common;
 
 use common::{kb_cmd, make_temp_kb};
+use kb_query::grounding::{
+    self, AnswerEvidence, GroundingThresholds, QuestionGrounding,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
@@ -56,8 +59,21 @@ struct BaselineRun {
     mean_llm_citation_coverage: Option<f64>,
     /// Average hallucination rate (`None` when all questions lack LLM data).
     mean_hallucination_rate: Option<f64>,
+    /// Grounding quality report (`None` when LLM data unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    grounding: Option<GroundingBaseline>,
     /// Per-question results.
     questions: Vec<QuestionResult>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct GroundingBaseline {
+    mean_citation_precision: f64,
+    mean_citation_recall: f64,
+    mean_hallucination_rate: f64,
+    uncertainty_accuracy: f64,
+    passes_ship_threshold: bool,
+    thresholds: GroundingThresholds,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -314,7 +330,7 @@ fn gold_retrieval_coverage() {
     print_coverage_report(&results, mean_coverage);
 
     if std::env::var("GOLD_RECORD_BASELINE").is_ok() {
-        write_baseline(&results, mean_coverage, None, None);
+        write_baseline(&results, mean_coverage, None, None, None);
     }
 
     // Retrieval coverage must be at least 70% on average to pass.
@@ -325,21 +341,22 @@ fn gold_retrieval_coverage() {
     );
 }
 
-/// Measures LLM citation coverage and hallucination rate against a real backend.
+/// Measures LLM citation coverage, hallucination rate, and grounding quality
+/// against a real backend.
 ///
 /// Run with:
 /// ```text
-/// cargo test --test gold_harness -- --ignored
+/// cargo test --test gold_harness -- --ignored gold_llm_grounding
 /// ```
 ///
 /// To record the results as the new baseline:
 /// ```text
-/// GOLD_RECORD_BASELINE=1 cargo test --test gold_harness -- --ignored
+/// GOLD_RECORD_BASELINE=1 cargo test --test gold_harness -- --ignored gold_llm_grounding
 /// ```
 #[allow(clippy::cast_precision_loss)]
 #[test]
 #[ignore = "requires real LLM backend; run manually and set GOLD_RECORD_BASELINE=1 to update"]
-fn gold_llm_citation_quality() {
+fn gold_llm_grounding() {
     let corpus_path = PathBuf::from(CORPUS_DIR);
     assert!(
         corpus_path.exists(),
@@ -359,52 +376,162 @@ fn gold_llm_citation_quality() {
     let total_retrieval: f64 = results.iter().map(|r| r.retrieval_coverage).sum();
     let mean_retrieval = total_retrieval / questions.len() as f64;
 
-    let mut total_llm_citation = 0.0_f64;
-    let mut total_hallucination = 0.0_f64;
-    let mut llm_question_count = 0_usize;
-
-    for (r, q) in results.iter().zip(questions.iter()) {
-        let valid = r.valid_citations.unwrap_or(0);
-        let invalid = r.invalid_citations.unwrap_or(0);
-        let total_cits = valid + invalid;
-
-        // Only count questions where the LLM produced citations.
-        if total_cits > 0 || r.valid_citations.is_some() {
-            let hallucination_rate = if total_cits > 0 {
-                invalid as f64 / total_cits as f64
-            } else {
-                0.0
-            };
-            let llm_cit_cov = if q.expected_sources.is_empty() {
-                1.0
-            } else {
-                valid as f64 / q.expected_sources.len() as f64
-            };
-            total_llm_citation += llm_cit_cov;
-            total_hallucination += hallucination_rate;
-            llm_question_count += 1;
-        }
-    }
-
-    let mean_llm_cov = if llm_question_count > 0 {
-        Some(total_llm_citation / llm_question_count as f64)
-    } else {
-        None
-    };
-    let mean_hallucination = if llm_question_count > 0 {
-        Some(total_hallucination / llm_question_count as f64)
-    } else {
-        None
-    };
+    let grounding_questions = build_grounding_questions(&results, &questions);
+    let thresholds = GroundingThresholds::ship();
+    let report = grounding::aggregate(&grounding_questions, &thresholds);
 
     print_coverage_report(&results, mean_retrieval);
-    if let Some(h) = mean_hallucination {
-        println!("mean hallucination rate: {h:.2}");
-    }
+    print_grounding_report(&report);
+
+    let mean_llm_cov = if grounding_questions.is_empty() {
+        None
+    } else {
+        Some(report.mean_citation_recall)
+    };
+    let mean_hallucination = if grounding_questions.is_empty() {
+        None
+    } else {
+        Some(report.mean_hallucination_rate)
+    };
 
     if std::env::var("GOLD_RECORD_BASELINE").is_ok() {
-        write_baseline(&results, mean_retrieval, mean_llm_cov, mean_hallucination);
+        let grounding_baseline = GroundingBaseline {
+            mean_citation_precision: report.mean_citation_precision,
+            mean_citation_recall: report.mean_citation_recall,
+            mean_hallucination_rate: report.mean_hallucination_rate,
+            uncertainty_accuracy: report.uncertainty_accuracy,
+            passes_ship_threshold: report.passes_ship_threshold,
+            thresholds,
+        };
+        write_baseline(
+            &results,
+            mean_retrieval,
+            mean_llm_cov,
+            mean_hallucination,
+            Some(grounding_baseline),
+        );
     }
+}
+
+/// Offline grounding test: verifies the grounding scorer against synthetic answers.
+/// Runs in CI without an LLM backend.
+#[test]
+fn gold_grounding_scorer_offline() {
+    let thresholds = GroundingThresholds::ship();
+
+    let perfect = grounding::score_answer(&AnswerEvidence {
+        valid_citations: 3,
+        invalid_citations: 0,
+        total_manifest_entries: 3,
+        expected_sources_cited: 2,
+        total_expected_sources: 2,
+        has_uncertainty_banner: false,
+        should_have_uncertainty: false,
+    });
+    assert_eq!(grounding::classify(&perfect), grounding::GroundingVerdict::Strong);
+
+    let hallucinated = grounding::score_answer(&AnswerEvidence {
+        valid_citations: 1,
+        invalid_citations: 4,
+        total_manifest_entries: 2,
+        expected_sources_cited: 1,
+        total_expected_sources: 3,
+        has_uncertainty_banner: false,
+        should_have_uncertainty: true,
+    });
+    assert_eq!(
+        grounding::classify(&hallucinated),
+        grounding::GroundingVerdict::Ungrounded
+    );
+
+    let weak = grounding::score_answer(&AnswerEvidence {
+        valid_citations: 1,
+        invalid_citations: 0,
+        total_manifest_entries: 5,
+        expected_sources_cited: 1,
+        total_expected_sources: 4,
+        has_uncertainty_banner: true,
+        should_have_uncertainty: true,
+    });
+    assert_eq!(grounding::classify(&weak), grounding::GroundingVerdict::Weak);
+
+    let good_questions = vec![
+        QuestionGrounding {
+            id: "synthetic-1".to_string(),
+            metrics: perfect.clone(),
+            verdict: grounding::classify(&perfect),
+        },
+        QuestionGrounding {
+            id: "synthetic-2".to_string(),
+            metrics: grounding::GroundingMetrics {
+                citation_precision: 0.85,
+                citation_recall: 0.60,
+                hallucination_rate: 0.05,
+                uncertainty_appropriate: true,
+            },
+            verdict: grounding::GroundingVerdict::Acceptable,
+        },
+    ];
+    let report = grounding::aggregate(&good_questions, &thresholds);
+    assert!(
+        report.passes_ship_threshold,
+        "synthetic good answers should pass ship threshold"
+    );
+
+    let bad_questions = vec![
+        QuestionGrounding {
+            id: "synthetic-bad".to_string(),
+            metrics: hallucinated,
+            verdict: grounding::GroundingVerdict::Ungrounded,
+        },
+        QuestionGrounding {
+            id: "synthetic-weak".to_string(),
+            metrics: weak,
+            verdict: grounding::GroundingVerdict::Weak,
+        },
+    ];
+    let bad_report = grounding::aggregate(&bad_questions, &thresholds);
+    assert!(
+        !bad_report.passes_ship_threshold,
+        "synthetic bad answers should fail ship threshold"
+    );
+}
+
+// ── Grounding helpers ───────────────────────────────────────────────────────
+
+#[allow(clippy::cast_precision_loss)]
+fn build_grounding_questions(
+    results: &[QuestionResult],
+    questions: &[GoldQuestion],
+) -> Vec<QuestionGrounding> {
+    results
+        .iter()
+        .zip(questions.iter())
+        .filter_map(|(r, q)| {
+            let valid = r.valid_citations?;
+            let invalid = r.invalid_citations.unwrap_or(0);
+            let total_cits = valid + invalid;
+            let should_uncertain = r.retrieval_coverage < 0.5
+                || (total_cits == 0 && !q.expected_sources.is_empty());
+
+            let evidence = AnswerEvidence {
+                valid_citations: valid,
+                invalid_citations: invalid,
+                total_manifest_entries: valid + invalid,
+                expected_sources_cited: std::cmp::min(valid, q.expected_sources.len()),
+                total_expected_sources: q.expected_sources.len(),
+                has_uncertainty_banner: false,
+                should_have_uncertainty: should_uncertain,
+            };
+            let metrics = grounding::score_answer(&evidence);
+            let verdict = grounding::classify(&metrics);
+            Some(QuestionGrounding {
+                id: r.id.clone(),
+                metrics,
+                verdict,
+            })
+        })
+        .collect()
 }
 
 // ── Reporting ────────────────────────────────────────────────────────────────
@@ -429,11 +556,54 @@ fn print_coverage_report(results: &[QuestionResult], mean_coverage: f64) {
     );
 }
 
+fn print_grounding_report(report: &grounding::GroundingReport) {
+    println!("\n── Grounding Quality Report ────────────────────────────────────────");
+    for q in &report.per_question {
+        println!(
+            "  {} — precision:{:.0}% recall:{:.0}% hallucination:{:.0}% → {}",
+            q.id,
+            q.metrics.citation_precision * 100.0,
+            q.metrics.citation_recall * 100.0,
+            q.metrics.hallucination_rate * 100.0,
+            q.verdict,
+        );
+    }
+    println!("────────────────────────────────────────────────────────────────────");
+    println!(
+        "  mean citation precision:  {:.2} ({:.0}%)",
+        report.mean_citation_precision,
+        report.mean_citation_precision * 100.0
+    );
+    println!(
+        "  mean citation recall:     {:.2} ({:.0}%)",
+        report.mean_citation_recall,
+        report.mean_citation_recall * 100.0
+    );
+    println!(
+        "  mean hallucination rate:  {:.2} ({:.0}%)",
+        report.mean_hallucination_rate,
+        report.mean_hallucination_rate * 100.0
+    );
+    println!(
+        "  uncertainty accuracy:     {:.2} ({:.0}%)",
+        report.uncertainty_accuracy,
+        report.uncertainty_accuracy * 100.0
+    );
+    let pass_label = if report.passes_ship_threshold {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    println!("  ship threshold:           {pass_label}");
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_baseline(
     results: &[QuestionResult],
     mean_retrieval: f64,
     mean_llm_cov: Option<f64>,
     mean_hallucination: Option<f64>,
+    grounding_baseline: Option<GroundingBaseline>,
 ) {
     let baseline = BaselineRun {
         date: chrono_now(),
@@ -441,6 +611,7 @@ fn write_baseline(
         mean_retrieval_coverage: mean_retrieval,
         mean_llm_citation_coverage: mean_llm_cov,
         mean_hallucination_rate: mean_hallucination,
+        grounding: grounding_baseline,
         questions: results.to_vec(),
     };
 
