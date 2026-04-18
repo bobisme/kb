@@ -16,7 +16,6 @@ pub struct Config {
     pub ask: AskConfig,
     pub lint: LintConfig,
     pub publish: PublishConfig,
-    pub review: ReviewConfig,
     pub lock: LockConfig,
 }
 
@@ -50,10 +49,6 @@ impl Config {
 
         if let Ok(default_model) = env::var("KB_LLM_DEFAULT_MODEL") {
             self.llm.default_model = default_model;
-        }
-
-        if let Ok(fallback_model) = env::var("KB_LLM_FALLBACK_MODEL") {
-            self.llm.fallback_model = Some(fallback_model);
         }
 
         if let Ok(command) = env::var("KB_LLM_RUNNER_OPENCODE_COMMAND") {
@@ -132,35 +127,8 @@ impl Config {
             self.compile.token_budget = parse_u32_var("KB_COMPILE_TOKEN_BUDGET", &token_budget)?;
         }
 
-        if let Ok(retry_limit) = env::var("KB_COMPILE_RETRY_LIMIT") {
-            self.compile.retry_limit = parse_u32_var("KB_COMPILE_RETRY_LIMIT", &retry_limit)?;
-        }
-
-        if let Ok(timeout_seconds) = env::var("KB_COMPILE_TIMEOUT_SECONDS") {
-            self.compile.timeout_seconds =
-                parse_u64_var("KB_COMPILE_TIMEOUT_SECONDS", &timeout_seconds)?;
-        }
-
         if let Ok(token_budget) = env::var("KB_ASK_TOKEN_BUDGET") {
             self.ask.token_budget = parse_u32_var("KB_ASK_TOKEN_BUDGET", &token_budget)?;
-        }
-
-        if let Ok(max_retries) = env::var("KB_LINT_RETRY_LIMIT") {
-            self.lint.retry_limit = parse_u32_var("KB_LINT_RETRY_LIMIT", &max_retries)?;
-        }
-
-        if let Ok(timeout_seconds) = env::var("KB_LINT_TIMEOUT_SECONDS") {
-            self.lint.timeout_seconds = parse_u64_var("KB_LINT_TIMEOUT_SECONDS", &timeout_seconds)?;
-        }
-
-        if let Ok(require) = env::var("KB_REVIEW_REQUIRES_APPROVAL") {
-            self.review.requires_approval =
-                parse_bool_var("KB_REVIEW_REQUIRES_APPROVAL", &require)?;
-        }
-
-        if let Ok(require) = env::var("KB_REVIEW_REQUIRES_DESTRUCTIVE_APPROVAL") {
-            self.review.requires_destructive_approval =
-                parse_bool_var("KB_REVIEW_REQUIRES_DESTRUCTIVE_APPROVAL", &require)?;
         }
 
         if let Ok(timeout_ms) = env::var("KB_LOCK_TIMEOUT_MS") {
@@ -187,35 +155,17 @@ impl Config {
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct DataConfig {
-    #[serde(rename = "raw_dir")]
-    pub raw: String,
-    #[serde(rename = "normalized_dir")]
-    pub normalized: String,
-    #[serde(rename = "wiki_dir")]
-    pub wiki: String,
-    #[serde(rename = "outputs_dir")]
-    pub outputs: String,
+    /// Directory (relative to KB root) where prompt templates live. The
+    /// LLM adapter loads `<root>/<prompt_templates>/<name>.md`, falling
+    /// back to bundled defaults when the file is absent.
     #[serde(rename = "prompt_templates_dir")]
     pub prompt_templates: String,
-    #[serde(rename = "cache_dir")]
-    pub cache: String,
-    #[serde(rename = "log_dir")]
-    pub logs: String,
-    #[serde(rename = "state_dir")]
-    pub state: String,
 }
 
 impl Default for DataConfig {
     fn default() -> Self {
         Self {
-            raw: "raw".to_string(),
-            normalized: "normalized".to_string(),
-            wiki: "wiki".to_string(),
-            outputs: "outputs".to_string(),
             prompt_templates: "prompts".to_string(),
-            cache: "cache".to_string(),
-            logs: "logs".to_string(),
-            state: "state".to_string(),
         }
     }
 }
@@ -226,7 +176,6 @@ impl Default for DataConfig {
 pub struct LlmConfig {
     pub default_runner: String,
     pub default_model: String,
-    pub fallback_model: Option<String>,
     pub runners: HashMap<String, LlmRunnerConfig>,
 }
 
@@ -263,7 +212,6 @@ impl Default for LlmConfig {
         Self {
             default_runner: "opencode".to_string(),
             default_model: "openai/gpt-5.4".to_string(),
-            fallback_model: Some("openai/gpt-4.1".to_string()),
             runners,
         }
     }
@@ -304,20 +252,12 @@ impl Default for LlmRunnerConfig {
 #[serde(deny_unknown_fields)]
 pub struct CompileConfig {
     pub token_budget: u32,
-    pub cost_budget_cents: u32,
-    pub timeout_seconds: u64,
-    pub retry_limit: u32,
-    pub strictness: u32,
 }
 
 impl Default for CompileConfig {
     fn default() -> Self {
         Self {
             token_budget: 25_000,
-            cost_budget_cents: 1000,
-            timeout_seconds: 900,
-            retry_limit: 3,
-            strictness: 3,
         }
     }
 }
@@ -327,9 +267,6 @@ impl Default for CompileConfig {
 #[serde(deny_unknown_fields)]
 pub struct AskConfig {
     pub token_budget: u32,
-    pub cost_budget_cents: u32,
-    pub timeout_seconds: u64,
-    pub retry_limit: u32,
     pub artifact_default_format: String,
 }
 
@@ -337,9 +274,6 @@ impl Default for AskConfig {
     fn default() -> Self {
         Self {
             token_budget: 20_000,
-            cost_budget_cents: 500,
-            timeout_seconds: 900,
-            retry_limit: 2,
             artifact_default_format: "markdown".to_string(),
         }
     }
@@ -349,10 +283,6 @@ impl Default for AskConfig {
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct LintConfig {
-    pub strictness: u32,
-    pub timeout_seconds: u64,
-    pub retry_limit: u32,
-    pub max_broken_links: u32,
     pub require_citations: bool,
     pub missing_citations_level: String,
 }
@@ -360,10 +290,6 @@ pub struct LintConfig {
 impl Default for LintConfig {
     fn default() -> Self {
         Self {
-            strictness: 2,
-            timeout_seconds: 600,
-            retry_limit: 1,
-            max_broken_links: 100,
             require_citations: true,
             missing_citations_level: "warn".to_string(),
         }
@@ -382,46 +308,11 @@ pub struct PublishTargetConfig {
     pub format: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct PublishConfig {
-    pub default_destination: String,
-    pub timeout_seconds: u64,
-    pub retry_limit: u32,
-    pub artifact_dir: String,
     pub targets: HashMap<String, PublishTargetConfig>,
-}
-
-impl Default for PublishConfig {
-    fn default() -> Self {
-        Self {
-            default_destination: "notes".to_string(),
-            timeout_seconds: 900,
-            retry_limit: 2,
-            artifact_dir: "outputs".to_string(),
-            targets: HashMap::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", default)]
-#[serde(deny_unknown_fields)]
-pub struct ReviewConfig {
-    pub requires_approval: bool,
-    pub requires_destructive_approval: bool,
-    pub max_open_items: u32,
-}
-
-impl Default for ReviewConfig {
-    fn default() -> Self {
-        Self {
-            requires_approval: true,
-            requires_destructive_approval: true,
-            max_open_items: 50,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -481,16 +372,8 @@ token_budget = 12000
         assert_eq!(cfg.llm.default_runner, Config::default().llm.default_runner);
         assert_eq!(cfg.compile.token_budget, 12_000);
         assert_eq!(
-            cfg.compile.cost_budget_cents,
-            Config::default().compile.cost_budget_cents
-        );
-        assert_eq!(
             cfg.ask.artifact_default_format,
             Config::default().ask.artifact_default_format
-        );
-        assert_eq!(
-            cfg.publish.default_destination,
-            Config::default().publish.default_destination
         );
         assert_eq!(cfg.lock.timeout_ms, Config::default().lock.timeout_ms);
         Ok(())
