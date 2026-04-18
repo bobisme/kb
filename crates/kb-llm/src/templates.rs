@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
@@ -23,10 +23,7 @@ impl Template {
     ///
     /// # Errors
     /// Returns an error if the template cannot be read or no bundled default is available.
-    pub fn load(
-        name: &str,
-        project_root: Option<&Path>,
-    ) -> Result<Self> {
+    pub fn load(name: &str, project_root: Option<&Path>) -> Result<Self> {
         let content = if let Some(root) = project_root {
             let path = root.join("prompts").join(name);
             if path.exists() {
@@ -53,7 +50,12 @@ impl Template {
         match name {
             "ask.md" => Ok(include_str!("../prompts/ask.md").to_string()),
             "compile.md" => Ok(include_str!("../prompts/compile.md").to_string()),
-            _ => Err(anyhow!("template '{name}' not found in project and no bundled default available")),
+            "summarize_document.md" => {
+                Ok(include_str!("../prompts/summarize_document.md").to_string())
+            }
+            _ => Err(anyhow!(
+                "template '{name}' not found in project and no bundled default available"
+            )),
         }
     }
 
@@ -119,7 +121,9 @@ impl Template {
         match name {
             "researcher" => Ok(include_str!("../prompts/personas/researcher.md").to_string()),
             "analyst" => Ok(include_str!("../prompts/personas/analyst.md").to_string()),
-            _ => Err(anyhow!("persona '{name}' not found in project and no bundled default available")),
+            _ => Err(anyhow!(
+                "persona '{name}' not found in project and no bundled default available"
+            )),
         }
     }
 }
