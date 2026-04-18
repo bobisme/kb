@@ -208,7 +208,6 @@ fn build_record_for_summary(
         input_ids: vec![document.metadata.id.clone(), document.source_revision_id.clone()],
         output_ids: vec![source_page_id.to_string()],
         manifest_hash,
-        pass_name: "source_summary".to_string(),
     })
 }
 
