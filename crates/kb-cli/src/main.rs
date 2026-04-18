@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod init;
 mod jobs;
 mod root;
 
@@ -204,13 +205,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Some(Command::Init { path }) => {
-            println!(
-                "init is not implemented yet{}",
-                path.map_or(String::new(), |p| format!(" at {}", p.display()))
-            );
-            Ok(())
-        }
+        Some(Command::Init { path }) => init::init(root, path, cli.force),
         Some(Command::Search { query }) => {
             println!("search is not implemented yet: {query}");
             Ok(())
