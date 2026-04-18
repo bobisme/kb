@@ -2,6 +2,7 @@
 
 pub mod concept_extraction;
 pub mod orchestrator;
+pub mod source_page;
 pub mod source_summary;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
