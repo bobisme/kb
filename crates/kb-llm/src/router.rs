@@ -34,6 +34,20 @@ pub struct Router {
     configured_backends: HashSet<Backend>,
 }
 
+/// Errors produced when a model cannot be routed to a backend.
+#[derive(Debug, thiserror::Error)]
+pub enum RouterError {
+    /// Caller requested a Claude-family model but no `ClaudeCode` backend is configured.
+    ///
+    /// Anthropic's subscription terms forbid running Claude models through third-party
+    /// harnesses, so the router refuses to fall back rather than silently violating those terms.
+    #[error(
+        "Claude-family model '{model}' requires the ClaudeCode backend, but it is not configured. \
+         Add a [llm.runners.claude] section to kb.toml to enable it."
+    )]
+    ClaudeCodeRequired { model: String },
+}
+
 impl Router {
     /// Create a router with a single default backend configured.
     #[must_use]
@@ -65,30 +79,35 @@ impl Router {
     }
 
     /// Return the backend selected for the provided model identifier.
-    #[must_use]
-    pub fn route_model(&self, model: &str) -> Backend {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::ClaudeCodeRequired`] if a Claude-family model is requested
+    /// but the `ClaudeCode` backend is not configured. Claude models may not route to
+    /// any other backend (Anthropic's subscription terms); the router refuses to fall back silently.
+    pub fn route_model(&self, model: &str) -> Result<Backend, RouterError> {
         if is_claude_model(model) {
-            // Claude family models MUST go to Claude Code regardless of caller preference.
             if self.configured_backends.contains(&Backend::ClaudeCode) {
-                Backend::ClaudeCode
+                Ok(Backend::ClaudeCode)
             } else {
-                self.default_backend
+                Err(RouterError::ClaudeCodeRequired {
+                    model: model.to_string(),
+                })
             }
+        } else if self.configured_backends.contains(&self.default_backend) {
+            Ok(self.default_backend)
         } else {
-            // For non-Claude models, prefer pi when configured, otherwise default.
-            if self.configured_backends.contains(&Backend::Pi) {
-                Backend::Pi
-            } else if self.configured_backends.contains(&self.default_backend) {
-                self.default_backend
-            } else {
-                Backend::Opencode
-            }
+            // Fall back to opencode only when the configured default is absent.
+            Ok(Backend::Opencode)
         }
     }
 
     /// Alias kept for callers expecting `backend_for_model` naming.
-    #[must_use]
-    pub fn backend_for_model(&self, model: &str) -> Backend {
+    ///
+    /// # Errors
+    ///
+    /// Same conditions as [`Router::route_model`].
+    pub fn backend_for_model(&self, model: &str) -> Result<Backend, RouterError> {
         self.route_model(model)
     }
 }
@@ -104,6 +123,7 @@ fn is_claude_model(model: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -114,36 +134,66 @@ mod tests {
             [Backend::ClaudeCode, Backend::Opencode, Backend::Pi],
         );
 
-        assert_eq!(router.route_model("claude-opus-4-7"), Backend::ClaudeCode);
         assert_eq!(
-            router.route_model("anthropic/claude-sonnet-4-6"),
+            router.route_model("claude-opus-4-7").unwrap(),
             Backend::ClaudeCode
         );
-        assert_eq!(router.route_model("claude/haiku-3"), Backend::ClaudeCode);
+        assert_eq!(
+            router.route_model("anthropic/claude-sonnet-4-6").unwrap(),
+            Backend::ClaudeCode
+        );
+        assert_eq!(
+            router.route_model("claude/haiku-3").unwrap(),
+            Backend::ClaudeCode
+        );
     }
 
     #[test]
-    fn routes_non_claude_to_pi_when_configured() {
+    fn non_claude_models_use_configured_default() {
         let router = Router::with_backends(
             Backend::Opencode,
             [Backend::ClaudeCode, Backend::Opencode, Backend::Pi],
         );
 
-        assert_eq!(router.route_model("openai/gpt-5.4"), Backend::Pi);
-        assert_eq!(router.route_model("gemini-flash"), Backend::Pi);
         assert_eq!(
-            router.route_model("openai/gpt-5.4"),
-            router.backend_for_model("openai/gpt-5.4")
+            router.route_model("openai/gpt-5.4").unwrap(),
+            Backend::Opencode
+        );
+        assert_eq!(
+            router.route_model("gemini-flash").unwrap(),
+            Backend::Opencode
+        );
+        assert_eq!(
+            router.route_model("openai/gpt-5.4").unwrap(),
+            router.backend_for_model("openai/gpt-5.4").unwrap()
         );
     }
 
     #[test]
-    fn routes_non_claude_to_opencode_when_pi_not_configured() {
-        let router =
-            Router::with_backends(Backend::Opencode, [Backend::ClaudeCode, Backend::Opencode]);
+    fn non_claude_default_pi_when_configured() {
+        let router = Router::with_backends(Backend::Pi, [Backend::ClaudeCode, Backend::Pi]);
 
-        assert_eq!(router.route_model("openai/gpt-5.4"), Backend::Opencode);
-        assert_eq!(router.route_model("gemini-2.5-pro"), Backend::Opencode);
+        assert_eq!(router.route_model("openai/gpt-5.4").unwrap(), Backend::Pi);
+    }
+
+    #[test]
+    fn routes_non_claude_to_opencode_when_default_missing() {
+        let router = Router::with_backends(Backend::Opencode, [Backend::ClaudeCode]);
+
+        assert_eq!(
+            router.route_model("openai/gpt-5.4").unwrap(),
+            Backend::Opencode
+        );
+    }
+
+    #[test]
+    fn claude_refuses_when_claude_code_not_configured() {
+        let router = Router::with_backends(Backend::Opencode, [Backend::Opencode]);
+
+        let err = router
+            .route_model("claude-opus-4-7")
+            .expect_err("must refuse claude without ClaudeCode backend");
+        assert!(matches!(err, RouterError::ClaudeCodeRequired { .. }));
     }
 
     #[test]
@@ -152,7 +202,7 @@ mod tests {
             Router::with_backends(Backend::Opencode, [Backend::ClaudeCode, Backend::Opencode]);
 
         assert_eq!(
-            router.route_model("ANTHROPIC/CLAUDE-SONNET-4-6"),
+            router.route_model("ANTHROPIC/CLAUDE-SONNET-4-6").unwrap(),
             Backend::ClaudeCode
         );
     }

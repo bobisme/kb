@@ -1315,12 +1315,26 @@ fn create_ask_adapter(
         .clone()
         .unwrap_or_else(|| cfg.llm.default_model.clone());
 
-    let router = kb_llm::Router::new(match runner_name.as_str() {
+    // Build a router that reflects every configured runner, so claude models route
+    // to ClaudeCode even when `default_runner = "opencode"`.
+    let mut configured = Vec::new();
+    for name in cfg.llm.runners.keys() {
+        match name.as_str() {
+            "claude" => configured.push(kb_llm::Backend::ClaudeCode),
+            "pi" => configured.push(kb_llm::Backend::Pi),
+            _ => configured.push(kb_llm::Backend::Opencode),
+        }
+    }
+    let default_backend = match runner_name.as_str() {
         "claude" => kb_llm::Backend::ClaudeCode,
+        "pi" => kb_llm::Backend::Pi,
         _ => kb_llm::Backend::Opencode,
-    });
+    };
+    let router = kb_llm::Router::with_backends(default_backend, configured);
 
-    let backend = router.route_model(&model);
+    let backend = router
+        .route_model(&model)
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
 
     match backend {
         kb_llm::Backend::ClaudeCode => {
