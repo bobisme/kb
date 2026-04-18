@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use kb_core::fs::atomic_write;
-use kb_core::{extract_managed_regions, frontmatter::read_frontmatter};
+use kb_core::{
+    extract_managed_regions, frontmatter::read_frontmatter, managed_region::slug_from_title,
+    read_normalized_document,
+};
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use tracing::warn;
@@ -67,6 +70,34 @@ pub struct RetrievalCandidate {
     pub score: usize,
     pub estimated_tokens: u32,
     pub reasons: Vec<String>,
+}
+
+/// A budgeted context payload assembled from retrieval candidates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssembledContext {
+    pub text: String,
+    pub token_budget: u32,
+    pub estimated_tokens: u32,
+    pub manifest: Vec<ContextManifestEntry>,
+}
+
+/// Maps a span in [`AssembledContext::text`] back to a source location.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextManifestEntry {
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub source_id: String,
+    pub anchor: Option<String>,
+    pub chunk_kind: ContextChunkKind,
+}
+
+/// The kind of chunk inserted into assembled retrieval context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextChunkKind {
+    FullDocument,
+    Summary,
+    Section,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +230,123 @@ impl LexicalIndex {
             candidates,
         }
     }
+}
+
+/// Assemble full-text retrieval context from a ranked retrieval plan.
+///
+/// Source wiki pages prefer the backing `normalized/<doc-id>/source.md` body when possible.
+/// If a full document does not fit inside the remaining budget, the assembler falls back to a
+/// summary chunk plus the highest-scoring sections for that document, each wrapped in a stable
+/// delimiter that preserves citation anchors.
+///
+/// # Errors
+///
+/// Returns an error when a referenced retrieval candidate cannot be read.
+pub fn assemble_context(root: &Path, plan: &RetrievalPlan) -> Result<AssembledContext> {
+    if plan.token_budget == 0 || plan.candidates.is_empty() {
+        return Ok(AssembledContext {
+            text: String::new(),
+            token_budget: plan.token_budget,
+            estimated_tokens: 0,
+            manifest: Vec::new(),
+        });
+    }
+
+    let query_tokens = tokenize(&plan.query);
+    let mut text = String::new();
+    let mut manifest = Vec::new();
+    let mut estimated_tokens = 0_u32;
+
+    for candidate in &plan.candidates {
+        let document = load_context_document(root, &candidate.id)?;
+        let full_chunk = render_context_chunk(
+            &document.source_id,
+            None,
+            ContextChunkKind::FullDocument,
+            &document.full_text,
+        );
+        let full_tokens = estimate_text_tokens(&full_chunk);
+
+        if estimated_tokens.saturating_add(full_tokens) <= plan.token_budget {
+            push_chunk(
+                &mut text,
+                &mut manifest,
+                &document.source_id,
+                None,
+                ContextChunkKind::FullDocument,
+                &full_chunk,
+            );
+            estimated_tokens = estimated_tokens.saturating_add(full_tokens);
+            continue;
+        }
+
+        if !document.summary.is_empty() {
+            let summary_chunk = render_context_chunk(
+                &document.source_id,
+                Some("summary"),
+                ContextChunkKind::Summary,
+                &document.summary,
+            );
+            let summary_tokens = estimate_text_tokens(&summary_chunk);
+            if estimated_tokens.saturating_add(summary_tokens) <= plan.token_budget {
+                push_chunk(
+                    &mut text,
+                    &mut manifest,
+                    &document.source_id,
+                    Some("summary"),
+                    ContextChunkKind::Summary,
+                    &summary_chunk,
+                );
+                estimated_tokens = estimated_tokens.saturating_add(summary_tokens);
+            }
+        }
+
+        let mut sections: Vec<(usize, usize, &ContextSection)> = document
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(index, section)| {
+                (
+                    score_section(section, &query_tokens),
+                    index,
+                    section,
+                )
+            })
+            .filter(|(score, _, _)| *score > 0)
+            .collect();
+        sections.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+
+        for (_, _, section) in sections {
+            let anchor = section.anchor.as_deref().or(Some("section"));
+            let section_chunk = render_context_chunk(
+                &document.source_id,
+                anchor,
+                ContextChunkKind::Section,
+                &section.content,
+            );
+            let section_tokens = estimate_text_tokens(&section_chunk);
+            if estimated_tokens.saturating_add(section_tokens) > plan.token_budget {
+                continue;
+            }
+
+            push_chunk(
+                &mut text,
+                &mut manifest,
+                &document.source_id,
+                anchor,
+                ContextChunkKind::Section,
+                &section_chunk,
+            );
+            estimated_tokens = estimated_tokens.saturating_add(section_tokens);
+        }
+    }
+
+    Ok(AssembledContext {
+        text,
+        token_budget: plan.token_budget,
+        estimated_tokens,
+        manifest,
+    })
 }
 
 /// Build a lexical index by scanning wiki pages under `root`.
@@ -431,20 +579,211 @@ fn estimate_entry_tokens(entry: &LexicalEntry) -> u32 {
         .max(MIN_ENTRY_TOKEN_ESTIMATE)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextDocument {
+    source_id: String,
+    full_text: String,
+    summary: String,
+    sections: Vec<ContextSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextSection {
+    anchor: Option<String>,
+    content: String,
+}
+
+fn load_context_document(root: &Path, candidate_id: &str) -> Result<ContextDocument> {
+    let page_path = root.join(candidate_id);
+    let (frontmatter, body) = read_frontmatter(&page_path)
+        .with_context(|| format!("parse retrieval candidate {}", page_path.display()))?;
+
+    if candidate_id.starts_with(WIKI_SOURCES) {
+        let source_id = frontmatter
+            .get("source_document_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let summary = extract_summary(&body);
+
+        if !source_id.is_empty()
+            && let Ok(document) = read_normalized_document(root, source_id)
+        {
+            let full_text = document.canonical_text.trim().to_string();
+            let sections = split_markdown_sections(&full_text);
+            return Ok(ContextDocument {
+                source_id: candidate_id.to_string(),
+                full_text,
+                summary,
+                sections,
+            });
+        }
+
+        let full_text = body.trim().to_string();
+        let sections = split_markdown_sections(&full_text);
+        return Ok(ContextDocument {
+            source_id: candidate_id.to_string(),
+            full_text,
+            summary,
+            sections,
+        });
+    }
+
+    let full_text = body.trim().to_string();
+    let summary = extract_summary(&body);
+    let sections = split_markdown_sections(&full_text);
+    Ok(ContextDocument {
+        source_id: candidate_id.to_string(),
+        full_text,
+        summary,
+        sections,
+    })
+}
+
+fn extract_summary(body: &str) -> String {
+    extract_managed_regions(body)
+        .into_iter()
+        .find(|region| region.id == "summary")
+        .map(|region| region.body(body).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn split_markdown_sections(text: &str) -> Vec<ContextSection> {
+    let mut sections = Vec::new();
+    let mut current_heading: Option<String> = None;
+    let mut current_lines: Vec<&str> = Vec::new();
+
+    for line in text.lines() {
+        if line.starts_with('#') {
+            if let Some(section) = finalize_section(current_heading.take(), &current_lines) {
+                sections.push(section);
+            }
+            current_heading = Some(line.to_string());
+            current_lines.clear();
+            current_lines.push(line);
+        } else if current_heading.is_some() {
+            current_lines.push(line);
+        }
+    }
+
+    if let Some(section) = finalize_section(current_heading, &current_lines) {
+        sections.push(section);
+    }
+
+    sections
+}
+
+fn finalize_section(heading_line: Option<String>, lines: &[&str]) -> Option<ContextSection> {
+    let heading_line = heading_line?;
+    let heading_text = heading_line.trim_start_matches('#').trim();
+    if heading_text.is_empty() {
+        return None;
+    }
+
+    Some(ContextSection {
+        anchor: Some(slug_from_title(heading_text)),
+        content: lines.join("\n").trim().to_string(),
+    })
+}
+
+fn score_section(section: &ContextSection, query_tokens: &[String]) -> usize {
+    let anchor_tokens = section
+        .anchor
+        .as_deref()
+        .map(tokenize)
+        .unwrap_or_default();
+    let section_tokens = tokenize(&section.content);
+    let mut score = 0;
+    score += query_tokens
+        .iter()
+        .map(|token| count_occurrences(&anchor_tokens, token) * WEIGHT_HEADING)
+        .sum::<usize>();
+    score += query_tokens
+        .iter()
+        .map(|token| count_occurrences(&section_tokens, token))
+        .sum::<usize>();
+    score
+}
+
+fn render_context_chunk(
+    source_id: &str,
+    anchor: Option<&str>,
+    chunk_kind: ContextChunkKind,
+    content: &str,
+) -> String {
+    let anchor_suffix = anchor.map_or_else(String::new, |value| format!("#{value}"));
+    let kind_label = match chunk_kind {
+        ContextChunkKind::FullDocument => "full_document",
+        ContextChunkKind::Summary => "summary",
+        ContextChunkKind::Section => "section",
+    };
+    format!(
+        "<<<kb-source id=\"{source_id}{anchor_suffix}\" kind=\"{kind_label}\">>>\n{content}\n<<<kb-end>>>\n"
+    )
+}
+
+fn push_chunk(
+    text: &mut String,
+    manifest: &mut Vec<ContextManifestEntry>,
+    source_id: &str,
+    anchor: Option<&str>,
+    chunk_kind: ContextChunkKind,
+    chunk: &str,
+) {
+    let start_offset = text.len();
+    text.push_str(chunk);
+    let end_offset = text.len();
+    manifest.push(ContextManifestEntry {
+        start_offset,
+        end_offset,
+        source_id: source_id.to_string(),
+        anchor: anchor.map(str::to_string),
+        chunk_kind,
+    });
+}
+
+fn estimate_text_tokens(text: &str) -> u32 {
+    let estimated = text.len().div_ceil(APPROX_CHARS_PER_TOKEN);
+    u32::try_from(estimated).unwrap_or(u32::MAX)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use kb_core::{EntityMetadata, NormalizedDocument, Status, write_normalized_document};
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::tempdir;
 
     fn write_source_page(dir: &Path, slug: &str, title: &str, summary: &str) {
         let content = format!(
-            "---\nid: wiki-source-{slug}\ntype: source\ntitle: {title}\n---\n\
+            "---\nid: wiki-source-{slug}\ntype: source\ntitle: {title}\nsource_document_id: {slug}\nsource_revision_id: rev-{slug}\n---\n\
              \n# Source\n<!-- kb:begin id=title -->\n{title}\n<!-- kb:end id=title -->\n\
              \n## Summary\n<!-- kb:begin id=summary -->\n{summary}\n<!-- kb:end id=summary -->\n"
         );
         fs::write(dir.join(format!("{slug}.md")), content).unwrap();
+    }
+
+    fn write_normalized_source(root: &Path, id: &str, text: &str, heading_ids: &[&str]) {
+        let document = NormalizedDocument {
+            metadata: EntityMetadata {
+                id: id.to_string(),
+                created_at_millis: 1,
+                updated_at_millis: 1,
+                source_hashes: vec!["hash".to_string()],
+                model_version: None,
+                tool_version: None,
+                prompt_template_hash: None,
+                dependencies: Vec::new(),
+                output_paths: Vec::new(),
+                status: Status::Fresh,
+            },
+            source_revision_id: format!("rev-{id}"),
+            canonical_text: text.to_string(),
+            normalized_assets: Vec::<PathBuf>::new(),
+            heading_ids: heading_ids.iter().map(|value| (*value).to_string()).collect(),
+        };
+        write_normalized_document(root, &document).unwrap();
     }
 
     fn write_concept_page(dir: &Path, slug: &str, name: &str, aliases: &[&str]) {
@@ -670,5 +1009,107 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("title matched 'checker'")));
+    }
+
+    #[test]
+    fn assemble_context_prefers_full_normalized_source_when_it_fits() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(&sources, "rust-guide", "Rust Guide", "Short summary.");
+        write_normalized_source(
+            root,
+            "rust-guide",
+            "# Ownership\n\nOwnership keeps memory safe.\n\n## Borrowing\n\nBorrowing rules.\n",
+            &["ownership", "borrowing"],
+        );
+
+        let plan = RetrievalPlan {
+            query: "ownership".to_string(),
+            token_budget: 500,
+            estimated_tokens: 0,
+            candidates: vec![RetrievalCandidate {
+                id: "wiki/sources/rust-guide.md".to_string(),
+                title: "Rust Guide".to_string(),
+                score: 10,
+                estimated_tokens: 20,
+                reasons: vec!["title matched 'ownership' 1x (+4)".to_string()],
+            }],
+        };
+
+        let assembled = assemble_context(root, &plan).unwrap();
+        assert!(assembled.text.contains("Ownership keeps memory safe."));
+        assert!(!assembled.text.contains("Short summary."));
+        assert_eq!(assembled.manifest.len(), 1);
+        assert_eq!(assembled.manifest[0].chunk_kind, ContextChunkKind::FullDocument);
+        assert_eq!(assembled.manifest[0].anchor, None);
+        assert!(assembled.estimated_tokens <= assembled.token_budget);
+    }
+
+    #[test]
+    fn assemble_context_falls_back_to_summary_and_top_sections_under_budget() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(
+            &sources,
+            "rust-guide",
+            "Rust Guide",
+            "Borrowing summary for quick retrieval.",
+        );
+        write_normalized_source(
+            root,
+            "rust-guide",
+            "# Ownership\n\nOwnership keeps memory safe with moves and detailed compiler rules that span multiple paragraphs for retrieval budget pressure.\n\n## Borrowing\n\nBorrowing allows shared references.\n\n## Lifetimes\n\nLifetimes connect reference validity across functions, structs, traits, and longer examples that intentionally consume more context budget than the focused borrowing section.\n",
+            &["ownership", "borrowing", "lifetimes"],
+        );
+
+        let full_chunk = render_context_chunk(
+            "wiki/sources/rust-guide.md",
+            None,
+            ContextChunkKind::FullDocument,
+            "# Ownership\n\nOwnership keeps memory safe with moves and detailed compiler rules that span multiple paragraphs for retrieval budget pressure.\n\n## Borrowing\n\nBorrowing allows shared references.\n\n## Lifetimes\n\nLifetimes connect reference validity across functions, structs, traits, and longer examples that intentionally consume more context budget than the focused borrowing section.",
+        );
+        let summary_chunk = render_context_chunk(
+            "wiki/sources/rust-guide.md",
+            Some("summary"),
+            ContextChunkKind::Summary,
+            "Borrowing summary for quick retrieval.",
+        );
+        let borrowing_chunk = render_context_chunk(
+            "wiki/sources/rust-guide.md",
+            Some("borrowing"),
+            ContextChunkKind::Section,
+            "## Borrowing\n\nBorrowing allows shared references.",
+        );
+        let budget = estimate_text_tokens(&summary_chunk)
+            .saturating_add(estimate_text_tokens(&borrowing_chunk));
+        assert!(budget < estimate_text_tokens(&full_chunk));
+        let plan = RetrievalPlan {
+            query: "borrowing references".to_string(),
+            token_budget: budget,
+            estimated_tokens: 0,
+            candidates: vec![RetrievalCandidate {
+                id: "wiki/sources/rust-guide.md".to_string(),
+                title: "Rust Guide".to_string(),
+                score: 10,
+                estimated_tokens: 20,
+                reasons: vec!["summary matched 'borrowing' 1x (+1)".to_string()],
+            }],
+        };
+
+        let assembled = assemble_context(root, &plan).unwrap();
+        assert!(assembled.text.contains("Borrowing summary for quick retrieval."));
+        assert!(assembled.text.contains("Borrowing allows shared references."));
+        assert!(!assembled.text.contains("Lifetimes connect reference validity."));
+        assert_eq!(assembled.manifest.len(), 2);
+        assert_eq!(assembled.manifest[0].chunk_kind, ContextChunkKind::Summary);
+        assert_eq!(assembled.manifest[0].anchor.as_deref(), Some("summary"));
+        assert_eq!(assembled.manifest[1].chunk_kind, ContextChunkKind::Section);
+        assert_eq!(assembled.manifest[1].anchor.as_deref(), Some("borrowing"));
+        assert!(assembled.manifest[0].end_offset <= assembled.manifest[1].start_offset);
+        assert!(assembled.estimated_tokens <= assembled.token_budget);
     }
 }

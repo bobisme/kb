@@ -3,6 +3,6 @@
 pub mod lexical;
 
 pub use lexical::{
-    LexicalEntry, LexicalIndex, RetrievalCandidate, RetrievalPlan, SearchResult,
-    build_lexical_index,
+    AssembledContext, ContextChunkKind, ContextManifestEntry, LexicalEntry, LexicalIndex,
+    RetrievalCandidate, RetrievalPlan, SearchResult, assemble_context, build_lexical_index,
 };
