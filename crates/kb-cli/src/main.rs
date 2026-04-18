@@ -5,6 +5,7 @@ mod init;
 mod jobs;
 mod root;
 
+use std::error::Error as StdError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -84,9 +85,9 @@ enum Command {
     },
     /// Lint knowledge base for issues
     Lint {
-        /// Check specific rules
-        #[arg(long)]
-        rule: Option<String>,
+        /// Check a single lint check
+        #[arg(long, alias = "rule")]
+        check: Option<String>,
     },
     /// Run health checks on the knowledge base
     Doctor,
@@ -127,9 +128,33 @@ fn main() {
 
     if let Err(err) = run(cli) {
         eprintln!("error: {err}");
-        std::process::exit(1);
+        std::process::exit(exit_code_from_error(&err));
     }
 }
+
+fn exit_code_from_error(err: &anyhow::Error) -> i32 {
+    for current in err.chain() {
+        if let Some(exit_error) = current.downcast_ref::<LintExitCode>() {
+            return exit_error.code;
+        }
+    }
+
+    1
+}
+
+#[derive(Debug)]
+struct LintExitCode {
+    code: i32,
+    message: String,
+}
+
+impl std::fmt::Display for LintExitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl StdError for LintExitCode {}
 
 #[allow(clippy::too_many_lines)]
 fn run(cli: Cli) -> Result<()> {
@@ -205,13 +230,13 @@ fn run(cli: Cli) -> Result<()> {
                 execute_mutating_command(root.as_deref(), "ingest", action)
             }
         }
-        Some(Command::Lint { rule }) => {
+        Some(Command::Lint { check }) => {
             let lint_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
             let should_json = cli.json;
             execute_mutating_command(Some(lint_root), "lint", move || {
-                run_lint(lint_root, should_json, rule.as_deref())
+                run_lint(lint_root, should_json, check.as_deref())
             })
         }
         Some(Command::Publish { dest }) => {
@@ -828,9 +853,9 @@ fn render_ask_artifact(artifact: &Artifact, question: &Question, question_rel: &
     Ok(format!("---\n{yaml}---\n\n{body}"))
 }
 
-fn run_lint(root: &Path, json: bool, rule: Option<&str>) -> Result<()> {
+fn run_lint(root: &Path, json: bool, check: Option<&str>) -> Result<()> {
     let cfg = Config::load_from_root(root, None)?;
-    let rule = kb_lint::LintRule::parse(rule)?;
+    let check = kb_lint::LintRule::parse(check)?;
     let missing_citations_level = match cfg.lint.missing_citations_level.as_str() {
         "warn" | "warning" => kb_lint::MissingCitationsLevel::Warn,
         "error" => kb_lint::MissingCitationsLevel::Error,
@@ -842,45 +867,144 @@ fn run_lint(root: &Path, json: bool, rule: Option<&str>) -> Result<()> {
         require_citations: cfg.lint.require_citations,
         missing_citations_level,
     };
-    let report = kb_lint::run_lint_with_options(root, rule, &options)?;
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else if report.is_clean() {
-        println!("[ok] {}: no issues found", report.rule);
-    } else if report.has_errors() {
-        println!("[fail] {}: {} issue(s)", report.rule, report.issue_count);
-        for issue in &report.issues {
-            println!(
-                "- [{:?}] {}:{} {} ({})",
-                issue.severity, issue.referring_page, issue.line, issue.message, issue.target
-            );
-            if let Some(suggested_fix) = &issue.suggested_fix {
-                println!("  suggested fix: {suggested_fix}");
-            }
-        }
+    let rules = if matches!(check, kb_lint::LintRule::All) {
+        lint_rules_for_root(cfg.lint.require_citations)
     } else {
-        println!("[warn] {}: {} warning(s)", report.rule, report.issue_count);
+        vec![check]
+    };
+
+    let mut total_warnings = 0;
+    let mut total_errors = 0;
+    let mut reports = Vec::new();
+
+    for rule in &rules {
+        let rule = *rule;
+        let report = kb_lint::run_lint_with_options(root, rule, &options)?;
+        let mut warning_count = 0;
+        let mut error_count = 0;
         for issue in &report.issues {
-            println!(
-                "- [{:?}] {}:{} {} ({})",
-                issue.severity, issue.referring_page, issue.line, issue.message, issue.target
-            );
-            if let Some(suggested_fix) = &issue.suggested_fix {
-                println!("  suggested fix: {suggested_fix}");
+            if matches!(issue.severity, kb_lint::IssueSeverity::Warning) {
+                warning_count += 1;
+            } else {
+                error_count += 1;
             }
         }
+        total_warnings += warning_count;
+        total_errors += error_count;
+
+        print_lint_check_report(&report, rule, warning_count, error_count, json);
+        reports.push(LintCheckReport {
+            check: report.rule,
+            issue_count: report.issue_count,
+            warning_count,
+            error_count,
+            issues: report.issues,
+        });
+    }
+    if json {
+        let payload = LintReportPayload {
+            checks: reports,
+            checks_ran: rules.len(),
+            total_issue_count: total_warnings + total_errors,
+            warning_count: total_warnings,
+            error_count: total_errors,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
     }
 
-    if report.has_errors() {
-        Err(anyhow!(
-            "lint failed: {} issue(s) in {}",
-            report.issue_count,
-            report.rule
-        ))
+    if total_errors > 0 {
+        Err(anyhow!(LintExitCode {
+            code: 2,
+            message: format!("lint failed: {total_errors} error(s) and {total_warnings} warning(s)"),
+        }))
+    } else if total_warnings > 0 {
+        Err(anyhow!(LintExitCode {
+            code: 1,
+            message: format!("lint succeeded with {total_warnings} warning(s)"),
+        }))
     } else {
         Ok(())
     }
+}
+
+fn lint_rules_for_root(require_citations: bool) -> Vec<kb_lint::LintRule> {
+    let mut rules = vec![
+        kb_lint::LintRule::BrokenLinks,
+        kb_lint::LintRule::Orphans,
+        kb_lint::LintRule::StaleArtifacts,
+    ];
+    if require_citations {
+        rules.push(kb_lint::LintRule::MissingCitations);
+    }
+    rules
+}
+
+fn print_lint_check_report(
+    report: &kb_lint::LintReport,
+    rule: kb_lint::LintRule,
+    warning_count: usize,
+    error_count: usize,
+    json_mode: bool,
+) {
+    if json_mode {
+        return;
+    }
+
+    if report.is_clean() {
+        println!("[ok] {}: no issues found", report.rule);
+        return;
+    }
+
+    let mut warnings = Vec::new();
+    let mut errors = Vec::new();
+    for issue in &report.issues {
+        if matches!(issue.severity, kb_lint::IssueSeverity::Warning) {
+            warnings.push(issue);
+        } else {
+            errors.push(issue);
+        }
+    }
+
+    if !warnings.is_empty() {
+        println!("[warn] {}: {} issue(s)", rule.as_str(), warning_count);
+        print_lint_issues(&warnings);
+    }
+
+    if !errors.is_empty() {
+        println!("[fail] {}: {} issue(s)", rule.as_str(), error_count);
+        print_lint_issues(&errors);
+    }
+}
+
+fn print_lint_issues(issues: &[&kb_lint::LintIssue]) {
+    for issue in issues {
+        println!(
+            "- [{:?}] {}:{} {} ({})",
+            issue.severity, issue.referring_page, issue.line, issue.message, issue.target
+        );
+        if let Some(suggested_fix) = &issue.suggested_fix {
+            println!("  suggested fix: {suggested_fix}");
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct LintReportPayload {
+    checks: Vec<LintCheckReport>,
+    checks_ran: usize,
+    total_issue_count: usize,
+    warning_count: usize,
+    error_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct LintCheckReport {
+    check: String,
+    issue_count: usize,
+    warning_count: usize,
+    error_count: usize,
+    issues: Vec<kb_lint::LintIssue>,
 }
 fn execute_mutating_command(
     root: Option<&Path>,

@@ -499,7 +499,7 @@ fn lint_json_reports_clean_relative_links() {
     .expect("write page with relative link");
 
     let mut cmd = kb_cmd(&kb_root);
-    cmd.arg("--json").arg("lint").arg("--rule").arg("broken-links");
+    cmd.arg("--json").arg("lint").arg("--check").arg("broken-links");
     let output = cmd.output().expect("run kb lint json");
 
     assert!(
@@ -509,10 +509,13 @@ fn lint_json_reports_clean_relative_links() {
     );
 
     let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
-    assert_eq!(payload["rule"], "broken-links");
-    assert_eq!(payload["issue_count"], 0);
+    let checks = payload["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 1);
+    let broken_links = &checks[0];
+    assert_eq!(broken_links["check"], "broken-links");
+    assert_eq!(broken_links["issue_count"], 0);
     assert_eq!(
-        payload["issues"].as_array().expect("issues array").len(),
+        broken_links["issues"].as_array().expect("issues array").len(),
         0
     );
 }
@@ -530,7 +533,7 @@ fn lint_reports_orphan_pages_as_json() {
     .expect("write orphan page");
 
     let mut cmd = kb_cmd(&kb_root);
-    cmd.arg("--json").arg("lint").arg("--rule").arg("orphans");
+    cmd.arg("--json").arg("lint").arg("--check").arg("orphans");
     let output = cmd.output().expect("run kb lint");
 
     assert!(
@@ -539,14 +542,17 @@ fn lint_reports_orphan_pages_as_json() {
     );
 
     let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
-    assert_eq!(payload["issue_count"], 2);
-    let issues = payload["issues"].as_array().expect("issues array");
+    let checks = payload["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 1);
+    let orphans = &checks[0];
+    assert_eq!(orphans["issue_count"], 2);
+    let issues = orphans["issues"].as_array().expect("issues array");
     assert!(issues.iter().any(|issue| issue["kind"] == "source_document_missing"));
     assert!(issues.iter().any(|issue| issue["kind"] == "source_revision_missing"));
 }
 
 #[test]
-fn lint_missing_citations_warns_by_default_without_failing() {
+fn lint_missing_citations_warns_by_default_with_warning_exit_code() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
 
@@ -558,10 +564,10 @@ fn lint_missing_citations_warns_by_default_without_failing() {
     .expect("write page");
 
     let mut cmd = kb_cmd(&kb_root);
-    cmd.arg("lint").arg("--rule").arg("missing-citations");
+    cmd.arg("lint").arg("--check").arg("missing-citations");
     let output = cmd.output().expect("run kb lint");
 
-    assert!(output.status.success(), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(1), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("[warn] missing-citations"), "stdout: {stdout}");
 }
@@ -585,12 +591,15 @@ fn lint_missing_citations_can_fail_when_configured_as_error() {
     .expect("write page");
 
     let mut cmd = kb_cmd(&kb_root);
-    cmd.arg("--json").arg("lint").arg("--rule").arg("missing-citations");
+    cmd.arg("--json").arg("lint").arg("--check").arg("missing-citations");
     let output = cmd.output().expect("run kb lint");
 
-    assert!(!output.status.success(), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert_eq!(output.status.code(), Some(2), "stdout: {} stderr: {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
     let payload: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
-    assert_eq!(payload["issue_count"], 1);
-    assert_eq!(payload["issues"][0]["severity"], "error");
-    assert_eq!(payload["issues"][0]["kind"], "missing_citations");
+    let checks = payload["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 1);
+    let missing_citations = &checks[0];
+    assert_eq!(missing_citations["issue_count"], 1);
+    assert_eq!(missing_citations["issues"][0]["severity"], "error");
+    assert_eq!(missing_citations["issues"][0]["kind"], "missing_citations");
 }
