@@ -1,0 +1,10 @@
+{
+  "id": "kb-obsidian",
+  "name": "KB Obsidian",
+  "version": "0.0.1",
+  "minAppVersion": "1.0.0",
+  "description": "Thin wrapper exposing kb ask, inspect, and compile as Obsidian commands",
+  "author": "KB Project",
+  "authorUrl": "https://github.com/shiftsource/kb",
+  "isDesktopOnly": true
+}

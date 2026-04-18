@@ -1,0 +1,19 @@
+# Build
+main.js
+main.js.map
+
+# Dependencies
+node_modules/
+package-lock.json
+yarn.lock
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
