@@ -200,7 +200,7 @@ impl Default for LlmConfig {
             LlmRunnerConfig {
                 command: "claude".to_string(),
                 model: None,
-                permission_mode: Some("ask".to_string()),
+                permission_mode: Some("default".to_string()),
                 tools_read: true,
                 tools_write: true,
                 tools_edit: true,

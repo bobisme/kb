@@ -29,7 +29,7 @@ impl Default for ClaudeCliConfig {
         Self {
             command: "claude".to_string(),
             model: None,
-            permission_mode: Some("ask".to_string()),
+            permission_mode: Some("default".to_string()),
             timeout: Duration::from_secs(900),
             project_root: None,
         }
@@ -756,7 +756,7 @@ mod tests {
         let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
             command: script_path.display().to_string(),
             model: Some("claude-haiku".to_string()),
-            permission_mode: Some("ask".to_string()),
+            permission_mode: Some("default".to_string()),
             timeout: Duration::from_secs(5),
             project_root: None,
         });
@@ -786,7 +786,7 @@ mod tests {
         assert!(args.contains("--output-format"));
         assert!(args.contains("json"));
         assert!(args.contains("--permission-mode"));
-        assert!(args.contains("ask"));
+        assert!(args.contains("default"));
         assert!(args.contains("--model"));
         assert!(args.contains("claude-haiku"));
         assert!(args.contains("Example Source"));
@@ -820,7 +820,7 @@ mod tests {
         let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
             command: script_path.display().to_string(),
             model: Some("claude-haiku".to_string()),
-            permission_mode: Some("ask".to_string()),
+            permission_mode: Some("default".to_string()),
             timeout: Duration::from_secs(5),
             project_root: None,
         });
