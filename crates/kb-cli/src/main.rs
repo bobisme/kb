@@ -1135,6 +1135,9 @@ fn run_ask(
     dry_run: bool,
     promote: bool,
 ) -> Result<()> {
+    if query.trim().is_empty() {
+        bail!("ask: question cannot be empty");
+    }
     let cfg = Config::load_from_root(root, cli_model)?;
     let requested_format =
         normalize_ask_format(requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()))?;
@@ -1588,6 +1591,9 @@ struct InspectTraceNode {
 }
 
 fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()> {
+    if target.trim().is_empty() {
+        bail!("inspect: target cannot be empty");
+    }
     let graph = Graph::load_from(root)?;
     let hash_state = kb_compile::HashState::load_from_root(root)?;
     let changed_inputs = find_changed_inputs(root, &hash_state)?;

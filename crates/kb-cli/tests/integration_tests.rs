@@ -502,6 +502,110 @@ fn inspect_json_trace_and_build_records_are_reported() {
 }
 
 #[test]
+fn ask_rejects_empty_argument() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask").arg("");
+    let output = cmd.output().expect("run kb ask with empty argument");
+
+    assert!(
+        !output.status.success(),
+        "kb ask with empty argument unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected stderr to mention 'empty', got: {stderr}"
+    );
+}
+
+#[test]
+fn ask_rejects_whitespace_only_argument() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask").arg("   ");
+    let output = cmd
+        .output()
+        .expect("run kb ask with whitespace-only argument");
+
+    assert!(
+        !output.status.success(),
+        "kb ask with whitespace-only argument unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected stderr to mention 'empty', got: {stderr}"
+    );
+}
+
+#[test]
+fn ask_stdin_empty_still_errors() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask").arg("-").write_stdin("");
+    let output = cmd.output().expect("run kb ask - with empty stdin");
+
+    assert!(
+        !output.status.success(),
+        "kb ask - with empty stdin unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no question provided"),
+        "expected stderr to mention 'no question provided', got: {stderr}"
+    );
+}
+
+#[test]
+fn inspect_rejects_empty_target() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("");
+    let output = cmd.output().expect("run kb inspect with empty target");
+
+    assert!(
+        !output.status.success(),
+        "kb inspect with empty target unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected stderr to mention 'empty', got: {stderr}"
+    );
+}
+
+#[test]
+fn inspect_rejects_whitespace_only_target() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("   ");
+    let output = cmd
+        .output()
+        .expect("run kb inspect with whitespace-only target");
+
+    assert!(
+        !output.status.success(),
+        "kb inspect with whitespace-only target unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected stderr to mention 'empty', got: {stderr}"
+    );
+}
+
+#[test]
 fn inspect_missing_target_has_actionable_error() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
