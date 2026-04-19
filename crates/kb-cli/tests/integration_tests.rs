@@ -1514,3 +1514,121 @@ fn review_list_empty_queue() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("No pending review items"));
 }
+
+#[test]
+fn approved_promotion_passes_orphan_lint_with_real_source_ids() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed a normalized source that the retrieval plan pointed at. The lint
+    // orphans check looks for `normalized/<doc_id>/metadata.json`.
+    let doc_id = "wiki/sources/rust-overview.md";
+    let normalized_dir = kb_root.join("normalized").join(doc_id);
+    fs::create_dir_all(&normalized_dir).expect("create normalized dir");
+    fs::write(
+        normalized_dir.join("metadata.json"),
+        "{\"source_revision_id\":\"rev-1\"}",
+    )
+    .expect("write normalized metadata");
+
+    // Also create the wiki page itself so the kb tree is well-formed.
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("create wiki sources");
+    fs::write(
+        kb_root.join(doc_id),
+        "---\nsource_document_id: wiki/sources/rust-overview.md\nsource_revision_id: rev-1\n---\n# Rust Overview\n",
+    )
+    .expect("write source wiki page");
+
+    // Seed the answer artifact that `execute_promotion` will read. Its frontmatter
+    // carries the real `source_document_ids` (as `kb_query::write_artifact` would).
+    let question_id = "question-promote-orphan";
+    let artifact_id = "artifact-promote-orphan";
+    let q_dir = kb_root.join("outputs/questions").join(question_id);
+    fs::create_dir_all(&q_dir).expect("create question dir");
+    fs::write(
+        q_dir.join("answer.md"),
+        format!(
+            "---\nid: {artifact_id}\ntype: question_answer\nquestion_id: {question_id}\nsource_document_ids:\n- {doc_id}\n---\n\nRust is a systems programming language.\n"
+        ),
+    )
+    .expect("write answer.md");
+
+    // Seed the ReviewItem with dependencies = [question_id, artifact_id] so we
+    // exercise the same dependency-split logic the real CLI uses.
+    let review_item = ReviewItem {
+        metadata: EntityMetadata {
+            id: "review-promote-orphan".to_string(),
+            created_at_millis: 1_000,
+            updated_at_millis: 1_000,
+            source_hashes: vec!["hash-1".to_string()],
+            model_version: None,
+            tool_version: Some("kb-test".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec![question_id.to_string(), artifact_id.to_string()],
+            output_paths: vec![
+                PathBuf::from(format!("outputs/questions/{question_id}/answer.md")),
+                PathBuf::from("wiki/questions/rust-overview-answer.md"),
+            ],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::Promotion,
+        target_entity_id: artifact_id.to_string(),
+        proposed_destination: Some(PathBuf::from("wiki/questions/rust-overview-answer.md")),
+        citations: vec![format!("{doc_id}#intro")],
+        affected_pages: vec![PathBuf::from("wiki/questions/rust-overview-answer.md")],
+        created_at_millis: 1_000,
+        status: ReviewStatus::Pending,
+        comment: "Promote answer for: What is Rust?".to_string(),
+    };
+    save_review_item(&kb_root, &review_item).expect("save review item");
+
+    // Approve -> triggers execute_promotion.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg("review-promote-orphan");
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        output.status.success(),
+        "kb review approve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let promoted_path = kb_root.join("wiki/questions/rust-overview-answer.md");
+    let promoted = fs::read_to_string(&promoted_path).expect("read promoted page");
+    assert!(
+        promoted.contains(&format!("- {doc_id}")),
+        "promoted page missing real source id: {promoted}"
+    );
+    assert!(
+        promoted.contains("derived_from:"),
+        "promoted page missing derived_from block: {promoted}"
+    );
+    // source_document_ids block in the frontmatter must not list the question/artifact IDs.
+    let fm_block = promoted
+        .strip_prefix("---\n")
+        .and_then(|rest| rest.split_once("\n---\n").map(|(fm, _)| fm))
+        .expect("frontmatter block");
+    let parsed: Value = serde_yaml::from_str(fm_block).expect("parse frontmatter");
+    let sources = parsed["source_document_ids"]
+        .as_array()
+        .expect("source_document_ids array");
+    let source_strs: Vec<&str> = sources.iter().filter_map(Value::as_str).collect();
+    assert!(!source_strs.iter().any(|s| s.starts_with("question-")));
+    assert!(!source_strs.iter().any(|s| s.starts_with("artifact-")));
+    assert!(source_strs.contains(&doc_id));
+
+    // Now run kb lint --check orphans. It must pass.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("lint").arg("--check").arg("orphans");
+    let output = cmd.output().expect("run kb lint");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    let checks = envelope["data"]["checks"].as_array().expect("checks");
+    let orphans = checks
+        .iter()
+        .find(|c| c["check"] == "orphans")
+        .expect("orphans check entry");
+    assert_eq!(
+        orphans["issue_count"], 0,
+        "promoted page should produce zero orphan findings: {}",
+        serde_json::to_string_pretty(orphans).unwrap_or_default()
+    );
+}

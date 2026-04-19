@@ -18,6 +18,18 @@ pub struct PromotionInput<'a> {
     pub review_item: &'a ReviewItem,
     pub artifact_body: &'a str,
     pub promoted_at: u64,
+    /// Source document IDs grounding the promoted page.
+    ///
+    /// These are the wiki/sources paths (or equivalent normalized document IDs)
+    /// drawn from the original retrieval plan. They populate the
+    /// `source_document_ids` frontmatter field so `kb lint` orphan checks pass.
+    pub source_document_ids: &'a [String],
+    /// Question ID that produced the answer, mirrored into `derived_from`
+    /// frontmatter so the promotion chain is traceable without polluting
+    /// `source_document_ids` with non-source IDs.
+    pub derived_from_question_id: Option<&'a str>,
+    /// Artifact ID that holds the answer body, mirrored into `derived_from`.
+    pub derived_from_artifact_id: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +69,14 @@ pub fn render_promotion(
 
     let build_record_id = format!("promote-{}", item.metadata.id);
 
-    let frontmatter = build_frontmatter(item, &build_record_id, input.promoted_at);
+    let frontmatter = build_frontmatter(
+        item,
+        &build_record_id,
+        input.promoted_at,
+        input.source_document_ids,
+        input.derived_from_question_id,
+        input.derived_from_artifact_id,
+    );
     let body = build_body(input.artifact_body, &item.citations, existing_page);
     let markdown = serialize_frontmatter(&frontmatter, &body)?;
 
@@ -118,7 +137,10 @@ pub fn execute_promotion(
         .as_ref()
         .context("ReviewItem has no proposed_destination")?;
 
-    let artifact_body = read_artifact_body(root, review_item)
+    let ArtifactLoad {
+        body: artifact_body,
+        source_document_ids,
+    } = load_artifact(root, review_item)
         .with_context(|| format!("read artifact for review {}", review_item.metadata.id))?;
 
     let existing_page = {
@@ -133,10 +155,15 @@ pub fn execute_promotion(
         }
     };
 
+    let (question_id, artifact_id) = split_derived_ids(&review_item.metadata.dependencies);
+
     let input = PromotionInput {
         review_item,
         artifact_body: &artifact_body,
         promoted_at,
+        source_document_ids: &source_document_ids,
+        derived_from_question_id: question_id.as_deref(),
+        derived_from_artifact_id: artifact_id.as_deref(),
     };
 
     let result = render_promotion(&input, existing_page.as_deref())?;
@@ -156,16 +183,22 @@ pub fn execute_promotion(
     Ok(result)
 }
 
-fn read_artifact_body(root: &Path, item: &ReviewItem) -> Result<String> {
+struct ArtifactLoad {
+    body: String,
+    source_document_ids: Vec<String>,
+}
+
+fn load_artifact(root: &Path, item: &ReviewItem) -> Result<ArtifactLoad> {
     for dep in &item.metadata.dependencies {
         if dep.starts_with("artifact-") {
-            let answer_path = root.join("outputs/questions")
+            let answer_path = root
+                .join("outputs/questions")
                 .join(dep.strip_prefix("artifact-").unwrap_or(dep))
                 .join("answer.md");
             if answer_path.exists() {
                 let raw = std::fs::read_to_string(&answer_path)
                     .with_context(|| format!("read artifact {}", answer_path.display()))?;
-                return Ok(strip_frontmatter(&raw));
+                return Ok(parse_artifact(&raw));
             }
         }
     }
@@ -175,7 +208,7 @@ fn read_artifact_body(root: &Path, item: &ReviewItem) -> Result<String> {
         if full.exists() && full.extension().is_some_and(|e| e == "md") {
             let raw = std::fs::read_to_string(&full)
                 .with_context(|| format!("read artifact {}", full.display()))?;
-            return Ok(strip_frontmatter(&raw));
+            return Ok(parse_artifact(&raw));
         }
     }
 
@@ -183,6 +216,68 @@ fn read_artifact_body(root: &Path, item: &ReviewItem) -> Result<String> {
         "could not locate artifact body for review item {}",
         item.metadata.id
     );
+}
+
+fn parse_artifact(raw: &str) -> ArtifactLoad {
+    let source_document_ids = extract_source_document_ids(raw);
+    ArtifactLoad {
+        body: strip_frontmatter(raw),
+        source_document_ids,
+    }
+}
+
+fn extract_source_document_ids(markdown: &str) -> Vec<String> {
+    let Some(yaml) = extract_frontmatter_yaml(markdown) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_yaml::from_str::<Value>(yaml) else {
+        return Vec::new();
+    };
+    let Some(mapping) = value.as_mapping() else {
+        return Vec::new();
+    };
+    let Some(seq) = mapping
+        .get(Value::String("source_document_ids".into()))
+        .and_then(Value::as_sequence)
+    else {
+        return Vec::new();
+    };
+    seq.iter()
+        .filter_map(|v| v.as_str().map(ToString::to_string))
+        .collect()
+}
+
+fn extract_frontmatter_yaml(markdown: &str) -> Option<&str> {
+    let rest = markdown
+        .strip_prefix("---\n")
+        .or_else(|| markdown.strip_prefix("---\r\n"))?;
+    if let Some(end) = rest.find("\n---\n") {
+        return Some(&rest[..=end]);
+    }
+    if let Some(end) = rest.find("\r\n---\r\n") {
+        return Some(&rest[..=end + 1]);
+    }
+    if let Some(end) = rest.find("\n---") {
+        // Trailing "---" without a newline after (end of file).
+        return Some(&rest[..=end]);
+    }
+    None
+}
+
+fn split_derived_ids(deps: &[String]) -> (Option<String>, Option<String>) {
+    let mut question_id = None;
+    let mut artifact_id = None;
+    for dep in deps {
+        if dep.starts_with("artifact-") && artifact_id.is_none() {
+            artifact_id = Some(dep.clone());
+        } else if dep.starts_with("question-") && question_id.is_none() {
+            question_id = Some(dep.clone());
+        } else if question_id.is_none() && !dep.starts_with("artifact-") {
+            // Fallback: older pipelines stored the bare question id without a prefix.
+            question_id = Some(dep.clone());
+        }
+    }
+    (question_id, artifact_id)
 }
 
 fn strip_frontmatter(markdown: &str) -> String {
@@ -201,7 +296,14 @@ fn strip_frontmatter(markdown: &str) -> String {
     markdown.to_string()
 }
 
-fn build_frontmatter(item: &ReviewItem, build_record_id: &str, promoted_at: u64) -> Mapping {
+fn build_frontmatter(
+    item: &ReviewItem,
+    build_record_id: &str,
+    promoted_at: u64,
+    source_document_ids: &[String],
+    derived_from_question_id: Option<&str>,
+    derived_from_artifact_id: Option<&str>,
+) -> Mapping {
     let mut fm = Mapping::new();
     fm.insert(
         Value::String("id".into()),
@@ -236,17 +338,35 @@ fn build_frontmatter(item: &ReviewItem, build_record_id: &str, promoted_at: u64)
         );
     }
 
-    let source_ids: Vec<Value> = item
-        .metadata
-        .dependencies
-        .iter()
-        .map(|d| Value::String(d.clone()))
-        .collect();
-    if !source_ids.is_empty() {
+    // `source_document_ids` must list *real* sources (retrieval plan candidates)
+    // so `kb lint`'s orphan check can resolve them against `normalized/<id>/`.
+    // The question/artifact IDs are linkage, not sources, and go in `derived_from`.
+    if !source_document_ids.is_empty() {
+        let source_ids: Vec<Value> = source_document_ids
+            .iter()
+            .map(|d| Value::String(d.clone()))
+            .collect();
         fm.insert(
             Value::String("source_document_ids".into()),
             Value::Sequence(source_ids),
         );
+    }
+
+    if derived_from_question_id.is_some() || derived_from_artifact_id.is_some() {
+        let mut derived = Mapping::new();
+        if let Some(qid) = derived_from_question_id {
+            derived.insert(
+                Value::String("question_id".into()),
+                Value::String(qid.to_string()),
+            );
+        }
+        if let Some(aid) = derived_from_artifact_id {
+            derived.insert(
+                Value::String("artifact_id".into()),
+                Value::String(aid.to_string()),
+            );
+        }
+        fm.insert(Value::String("derived_from".into()), Value::Mapping(derived));
     }
 
     fm
@@ -358,6 +478,21 @@ mod tests {
     use kb_core::EntityMetadata;
     use tempfile::tempdir;
 
+    fn test_input<'a>(
+        item: &'a ReviewItem,
+        artifact_body: &'a str,
+        promoted_at: u64,
+    ) -> PromotionInput<'a> {
+        PromotionInput {
+            review_item: item,
+            artifact_body,
+            promoted_at,
+            source_document_ids: &[],
+            derived_from_question_id: None,
+            derived_from_artifact_id: None,
+        }
+    }
+
     fn test_review_item(id: &str) -> ReviewItem {
         ReviewItem {
             metadata: EntityMetadata {
@@ -389,11 +524,7 @@ mod tests {
     #[test]
     fn render_promotion_creates_page_with_managed_regions() {
         let item = test_review_item("review-1");
-        let input = PromotionInput {
-            review_item: &item,
-            artifact_body: "Rust is a systems programming language.",
-            promoted_at: 2000,
-        };
+        let input = test_input(&item, "Rust is a systems programming language.", 2000);
 
         let result = render_promotion(&input, None).expect("render");
 
@@ -415,11 +546,7 @@ mod tests {
         let existing = "---\nid: old\n---\n## Answer\n<!-- kb:begin id=answer -->\nOld answer.\n<!-- kb:end id=answer -->\n\n## Notes\nKeep this manual section.\n\n## Citations\n<!-- kb:begin id=citations -->\n- old-citation\n<!-- kb:end id=citations -->\n";
 
         let item = test_review_item("review-2");
-        let input = PromotionInput {
-            review_item: &item,
-            artifact_body: "Updated answer text.",
-            promoted_at: 3000,
-        };
+        let input = test_input(&item, "Updated answer text.", 3000);
 
         let result = render_promotion(&input, Some(existing)).expect("render");
 
@@ -435,11 +562,7 @@ mod tests {
         let existing = "---\nid: old\n---\n## Answer\n<!-- kb:begin id=answer -->\nOld answer.\n<!-- kb:end id=answer -->\n\n## Custom\n<!-- kb:begin id=custom -->\nCustom content here.\n<!-- kb:end id=custom -->\n\n## Citations\n<!-- kb:begin id=citations -->\n- old-citation\n<!-- kb:end id=citations -->\n";
 
         let item = test_review_item("review-3");
-        let input = PromotionInput {
-            review_item: &item,
-            artifact_body: "New answer.",
-            promoted_at: 4000,
-        };
+        let input = test_input(&item, "New answer.", 4000);
 
         let result = render_promotion(&input, Some(existing)).expect("render");
 
@@ -451,11 +574,7 @@ mod tests {
     #[test]
     fn render_promotion_emits_build_record() {
         let item = test_review_item("review-4");
-        let input = PromotionInput {
-            review_item: &item,
-            artifact_body: "Answer body.",
-            promoted_at: 5000,
-        };
+        let input = test_input(&item, "Answer body.", 5000);
 
         let result = render_promotion(&input, None).expect("render");
 
@@ -476,11 +595,7 @@ mod tests {
     fn render_promotion_with_empty_citations() {
         let mut item = test_review_item("review-5");
         item.citations.clear();
-        let input = PromotionInput {
-            review_item: &item,
-            artifact_body: "Answer.",
-            promoted_at: 6000,
-        };
+        let input = test_input(&item, "Answer.", 6000);
 
         let result = render_promotion(&input, None).expect("render");
 
@@ -491,11 +606,7 @@ mod tests {
     fn render_promotion_rejects_non_promotion_kind() {
         let mut item = test_review_item("review-6");
         item.kind = ReviewKind::ConceptMerge;
-        let input = PromotionInput {
-            review_item: &item,
-            artifact_body: "Answer.",
-            promoted_at: 7000,
-        };
+        let input = test_input(&item, "Answer.", 7000);
 
         let err = render_promotion(&input, None).expect_err("should reject non-promotion");
         assert!(err.to_string().contains("Promotion"));
@@ -505,11 +616,7 @@ mod tests {
     fn render_promotion_rejects_missing_destination() {
         let mut item = test_review_item("review-7");
         item.proposed_destination = None;
-        let input = PromotionInput {
-            review_item: &item,
-            artifact_body: "Answer.",
-            promoted_at: 8000,
-        };
+        let input = test_input(&item, "Answer.", 8000);
 
         let err = render_promotion(&input, None).expect_err("should reject no destination");
         assert!(err.to_string().contains("proposed_destination"));
@@ -523,7 +630,7 @@ mod tests {
         std::fs::create_dir_all(root.join("outputs/questions/q1")).expect("create artifact dir");
         std::fs::write(
             root.join("outputs/questions/q1/answer.md"),
-            "---\nid: artifact-q1\ntype: question_answer\n---\n\nRust is great.\n",
+            "---\nid: artifact-q1\ntype: question_answer\nsource_document_ids:\n- wiki/sources/rust.md\n- wiki/sources/cargo.md\n---\n\nRust is great.\n",
         )
         .expect("write artifact");
 
@@ -543,6 +650,95 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(review_path).expect("read review"))
                 .expect("parse review");
         assert_eq!(saved.status, ReviewStatus::Approved);
+    }
+
+    #[test]
+    fn execute_promotion_uses_retrieval_sources_not_dependency_ids() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+
+        std::fs::create_dir_all(root.join("outputs/questions/q1")).expect("create artifact dir");
+        std::fs::write(
+            root.join("outputs/questions/q1/answer.md"),
+            "---\nid: artifact-q1\ntype: question_answer\nsource_document_ids:\n- wiki/sources/rust.md\n- wiki/sources/cargo.md\n---\n\nBody.\n",
+        )
+        .expect("write artifact");
+
+        let item = test_review_item("review-exec-src-1");
+        let _ = execute_promotion(root, &item, 10_000).expect("execute");
+
+        let page_path = root.join("wiki/questions/example.md");
+        let page = std::fs::read_to_string(&page_path).expect("read page");
+
+        // Real sources from the artifact frontmatter (retrieval plan candidates)
+        // end up in `source_document_ids`.
+        assert!(
+            page.contains("- wiki/sources/rust.md"),
+            "expected retrieval source in frontmatter: {page}"
+        );
+        assert!(
+            page.contains("- wiki/sources/cargo.md"),
+            "expected retrieval source in frontmatter: {page}"
+        );
+
+        // Extract the frontmatter only so we don't pick up body/citation occurrences.
+        let fm = page
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n").map(|(fm, _)| fm))
+            .expect("frontmatter block");
+
+        // Parse the frontmatter and check the specific sequence.
+        let doc: serde_yaml::Value = serde_yaml::from_str(fm).expect("parse frontmatter");
+        let sources = doc
+            .get("source_document_ids")
+            .and_then(Value::as_sequence)
+            .expect("source_document_ids present");
+        let source_strs: Vec<&str> = sources.iter().filter_map(Value::as_str).collect();
+        assert_eq!(source_strs, vec!["wiki/sources/rust.md", "wiki/sources/cargo.md"]);
+        for s in &source_strs {
+            assert!(
+                !s.starts_with("question-") && !s.starts_with("artifact-"),
+                "source_document_ids must not contain question/artifact IDs: {s}"
+            );
+        }
+
+        // Linkage is preserved under `derived_from`.
+        let derived = doc
+            .get("derived_from")
+            .and_then(Value::as_mapping)
+            .expect("derived_from mapping");
+        assert_eq!(
+            derived.get(Value::String("question_id".into())).and_then(Value::as_str),
+            Some("question-1")
+        );
+        assert_eq!(
+            derived.get(Value::String("artifact_id".into())).and_then(Value::as_str),
+            Some("artifact-q1")
+        );
+    }
+
+    #[test]
+    fn extract_source_document_ids_from_answer_frontmatter() {
+        let md = "---\nid: artifact-q1\nsource_document_ids:\n- wiki/sources/a.md\n- wiki/sources/b.md\n---\n\nBody\n";
+        let ids = extract_source_document_ids(md);
+        assert_eq!(ids, vec!["wiki/sources/a.md", "wiki/sources/b.md"]);
+    }
+
+    #[test]
+    fn extract_source_document_ids_missing_returns_empty() {
+        let md = "---\nid: artifact-q1\n---\n\nBody\n";
+        assert!(extract_source_document_ids(md).is_empty());
+    }
+
+    #[test]
+    fn split_derived_ids_picks_out_question_and_artifact() {
+        let deps = vec![
+            "question-abcd".to_string(),
+            "artifact-q1".to_string(),
+        ];
+        let (q, a) = split_derived_ids(&deps);
+        assert_eq!(q.as_deref(), Some("question-abcd"));
+        assert_eq!(a.as_deref(), Some("artifact-q1"));
     }
 
     #[test]
