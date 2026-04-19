@@ -386,7 +386,7 @@ impl LlmAdapter for OpencodeAdapter {
         _request: RunHealthCheckRequest,
     ) -> Result<(RunHealthCheckResponse, ProvenanceRecord), LlmAdapterError> {
         let prompt = "respond with OK";
-        let timeout = Duration::from_secs(10);
+        let timeout = health_check_timeout(self.config.timeout);
 
         let (temp_dir, config_path) = self.write_config()?;
         let command = self.build_command(&config_path, prompt);
@@ -400,7 +400,8 @@ impl LlmAdapter for OpencodeAdapter {
 
         let output = result.map_err(|e| match e {
             SubprocessError::TimedOut { timeout, .. } => LlmAdapterError::Timeout(format!(
-                "opencode health check exceeded timeout of {timeout:?}"
+                "opencode health check exceeded timeout of {}s \u{2014} this can mean the harness is slow to start (try again), the runner isn't authenticated, or the model isn't available.",
+                timeout.as_secs()
             )),
             SubprocessError::Other(err) => {
                 let msg = err.to_string();
@@ -480,6 +481,17 @@ fn strip_ansi_header(text: &str) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Clamp the configured runner timeout into `[30s, 60s]` for health checks.
+///
+/// `kb doctor` shouldn't hang for 900s on a misconfigured harness, but a cold
+/// `opencode` invocation can take 10-15s on first call due to mise/TS bootup.
+/// The `[30s, 60s]` range keeps doctor snappy while tolerating cold starts.
+fn health_check_timeout(configured: Duration) -> Duration {
+    configured
+        .min(Duration::from_secs(60))
+        .max(Duration::from_secs(30))
 }
 
 fn unix_time_ms() -> Result<u64, LlmAdapterError> {
@@ -778,21 +790,38 @@ mod tests {
     }
 
     #[test]
-    fn run_health_check_returns_timeout_error() {
-        let (adapter, _tmp) = test_adapter_with_script("#!/bin/sh\nsleep 100");
-        let adapter = OpencodeAdapter::new(OpencodeConfig {
-            command: adapter.config.command,
-            timeout: Duration::from_millis(50),
-            ..Default::default()
-        });
+    fn health_check_timeout_clamps_to_thirty_sixty_range() {
+        // Below-floor runner timeouts get lifted to the 30s floor so cold-start
+        // opencode invocations don't false-negative.
+        assert_eq!(
+            health_check_timeout(Duration::from_secs(5)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            health_check_timeout(Duration::from_millis(50)),
+            Duration::from_secs(30)
+        );
 
-        let err = adapter
-            .run_health_check(RunHealthCheckRequest {
-                check_details: None,
-            })
-            .expect_err("should time out");
+        // Above-ceiling runner timeouts (typically 900s) get clamped to the 60s
+        // ceiling so `kb doctor` stays snappy on a genuinely-broken harness.
+        assert_eq!(
+            health_check_timeout(Duration::from_secs(900)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            health_check_timeout(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
 
-        assert!(matches!(err, LlmAdapterError::Timeout(_)));
+        // Values inside the band pass through unchanged.
+        assert_eq!(
+            health_check_timeout(Duration::from_secs(45)),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            health_check_timeout(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]
