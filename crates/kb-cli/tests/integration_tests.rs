@@ -2879,3 +2879,240 @@ fn status_below_failed_cap_has_no_more_hint() {
         "no more-hint expected below the cap; got: {stdout}"
     );
 }
+
+// ── concept_merge auto-apply tests ───────────────────────────────────────────
+
+fn seed_concept_page(root: &Path, rel: &str, frontmatter: &str, body: &str) -> PathBuf {
+    let full = root.join(rel);
+    fs::create_dir_all(full.parent().expect("parent")).expect("create dirs");
+    let content = format!("---\n{frontmatter}---\n{body}");
+    fs::write(&full, content).expect("write concept page");
+    full
+}
+
+fn seed_concept_merge_review(
+    root: &Path,
+    id: &str,
+    canonical_rel: &str,
+    members: &[&str],
+) -> PathBuf {
+    // `dependencies` carries the raw candidate names — the canonical page's
+    // candidate plus the ones being subsumed. `proposed_destination` is the
+    // canonical concept page path.
+    let item = ReviewItem {
+        metadata: EntityMetadata {
+            id: id.to_string(),
+            created_at_millis: 1_000,
+            updated_at_millis: 1_000,
+            source_hashes: vec!["hash-merge-1".to_string()],
+            model_version: None,
+            tool_version: Some("kb-test".to_string()),
+            prompt_template_hash: None,
+            dependencies: members.iter().map(|s| (*s).to_string()).collect(),
+            output_paths: vec![PathBuf::from(canonical_rel)],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::ConceptMerge,
+        target_entity_id: id.to_string(),
+        proposed_destination: Some(PathBuf::from(canonical_rel)),
+        citations: vec![],
+        affected_pages: vec![PathBuf::from(canonical_rel)],
+        created_at_millis: 1_000,
+        status: ReviewStatus::Pending,
+        comment: format!(
+            "Proposed canonical: Borrow checker\nMembers: {}\n",
+            members.join(", ")
+        ),
+    };
+    save_review_item(root, &item).expect("save review item");
+    root.join(format!("reviews/merges/{id}.json"))
+}
+
+#[test]
+fn review_approve_applies_concept_merge() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Canonical concept page with a single alias and one source id.
+    let canonical = seed_concept_page(
+        &kb_root,
+        "wiki/concepts/borrow-checker.md",
+        "id: concept:borrow-checker\nname: Borrow checker\naliases:\n  - borrowck\nsource_document_ids:\n  - src-aaa\n",
+        "\n# Borrow checker\n\nValidates references at compile time.\n",
+    );
+
+    // Subsumed member with its own alias + source_document_ids + sources.
+    let member_path = seed_concept_page(
+        &kb_root,
+        "wiki/concepts/borrow-checker-pass.md",
+        "id: concept:borrow-checker-pass\nname: Borrow checker pass\naliases:\n  - bc pass\nsource_document_ids:\n  - src-bbb\nsources:\n  - heading_anchor: ownership\n    quote: The borrow checker validates references.\n",
+        "\n# Borrow checker pass\n\nAnother view of the checker.\n",
+    );
+
+    seed_concept_merge_review(
+        &kb_root,
+        "merge:borrow-checker",
+        "wiki/concepts/borrow-checker.md",
+        &["borrow checker", "borrow checker pass"],
+    );
+
+    // First approve: applies the merge.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg("merge:borrow-checker");
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        output.status.success(),
+        "kb review approve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Approved: merge:borrow-checker"));
+    assert!(stdout.contains("concept_merge"));
+    assert!(stdout.contains("wiki/concepts/borrow-checker.md"));
+    assert!(stdout.contains("wiki/concepts/borrow-checker-pass.md"));
+    assert!(stdout.contains("kb compile"));
+
+    // Subsumed member file is gone.
+    assert!(
+        !member_path.exists(),
+        "subsumed concept page should be deleted"
+    );
+
+    // Canonical page has been updated: frontmatter carries merged aliases +
+    // source_document_ids + the member name itself as an alias.
+    let canonical_text = fs::read_to_string(&canonical).expect("read canonical");
+    assert!(
+        canonical_text.contains("- borrowck"),
+        "pre-existing alias preserved; content: {canonical_text}"
+    );
+    assert!(
+        canonical_text.contains("- bc pass"),
+        "member alias merged; content: {canonical_text}"
+    );
+    assert!(
+        canonical_text.contains("- borrow checker pass"),
+        "member name added as alias; content: {canonical_text}"
+    );
+    assert!(
+        canonical_text.contains("src-aaa"),
+        "pre-existing source id preserved"
+    );
+    assert!(
+        canonical_text.contains("src-bbb"),
+        "member source id merged"
+    );
+    assert!(
+        canonical_text.contains("sources:"),
+        "member sources list merged; content: {canonical_text}"
+    );
+    assert!(
+        canonical_text.contains("Validates references at compile time."),
+        "body preserved"
+    );
+
+    // Review item status flipped to approved.
+    let review_path = kb_root.join("reviews/merges/merge:borrow-checker.json");
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).expect("read review")).expect("parse");
+    assert_eq!(saved["status"], "approved");
+
+    // Idempotency: re-approve is a no-op that re-prints the summary.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg("merge:borrow-checker");
+    let output = cmd.output().expect("run kb review approve (reapply)");
+    assert!(
+        output.status.success(),
+        "re-approve must succeed without error: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Already approved")
+            || stdout.contains("Approved: merge:borrow-checker"),
+        "re-apply output should acknowledge prior approval: {stdout}"
+    );
+    // Canonical page is unchanged on re-apply.
+    let canonical_text_after = fs::read_to_string(&canonical).expect("read canonical");
+    assert_eq!(
+        canonical_text, canonical_text_after,
+        "re-apply must not mutate canonical page"
+    );
+}
+
+#[test]
+fn review_approve_concept_merge_missing_canonical_errors() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Member exists but canonical does not — apply must bail cleanly, leaving
+    // the review item pending.
+    seed_concept_page(
+        &kb_root,
+        "wiki/concepts/borrowck.md",
+        "id: concept:borrowck\nname: borrowck\n",
+        "\n# borrowck\n",
+    );
+
+    seed_concept_merge_review(
+        &kb_root,
+        "merge:missing-canonical",
+        "wiki/concepts/borrow-checker.md",
+        &["borrow checker", "borrowck"],
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg("merge:missing-canonical");
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        !output.status.success(),
+        "kb review approve should fail when canonical page missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("canonical") || stderr.contains("borrow-checker"),
+        "stderr should mention missing canonical: {stderr}"
+    );
+
+    // Review item still pending.
+    let review_path = kb_root.join("reviews/merges/merge:missing-canonical.json");
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).expect("read review")).expect("parse");
+    assert_eq!(saved["status"], "pending");
+
+    // Member file untouched.
+    assert!(kb_root.join("wiki/concepts/borrowck.md").exists());
+}
+
+#[test]
+fn review_show_mentions_auto_apply_for_concept_merge() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    seed_concept_merge_review(
+        &kb_root,
+        "merge:show-me",
+        "wiki/concepts/x.md",
+        &["x", "y"],
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("show").arg("merge:show-me");
+    let output = cmd.output().expect("run kb review show");
+    assert!(
+        output.status.success(),
+        "kb review show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("On approve"),
+        "show output must describe approve behavior: {stdout}"
+    );
+    assert!(
+        stdout.to_lowercase().contains("delete")
+            || stdout.to_lowercase().contains("subsumed")
+            || stdout.to_lowercase().contains("absorb"),
+        "show output must mention that files are deleted/absorbed: {stdout}"
+    );
+}

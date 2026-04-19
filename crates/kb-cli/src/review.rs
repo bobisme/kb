@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use kb_compile::concept_merge::{AppliedMerge, apply_concept_merge};
 use kb_compile::promotion::execute_promotion;
 use kb_core::{
     ReviewItem, ReviewKind, ReviewStatus, list_review_items, load_review_item, save_review_item,
@@ -154,6 +155,25 @@ pub fn run_review_show(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(&st
     println!("Review: {}", item.metadata.id);
     println!("Kind:   {}", kind_label(item.kind));
     println!("Status: {}", status_label(item.status));
+    if item.status == ReviewStatus::Pending {
+        match item.kind {
+            ReviewKind::ConceptMerge => {
+                println!(
+                    "On approve: the canonical page absorbs member aliases + sources \
+                     and the subsumed member concept files are deleted."
+                );
+            }
+            ReviewKind::Promotion => {
+                println!("On approve: the promotion is executed and the wiki page written.");
+            }
+            ReviewKind::AliasMerge | ReviewKind::Canonicalization => {
+                println!(
+                    "On approve: the decision is recorded; the corresponding edit \
+                     must be made manually, then run 'kb compile'."
+                );
+            }
+        }
+    }
     println!("Comment: {}", item.comment);
     println!("Target: {}", item.target_entity_id);
     if let Some(dest) = &item.proposed_destination {
@@ -207,7 +227,14 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
     let item = load_review_item(root, id)?
         .with_context(|| format!("review item '{id}' not found"))?;
 
-    if item.status != ReviewStatus::Pending {
+    // `concept_merge` approvals execute the merge (see `apply_concept_merge`).
+    // Re-approving an already-approved merge is a no-op that re-prints the
+    // summary instead of erroring, so users who repeat the command or run it
+    // after a crash don't get a scary failure. Every other kind still requires
+    // a fresh Pending item.
+    let allow_reapply = item.kind == ReviewKind::ConceptMerge
+        && item.status == ReviewStatus::Approved;
+    if item.status != ReviewStatus::Pending && !allow_reapply {
         bail!(
             "review item '{}' is {} — only pending items can be approved",
             id,
@@ -236,12 +263,28 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
                 println!("  Build record: {}", result.build_record.metadata.id);
             }
         }
+        ReviewKind::ConceptMerge => {
+            let applied = apply_concept_merge(root, &item)
+                .with_context(|| format!("apply concept merge for review '{id}'"))?;
+
+            let prior_status = item.status;
+            // Flip status on first apply; a re-apply leaves it approved.
+            if prior_status == ReviewStatus::Pending {
+                let mut approved = item;
+                approved.status = ReviewStatus::Approved;
+                approved.metadata.updated_at_millis = now;
+                save_review_item(root, &approved)
+                    .with_context(|| format!("save approved review item '{id}'"))?;
+            }
+
+            emit_concept_merge_applied(id, &applied, prior_status, json, emit_json)?;
+        }
         other => {
-            // Non-Promotion approvals (concept_merge, alias_merge, canonicalization)
-            // flip the status so the queue moves on, but v1 does not execute the
-            // proposed change automatically — the reviewer is expected to make the
-            // corresponding edit (rename a concept page, adjust aliases, etc.) by
-            // hand. Be explicit about this rather than silently implying success.
+            // alias_merge and canonicalization remain decision-only for now: we
+            // flip status so the queue moves on but the reviewer must make the
+            // corresponding edit (rename a concept page, adjust aliases, etc.)
+            // by hand. Be explicit about this rather than silently implying
+            // success.
             let mut approved = item;
             approved.status = ReviewStatus::Approved;
             approved.metadata.updated_at_millis = now;
@@ -265,6 +308,66 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
         }
     }
 
+    Ok(())
+}
+
+fn emit_concept_merge_applied(
+    id: &str,
+    applied: &AppliedMerge,
+    prior_status: ReviewStatus,
+    json: bool,
+    emit_json: &dyn Fn(&str, serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    let was_reapply = prior_status == ReviewStatus::Approved;
+
+    if json {
+        emit_json(
+            "review.approve",
+            serde_json::json!({
+                "id": id,
+                "action": if was_reapply { "reapplied" } else { "approved" },
+                "kind": "concept_merge",
+                "canonical_page": applied.canonical_path.display().to_string(),
+                "removed_members": applied
+                    .removed_members
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
+                "added_aliases": applied.added_aliases,
+                "added_source_document_ids": applied.added_source_document_ids,
+                "canonical_updated": applied.canonical_updated,
+            }),
+        )?;
+        return Ok(());
+    }
+
+    if was_reapply {
+        println!("Already approved: {id} (concept_merge) — nothing new to apply.");
+    } else {
+        println!("Approved: {id} (concept_merge)");
+    }
+    println!("  Canonical: {}", applied.canonical_path.display());
+    if applied.removed_members.is_empty() {
+        println!("  Removed members: (none)");
+    } else {
+        println!("  Removed members:");
+        for rel in &applied.removed_members {
+            println!("    - {}", rel.display());
+        }
+    }
+    if !applied.added_aliases.is_empty() {
+        println!("  Merged aliases: {}", applied.added_aliases.join(", "));
+    }
+    if !applied.added_source_document_ids.is_empty() {
+        println!(
+            "  Merged source_document_ids: {}",
+            applied.added_source_document_ids.join(", ")
+        );
+    }
+    if !applied.canonical_updated && applied.removed_members.is_empty() {
+        println!("  (no changes — canonical already holds all member data)");
+    }
+    println!("  Next: run 'kb compile' to regenerate backlinks.");
     Ok(())
 }
 

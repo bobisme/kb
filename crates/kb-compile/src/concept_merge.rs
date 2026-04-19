@@ -3,8 +3,9 @@ use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use kb_core::fs::atomic_write;
+use kb_core::frontmatter::{read_frontmatter, write_frontmatter};
 use kb_core::{
     BuildRecord, EntityMetadata, ReviewItem, ReviewKind, ReviewStatus, Status, hash_many,
     save_review_item, slug_from_title,
@@ -13,6 +14,7 @@ use kb_llm::{
     ConceptCandidate, LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest,
     MergeConceptCandidatesResponse, MergeGroup, ProvenanceRecord, SourceAnchor,
 };
+use serde_yaml::{Mapping, Value};
 
 pub const WIKI_CONCEPTS_DIR: &str = "wiki/concepts";
 pub const MERGE_REVIEWS_DIR: &str = "reviews/merges";
@@ -451,6 +453,266 @@ fn build_record_for_merge(
         output_ids,
         manifest_hash,
     })
+}
+
+/// Summary of an applied concept merge.
+///
+/// Returned by [`apply_concept_merge`] so callers (the CLI `kb review approve`
+/// path) can render the same summary on first apply and on re-apply of an
+/// already-approved item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedMerge {
+    /// Canonical concept page path (relative to the kb root).
+    pub canonical_path: PathBuf,
+    /// Canonical page existed before apply (true on first apply, true on re-apply).
+    pub canonical_existed: bool,
+    /// Paths of subsumed member concept files that were (or already were) removed.
+    pub removed_members: Vec<PathBuf>,
+    /// Aliases merged into the canonical page on this call.
+    pub added_aliases: Vec<String>,
+    /// Source document IDs merged into the canonical page on this call.
+    pub added_source_document_ids: Vec<String>,
+    /// True when the canonical page was updated in place; false on an idempotent
+    /// re-apply where nothing changed.
+    pub canonical_updated: bool,
+}
+
+/// Apply a `concept_merge` review item: fold subsumed concept pages into the
+/// canonical page and delete them.
+///
+/// The review item is expected to carry:
+/// - `proposed_destination` = path (relative to `root`) to the canonical concept page.
+/// - `metadata.dependencies` = member candidate names (the canonical candidate
+///   plus the ones being subsumed). Each name is slugged to resolve its
+///   `wiki/concepts/<slug>.md` path.
+///
+/// On apply:
+/// 1. Each subsumed member file's frontmatter is read; its `aliases`,
+///    `source_document_ids`, and `sources` entries are unioned into the
+///    canonical page. The member's own name is also added as an alias on the
+///    canonical page.
+/// 2. Each subsumed member file is deleted.
+/// 3. The canonical page's frontmatter is rewritten with the merged fields
+///    (sorted + de-duplicated for deterministic output).
+///
+/// Idempotency: calling apply a second time (after all members have already
+/// been removed) is a no-op — it recomputes the same summary, detects nothing
+/// to merge, and does not error.
+///
+/// # Errors
+///
+/// Returns an error when the review item has no `proposed_destination`, is not
+/// a `concept_merge`, or when the canonical page is missing on disk.
+pub fn apply_concept_merge(root: &Path, item: &ReviewItem) -> Result<AppliedMerge> {
+    if item.kind != ReviewKind::ConceptMerge {
+        bail!(
+            "apply_concept_merge called on a {:?} review item",
+            item.kind
+        );
+    }
+
+    let canonical_rel = item
+        .proposed_destination
+        .as_ref()
+        .context("review item has no proposed_destination")?
+        .clone();
+    let canonical_path = root.join(&canonical_rel);
+
+    if !canonical_path.exists() {
+        bail!(
+            "canonical concept page missing at {}; cannot apply merge '{}'",
+            canonical_rel.display(),
+            item.metadata.id
+        );
+    }
+
+    let canonical_slug = canonical_rel
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map_or_else(String::new, ToString::to_string);
+
+    let (mut fm, body) = read_frontmatter(&canonical_path).with_context(|| {
+        format!("read canonical concept page {}", canonical_path.display())
+    })?;
+
+    let mut existing = CanonicalFields::read(&fm);
+    let mut additions = MergeAdditions::default();
+    let mut removed_members: Vec<PathBuf> = Vec::new();
+
+    for member_name in &item.metadata.dependencies {
+        let member_slug = slug_from_title(member_name);
+        if member_slug == canonical_slug {
+            // The canonical candidate shares a file with the canonical page; don't
+            // delete it or add its own name as an alias.
+            continue;
+        }
+
+        let member_rel = PathBuf::from(WIKI_CONCEPTS_DIR).join(format!("{member_slug}.md"));
+        let member_path = root.join(&member_rel);
+
+        // Always record the member's name as an alias on the canonical page, even
+        // if the member file is already gone (idempotent re-apply still sets it).
+        additions.add_alias(&existing.aliases, member_name);
+
+        if !member_path.exists() {
+            continue;
+        }
+
+        absorb_member_frontmatter(&member_path, &existing, &mut additions)?;
+
+        std::fs::remove_file(&member_path)
+            .with_context(|| format!("delete subsumed concept page {}", member_path.display()))?;
+        removed_members.push(member_rel);
+    }
+
+    let added_aliases: Vec<String> = additions.aliases.into_iter().collect();
+    let added_source_document_ids: Vec<String> = additions.source_ids.into_iter().collect();
+    let canonical_updated = !added_aliases.is_empty()
+        || !added_source_document_ids.is_empty()
+        || !additions.sources.is_empty();
+
+    if canonical_updated {
+        existing.union_additions(&added_aliases, &added_source_document_ids, additions.sources);
+        existing.write_into(&mut fm);
+        write_frontmatter(&canonical_path, &fm, body.as_str())
+            .with_context(|| format!("rewrite canonical concept page {}", canonical_path.display()))?;
+    }
+
+    Ok(AppliedMerge {
+        canonical_path: canonical_rel,
+        canonical_existed: true,
+        removed_members,
+        added_aliases,
+        added_source_document_ids,
+        canonical_updated,
+    })
+}
+
+#[derive(Default)]
+struct CanonicalFields {
+    aliases: Vec<String>,
+    source_ids: Vec<String>,
+    sources: Vec<Value>,
+}
+
+impl CanonicalFields {
+    fn read(fm: &Mapping) -> Self {
+        Self {
+            aliases: string_seq(fm, "aliases"),
+            source_ids: string_seq(fm, "source_document_ids"),
+            sources: fm
+                .get(Value::String("sources".into()))
+                .and_then(|v| v.as_sequence())
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn union_additions(
+        &mut self,
+        added_aliases: &[String],
+        added_source_ids: &[String],
+        added_sources: Vec<Value>,
+    ) {
+        self.aliases.extend(added_aliases.iter().cloned());
+        self.aliases.sort();
+        self.aliases.dedup();
+
+        self.source_ids.extend(added_source_ids.iter().cloned());
+        self.source_ids.sort();
+        self.source_ids.dedup();
+
+        self.sources.extend(added_sources);
+    }
+
+    fn write_into(&self, fm: &mut Mapping) {
+        if !self.aliases.is_empty() {
+            fm.insert(
+                Value::String("aliases".into()),
+                Value::Sequence(self.aliases.iter().map(|s| Value::String(s.clone())).collect()),
+            );
+        }
+        if !self.source_ids.is_empty() {
+            fm.insert(
+                Value::String("source_document_ids".into()),
+                Value::Sequence(
+                    self.source_ids
+                        .iter()
+                        .map(|s| Value::String(s.clone()))
+                        .collect(),
+                ),
+            );
+        }
+        if !self.sources.is_empty() {
+            fm.insert(
+                Value::String("sources".into()),
+                Value::Sequence(self.sources.clone()),
+            );
+        }
+    }
+}
+
+#[derive(Default)]
+struct MergeAdditions {
+    aliases: BTreeSet<String>,
+    source_ids: BTreeSet<String>,
+    sources: Vec<Value>,
+}
+
+impl MergeAdditions {
+    fn add_alias(&mut self, existing: &[String], alias: &str) {
+        if !existing.iter().any(|a| a == alias) {
+            self.aliases.insert(alias.to_string());
+        }
+    }
+
+    fn add_source_id(&mut self, existing: &[String], id: &str) {
+        if !existing.iter().any(|a| a == id) {
+            self.source_ids.insert(id.to_string());
+        }
+    }
+
+    fn add_source_entry(&mut self, existing: &[Value], entry: &Value) {
+        if !existing.iter().any(|e| e == entry) && !self.sources.iter().any(|e| e == entry) {
+            self.sources.push(entry.clone());
+        }
+    }
+}
+
+fn absorb_member_frontmatter(
+    member_path: &Path,
+    existing: &CanonicalFields,
+    additions: &mut MergeAdditions,
+) -> Result<()> {
+    let (member_fm, _body) = read_frontmatter(member_path)
+        .with_context(|| format!("read member concept page {}", member_path.display()))?;
+
+    for alias in string_seq(&member_fm, "aliases") {
+        additions.add_alias(&existing.aliases, &alias);
+    }
+    for id in string_seq(&member_fm, "source_document_ids") {
+        additions.add_source_id(&existing.source_ids, &id);
+    }
+    if let Some(seq) = member_fm
+        .get(Value::String("sources".into()))
+        .and_then(|v| v.as_sequence())
+    {
+        for entry in seq {
+            additions.add_source_entry(&existing.sources, entry);
+        }
+    }
+    Ok(())
+}
+
+fn string_seq(fm: &Mapping, key: &str) -> Vec<String> {
+    fm.get(Value::String(key.into()))
+        .and_then(|v| v.as_sequence())
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|v| v.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn unix_time_ms() -> Result<u64, ConceptMergeError> {
