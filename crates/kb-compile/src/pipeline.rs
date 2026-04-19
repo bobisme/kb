@@ -282,54 +282,37 @@ pub fn run_compile_with_llm(
         let mut passes = Vec::new();
 
         // Per-document LLM passes come first in the live run, so mirror that order.
-        // When an adapter is configured, preview what *would* run for each stale doc.
-        // When no adapter is configured, surface the same passes as [skipped-dry] so
-        // the user sees that a configured adapter would trigger them.
+        // Dry-run is a *preview*: we always report what would happen once the
+        // pipeline runs for real, regardless of whether the caller wired up an
+        // adapter. The CLI intentionally skips adapter construction under
+        // `--dry-run` (no credentials needed to inspect what *would* run), so
+        // adapter=None here is the normal case — not a misconfiguration. Emit
+        // DryRun so users don't read "no LLM adapter configured" and assume
+        // their kb.toml is broken.
         if !stale_doc_ids.is_empty() {
             let stale_node_ids: Vec<String> = stale_doc_ids
                 .iter()
                 .map(|id| format!("normalized/{id}"))
                 .collect();
 
-            if adapter.is_some() {
-                passes.push((
-                    "source_summary".to_string(),
-                    PassStatus::DryRun {
-                        would_process: stale_node_ids.clone(),
-                    },
-                ));
-                passes.push((
-                    "concept_extraction".to_string(),
-                    PassStatus::DryRun {
-                        would_process: stale_node_ids,
-                    },
-                ));
-                passes.push((
-                    "concept_merge".to_string(),
-                    PassStatus::DryRun {
-                        would_process: vec!["wiki/concepts/* (global)".to_string()],
-                    },
-                ));
-            } else {
-                passes.push((
-                    "source_summary".to_string(),
-                    PassStatus::Skipped {
-                        reason: "no LLM adapter configured".to_string(),
-                    },
-                ));
-                passes.push((
-                    "concept_extraction".to_string(),
-                    PassStatus::Skipped {
-                        reason: "no LLM adapter configured".to_string(),
-                    },
-                ));
-                passes.push((
-                    "concept_merge".to_string(),
-                    PassStatus::Skipped {
-                        reason: "no LLM adapter configured".to_string(),
-                    },
-                ));
-            }
+            passes.push((
+                "source_summary".to_string(),
+                PassStatus::DryRun {
+                    would_process: stale_node_ids.clone(),
+                },
+            ));
+            passes.push((
+                "concept_extraction".to_string(),
+                PassStatus::DryRun {
+                    would_process: stale_node_ids,
+                },
+            ));
+            passes.push((
+                "concept_merge".to_string(),
+                PassStatus::DryRun {
+                    would_process: vec!["wiki/concepts/* (global)".to_string()],
+                },
+            ));
         }
 
         passes.push((
@@ -1066,8 +1049,10 @@ mod tests {
         assert_eq!(report.stale_sources, 1);
         assert_eq!(report.build_records_emitted, 0);
 
-        // Without an adapter, per-doc LLM passes appear as Skipped so the user
-        // sees what would happen once an adapter is configured.
+        // Dry-run is a preview, so every pass — per-doc and batch — must be
+        // reported as DryRun. The CLI deliberately skips adapter construction
+        // under --dry-run, so the absence of an adapter is normal here and
+        // must NOT be surfaced as "no LLM adapter configured" (bn-1xf).
         let names: Vec<&str> = report
             .passes
             .iter()
@@ -1087,23 +1072,11 @@ mod tests {
             );
         }
 
-        // Batch passes must be DryRun; per-doc passes must be Skipped (no adapter).
         for (name, status) in &report.passes {
-            match name.as_str() {
-                "source_summary" | "concept_extraction" | "concept_merge" => {
-                    assert!(
-                        matches!(
-                            status,
-                            PassStatus::Skipped { reason } if reason == "no LLM adapter configured"
-                        ),
-                        "`{name}` should be Skipped with adapter-missing reason without an adapter"
-                    );
-                }
-                _ => assert!(
-                    matches!(status, PassStatus::DryRun { .. }),
-                    "batch pass `{name}` should be DryRun"
-                ),
-            }
+            assert!(
+                matches!(status, PassStatus::DryRun { .. }),
+                "dry-run pass `{name}` should be DryRun; got {status:?}"
+            );
         }
 
         assert!(
@@ -1188,6 +1161,60 @@ mod tests {
             .find(|(n, _)| n == "concept_merge")
             .expect("concept_merge entry");
         assert!(matches!(&merge_pass.1, PassStatus::DryRun { would_process } if would_process.len() == 1));
+    }
+
+    #[test]
+    fn dry_run_reports_per_doc_passes_regardless_of_adapter() {
+        // bn-1xf regression: `kb compile --dry-run` deliberately skips adapter
+        // construction, so run_compile_with_llm is called with adapter=None
+        // under dry_run=true. Previously that path emitted
+        // `Skipped { reason: "no LLM adapter configured" }`, which misled
+        // users into thinking their kb.toml was broken. Dry-run is a preview;
+        // per-doc passes must be reported as DryRun with the stale doc IDs.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# A")).expect("write doc");
+
+        let report = run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: true,
+                progress: false,
+                log_sink: None,
+            },
+            None::<&dyn LlmAdapter>,
+        )
+        .expect("dry run without adapter");
+
+        for name in ["source_summary", "concept_extraction", "concept_merge"] {
+            let entry = report
+                .passes
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("missing `{name}` pass"));
+            assert!(
+                matches!(&entry.1, PassStatus::DryRun { .. }),
+                "`{name}` must be DryRun under --dry-run (adapter absence is expected); got {:?}",
+                entry.1
+            );
+        }
+
+        // source_summary/concept_extraction previews list the stale doc IDs;
+        // concept_merge previews the global merge scope.
+        let summary_pass = report
+            .passes
+            .iter()
+            .find(|(n, _)| n == "source_summary")
+            .expect("source_summary entry");
+        match &summary_pass.1 {
+            PassStatus::DryRun { would_process } => {
+                assert_eq!(would_process, &vec!["normalized/doc-a".to_string()]);
+            }
+            other => panic!("expected DryRun, got {other:?}"),
+        }
     }
 
     #[test]
