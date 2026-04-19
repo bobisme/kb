@@ -923,7 +923,19 @@ fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<Lin
         let rev_ids =
             frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
         let has_sources = !(doc_ids.is_empty() && rev_ids.is_empty());
-        let has_citations = page_has_citations(&body);
+        // Concept pages (under wiki/concepts/) store provenance as a structured
+        // `sources:` list in frontmatter — that is the established shape written
+        // by render_concept_page. Treat a non-empty `sources:` list as
+        // satisfying the body-citation requirement for concept pages.
+        let rel_path = relative_to_root(root, &page);
+        let is_concept_page = rel_path.starts_with("wiki/concepts");
+        let has_frontmatter_sources_list =
+            frontmatter_has_non_empty_sequence(&frontmatter, "sources");
+        let has_citations = if is_concept_page && has_frontmatter_sources_list {
+            true
+        } else {
+            page_has_citations(&body)
+        };
 
         if has_sources && has_citations {
             continue;
@@ -1028,6 +1040,13 @@ fn yaml_string_list(value: &Value) -> Vec<String> {
             .collect(),
         Value::String(s) => vec![s.clone()],
         _ => Vec::new(),
+    }
+}
+
+fn frontmatter_has_non_empty_sequence(frontmatter: &serde_yaml::Mapping, key: &str) -> bool {
+    match frontmatter.get(Value::String(key.to_string())) {
+        Some(Value::Sequence(values)) => !values.is_empty(),
+        _ => false,
     }
 }
 
@@ -1357,6 +1376,85 @@ mod tests {
 
         // And has_errors is true.
         assert!(report.has_errors());
+    }
+
+    #[test]
+    fn missing_citations_accepts_frontmatter_sources_on_concept_pages() {
+        // Regression: bn-358. Concept pages store provenance as a structured
+        // `sources:` list in frontmatter (written by render_concept_page). That
+        // structured data IS the citation, so body-citation markers should not
+        // be required when `sources:` + `source_document_ids:` are both
+        // populated.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::write(
+            root.join("wiki/concepts/rust.md"),
+            "---\nsource_document_ids:\n  - doc-1\nsources:\n  - heading_anchor: intro\n    quote: \"Rust is a systems language.\"\n---\n# Rust\n\n<!-- kb:begin id=summary -->\nA short definition.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write concept page");
+
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert!(
+            report.is_clean(),
+            "concept page with frontmatter sources should not warn: {report:?}"
+        );
+    }
+
+    #[test]
+    fn missing_citations_flags_concept_pages_missing_both_sources_and_citations() {
+        // Regression guard: a concept page with neither `source_document_ids`
+        // nor `sources:` (and no body citations) must still trigger the warning.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::write(
+            root.join("wiki/concepts/rust.md"),
+            "---\ngenerated_by: builder\n---\n# Rust\n\n<!-- kb:begin id=summary -->\nA short definition.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write concept page");
+
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert!(
+            !report.is_clean(),
+            "concept page with no grounding should still warn: {report:?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::MissingCitations),
+            "expected MissingCitations issue, got: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn missing_citations_still_requires_body_citations_for_source_pages() {
+        // Unchanged behavior: source pages under wiki/sources/ must have body
+        // citations even if frontmatter has `sources:`.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+        fs::write(
+            root.join("wiki/sources/doc.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\nsources:\n  - heading_anchor: intro\n    quote: \"Rust is a systems language.\"\n---\n# Source\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert!(
+            !report.is_clean(),
+            "source page without body citations should still warn: {report:?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::MissingCitations),
+            "expected MissingCitations issue, got: {:?}",
+            report.issues
+        );
     }
 
     #[test]
