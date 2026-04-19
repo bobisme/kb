@@ -1734,7 +1734,7 @@ fn build_graph_inspect_report(
     graph: &Graph,
     target: &str,
     id: &str,
-    changed_inputs: &[PathBuf],
+    changed_inputs: &[ChangedInput],
     jobs: &[JobRun],
 ) -> Result<InspectReport> {
     let inspection = graph.inspect(id)?;
@@ -1866,7 +1866,7 @@ fn build_file_report(
     path: &Path,
     jobs: &[JobRun],
     graph: &Graph,
-    changed_inputs: &[PathBuf],
+    changed_inputs: &[ChangedInput],
     hash_state: &kb_compile::HashState,
 ) -> Result<InspectReport> {
     let rel = path
@@ -2070,7 +2070,7 @@ fn file_freshness(
     abs_path: &Path,
     rel: &str,
     graph: &Graph,
-    changed_inputs: &[PathBuf],
+    changed_inputs: &[ChangedInput],
     _hash_state: &kb_compile::HashState,
     exists: bool,
 ) -> String {
@@ -2116,14 +2116,19 @@ fn source_page_freshness(root: &Path, page_path: &Path) -> Option<String> {
     })
 }
 
-fn inspect_freshness(graph: &Graph, id: &str, changed_inputs: &[PathBuf], exists_on_disk: bool) -> String {
+fn inspect_freshness(
+    graph: &Graph,
+    id: &str,
+    changed_inputs: &[ChangedInput],
+    exists_on_disk: bool,
+) -> String {
     if !exists_on_disk {
         return "missing".to_string();
     }
 
     let changed: std::collections::BTreeSet<_> = changed_inputs
         .iter()
-        .map(|path| path.to_string_lossy().into_owned())
+        .map(|input| input.normalized_path.to_string_lossy().into_owned())
         .collect();
     if changed.contains(id) {
         return "stale".to_string();
@@ -2502,9 +2507,16 @@ struct StatusPayload {
     concepts: usize,
     stale_count: usize,
     recent_jobs: Vec<JobRun>,
+    /// Failed job runs, capped at `FAILED_JOBS_DISPLAY_LIMIT` most recent.
     failed_jobs: Vec<JobRun>,
+    /// Total count of failed jobs, including those truncated from `failed_jobs`.
+    failed_jobs_total: usize,
     interrupted_jobs: Vec<JobRun>,
-    changed_inputs_not_compiled: Vec<PathBuf>,
+    /// Normalized source directories whose contents haven't been compiled yet,
+    /// each annotated (when available) with the original filename/URL the
+    /// source was ingested from so users can grep by filename — not just the
+    /// opaque `src-<id>` hash.
+    changed_inputs_not_compiled: Vec<ChangedInput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2512,6 +2524,28 @@ struct SourceCounts {
     total: usize,
     by_kind: std::collections::BTreeMap<String, usize>,
 }
+
+/// One uncompiled normalized source, carrying both the bare on-disk path
+/// (backward-compat grep target) and — when the raw-ingest record is
+/// readable — the original filename or URL the source came from.
+#[derive(Debug, Serialize)]
+struct ChangedInput {
+    /// Full normalized path like `<root>/normalized/src-0639ebb0`.
+    normalized_path: PathBuf,
+    /// Source document id (e.g. `src-0639ebb0`) parsed from the directory name.
+    src_id: String,
+    /// Best-available human-readable origin: local filesystem path or URL.
+    /// `None` when `raw/inbox/<src>/source_document.json` is missing or
+    /// unparseable (e.g. a legacy KB, manually-placed normalized dir, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    original_path: Option<String>,
+}
+
+/// Maximum number of failed jobs shown in text `kb status` output. Additional
+/// failures are summarized with a "... and N more" hint. Kept small because
+/// typo/bad-path failures accrue indefinitely and would otherwise drown the
+/// signal in every `kb status` invocation.
+const FAILED_JOBS_DISPLAY_LIMIT: usize = 10;
 
 fn gather_status(root: &Path) -> Result<StatusPayload> {
     let graph = Graph::load_from(root)?;
@@ -2576,10 +2610,18 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         .cloned()
         .collect();
 
+    // Failed jobs: the full total is used by `print_status` to emit a
+    // "... and M more" hint when more than `FAILED_JOBS_DISPLAY_LIMIT`
+    // failures exist. Typo/bad-path failures accumulate forever, so only
+    // the cap is rendered while the count stays honest.
+    let failed_jobs_total = all_jobs
+        .iter()
+        .filter(|j| j.status == JobRunStatus::Failed)
+        .count();
     let failed_jobs: Vec<_> = all_jobs
         .iter()
         .filter(|j| j.status == JobRunStatus::Failed)
-        .take(20)
+        .take(FAILED_JOBS_DISPLAY_LIMIT)
         .cloned()
         .collect();
 
@@ -2593,6 +2635,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         stale_count,
         recent_jobs,
         failed_jobs,
+        failed_jobs_total,
         interrupted_jobs,
         changed_inputs_not_compiled,
     })
@@ -2656,9 +2699,19 @@ fn extract_source_kind(node_id: &str) -> &str {
 /// misses this because compile *did* run once and recorded a fingerprint —
 /// it just recorded an out-of-date one.
 ///
+/// For each flagged source we also try to recover the original filename or
+/// URL from `raw/inbox/<src>/source_document.json` (written by ingest).
+/// This lets `kb status` render `<filename> (src-<id>)` instead of an opaque
+/// `normalized/src-0639ebb0`, which users can't meaningfully grep. When the
+/// raw record is missing or unreadable (legacy KB, hand-placed normalized
+/// dir, partial deletion), we fall back to just the src-id.
+///
 /// Missing `state/hashes.json` is treated as an empty state, so every
 /// normalized source will be reported until `kb compile` runs.
-fn find_changed_inputs(root: &Path, hash_state: &kb_compile::HashState) -> Result<Vec<PathBuf>> {
+fn find_changed_inputs(
+    root: &Path,
+    hash_state: &kb_compile::HashState,
+) -> Result<Vec<ChangedInput>> {
     let normalized_dir = root.join("normalized");
     if !normalized_dir.exists() {
         return Ok(Vec::new());
@@ -2680,14 +2733,24 @@ fn find_changed_inputs(root: &Path, hash_state: &kb_compile::HashState) -> Resul
         // Match the graph node id convention used by compile: `normalized/<id>`.
         let node_id = format!("normalized/{name}");
         if !hash_state.hashes.contains_key(&node_id) {
-            changed.push(entry.path());
+            let original_path = lookup_source_origin(root, name);
+            changed.push(ChangedInput {
+                normalized_path: entry.path(),
+                src_id: name.to_string(),
+                original_path,
+            });
             continue;
         }
         if source_revision_mismatched(root, name)? {
-            changed.push(entry.path());
+            let original_path = lookup_source_origin(root, name);
+            changed.push(ChangedInput {
+                normalized_path: entry.path(),
+                src_id: name.to_string(),
+                original_path,
+            });
         }
     }
-    changed.sort();
+    changed.sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
     Ok(changed)
 }
 
@@ -2770,6 +2833,28 @@ fn extract_frontmatter(markdown: &str) -> Option<String> {
     None
 }
 
+/// Best-effort lookup of the human-readable origin for a source-document id.
+///
+/// Reads `raw/inbox/<src_id>/source_document.json` and returns its
+/// `stable_location` field (the canonical filesystem path for local files,
+/// or the normalized URL for web sources). Any failure — missing file,
+/// unparseable JSON, missing field — yields `None` rather than erroring;
+/// this is display-only metadata and must never block status rendering.
+fn lookup_source_origin(root: &Path, src_id: &str) -> Option<String> {
+    let record_path = root
+        .join("raw")
+        .join("inbox")
+        .join(src_id)
+        .join("source_document.json");
+    let bytes = std::fs::read(&record_path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("stable_location")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+
 fn print_status(status: &StatusPayload) {
     println!("kb status");
     println!();
@@ -2779,8 +2864,16 @@ fn print_status(status: &StatusPayload) {
         println!("wiki source pages: 0    (run 'kb compile' to generate)");
     } else {
         println!("wiki source pages: {}", status.sources.total);
-        for (kind, count) in &status.sources.by_kind {
-            println!("  {kind}: {count}");
+        // ST2: a single-kind breakdown is always just `<kind>: <total>`,
+        // which carries no information beyond the header line. Only render
+        // the breakdown when there's actual variety (≥2 distinct kinds).
+        // The default "other" bucket — dominant until ingest starts plumbing
+        // raw-subdir categories through — collapses into the header instead
+        // of showing `other: N` after every count.
+        if status.sources.by_kind.len() > 1 {
+            for (kind, count) in &status.sources.by_kind {
+                println!("  {kind}: {count}");
+            }
         }
     }
     println!("wiki concept pages: {}", status.concepts);
@@ -2789,8 +2882,21 @@ fn print_status(status: &StatusPayload) {
 
     if !status.changed_inputs_not_compiled.is_empty() {
         println!("changed inputs not yet compiled:");
-        for path in &status.changed_inputs_not_compiled {
-            println!("  - {}", path.display());
+        for input in &status.changed_inputs_not_compiled {
+            // ST1: users can't meaningfully grep or recognize a bare
+            // `/tmp/kb/normalized/src-0639ebb0`. Prefer the original
+            // filename from the raw-ingest record, falling back to the
+            // normalized path when the record is absent. The src-id is
+            // always included so operators can still match on it in logs.
+            match &input.original_path {
+                Some(origin) => {
+                    let display = origin_display_name(origin);
+                    println!("  - {display}  ({})", input.src_id);
+                }
+                None => {
+                    println!("  - {}  ({})", input.normalized_path.display(), input.src_id);
+                }
+            }
         }
         println!();
     }
@@ -2833,7 +2939,11 @@ fn print_status(status: &StatusPayload) {
     println!();
 
     if !status.failed_jobs.is_empty() {
-        println!("failed job runs ({}):", status.failed_jobs.len());
+        // ST3: header shows the true total (e.g. "failed job runs (47):")
+        // so users see the real scope of accumulated failures, while the
+        // body is capped at `FAILED_JOBS_DISPLAY_LIMIT` most recent to
+        // avoid drowning `kb status` output in stale typos.
+        println!("failed job runs ({}):", status.failed_jobs_total);
         for job in &status.failed_jobs {
             let duration = job
                 .ended_at_millis
@@ -2848,7 +2958,30 @@ fn print_status(status: &StatusPayload) {
                 duration_str
             );
         }
+        if status.failed_jobs_total > status.failed_jobs.len() {
+            let hidden = status.failed_jobs_total - status.failed_jobs.len();
+            // `kb jobs --failed` is not yet implemented (see bn-2cr scope
+            // note); the hint points at the intended future entry point so
+            // users know where to look once it lands.
+            println!("  ... and {hidden} more (run 'kb jobs --failed' to inspect)");
+        }
     }
+}
+
+/// Render the filename portion of a source origin for the status display.
+///
+/// For local filesystem paths we strip the directory prefix to keep lines
+/// short — the src-id suffix already disambiguates files with the same
+/// basename. URLs are passed through untouched because their "filename"
+/// alone (e.g. the trailing path segment) is rarely meaningful.
+fn origin_display_name(origin: &str) -> String {
+    if origin.starts_with("http://") || origin.starts_with("https://") {
+        return origin.to_string();
+    }
+    Path::new(origin)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map_or_else(|| origin.to_string(), ToOwned::to_owned)
 }
 fn execute_mutating_command(
     root: Option<&Path>,
@@ -3022,8 +3155,10 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
         // to rev-B, wiki page still reflects rev-A. Status must flag it.
         write_normalized_metadata(root, "src-1", "rev-B");
         let changed = find_changed_inputs(root, &hash_state).expect("find changed (reingested)");
+        let changed_paths: Vec<PathBuf> =
+            changed.into_iter().map(|c| c.normalized_path).collect();
         assert_eq!(
-            changed,
+            changed_paths,
             vec![root.join("normalized").join("src-1")],
             "re-ingested source with stale wiki page must be reported as changed",
         );
@@ -3040,7 +3175,9 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
         let hash_state = kb_compile::HashState::default();
         let changed =
             find_changed_inputs(root, &hash_state).expect("find changed (never compiled)");
-        assert_eq!(changed, vec![root.join("normalized").join("src-fresh")]);
+        let changed_paths: Vec<PathBuf> =
+            changed.into_iter().map(|c| c.normalized_path).collect();
+        assert_eq!(changed_paths, vec![root.join("normalized").join("src-fresh")]);
     }
 
     #[test]

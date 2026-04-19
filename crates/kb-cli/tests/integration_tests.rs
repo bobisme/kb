@@ -2549,7 +2549,12 @@ fn status_changed_inputs(kb_root: &Path) -> Vec<String> {
         .as_array()
         .expect("changed_inputs_not_compiled array")
         .iter()
-        .map(|v| v.as_str().expect("changed entry is string").to_string())
+        .map(|v| {
+            v.get("normalized_path")
+                .and_then(Value::as_str)
+                .expect("changed entry has normalized_path string")
+                .to_string()
+        })
         .collect()
 }
 
@@ -2603,5 +2608,274 @@ fn kb_status_flags_reingested_source_with_stale_wiki_page() {
     assert!(
         changed.is_empty(),
         "after recompile, changed_inputs_not_compiled should clear, got: {changed:?}",
+    );
+}
+
+// --- bn-2cr: kb status readability regressions -----------------------------
+
+/// Seed a failed `JobRun` manifest directly under `state/jobs/` so we don't
+/// have to actually provoke N different failure modes from the CLI. The
+/// shape mirrors `jobs::load_job_run`'s serde expectations — if this drifts,
+/// update alongside the `JobRun`/`EntityMetadata` structs.
+fn seed_failed_job(root: &Path, id: &str, started_at_millis: u64) {
+    let jobs_dir = root.join("state/jobs");
+    fs::create_dir_all(&jobs_dir).expect("create state/jobs");
+    let manifest = serde_json::json!({
+        "metadata": {
+            "id": id,
+            "created_at_millis": started_at_millis,
+            "updated_at_millis": started_at_millis,
+            "source_hashes": [],
+            "model_version": null,
+            "tool_version": "kb-cli/0.1.0",
+            "prompt_template_hash": null,
+            "dependencies": [],
+            "output_paths": [],
+            "status": "fresh"
+        },
+        "command": "ingest",
+        "root_path": root,
+        "started_at_millis": started_at_millis,
+        "ended_at_millis": started_at_millis + 1,
+        "status": "failed",
+        "log_path": null,
+        "affected_outputs": [],
+        "pid": 12_345,
+        "exit_code": 1
+    });
+    fs::write(
+        jobs_dir.join(format!("{id}.json")),
+        manifest.to_string(),
+    )
+    .expect("write failed job manifest");
+}
+
+/// ST1: `kb status` must show the original filename alongside the src-id
+/// for changed-but-not-yet-compiled inputs. A bare `normalized/src-<id>`
+/// path is meaningless to users; the filename lets them recognize what's
+/// pending at a glance and grep by it.
+#[test]
+fn status_changed_inputs_show_filename_and_src_id() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Ingest a file with a recognizable name but *don't* compile, so it
+    // stays in the "changed inputs not yet compiled" list.
+    let source = kb_root.join("concurrent-a.md");
+    fs::write(&source, "# Concurrent A\nBody.\n").expect("write source");
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ingest").arg(&source);
+    let ingest_output = cmd.output().expect("run kb ingest");
+    assert!(
+        ingest_output.status.success(),
+        "kb ingest failed: {}",
+        String::from_utf8_lossy(&ingest_output.stderr)
+    );
+
+    // Text output: filename appears, and the src-id is present as a suffix
+    // so operators can still grep by hash.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(
+        output.status.success(),
+        "kb status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("changed inputs not yet compiled:"),
+        "expected changed-inputs section; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("concurrent-a.md"),
+        "expected filename in changed-inputs list; got: {stdout}"
+    );
+    // The src-id is a deterministic sha-prefixed string; we don't know the
+    // exact value here, but we know it appears in parentheses after the
+    // filename and starts with `src-`.
+    let has_src_id_annotation = stdout
+        .lines()
+        .filter(|line| line.contains("concurrent-a.md"))
+        .any(|line| line.contains("(src-"));
+    assert!(
+        has_src_id_annotation,
+        "expected '(src-...)' annotation next to filename; got: {stdout}"
+    );
+
+    // JSON output: each changed input carries the original_path field,
+    // plus normalized_path and src_id.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("status");
+    let output = cmd.output().expect("run kb --json status");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    let entries = envelope["data"]["changed_inputs_not_compiled"]
+        .as_array()
+        .expect("changed_inputs_not_compiled should be an array");
+    assert_eq!(entries.len(), 1, "one pending input; got {entries:?}");
+    let entry = &entries[0];
+    assert!(
+        entry["src_id"].as_str().unwrap_or("").starts_with("src-"),
+        "src_id should be a src-<hash> string: {entry}"
+    );
+    assert!(
+        entry["normalized_path"]
+            .as_str()
+            .unwrap_or("")
+            .contains("normalized"),
+        "normalized_path should reference the normalized/ dir: {entry}"
+    );
+    let original = entry["original_path"]
+        .as_str()
+        .expect("original_path should be populated for a freshly ingested file");
+    assert!(
+        original.ends_with("concurrent-a.md"),
+        "original_path should recover the ingest filename; got {original}"
+    );
+}
+
+/// ST2: when every source falls in the same kind bucket, the per-kind
+/// breakdown carries no information and must be suppressed. The header
+/// line (`wiki source pages: N`) already conveys the total.
+#[test]
+fn status_hides_single_kind_source_breakdown() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // One file-type source page is enough to populate a single "other"
+    // bucket via `extract_source_kind`.
+    write_source_page(&kb_root, "only", "Only", "body.");
+    let mut compile = kb_cmd(&kb_root);
+    compile.arg("compile");
+    let compile_out = compile.output().expect("run kb compile");
+    assert!(
+        compile_out.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("wiki source pages:"),
+        "expected wiki source pages header; got: {stdout}"
+    );
+    // The key regression: no `other: N` (or any per-kind) line when the
+    // breakdown is a single bucket.
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        assert!(
+            !trimmed.starts_with("other:"),
+            "single-kind breakdown must be hidden; got line: {line}\nfull: {stdout}"
+        );
+    }
+
+    // JSON schema stays unchanged — `by_kind` is still emitted so callers
+    // that consume it don't break.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("status");
+    let output = cmd.output().expect("run kb --json status");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    assert!(
+        envelope["data"]["sources"]["by_kind"].is_object(),
+        "JSON payload must still expose sources.by_kind"
+    );
+}
+
+/// ST3: failed jobs accumulate indefinitely (every typo, every bad path
+/// adds one). The text list must cap at 10 and emit a "... and N more"
+/// hint when exceeded; the header shows the true total so users see scope.
+#[test]
+fn status_caps_failed_jobs_at_ten_with_more_hint() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed 15 failed jobs with strictly-increasing timestamps so sort
+    // order is deterministic.
+    for i in 0u32..15 {
+        seed_failed_job(&kb_root, &format!("fail-{i:02}"), 1_000 + u64::from(i));
+    }
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(
+        output.status.success(),
+        "kb status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Header shows the real total.
+    assert!(
+        stdout.contains("failed job runs (15):"),
+        "header should report true total of 15; got: {stdout}"
+    );
+
+    // Body is capped at 10 detail lines. Count lines that look like a
+    // job entry (`  <id> | Failed | ...`).
+    let detail_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("  fail-"))
+        .count();
+    assert_eq!(
+        detail_lines, 10,
+        "exactly 10 failed-job detail lines should render; got {detail_lines}\nfull: {stdout}"
+    );
+
+    // "... and 5 more (run 'kb jobs --failed' to inspect)" hint.
+    assert!(
+        stdout.contains("... and 5 more"),
+        "expected '... and 5 more' hint; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("kb jobs --failed"),
+        "hint should point at future `kb jobs --failed` entry point; got: {stdout}"
+    );
+
+    // JSON payload: `failed_jobs_total` carries the true total, and
+    // `failed_jobs` is capped at the display limit so JSON consumers get a
+    // bounded list too.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("status");
+    let output = cmd.output().expect("run kb --json status");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    assert_eq!(envelope["data"]["failed_jobs_total"], 15);
+    assert_eq!(
+        envelope["data"]["failed_jobs"]
+            .as_array()
+            .expect("failed_jobs array")
+            .len(),
+        10
+    );
+}
+
+/// ST3 negative: with fewer than 10 failures the "more" hint must not
+/// appear — we don't want a dangling "... and 0 more" line.
+#[test]
+fn status_below_failed_cap_has_no_more_hint() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    for i in 0u32..3 {
+        seed_failed_job(&kb_root, &format!("fail-{i}"), 1_000 + u64::from(i));
+    }
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("failed job runs (3):"));
+    assert!(
+        !stdout.contains("... and"),
+        "no more-hint expected below the cap; got: {stdout}"
     );
 }
