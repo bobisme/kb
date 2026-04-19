@@ -782,26 +782,50 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
     }
 
     for record in load_all_build_records(root)? {
-        for output_id in &record.output_ids {
-            let output_path = root.join(output_id);
-            if !output_path.exists() {
-                issues.push(LintIssue {
-                    severity: IssueSeverity::Error,
-                    kind: IssueKind::BuildRecordOutputMissing,
-                    referring_page: output_id.clone(),
-                    line: 0,
-                    target: record.metadata.id.clone(),
-                    message: format!(
-                        "build record '{}' points to a missing output",
-                        record.metadata.id
-                    ),
-                    suggested_fix: None,
-                });
-            }
+        if let Some(issue) = build_record_output_missing(root, &record) {
+            issues.push(issue);
         }
     }
 
     Ok(issues)
+}
+
+/// Flag a build record whose declared outputs are all missing from disk.
+///
+/// A build record is considered fresh iff at least one declared output path
+/// exists. `output_ids` are synthetic graph identities (e.g.
+/// `wiki-source-src-xxxx`) and are **not** filesystem paths, so existence
+/// checks must resolve through `metadata.output_paths`.
+fn build_record_output_missing(root: &Path, record: &BuildRecord) -> Option<LintIssue> {
+    if record.metadata.output_paths.is_empty() {
+        return None;
+    }
+    let all_missing = record
+        .metadata
+        .output_paths
+        .iter()
+        .all(|p| !root.join(p).exists());
+    if !all_missing {
+        return None;
+    }
+    let target_path = record
+        .metadata
+        .output_paths
+        .first()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Some(LintIssue {
+        severity: IssueSeverity::Error,
+        kind: IssueKind::BuildRecordOutputMissing,
+        referring_page: target_path,
+        line: 0,
+        target: record.metadata.id.clone(),
+        message: format!(
+            "build record '{}' points to a missing output",
+            record.metadata.id
+        ),
+        suggested_fix: None,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,11 +1067,15 @@ mod tests {
     }
 
     fn build_record(id: &str, manifest_hash: &str, output: &str) -> BuildRecord {
+        let mut meta = metadata(id);
+        // Mirror production: `output_paths` carries the real filesystem paths,
+        // while `output_ids` are synthetic graph identities.
+        meta.output_paths = vec![PathBuf::from(output)];
         BuildRecord {
-            metadata: metadata(id),
+            metadata: meta,
             pass_name: "test".to_string(),
             input_ids: vec!["normalized/doc-1".to_string()],
-            output_ids: vec![output.to_string()],
+            output_ids: vec![format!("wiki-{id}")],
             manifest_hash: manifest_hash.to_string(),
         }
     }
@@ -1147,6 +1175,62 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.kind == IssueKind::SourceRevisionMissing)
+        );
+    }
+
+    #[test]
+    fn stale_check_uses_output_paths_not_output_ids_for_existence() {
+        // Regression: bn-2bv. `output_ids` holds synthetic graph IDs like
+        // `wiki-source-src-xxxx` which are NOT filesystem paths. Existence
+        // checks must resolve through `metadata.output_paths`.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let output_rel = PathBuf::from("wiki/sources/src-04aca3d1.md");
+        let output_abs = root.join(&output_rel);
+        fs::create_dir_all(output_abs.parent().expect("parent")).expect("create output dir");
+        fs::write(
+            &output_abs,
+            "---\nbuild_record_id: build:source-summary:src-04aca3d1\n---\n# Src\n",
+        )
+        .expect("write output");
+
+        let mut record = build_record(
+            "build:source-summary:src-04aca3d1",
+            "manifest-a",
+            output_rel.to_str().expect("utf-8"),
+        );
+        // Mirror the real shape: synthetic id, real path.
+        record.output_ids = vec!["wiki-source-src-04aca3d1".to_string()];
+        record.metadata.output_paths = vec![output_rel.clone()];
+
+        Manifest {
+            artifacts: BTreeMap::from([(output_rel, record.clone())]),
+        }
+        .save(root)
+        .expect("save manifest");
+        save_build_record(root, &record).expect("save build record");
+
+        // Healthy KB: no BuildRecordOutputMissing.
+        let report = run_lint(root, LintRule::StaleArtifacts).expect("lint report");
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| i.kind != IssueKind::BuildRecordOutputMissing),
+            "unexpected BuildRecordOutputMissing on healthy KB: {:?}",
+            report.issues
+        );
+
+        // Delete the real file — the finding should now fire.
+        fs::remove_file(&output_abs).expect("remove output");
+        let report = run_lint(root, LintRule::StaleArtifacts).expect("lint report");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.kind == IssueKind::BuildRecordOutputMissing),
+            "expected BuildRecordOutputMissing after deleting output: {:?}",
+            report.issues
         );
     }
 
