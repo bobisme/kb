@@ -112,11 +112,34 @@ fn write_lock_metadata(path: &Path, metadata: &LockMetadata) -> Result<()> {
 
 fn format_lock_holder(path: &Path) -> String {
     match load_lock_metadata(path) {
-        Ok(metadata) => format!(
-            "command={} pid={} started_at_millis={}",
-            metadata.command, metadata.pid, metadata.started_at_millis
-        ),
+        Ok(metadata) => {
+            let alive_note = if is_pid_alive(metadata.pid) {
+                ""
+            } else {
+                " (holder pid is dead; lock metadata is stale)"
+            };
+            format!(
+                "command={} pid={} started_at_millis={}{}",
+                metadata.command, metadata.pid, metadata.started_at_millis, alive_note
+            )
+        }
         Err(_) => "metadata unavailable".to_string(),
+    }
+}
+
+/// If the sidecar metadata records a dead pid, remove it so the next acquire
+/// attempt does not report a ghost holder. Returns true when stale metadata
+/// was cleaned up.
+fn reap_stale_metadata(path: &Path) -> bool {
+    match load_lock_metadata(path) {
+        Ok(metadata) => {
+            if is_pid_alive(metadata.pid) {
+                false
+            } else {
+                fs::remove_file(path).is_ok()
+            }
+        }
+        Err(_) => false,
     }
 }
 
@@ -175,7 +198,20 @@ impl KbLock {
                     });
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                    // The OS releases the advisory lock when a holder dies, but
+                    // the sidecar metadata file persists. If the recorded pid is
+                    // not alive, reap the stale metadata and retry acquiring
+                    // immediately so we never report a ghost holder.
+                    if reap_stale_metadata(&metadata_path) {
+                        continue;
+                    }
                     if Instant::now() >= deadline {
+                        // Re-check one last time before building the error so
+                        // the message reflects whether the holder is actually
+                        // alive right now.
+                        if reap_stale_metadata(&metadata_path) {
+                            continue;
+                        }
                         let holder = format_lock_holder(&metadata_path);
                         return Err(anyhow!(
                             "timed out waiting for KB root lock after {}ms ({holder})",
@@ -365,5 +401,90 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("timed out waiting for KB root lock"));
         assert!(message.contains("command=compile"));
+    }
+
+    /// Simulates the SIGKILL scenario: the previous holder's process died, so
+    /// the OS released the advisory lock, but the sidecar metadata still
+    /// references a pid that is no longer alive. The next acquire must succeed
+    /// and overwrite the stale metadata with its own.
+    #[test]
+    fn acquire_reaps_stale_metadata_from_dead_holder() {
+        let dir = tempdir().expect("tempdir");
+        let locks_root = locks_dir(dir.path());
+        fs::create_dir_all(&locks_root).expect("create locks dir");
+
+        // Pick a pid that is virtually guaranteed to be dead. pid 0 is treated
+        // as "not alive" by is_pid_alive, but we want something that actually
+        // round-trips through kill -0 as "no such process".
+        let dead_pid: u32 = u32::MAX / 2;
+        assert!(
+            !is_pid_alive(dead_pid),
+            "test prerequisite: pid {dead_pid} must not be running",
+        );
+
+        // Seed a sidecar metadata file as if a killed process had written it.
+        let stale = LockMetadata {
+            command: "compile".to_string(),
+            pid: dead_pid,
+            started_at_millis: 1,
+        };
+        write_lock_metadata(&root_lock_metadata_path(dir.path()), &stale)
+            .expect("write stale metadata");
+
+        // With the file advisory lock unheld, acquire should succeed quickly,
+        // not time out printing the ghost pid.
+        let lock = KbLock::acquire(dir.path(), "lint", Duration::from_millis(500))
+            .expect("acquire should succeed despite stale metadata");
+
+        // The sidecar file should now reflect the current holder, not the
+        // dead one.
+        let fresh = read_lock_metadata(dir.path()).expect("read fresh metadata");
+        assert_eq!(fresh.command, "lint");
+        assert_eq!(fresh.pid, process::id());
+        assert_ne!(fresh.pid, dead_pid);
+
+        drop(lock);
+    }
+
+    /// If the advisory lock is held by a live process AND the recorded pid is
+    /// dead (shouldn't normally happen, but guards against a metadata file
+    /// that was swapped in underneath us), the timeout error should mark the
+    /// holder as dead rather than reporting it as a live ghost.
+    #[test]
+    fn timeout_error_notes_dead_pid_in_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let locks_root = locks_dir(dir.path());
+        fs::create_dir_all(&locks_root).expect("create locks dir");
+
+        // Hold the OS lock with a live process (ourselves).
+        let lock_path = root_lock_path(dir.path());
+        let holder_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .expect("open lock file");
+        holder_file.try_lock_exclusive().expect("hold OS lock");
+
+        // Overwrite the metadata with a dead pid after reaping would normally
+        // delete it. reap_stale_metadata will pick this up and loop, so we
+        // instead verify the format_lock_holder annotation when acquire can't
+        // escape the WouldBlock branch. To exercise that, we keep rewriting
+        // the metadata inside a very short timeout window: we simulate it
+        // statically by calling format_lock_holder directly.
+        let dead_pid: u32 = u32::MAX / 2;
+        let stale = LockMetadata {
+            command: "compile".to_string(),
+            pid: dead_pid,
+            started_at_millis: 42,
+        };
+        let metadata_path = root_lock_metadata_path(dir.path());
+        write_lock_metadata(&metadata_path, &stale).expect("write metadata");
+
+        let rendered = format_lock_holder(&metadata_path);
+        assert!(rendered.contains("holder pid is dead"), "got: {rendered}");
+
+        FileExt::unlock(&holder_file).expect("release OS lock");
     }
 }
