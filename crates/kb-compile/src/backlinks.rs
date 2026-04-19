@@ -260,6 +260,22 @@ fn collect_frontmatter_source_backlinks(
         let Ok(parsed) = serde_yaml::from_str::<Value>(&fm) else {
             continue;
         };
+        // The concept's own `source_document_ids:` frontmatter field is the
+        // authoritative set of contributing source documents. Gate anchor
+        // resolution by this set so unrelated sources that happen to share a
+        // heading name (e.g. `## Pitfalls`) don't get spuriously credited.
+        // Fallback: if the field is missing (older concept pages), allow any
+        // anchor match — preserves legacy behavior.
+        let concept_source_docs: BTreeSet<String> = parsed
+            .get("source_document_ids")
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         if let Some(sources) = parsed.get("sources").and_then(|v| v.as_sequence()) {
             for entry in sources {
                 let Some(anchor) = entry.get("heading_anchor").and_then(|v| v.as_str()) else {
@@ -269,6 +285,9 @@ fn collect_frontmatter_source_backlinks(
                     continue;
                 };
                 for doc_id in candidate_docs {
+                    if !concept_source_docs.is_empty() && !concept_source_docs.contains(doc_id) {
+                        continue;
+                    }
                     let Some(source_page_id) = source_doc_to_page.get(doc_id) else {
                         continue;
                     };
@@ -740,5 +759,81 @@ mod tests {
         );
         let abc_count = concept.updated_markdown.matches("- [[wiki/sources/src-abc]]").count();
         assert_eq!(abc_count, 1, "src-abc should appear exactly once");
+    }
+
+    #[test]
+    fn heading_anchor_resolution_respects_concept_source_document_ids() {
+        let root = tempdir().expect("tempdir");
+
+        // Two unrelated sources that happen to share a heading named "summary".
+        write(
+            &root.path().join("normalized/src-a/metadata.json"),
+            r#"{
+                "metadata": {"id": "src-a"},
+                "source_revision_id": "rev-a",
+                "heading_ids": ["summary"]
+            }"#,
+        );
+        write(
+            &root.path().join("normalized/src-b/metadata.json"),
+            r#"{
+                "metadata": {"id": "src-b"},
+                "source_revision_id": "rev-b",
+                "heading_ids": ["summary"]
+            }"#,
+        );
+        write(
+            &root.path().join("wiki/sources/src-a.md"),
+            "---\nid: wiki-source-src-a\ntype: source\ntitle: A\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Source A\n",
+        );
+        write(
+            &root.path().join("wiki/sources/src-b.md"),
+            "---\nid: wiki-source-src-b\ntype: source\ntitle: B\nsource_document_id: src-b\nsource_revision_id: rev-b\n---\n# Source B\n",
+        );
+
+        // Concept sourced only from src-a. Its sources[].heading_anchor matches
+        // "summary" — which globally resolves to both src-a and src-b — but the
+        // concept's source_document_ids restricts the candidates to src-a only.
+        write(
+            &root.path().join("wiki/concepts/topic.md"),
+            "---\nid: concept:topic\nname: Topic\nsources:\n- heading_anchor: summary\n  quote: A summary from src-a.\nsource_document_ids:\n- src-a\n---\n\n# Topic\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/topic.md"))
+            .expect("concept artifact");
+        assert!(
+            concept.updated_markdown.contains("- [[wiki/sources/src-a]]"),
+            "concept should backlink to src-a:\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            !concept.updated_markdown.contains("- [[wiki/sources/src-b]]"),
+            "concept must NOT backlink to unrelated src-b via shared anchor:\n{}",
+            concept.updated_markdown
+        );
+
+        let src_b = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/sources/src-b.md"))
+            .expect("src-b artifact");
+        assert!(
+            !src_b.updated_markdown.contains("- [[wiki/concepts/topic]]"),
+            "src-b must NOT list topic under Referenced by concepts:\n{}",
+            src_b.updated_markdown
+        );
+
+        let src_a = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/sources/src-a.md"))
+            .expect("src-a artifact");
+        assert!(
+            src_a.updated_markdown.contains("- [[wiki/concepts/topic]]"),
+            "src-a should list topic under Referenced by concepts:\n{}",
+            src_a.updated_markdown
+        );
     }
 }
