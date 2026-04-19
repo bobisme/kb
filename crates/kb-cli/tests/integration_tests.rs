@@ -636,6 +636,57 @@ fn ingest_mixed_file_directory_and_url_reports_summary() {
     );
 }
 
+#[test]
+fn error_output_includes_inner_cause_chain() {
+    // Regression guard for bn-1g5: `eprintln!("error: {err}")` only printed
+    // anyhow's outermost context, so the inner cause (HTTP status, IO error,
+    // ...) was hidden. Using `{err:#}` joins the full chain with `: ` so
+    // every context level reaches the user.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+    let address = listener.local_addr().expect("local addr");
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept connection");
+        let mut buffer = [0_u8; 1024];
+        let _ = stream.read(&mut buffer).expect("read request");
+        let body = "not found";
+        write!(
+            stream,
+            "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .expect("write response");
+    });
+
+    let url = format!("http://{address}/missing");
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ingest").arg(&url);
+    let output = cmd.output().expect("run kb ingest against 404 stub");
+    server.join().expect("join server");
+
+    assert!(
+        !output.status.success(),
+        "kb ingest against 404 URL should fail"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fetch"),
+        "stderr should include outer 'fetch' context; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("404"),
+        "stderr should include inner HTTP 404 cause; got: {stderr}"
+    );
+    assert!(
+        stderr.contains(&url),
+        "stderr should include the URL; got: {stderr}"
+    );
+}
+
 fn write_source_page(root: &Path, slug: &str, title: &str, summary: &str) {
     let dir = root.join("wiki/sources");
     fs::create_dir_all(&dir).expect("create wiki/sources");

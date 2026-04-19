@@ -196,7 +196,7 @@ fn main() {
         let exit_code = err
             .downcast_ref::<ExitCodeError>()
             .map_or(1, |err| err.exit_code);
-        eprintln!("error: {err}");
+        eprintln!("error: {err:#}");
         std::process::exit(exit_code);
     }
 }
