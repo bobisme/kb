@@ -425,7 +425,7 @@ pub use source_identity::{
     source_document_id_for_file, source_document_id_for_url, source_revision_content_hash,
 };
 pub use state::{
-    Hashes, Manifest, build_records_dir, find_build_records_for_output, hashes_path,
-    list_review_items, load_build_record, load_review_item, manifest_path, review_queue_dir,
-    save_build_record, save_review_item,
+    Manifest, build_records_dir, find_build_records_for_output, list_review_items,
+    load_build_record, load_review_item, manifest_path, review_queue_dir, save_build_record,
+    save_review_item,
 };

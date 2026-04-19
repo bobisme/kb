@@ -1586,8 +1586,8 @@ struct InspectTraceNode {
 
 fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()> {
     let graph = Graph::load_from(root)?;
-    let hashes = kb_core::Hashes::load(root)?;
-    let changed_inputs = find_changed_inputs(root, &hashes)?;
+    let hash_state = kb_compile::HashState::load_from_root(root)?;
+    let changed_inputs = find_changed_inputs(root, &hash_state)?;
     let jobs = jobs::recent_jobs(root, 1_000)?;
 
     let mut report = if let Some(id) = graph.resolve_node_id(target) {
@@ -2237,7 +2237,7 @@ struct SourceCounts {
 fn gather_status(root: &Path) -> Result<StatusPayload> {
     let graph = Graph::load_from(root)?;
     let manifest = kb_core::Manifest::load(root)?;
-    let hashes = kb_core::Hashes::load(root)?;
+    let hash_state = kb_compile::HashState::load_from_root(root)?;
     let all_jobs = jobs::recent_jobs(root, 1000)?;
 
     let normalized_source_count = count_normalized_sources(root)?;
@@ -2304,7 +2304,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         .cloned()
         .collect();
 
-    let changed_inputs_not_compiled = find_changed_inputs(root, &hashes)?;
+    let changed_inputs_not_compiled = find_changed_inputs(root, &hash_state)?;
 
     Ok(StatusPayload {
         normalized_source_count,
@@ -2358,18 +2358,40 @@ fn extract_source_kind(node_id: &str) -> &str {
     }
 }
 
-fn find_changed_inputs(_root: &Path, hashes: &kb_core::Hashes) -> Result<Vec<PathBuf>> {
+/// Return the set of normalized source directories whose contents do not
+/// appear in the compile hash state — i.e. inputs that exist on disk but
+/// have not been compiled yet (or have been changed since the last compile).
+///
+/// Walks `normalized/*/` under the KB root and flags any directory whose
+/// normalized id is absent from the loaded `HashState`. Missing
+/// `state/hashes.json` is treated as an empty state, so every normalized
+/// source will be reported until `kb compile` runs.
+fn find_changed_inputs(root: &Path, hash_state: &kb_compile::HashState) -> Result<Vec<PathBuf>> {
+    let normalized_dir = root.join("normalized");
+    if !normalized_dir.exists() {
+        return Ok(Vec::new());
+    }
+
     let mut changed = Vec::new();
-    for path in hashes.inputs.keys() {
-        if path.exists() {
-            let current_hash = kb_core::hash_file(path)?;
-            if hashes.inputs.get(path) != Some(&current_hash) {
-                changed.push(path.clone());
-            }
-        } else {
-            changed.push(path.clone());
+    for entry in std::fs::read_dir(&normalized_dir)
+        .with_context(|| format!("read normalized dir {}", normalized_dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("read normalized entry in {}", normalized_dir.display()))?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name();
+        let Some(name) = dir_name.to_str() else {
+            continue;
+        };
+        // Match the graph node id convention used by compile: `normalized/<id>`.
+        let node_id = format!("normalized/{name}");
+        if !hash_state.hashes.contains_key(&node_id) {
+            changed.push(entry.path());
         }
     }
+    changed.sort();
     Ok(changed)
 }
 

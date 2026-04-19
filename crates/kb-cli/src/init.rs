@@ -3,7 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-use kb_core::{Hashes, Manifest};
+use kb_core::Manifest;
 
 use crate::config::Config;
 
@@ -92,7 +92,6 @@ pub fn init(
     }
 
     Manifest::default().save(&target)?;
-    Hashes::default().save(&target)?;
 
     let index_path = target.join("wiki/index.md");
     if !index_path.exists() || force {

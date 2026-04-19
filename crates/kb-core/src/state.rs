@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::fs::atomic_write;
-use crate::{BuildRecord, EntityId, Hash, ReviewItem, ReviewKind, ReviewStatus, hash_file};
+use crate::{BuildRecord, EntityId, ReviewItem, ReviewKind, ReviewStatus};
 
 #[must_use]
 pub fn build_records_dir(root: &Path) -> PathBuf {
@@ -189,19 +189,9 @@ pub struct Manifest {
     pub artifacts: BTreeMap<PathBuf, BuildRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Hashes {
-    pub inputs: BTreeMap<PathBuf, Hash>,
-}
-
 #[must_use]
 pub fn manifest_path(root: &Path) -> PathBuf {
     root.join("state").join("manifest.json")
-}
-
-#[must_use]
-pub fn hashes_path(root: &Path) -> PathBuf {
-    root.join("state").join("hashes.json")
 }
 
 impl Manifest {
@@ -248,56 +238,6 @@ impl Manifest {
         }
 
         stale
-    }
-}
-
-impl Hashes {
-    /// Load the tracked input hashes from disk, returning an empty set when absent.
-    ///
-    /// # Errors
-    /// Returns an error when the hashes file exists but cannot be read or decoded.
-    pub fn load(root: &Path) -> Result<Self> {
-        load_json_file(&hashes_path(root), "hashes")
-    }
-
-    /// Persist the tracked input hashes atomically.
-    ///
-    /// # Errors
-    /// Returns an error when the hashes cannot be serialized or written.
-    pub fn save(&self, root: &Path) -> Result<()> {
-        write_json_file(&hashes_path(root), "hashes", self)
-    }
-
-    /// Recompute hashes for the provided inputs, returning the paths whose hash changed,
-    /// were newly added, or were removed from the tracked set.
-    ///
-    /// # Errors
-    /// Returns an error when any tracked file cannot be hashed.
-    pub fn reconcile_inputs<I>(&mut self, paths: I) -> Result<BTreeSet<PathBuf>>
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        let tracked: BTreeSet<_> = paths.into_iter().collect();
-        let mut changed = BTreeSet::new();
-        let mut next = BTreeMap::new();
-
-        for path in &tracked {
-            let hash = hash_file(path)
-                .with_context(|| format!("hash tracked input {}", path.display()))?;
-            if self.inputs.get(path) != Some(&hash) {
-                changed.insert(path.clone());
-            }
-            next.insert(path.clone(), hash);
-        }
-
-        for previous_path in self.inputs.keys() {
-            if !tracked.contains(previous_path) {
-                changed.insert(previous_path.clone());
-            }
-        }
-
-        self.inputs = next;
-        Ok(changed)
     }
 }
 
@@ -397,35 +337,6 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("deserialize manifest"));
         assert!(message.contains("state/manifest.json"));
-    }
-
-    #[test]
-    fn reconcile_inputs_detects_added_changed_and_removed_files() {
-        let dir = tempdir().expect("tempdir");
-        let source = dir.path().join("source.md");
-        fs::write(&source, "hello\n").expect("write source");
-
-        let mut hashes = Hashes::default();
-        let changed = hashes
-            .reconcile_inputs(vec![source.clone()])
-            .expect("hash initial input");
-        assert_eq!(changed, BTreeSet::from([source.clone()]));
-
-        let changed = hashes
-            .reconcile_inputs(vec![source.clone()])
-            .expect("rehash unchanged input");
-        assert!(changed.is_empty());
-
-        fs::write(&source, "hello world\n").expect("update source");
-        let changed = hashes
-            .reconcile_inputs(vec![source.clone()])
-            .expect("rehash changed input");
-        assert_eq!(changed, BTreeSet::from([source.clone()]));
-
-        let changed = hashes
-            .reconcile_inputs(Vec::new())
-            .expect("remove tracked input");
-        assert_eq!(changed, BTreeSet::from([source]));
     }
 
     #[test]
