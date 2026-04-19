@@ -130,14 +130,20 @@ fn init_creates_empty_state_files() {
 
     let manifest =
         fs::read_to_string(kb_root.join("state/manifest.json")).expect("read manifest state file");
-    let hashes =
-        fs::read_to_string(kb_root.join("state/hashes.json")).expect("read hashes state file");
-
     let manifest_json: Value = serde_json::from_str(&manifest).expect("parse manifest json");
-    let hashes_json: Value = serde_json::from_str(&hashes).expect("parse hashes json");
-
     assert_eq!(manifest_json, serde_json::json!({ "artifacts": {} }));
-    assert_eq!(hashes_json, serde_json::json!({ "inputs": {} }));
+
+    // hashes.json is not created at init — it's written by the first
+    // successful `kb compile` in the canonical HashState schema
+    // (see bn-1pw: removed the stale Hashes default-write from init).
+    assert!(
+        !kb_root.join("state/hashes.json").exists(),
+        "hashes.json should not exist until first compile"
+    );
+    assert!(
+        kb_root.join("state/build_records").exists(),
+        "state/build_records must exist after init"
+    );
 }
 
 #[test]
