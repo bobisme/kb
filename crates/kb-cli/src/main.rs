@@ -234,7 +234,13 @@ fn run(cli: Cli) -> Result<()> {
             let json = cli.json;
             let cli_model = cli.model.clone();
             execute_mutating_command(Some(compile_root), "compile", move || {
-                let options = kb_compile::pipeline::CompileOptions { force, dry_run };
+                let options = kb_compile::pipeline::CompileOptions {
+                    force,
+                    dry_run,
+                    // Progress lines go to stderr so `--json` stdout stays clean.
+                    // Suppress entirely under --json to avoid log noise.
+                    progress: !json,
+                };
 
                 // Dry-run does not call the LLM; skip adapter construction so users can
                 // preview the stale set without needing a configured backend.

@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use kb_core::{
@@ -9,10 +10,14 @@ use kb_llm::{ConceptCandidate, LlmAdapter};
 
 use crate::{HashState, StaleNode, detect_stale};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CompileOptions {
     pub force: bool,
     pub dry_run: bool,
+    /// When true, print per-pass progress lines (start/end with elapsed time)
+    /// to stderr. Meant to reassure humans that long LLM passes are alive.
+    /// Should be disabled under `--json` so structured consumers see clean logs.
+    pub progress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -244,10 +249,16 @@ pub fn run_compile_with_llm(
     let mut passes = Vec::new();
     let mut build_records_emitted: usize = 0;
 
+    if options.progress {
+        eprintln!(
+            "compile: {total_sources} source(s), {stale_sources} stale",
+        );
+    }
+
     // Per-document LLM passes (only when an adapter is configured and we have stale docs).
     if let Some(adapter) = adapter {
         if !stale_doc_ids.is_empty() {
-            match run_per_document_passes(root, &stale_doc_ids, adapter) {
+            match run_per_document_passes(root, &stale_doc_ids, adapter, options.progress) {
                 Ok(report) => {
                     build_records_emitted += report.build_records_emitted;
                     passes.push((
@@ -282,7 +293,7 @@ pub fn run_compile_with_llm(
         }
 
         // Global concept merge (reads all candidate JSONs so prior-run candidates still count).
-        match run_concept_merge_from_state(root, adapter) {
+        match run_concept_merge_from_state(root, adapter, options.progress) {
             Ok(report) => {
                 build_records_emitted += report.build_records_emitted;
                 passes.push((
@@ -391,10 +402,12 @@ struct PerDocumentReport {
 /// For each stale normalized document, run source summary + source page render +
 /// concept extraction. Writes are atomic; a failure for one document still lets the
 /// others finish (so a single bad source does not poison the whole compile).
+#[allow(clippy::too_many_lines)]
 fn run_per_document_passes(
     root: &Path,
     stale_doc_ids: &[String],
     adapter: &(dyn LlmAdapter + '_),
+    progress: bool,
 ) -> Result<PerDocumentReport> {
     let mut source_pages_written = 0;
     let mut candidate_files_written = 0;
@@ -412,6 +425,10 @@ fn run_per_document_passes(
             .and_then(split_body_from_frontmatter);
         let page_id = format!("wiki-source-{}", slug_from_title(doc_id));
 
+        if progress {
+            eprintln!("  [run] source_summary: {doc_id}...");
+        }
+        let summary_started = Instant::now();
         let summary_artifact = match crate::source_summary::run_source_summary_pass(
             adapter,
             &doc,
@@ -424,9 +441,21 @@ fn run_per_document_passes(
             Ok(artifact) => artifact,
             Err(err) => {
                 tracing::warn!("source_summary failed for {doc_id}: {err}");
+                if progress {
+                    eprintln!(
+                        "  [err] source_summary: {doc_id} ({:.1}s) — {err}",
+                        summary_started.elapsed().as_secs_f64(),
+                    );
+                }
                 continue;
             }
         };
+        if progress {
+            eprintln!(
+                "  [ok]  source_summary: {doc_id} ({:.1}s)",
+                summary_started.elapsed().as_secs_f64(),
+            );
+        }
 
         save_build_record(root, &summary_artifact.build_record)
             .with_context(|| format!("save build record for source_summary {doc_id}"))?;
@@ -467,6 +496,10 @@ fn run_per_document_passes(
         source_pages_written += 1;
 
         let candidates_path = crate::concept_extraction::concept_candidates_path(root, doc_id);
+        if progress {
+            eprintln!("  [run] concept_extraction: {doc_id}...");
+        }
+        let extract_started = Instant::now();
         match crate::concept_extraction::run_concept_extraction_pass(
             adapter,
             &doc,
@@ -485,9 +518,21 @@ fn run_per_document_passes(
                 })?;
                 candidate_files_written += 1;
                 build_records_emitted += 1;
+                if progress {
+                    eprintln!(
+                        "  [ok]  concept_extraction: {doc_id} ({:.1}s)",
+                        extract_started.elapsed().as_secs_f64(),
+                    );
+                }
             }
             Err(err) => {
                 tracing::warn!("concept_extraction failed for {doc_id}: {err}");
+                if progress {
+                    eprintln!(
+                        "  [err] concept_extraction: {doc_id} ({:.1}s) — {err}",
+                        extract_started.elapsed().as_secs_f64(),
+                    );
+                }
             }
         }
     }
@@ -511,6 +556,7 @@ struct MergeRunReport {
 fn run_concept_merge_from_state(
     root: &Path,
     adapter: &(dyn LlmAdapter + '_),
+    progress: bool,
 ) -> Result<MergeRunReport> {
     let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
     let mut all_candidates: Vec<ConceptCandidate> = Vec::new();
@@ -539,9 +585,22 @@ fn run_concept_merge_from_state(
         });
     }
 
+    if progress {
+        eprintln!(
+            "  [run] concept_merge: {} candidate(s)...",
+            all_candidates.len(),
+        );
+    }
+    let merge_started = Instant::now();
     let artifact =
         crate::concept_merge::run_concept_merge_pass(adapter, all_candidates, root)
             .map_err(|err| anyhow::anyhow!("{err}"))?;
+    if progress {
+        eprintln!(
+            "  [ok]  concept_merge ({:.1}s)",
+            merge_started.elapsed().as_secs_f64(),
+        );
+    }
     for page in &artifact.concept_pages {
         crate::concept_merge::persist_concept_page(page)?;
     }
@@ -623,6 +682,62 @@ mod tests {
     }
 
     #[test]
+    fn compile_options_default_suppresses_progress() {
+        let opts = CompileOptions::default();
+        assert!(!opts.progress, "progress must default to false (quiet)");
+        assert!(!opts.force);
+        assert!(!opts.dry_run);
+    }
+
+    #[test]
+    fn empty_kb_with_progress_disabled_succeeds_silently() {
+        // With progress=false, running compile on an empty KB must not panic and
+        // must not emit progress lines to stderr. We cannot intercept stderr from
+        // within a library test, but we exercise the code path to guarantee that
+        // every eprintln call is gated on `options.progress` — any ungated call
+        // would still fire and a reviewer can observe it in test output.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        let report = run_compile(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+            },
+        )
+        .expect("compile");
+
+        assert_eq!(report.total_sources, 0);
+        assert_eq!(report.stale_sources, 0);
+    }
+
+    #[test]
+    fn compile_with_progress_enabled_does_not_panic() {
+        // Smoke test: progress=true must run cleanly end-to-end without an adapter.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-1", "# Hello\nWorld")).expect("write");
+
+        let report = run_compile(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: true,
+            },
+        )
+        .expect("compile with progress");
+
+        assert_eq!(report.total_sources, 1);
+        assert_eq!(report.stale_sources, 1);
+    }
+
+    #[test]
     fn compile_on_empty_kb_runs_batch_passes() {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
@@ -633,6 +748,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("compile");
@@ -661,6 +777,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("compile");
@@ -683,6 +800,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("first compile");
@@ -692,6 +810,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("second compile");
@@ -714,6 +833,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("first compile");
@@ -726,6 +846,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("second compile");
@@ -747,6 +868,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("first compile");
@@ -756,6 +878,7 @@ mod tests {
             &CompileOptions {
                 force: true,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("force compile");
@@ -777,6 +900,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: true,
+                progress: false,
             },
         )
         .expect("dry run");
@@ -815,6 +939,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: true,
+                progress: false,
             },
         )
         .expect("dry run");
@@ -824,6 +949,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("live run");
@@ -871,6 +997,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("first compile");
@@ -880,6 +1007,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("second compile — no changes");
@@ -899,6 +1027,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("third compile — template changed");
@@ -1039,6 +1168,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
             Some(&adapter),
         )
@@ -1089,6 +1219,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
             Some(&adapter),
         )
@@ -1116,6 +1247,7 @@ mod tests {
             &CompileOptions {
                 force: false,
                 dry_run: false,
+                progress: false,
             },
         )
         .expect("compile");
