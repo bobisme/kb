@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -10,7 +11,41 @@ use kb_llm::{ConceptCandidate, LlmAdapter};
 
 use crate::{HashState, StaleNode, detect_stale};
 
-#[derive(Debug, Clone, Default)]
+/// Abstract sink that receives per-pass progress events so the compile
+/// pipeline does not need to depend on the CLI job-run machinery directly.
+///
+/// Implementations typically append each message as a line in the `JobRun`
+/// log file, but tests use an in-memory buffer and the dry-run code path
+/// uses `None` to skip log emission entirely. Messages mirror the
+/// progress-to-stderr strings emitted by the `progress` flag, so the
+/// two destinations stay in sync.
+pub trait LogSink: Send + Sync {
+    /// Append a single message as a log line. Implementations should not
+    /// panic on IO errors — a failed log write must never abort a compile.
+    fn append_log(&self, message: &str);
+}
+
+/// Max bytes of subprocess stderr to embed in a single log line when an
+/// LLM call fails. Keeps a single failed pass from flooding the log with
+/// megabytes of noisy backend output while still giving enough context to
+/// diagnose the failure.
+const ERR_TAIL_BYTES: usize = 2 * 1024;
+
+/// Trim `text` to its last `ERR_TAIL_BYTES` on a char boundary, prefixing
+/// with `...` when bytes were dropped. Safe for non-ASCII input because it
+/// scans backwards for a valid UTF-8 boundary.
+fn stderr_tail(text: &str) -> String {
+    if text.len() <= ERR_TAIL_BYTES {
+        return text.to_string();
+    }
+    let mut start = text.len() - ERR_TAIL_BYTES;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &text[start..])
+}
+
+#[derive(Clone, Default)]
 pub struct CompileOptions {
     pub force: bool,
     pub dry_run: bool,
@@ -18,6 +53,37 @@ pub struct CompileOptions {
     /// to stderr. Meant to reassure humans that long LLM passes are alive.
     /// Should be disabled under `--json` so structured consumers see clean logs.
     pub progress: bool,
+    /// Optional sink that receives the same progress lines written to stderr,
+    /// plus `[err]` lines on LLM-call failures (with a tail of subprocess
+    /// stderr embedded in the error). `None` disables log forwarding.
+    ///
+    /// The CLI typically supplies a sink backed by the active `JobRun` log
+    /// file so `state/jobs/<id>.log` captures per-pass events instead of
+    /// containing only the initial "job started" line.
+    pub log_sink: Option<Arc<dyn LogSink>>,
+}
+
+impl std::fmt::Debug for CompileOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompileOptions")
+            .field("force", &self.force)
+            .field("dry_run", &self.dry_run)
+            .field("progress", &self.progress)
+            .field("log_sink", &self.log_sink.as_ref().map(|_| "<LogSink>"))
+            .finish()
+    }
+}
+
+/// Emit `message` to both stderr (if progress is enabled) and the log
+/// sink (if one is configured). Centralised so every call site stays in
+/// sync and adding a new destination (e.g. tracing) is a one-line change.
+fn emit_event(options: &CompileOptions, message: &str) {
+    if options.progress {
+        eprintln!("{message}");
+    }
+    if let Some(sink) = options.log_sink.as_ref() {
+        sink.append_log(message);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -300,16 +366,15 @@ pub fn run_compile_with_llm(
     let mut passes = Vec::new();
     let mut build_records_emitted: usize = 0;
 
-    if options.progress {
-        eprintln!(
-            "compile: {total_sources} source(s), {stale_sources} stale",
-        );
-    }
+    emit_event(
+        options,
+        &format!("compile: {total_sources} source(s), {stale_sources} stale"),
+    );
 
     // Per-document LLM passes (only when an adapter is configured and we have stale docs).
     if let Some(adapter) = adapter {
         if !stale_doc_ids.is_empty() {
-            match run_per_document_passes(root, &stale_doc_ids, adapter, options.progress) {
+            match run_per_document_passes(root, &stale_doc_ids, adapter, options) {
                 Ok(report) => {
                     build_records_emitted += report.build_records_emitted;
                     passes.push((
@@ -344,7 +409,7 @@ pub fn run_compile_with_llm(
         }
 
         // Global concept merge (reads all candidate JSONs so prior-run candidates still count).
-        match run_concept_merge_from_state(root, adapter, options.progress) {
+        match run_concept_merge_from_state(root, adapter, options) {
             Ok(report) => {
                 build_records_emitted += report.build_records_emitted;
                 passes.push((
@@ -466,7 +531,7 @@ fn run_per_document_passes(
     root: &Path,
     stale_doc_ids: &[String],
     adapter: &(dyn LlmAdapter + '_),
-    progress: bool,
+    options: &CompileOptions,
 ) -> Result<PerDocumentReport> {
     let mut source_pages_written = 0;
     let mut candidate_files_written = 0;
@@ -484,9 +549,7 @@ fn run_per_document_passes(
             .and_then(split_body_from_frontmatter);
         let page_id = format!("wiki-source-{}", slug_from_title(doc_id));
 
-        if progress {
-            eprintln!("  [run] source_summary: {doc_id}...");
-        }
+        emit_event(options, &format!("  [run] source_summary: {doc_id}..."));
         let summary_started = Instant::now();
         let summary_artifact = match crate::source_summary::run_source_summary_pass(
             adapter,
@@ -500,21 +563,27 @@ fn run_per_document_passes(
             Ok(artifact) => artifact,
             Err(err) => {
                 tracing::warn!("source_summary failed for {doc_id}: {err}");
-                if progress {
-                    eprintln!(
-                        "  [err] source_summary: {doc_id} ({:.1}s) — {err}",
+                // Adapter errors already embed subprocess stderr (opencode/claude
+                // both format `stderr` into their LlmAdapterError message) — trim
+                // to ERR_TAIL_BYTES so a single failed pass can't flood the log.
+                let err_str = stderr_tail(&err.to_string());
+                emit_event(
+                    options,
+                    &format!(
+                        "  [err] source_summary: {doc_id} ({:.1}s) — {err_str}",
                         summary_started.elapsed().as_secs_f64(),
-                    );
-                }
+                    ),
+                );
                 continue;
             }
         };
-        if progress {
-            eprintln!(
+        emit_event(
+            options,
+            &format!(
                 "  [ok]  source_summary: {doc_id} ({:.1}s)",
                 summary_started.elapsed().as_secs_f64(),
-            );
-        }
+            ),
+        );
 
         save_build_record(root, &summary_artifact.build_record)
             .with_context(|| format!("save build record for source_summary {doc_id}"))?;
@@ -555,9 +624,7 @@ fn run_per_document_passes(
         source_pages_written += 1;
 
         let candidates_path = crate::concept_extraction::concept_candidates_path(root, doc_id);
-        if progress {
-            eprintln!("  [run] concept_extraction: {doc_id}...");
-        }
+        emit_event(options, &format!("  [run] concept_extraction: {doc_id}..."));
         let extract_started = Instant::now();
         match crate::concept_extraction::run_concept_extraction_pass(
             adapter,
@@ -577,21 +644,24 @@ fn run_per_document_passes(
                 })?;
                 candidate_files_written += 1;
                 build_records_emitted += 1;
-                if progress {
-                    eprintln!(
+                emit_event(
+                    options,
+                    &format!(
                         "  [ok]  concept_extraction: {doc_id} ({:.1}s)",
                         extract_started.elapsed().as_secs_f64(),
-                    );
-                }
+                    ),
+                );
             }
             Err(err) => {
                 tracing::warn!("concept_extraction failed for {doc_id}: {err}");
-                if progress {
-                    eprintln!(
-                        "  [err] concept_extraction: {doc_id} ({:.1}s) — {err}",
+                let err_str = stderr_tail(&err.to_string());
+                emit_event(
+                    options,
+                    &format!(
+                        "  [err] concept_extraction: {doc_id} ({:.1}s) — {err_str}",
                         extract_started.elapsed().as_secs_f64(),
-                    );
-                }
+                    ),
+                );
             }
         }
     }
@@ -615,7 +685,7 @@ struct MergeRunReport {
 fn run_concept_merge_from_state(
     root: &Path,
     adapter: &(dyn LlmAdapter + '_),
-    progress: bool,
+    options: &CompileOptions,
 ) -> Result<MergeRunReport> {
     let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
     let mut all_candidates: Vec<ConceptCandidate> = Vec::new();
@@ -644,22 +714,39 @@ fn run_concept_merge_from_state(
         });
     }
 
-    if progress {
-        eprintln!(
+    emit_event(
+        options,
+        &format!(
             "  [run] concept_merge: {} candidate(s)...",
             all_candidates.len(),
-        );
-    }
+        ),
+    );
     let merge_started = Instant::now();
-    let artifact =
-        crate::concept_merge::run_concept_merge_pass(adapter, all_candidates, root)
-            .map_err(|err| anyhow::anyhow!("{err}"))?;
-    if progress {
-        eprintln!(
+    let artifact = match crate::concept_merge::run_concept_merge_pass(
+        adapter,
+        all_candidates,
+        root,
+    ) {
+        Ok(a) => a,
+        Err(err) => {
+            let err_str = stderr_tail(&err.to_string());
+            emit_event(
+                options,
+                &format!(
+                    "  [err] concept_merge ({:.1}s) — {err_str}",
+                    merge_started.elapsed().as_secs_f64(),
+                ),
+            );
+            return Err(anyhow::anyhow!("{err}"));
+        }
+    };
+    emit_event(
+        options,
+        &format!(
             "  [ok]  concept_merge ({:.1}s)",
             merge_started.elapsed().as_secs_f64(),
-        );
-    }
+        ),
+    );
     for page in &artifact.concept_pages {
         crate::concept_merge::persist_concept_page(page)?;
     }
@@ -765,6 +852,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("compile");
@@ -788,6 +876,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: true,
+                log_sink: None,
             },
         )
         .expect("compile with progress");
@@ -808,6 +897,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("compile");
@@ -837,6 +927,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("compile");
@@ -860,6 +951,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("first compile");
@@ -870,6 +962,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("second compile");
@@ -893,6 +986,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("first compile");
@@ -906,6 +1000,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("second compile");
@@ -928,6 +1023,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("first compile");
@@ -938,6 +1034,7 @@ mod tests {
                 force: true,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("force compile");
@@ -960,6 +1057,7 @@ mod tests {
                 force: false,
                 dry_run: true,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("dry run");
@@ -1033,6 +1131,7 @@ mod tests {
                 force: false,
                 dry_run: true,
                 progress: false,
+                log_sink: None,
             },
             Some(&adapter),
         )
@@ -1108,6 +1207,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("first compile");
@@ -1118,6 +1218,7 @@ mod tests {
                 force: false,
                 dry_run: true,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("dry run with clean state");
@@ -1146,6 +1247,7 @@ mod tests {
                 force: false,
                 dry_run: true,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("dry run");
@@ -1156,6 +1258,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("live run");
@@ -1215,6 +1318,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("first compile");
@@ -1225,6 +1329,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("second compile — no changes");
@@ -1245,6 +1350,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("third compile — template changed");
@@ -1386,6 +1492,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
             Some(&adapter),
         )
@@ -1437,6 +1544,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
             Some(&adapter),
         )
@@ -1465,6 +1573,7 @@ mod tests {
                 force: false,
                 dry_run: false,
                 progress: false,
+                log_sink: None,
             },
         )
         .expect("compile");
@@ -1483,5 +1592,221 @@ mod tests {
             !root.join("wiki/sources/doc-1.md").exists(),
             "without adapter, source pages must not be written"
         );
+    }
+
+    /// In-memory `LogSink` used by the log-streaming tests. Collects every
+    /// message so assertions can look for `[run]`/`[ok]`/`[err]` markers.
+    #[derive(Default, Clone)]
+    struct MemorySink {
+        lines: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl MemorySink {
+        fn snapshot(&self) -> Vec<String> {
+            self.lines.lock().expect("lock").clone()
+        }
+    }
+
+    impl LogSink for MemorySink {
+        fn append_log(&self, message: &str) {
+            self.lines.lock().expect("lock").push(message.to_string());
+        }
+    }
+
+    /// An adapter whose `summarize_document` always fails. Mirrors the shape
+    /// of a real opencode/claude error, including a large stderr tail that
+    /// we expect the pipeline to truncate before embedding in the log.
+    struct FailingAdapter {
+        stderr_blob: String,
+    }
+
+    impl kb_llm::LlmAdapter for FailingAdapter {
+        fn summarize_document(
+            &self,
+            _req: kb_llm::SummarizeDocumentRequest,
+        ) -> Result<(kb_llm::SummarizeDocumentResponse, kb_llm::ProvenanceRecord), kb_llm::LlmAdapterError>
+        {
+            Err(kb_llm::LlmAdapterError::Transport(format!(
+                "opencode exited with error: stderr: {}",
+                self.stderr_blob
+            )))
+        }
+
+        fn extract_concepts(
+            &self,
+            _req: kb_llm::ExtractConceptsRequest,
+        ) -> Result<(kb_llm::ExtractConceptsResponse, kb_llm::ProvenanceRecord), kb_llm::LlmAdapterError>
+        {
+            unreachable!("extract should not run when summary fails")
+        }
+
+        fn merge_concept_candidates(
+            &self,
+            _req: kb_llm::MergeConceptCandidatesRequest,
+        ) -> Result<(kb_llm::MergeConceptCandidatesResponse, kb_llm::ProvenanceRecord), kb_llm::LlmAdapterError>
+        {
+            // When every per-doc pass fails there are no candidates, so merge
+            // short-circuits before calling this. Panic-loud guard anyway.
+            unreachable!("merge should not run when every per-doc pass fails")
+        }
+
+        fn answer_question(
+            &self,
+            _req: kb_llm::AnswerQuestionRequest,
+        ) -> Result<(kb_llm::AnswerQuestionResponse, kb_llm::ProvenanceRecord), kb_llm::LlmAdapterError>
+        {
+            unreachable!()
+        }
+
+        fn generate_slides(
+            &self,
+            _req: kb_llm::GenerateSlidesRequest,
+        ) -> Result<(kb_llm::GenerateSlidesResponse, kb_llm::ProvenanceRecord), kb_llm::LlmAdapterError>
+        {
+            unreachable!()
+        }
+
+        fn run_health_check(
+            &self,
+            _req: kb_llm::RunHealthCheckRequest,
+        ) -> Result<(kb_llm::RunHealthCheckResponse, kb_llm::ProvenanceRecord), kb_llm::LlmAdapterError>
+        {
+            unreachable!()
+        }
+    }
+
+    /// A successful compile must stream a `[run]` and matching `[ok]` line
+    /// per pass into the log sink. This is the core bn-3ny regression: before
+    /// the fix, the `JobRun` log only ever contained "job started".
+    #[test]
+    fn compile_streams_run_and_ok_events_to_log_sink() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-ok", "# Title\nBody.")).expect("write");
+
+        let sink = MemorySink::default();
+        let adapter = RecordingAdapter::default();
+        let options = CompileOptions {
+            force: false,
+            dry_run: false,
+            progress: false,
+            log_sink: Some(Arc::new(sink.clone())),
+        };
+        run_compile_with_llm(root, &options, Some(&adapter)).expect("compile");
+
+        let lines = sink.snapshot();
+        assert!(
+            lines.iter().any(|l| l.contains("[run] source_summary: doc-ok")),
+            "missing [run] source_summary line; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[ok]  source_summary: doc-ok")),
+            "missing [ok] source_summary line; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[run] concept_extraction: doc-ok")),
+            "missing [run] concept_extraction line; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[ok]  concept_extraction: doc-ok")),
+            "missing [ok] concept_extraction line; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[run] concept_merge")),
+            "missing [run] concept_merge line; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("[ok]  concept_merge")),
+            "missing [ok] concept_merge line; got {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.starts_with("compile:")),
+            "missing compile header line; got {lines:?}"
+        );
+    }
+
+    /// When the LLM adapter fails, the log must capture an `[err]` line and
+    /// include (a tail of) the subprocess stderr so the operator can debug
+    /// without re-running a long compile.
+    #[test]
+    fn compile_captures_stderr_tail_on_llm_failure() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-fail", "# T\nB.")).expect("write");
+
+        // 5 KB of junk > ERR_TAIL_BYTES, so we verify truncation kicks in.
+        let big_stderr: String = "E".repeat(5 * 1024) + "TAIL_MARKER";
+        let adapter = FailingAdapter {
+            stderr_blob: big_stderr.clone(),
+        };
+
+        let sink = MemorySink::default();
+        let options = CompileOptions {
+            force: false,
+            dry_run: false,
+            progress: false,
+            log_sink: Some(Arc::new(sink.clone())),
+        };
+        run_compile_with_llm(root, &options, Some(&adapter)).expect("compile succeeds (failures logged, not bubbled)");
+
+        let lines = sink.snapshot();
+        let err_line = lines
+            .iter()
+            .find(|l| l.contains("[err] source_summary: doc-fail"))
+            .unwrap_or_else(|| panic!("missing [err] line; got {lines:?}"));
+
+        // Tail marker at the *end* of stderr must survive truncation.
+        assert!(
+            err_line.contains("TAIL_MARKER"),
+            "stderr tail must preserve the last bytes; got {err_line:?}"
+        );
+        // Truncation must have dropped bytes — line length is bounded.
+        assert!(
+            err_line.len() < big_stderr.len(),
+            "err line should be shorter than the full stderr; got {} bytes",
+            err_line.len()
+        );
+        // Sentinel confirming the tail helper ran (prefix).
+        assert!(
+            err_line.contains("..."),
+            "truncated tail should be prefixed with '...'; got {err_line:?}"
+        );
+    }
+
+    /// Guards the behavior driving the Debug impl: the `log_sink` field must
+    /// render as `<LogSink>` (not leak internal state) and `None` must render
+    /// as `None`. Keeps Debug output useful in tracing without leaking paths.
+    #[test]
+    fn compile_options_debug_redacts_log_sink() {
+        let with_sink = CompileOptions {
+            force: false,
+            dry_run: false,
+            progress: false,
+            log_sink: Some(Arc::new(MemorySink::default())),
+        };
+        let rendered = format!("{with_sink:?}");
+        assert!(rendered.contains("Some(\"<LogSink>\")"), "got {rendered}");
+
+        let without = CompileOptions::default();
+        let rendered = format!("{without:?}");
+        assert!(rendered.contains("log_sink: None"), "got {rendered}");
+    }
+
+    #[test]
+    fn stderr_tail_preserves_short_input() {
+        let s = "short";
+        assert_eq!(stderr_tail(s), "short");
+    }
+
+    #[test]
+    fn stderr_tail_truncates_long_input() {
+        let s = "x".repeat(ERR_TAIL_BYTES + 100);
+        let out = stderr_tail(&s);
+        assert!(out.starts_with("..."));
+        assert!(out.len() <= ERR_TAIL_BYTES + 3);
     }
 }

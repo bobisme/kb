@@ -2,15 +2,52 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use fs2::FileExt;
+use kb_compile::pipeline::LogSink;
 use kb_core::EntityMetadata;
 use kb_core::fs::atomic_write;
 use kb_core::{JobRun, JobRunStatus, Status};
 use serde::{Deserialize, Serialize};
+
+/// `LogSink` backed by a job's on-disk log file. Clones share the same path,
+/// so cheap `Arc` sharing across the compile pipeline still writes to the
+/// single canonical log. Used by `execute_mutating_command` to plumb the
+/// active `JobRun`'s log through `CompileOptions::log_sink`.
+#[derive(Debug, Clone)]
+pub struct JobLogSink {
+    log_path: PathBuf,
+}
+
+impl JobLogSink {
+    #[must_use]
+    pub const fn new(log_path: PathBuf) -> Self {
+        Self { log_path }
+    }
+}
+
+impl LogSink for JobLogSink {
+    fn append_log(&self, message: &str) {
+        // Best effort: a failed append must never kill the compile. Errors
+        // here mean `state/jobs/<id>.log` loses a line, not that a pass
+        // couldn't run.
+        let _ = append_log_line(&self.log_path, message);
+    }
+}
+
+impl JobHandle {
+    /// Build an `Arc<dyn LogSink>` that writes to this job's log file.
+    /// Pass the result into `CompileOptions::log_sink` to have the compile
+    /// pipeline stream per-pass events into `state/jobs/<id>.log`.
+    #[must_use]
+    pub fn log_sink(&self) -> Arc<dyn LogSink> {
+        Arc::new(JobLogSink::new(self.log_path.clone()))
+    }
+}
 
 #[derive(Debug)]
 pub struct JobHandle {
@@ -361,6 +398,31 @@ pub fn start_job(root: &Path, command: &str) -> Result<JobHandle> {
 }
 
 impl JobHandle {
+    /// Append a line to this job's log file. IO errors are swallowed so a
+    /// transient write failure cannot tear down the job whose progress we
+    /// were trying to record — the log is strictly supplementary.
+    ///
+    /// Used by the compile pipeline (via `JobLogSink`) to stream per-pass
+    /// events (`[run]`/`[ok]`/`[err]` lines) into `state/jobs/<id>.log` so
+    /// a hung or failing compile is debuggable after the fact. Without
+    /// this, the log only ever contained "job started".
+    ///
+    /// Callers that own an `Arc<dyn LogSink>` should go through
+    /// `log_sink()` instead — this method is kept public for ad-hoc
+    /// single-line notes from the CLI itself and for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn append_log(&self, message: &str) {
+        let _ = append_log_line(&self.log_path, message);
+    }
+
+    /// Absolute path to the log file this job appends to. Exposed so
+    /// integration tests can assert on streamed content.
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn log_path(&self) -> &Path {
+        &self.log_path
+    }
+
     pub fn finish(
         mut self,
         status: JobRunStatus,
@@ -485,6 +547,32 @@ mod tests {
         assert_ne!(fresh.pid, dead_pid);
 
         drop(lock);
+    }
+
+    /// `start_job` seeds the log with a single "job started" line, and
+    /// `append_log` / the `JobLogSink` wrapper must add additional lines
+    /// that readers can observe by re-reading the log file. This is the
+    /// core bn-3ny guarantee: a caller plumbed through `log_sink` gets
+    /// structured events into `state/jobs/<id>.log`.
+    #[test]
+    fn job_handle_append_log_writes_lines_to_log_file() {
+        let dir = tempdir().expect("tempdir");
+        let handle = start_job(dir.path(), "compile").expect("start job");
+
+        handle.append_log("  [run] source_summary: doc-x...");
+        handle.append_log("  [ok]  source_summary: doc-x (0.4s)");
+
+        // Exercise the Arc<dyn LogSink> path that the compile pipeline uses.
+        let sink = handle.log_sink();
+        sink.append_log("  [err] concept_merge — boom");
+
+        let contents = fs::read_to_string(handle.log_path()).expect("read log");
+        assert!(contents.starts_with("job started\n"), "got:\n{contents}");
+        assert!(contents.contains("[run] source_summary: doc-x"));
+        assert!(contents.contains("[ok]  source_summary: doc-x"));
+        assert!(contents.contains("[err] concept_merge — boom"));
+        // Every line should be newline-terminated.
+        assert!(contents.ends_with('\n'));
     }
 
     /// While blocked on the lock, `acquire` must print at least one

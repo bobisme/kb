@@ -233,13 +233,18 @@ fn run(cli: Cli) -> Result<()> {
             let dry_run = cli.dry_run;
             let json = cli.json;
             let cli_model = cli.model.clone();
-            execute_mutating_command(Some(compile_root), "compile", move || {
+            execute_mutating_command_with_handle(Some(compile_root), "compile", move |handle| {
+                // Stream per-pass events into `state/jobs/<id>.log` so a hung
+                // or failing compile leaves a useful trail. Dry-run skips the
+                // sink because it performs no real passes — nothing to log.
+                let log_sink = if dry_run { None } else { Some(handle.log_sink()) };
                 let options = kb_compile::pipeline::CompileOptions {
                     force,
                     dry_run,
                     // Progress lines go to stderr so `--json` stdout stays clean.
                     // Suppress entirely under --json to avoid log noise.
                     progress: !json,
+                    log_sink,
                 };
 
                 // Dry-run does not call the LLM; skip adapter construction so users can
@@ -2453,13 +2458,25 @@ fn execute_mutating_command(
     command: &str,
     action: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    execute_mutating_command_with_handle(root, command, |_handle| action())
+}
+
+/// Like [`execute_mutating_command`] but hands the active `JobHandle` to
+/// the closure so commands can stream per-pass progress into the `JobRun`
+/// log (see `JobHandle::log_sink`). Kept internal so callers who don't
+/// need the handle stay on the simpler form above.
+fn execute_mutating_command_with_handle(
+    root: Option<&Path>,
+    command: &str,
+    action: impl FnOnce(&jobs::JobHandle) -> Result<()>,
+) -> Result<()> {
     let root = root.expect("root resolved for mutating commands");
     let cfg = Config::load_from_root(root, None)?;
     let _lock = jobs::KbLock::acquire(root, command, Duration::from_millis(cfg.lock.timeout_ms))?;
     jobs::check_stale_jobs(root)?;
     let handle = jobs::start_job(root, command)?;
 
-    let result = action();
+    let result = action(&handle);
     match result {
         Ok(()) => {
             handle.finish(JobRunStatus::Succeeded, Vec::new())?;
