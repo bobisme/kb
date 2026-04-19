@@ -1033,7 +1033,7 @@ fn lint_reports_orphan_pages_as_json() {
 }
 
 #[test]
-fn lint_missing_citations_warns_by_default_with_warning_exit_code() {
+fn lint_exits_zero_when_only_warnings() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
 
@@ -1050,15 +1050,82 @@ fn lint_missing_citations_warns_by_default_with_warning_exit_code() {
 
     assert_eq!(
         output.status.code(),
-        Some(1),
+        Some(0),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stdout.contains("[warn] missing-citations"),
         "stdout: {stdout}"
+    );
+    // No "error:" prefix on warning-only runs
+    assert!(
+        !stderr.contains("error:"),
+        "warning-only lint must not print 'error:' prefix, stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("error:"),
+        "warning-only lint must not print 'error:' prefix, stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("use --strict to fail on warnings"),
+        "expected informational hint about --strict, stdout: {stdout}"
+    );
+}
+
+#[test]
+fn lint_exits_one_when_any_error() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_concept_page(&kb_root, "rust", "Rust", &[]);
+    fs::write(
+        kb_root.join("wiki/sources/page.md"),
+        "# Page\nSee [[wiki/concepts/rsut]].\n",
+    )
+    .expect("write page with broken link");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint").arg("--check").arg("broken-links");
+    let output = cmd.output().expect("run kb lint");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn lint_strict_exits_one_on_warnings() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("create wiki sources");
+    fs::write(
+        kb_root.join("wiki/sources/page.md"),
+        "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Page\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+    )
+    .expect("write page");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint")
+        .arg("--check")
+        .arg("missing-citations")
+        .arg("--strict");
+    let output = cmd.output().expect("run kb lint --strict");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -1086,7 +1153,7 @@ fn lint_missing_citations_can_fail_when_configured_as_error() {
 
     assert_eq!(
         output.status.code(),
-        Some(2),
+        Some(1),
         "stdout: {} stderr: {}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)

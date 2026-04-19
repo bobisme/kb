@@ -122,6 +122,9 @@ enum Command {
         /// Check a single lint check
         #[arg(long, alias = "rule")]
         check: Option<String>,
+        /// Treat warnings as errors (exit 1 on warnings-only)
+        #[arg(long)]
+        strict: bool,
     },
     /// Run health checks on the knowledge base
     Doctor,
@@ -351,13 +354,13 @@ fn run(cli: Cli) -> Result<()> {
                 execute_mutating_command(root.as_deref(), "ingest", action)
             }
         }
-        Some(Command::Lint { check }) => {
+        Some(Command::Lint { check, strict }) => {
             // Lint is read-only: it walks generated artifacts and surfaces findings.
             // It must not take the root lock, so users can `kb lint` during a compile.
             let lint_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            run_lint(lint_root, cli.json, check.as_deref())
+            run_lint(lint_root, cli.json, check.as_deref(), strict)
         }
         Some(Command::Publish { target }) => {
             let publish_root = root
@@ -2061,7 +2064,7 @@ fn render_inspect_report(report: &InspectReport) -> String {
     sections.join("\n\n")
 }
 
-fn run_lint(root: &Path, json: bool, check: Option<&str>) -> Result<()> {
+fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Result<()> {
     let cfg = Config::load_from_root(root, None)?;
     let check = kb_lint::LintRule::parse(check)?;
     let missing_citations_level = match cfg.lint.missing_citations_level.as_str() {
@@ -2122,15 +2125,26 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>) -> Result<()> {
 
     if total_errors > 0 {
         Err(ExitCodeError {
-            exit_code: 2,
-            message: format!("lint failed: {total_errors} error(s) and {total_warnings} warning(s)"),
-        }.into())
-    } else if total_warnings > 0 {
+            exit_code: 1,
+            message: format!(
+                "lint failed with {total_errors} error(s), {total_warnings} warning(s)"
+            ),
+        }
+        .into())
+    } else if total_warnings > 0 && strict {
         Err(ExitCodeError {
             exit_code: 1,
-            message: format!("lint succeeded with {total_warnings} warning(s)"),
-        }.into())
+            message: format!(
+                "lint failed with 0 error(s), {total_warnings} warning(s) (--strict)"
+            ),
+        }
+        .into())
     } else {
+        if total_warnings > 0 && !json {
+            println!(
+                "lint: {total_warnings} warning(s) (use --strict to fail on warnings)"
+            );
+        }
         Ok(())
     }
 }
