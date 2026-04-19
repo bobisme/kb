@@ -213,30 +213,81 @@ pub fn run_compile_with_llm(
     };
 
     if options.dry_run {
-        let passes = vec![
-            (
-                "backlinks".to_string(),
-                PassStatus::DryRun {
-                    would_process: vec!["wiki/concepts/*".to_string()],
-                },
-            ),
-            (
-                "lexical_index".to_string(),
-                PassStatus::DryRun {
-                    would_process: vec!["wiki/**/*.md".to_string()],
-                },
-            ),
-            (
-                "index_pages".to_string(),
-                PassStatus::DryRun {
-                    would_process: vec![
-                        "wiki/index.md".to_string(),
-                        "wiki/sources/index.md".to_string(),
-                        "wiki/concepts/index.md".to_string(),
-                    ],
-                },
-            ),
-        ];
+        let mut passes = Vec::new();
+
+        // Per-document LLM passes come first in the live run, so mirror that order.
+        // When an adapter is configured, preview what *would* run for each stale doc.
+        // When no adapter is configured, surface the same passes as [skipped-dry] so
+        // the user sees that a configured adapter would trigger them.
+        if !stale_doc_ids.is_empty() {
+            let stale_node_ids: Vec<String> = stale_doc_ids
+                .iter()
+                .map(|id| format!("normalized/{id}"))
+                .collect();
+
+            if adapter.is_some() {
+                passes.push((
+                    "source_summary".to_string(),
+                    PassStatus::DryRun {
+                        would_process: stale_node_ids.clone(),
+                    },
+                ));
+                passes.push((
+                    "concept_extraction".to_string(),
+                    PassStatus::DryRun {
+                        would_process: stale_node_ids,
+                    },
+                ));
+                passes.push((
+                    "concept_merge".to_string(),
+                    PassStatus::DryRun {
+                        would_process: vec!["wiki/concepts/* (global)".to_string()],
+                    },
+                ));
+            } else {
+                passes.push((
+                    "source_summary".to_string(),
+                    PassStatus::Skipped {
+                        reason: "no LLM adapter configured".to_string(),
+                    },
+                ));
+                passes.push((
+                    "concept_extraction".to_string(),
+                    PassStatus::Skipped {
+                        reason: "no LLM adapter configured".to_string(),
+                    },
+                ));
+                passes.push((
+                    "concept_merge".to_string(),
+                    PassStatus::Skipped {
+                        reason: "no LLM adapter configured".to_string(),
+                    },
+                ));
+            }
+        }
+
+        passes.push((
+            "backlinks".to_string(),
+            PassStatus::DryRun {
+                would_process: vec!["wiki/concepts/*".to_string()],
+            },
+        ));
+        passes.push((
+            "lexical_index".to_string(),
+            PassStatus::DryRun {
+                would_process: vec!["wiki/**/*.md".to_string()],
+            },
+        ));
+        passes.push((
+            "index_pages".to_string(),
+            PassStatus::DryRun {
+                would_process: vec![
+                    "wiki/index.md".to_string(),
+                    "wiki/sources/index.md".to_string(),
+                    "wiki/concepts/index.md".to_string(),
+                ],
+            },
+        ));
 
         return Ok(CompileReport {
             total_sources,
@@ -315,6 +366,8 @@ pub fn run_compile_with_llm(
         }
     } else if !stale_doc_ids.is_empty() {
         // No adapter: record what we skipped so users see why summaries didn't appear.
+        // Keep parity with the dry-run block above so `dry_run_matches_live_run_stale_count`
+        // sees the same set of pass names regardless of mode.
         passes.push((
             "source_summary".to_string(),
             PassStatus::Skipped {
@@ -323,6 +376,12 @@ pub fn run_compile_with_llm(
         ));
         passes.push((
             "concept_extraction".to_string(),
+            PassStatus::Skipped {
+                reason: "no LLM adapter configured".to_string(),
+            },
+        ));
+        passes.push((
+            "concept_merge".to_string(),
             PassStatus::Skipped {
                 reason: "no LLM adapter configured".to_string(),
             },
@@ -909,11 +968,44 @@ mod tests {
         assert_eq!(report.stale_sources, 1);
         assert_eq!(report.build_records_emitted, 0);
 
-        for (_, status) in &report.passes {
+        // Without an adapter, per-doc LLM passes appear as Skipped so the user
+        // sees what would happen once an adapter is configured.
+        let names: Vec<&str> = report
+            .passes
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        for expected in [
+            "source_summary",
+            "concept_extraction",
+            "concept_merge",
+            "backlinks",
+            "lexical_index",
+            "index_pages",
+        ] {
             assert!(
-                matches!(status, PassStatus::DryRun { .. }),
-                "all passes should be dry-run"
+                names.contains(&expected),
+                "dry-run should list `{expected}` pass; got {names:?}"
             );
+        }
+
+        // Batch passes must be DryRun; per-doc passes must be Skipped (no adapter).
+        for (name, status) in &report.passes {
+            match name.as_str() {
+                "source_summary" | "concept_extraction" | "concept_merge" => {
+                    assert!(
+                        matches!(
+                            status,
+                            PassStatus::Skipped { reason } if reason == "no LLM adapter configured"
+                        ),
+                        "`{name}` should be Skipped with adapter-missing reason without an adapter"
+                    );
+                }
+                _ => assert!(
+                    matches!(status, PassStatus::DryRun { .. }),
+                    "batch pass `{name}` should be DryRun"
+                ),
+            }
         }
 
         assert!(
@@ -923,6 +1015,120 @@ mod tests {
                 .is_empty(),
             "hash state should not be persisted during dry run"
         );
+    }
+
+    #[test]
+    fn dry_run_with_adapter_previews_per_doc_passes() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# A")).expect("write doc");
+        write_normalized_document(root, &test_doc("doc-b", "# B")).expect("write doc");
+
+        let adapter = RecordingAdapter::default();
+        let report = run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: true,
+                progress: false,
+            },
+            Some(&adapter),
+        )
+        .expect("dry run with adapter");
+
+        // No LLM calls should have been made during a dry run.
+        assert_eq!(
+            adapter
+                .summarize_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "dry run must not invoke summarize_document"
+        );
+        assert_eq!(
+            adapter
+                .extract_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "dry run must not invoke extract_concepts"
+        );
+        assert_eq!(
+            adapter
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "dry run must not invoke merge_concept_candidates"
+        );
+
+        // Per-doc passes should list the stale doc IDs.
+        let summary_pass = report
+            .passes
+            .iter()
+            .find(|(n, _)| n == "source_summary")
+            .expect("source_summary entry");
+        match &summary_pass.1 {
+            PassStatus::DryRun { would_process } => {
+                assert_eq!(would_process.len(), 2, "one entry per stale doc");
+                assert!(would_process.iter().any(|s| s == "normalized/doc-a"));
+                assert!(would_process.iter().any(|s| s == "normalized/doc-b"));
+            }
+            other => panic!("expected DryRun, got {other:?}"),
+        }
+
+        let extract_pass = report
+            .passes
+            .iter()
+            .find(|(n, _)| n == "concept_extraction")
+            .expect("concept_extraction entry");
+        assert!(matches!(&extract_pass.1, PassStatus::DryRun { would_process } if would_process.len() == 2));
+
+        let merge_pass = report
+            .passes
+            .iter()
+            .find(|(n, _)| n == "concept_merge")
+            .expect("concept_merge entry");
+        assert!(matches!(&merge_pass.1, PassStatus::DryRun { would_process } if would_process.len() == 1));
+    }
+
+    #[test]
+    fn dry_run_with_no_stale_docs_omits_per_doc_passes() {
+        // When nothing is stale, the per-doc LLM passes wouldn't run in a live
+        // compile either, so the dry-run must not list them.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-1", "# Hello")).expect("write doc");
+
+        // First compile writes hash state so the second run sees zero stale.
+        run_compile(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+            },
+        )
+        .expect("first compile");
+
+        let report = run_compile(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: true,
+                progress: false,
+            },
+        )
+        .expect("dry run with clean state");
+
+        assert_eq!(report.stale_sources, 0);
+        for name in ["source_summary", "concept_extraction", "concept_merge"] {
+            assert!(
+                !report.passes.iter().any(|(n, _)| n == name),
+                "`{name}` must not appear when no docs are stale"
+            );
+        }
     }
 
     #[test]
@@ -956,6 +1162,17 @@ mod tests {
 
         assert_eq!(dry.total_sources, live.total_sources);
         assert_eq!(dry.stale_sources, live.stale_sources);
+
+        // Dry-run must mention every pass that the live run actually executed
+        // or skipped, so users see the same set of pass names in both modes.
+        let live_names: std::collections::BTreeSet<&str> =
+            live.passes.iter().map(|(n, _)| n.as_str()).collect();
+        let dry_names: std::collections::BTreeSet<&str> =
+            dry.passes.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            dry_names, live_names,
+            "dry-run pass names must match live-run pass names"
+        );
     }
 
     #[test]
