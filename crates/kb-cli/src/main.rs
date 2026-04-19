@@ -13,7 +13,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
@@ -2190,6 +2190,10 @@ struct LintCheckReport {
 }
 #[derive(Debug, Serialize)]
 struct StatusPayload {
+    /// Count of ingested sources discovered under `normalized/<id>/`.
+    normalized_source_count: usize,
+    /// Wiki source pages (`wiki-page-*` nodes referencing a source document),
+    /// and a by-kind breakdown carried over from the pre-compile graph.
     sources: SourceCounts,
     wiki_pages: usize,
     concepts: usize,
@@ -2211,6 +2215,8 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     let manifest = kb_core::Manifest::load(root)?;
     let hashes = kb_core::Hashes::load(root)?;
     let all_jobs = jobs::recent_jobs(root, 1000)?;
+
+    let normalized_source_count = count_normalized_sources(root)?;
 
     let mut source_counts = SourceCounts {
         total: 0,
@@ -2277,6 +2283,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     let changed_inputs_not_compiled = find_changed_inputs(root, &hashes)?;
 
     Ok(StatusPayload {
+        normalized_source_count,
         sources: source_counts,
         wiki_pages,
         concepts,
@@ -2286,6 +2293,29 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         interrupted_jobs,
         changed_inputs_not_compiled,
     })
+}
+
+/// Count ingested sources by listing subdirectories of `normalized/`.
+///
+/// Each ingested source lives at `normalized/<id>/` (written by
+/// `kb_ingest::write_normalized_for_file` and url ingest). The directory is
+/// missing on a freshly initialized KB that hasn't been ingested into yet —
+/// that's not an error, we just report zero.
+fn count_normalized_sources(root: &Path) -> Result<usize> {
+    let dir = root.join("normalized");
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in std::fs::read_dir(&dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        if entry.file_type()?.is_dir() {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn extract_source_kind(node_id: &str) -> &str {
@@ -2323,14 +2353,16 @@ fn print_status(status: &StatusPayload) {
     println!("kb status");
     println!();
 
-    println!("sources: {} total", status.sources.total);
-    for (kind, count) in &status.sources.by_kind {
-        println!("  {kind}: {count}");
+    println!("ingested sources: {}", status.normalized_source_count);
+    if status.sources.total == 0 {
+        println!("wiki source pages: 0    (run 'kb compile' to generate)");
+    } else {
+        println!("wiki source pages: {}", status.sources.total);
+        for (kind, count) in &status.sources.by_kind {
+            println!("  {kind}: {count}");
+        }
     }
-    println!();
-
-    println!("wiki pages: {}", status.wiki_pages);
-    println!("concepts: {}", status.concepts);
+    println!("wiki concept pages: {}", status.concepts);
     println!("stale artifacts: {}", status.stale_count);
     println!();
 
@@ -2459,6 +2491,38 @@ mod tests {
         .expect("status command succeeds");
         assert!(started.elapsed() < Duration::from_millis(250));
         drop(lock);
+    }
+
+    #[test]
+    fn count_normalized_sources_counts_subdirs() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        // Missing `normalized/` is not an error.
+        assert_eq!(count_normalized_sources(root).expect("no normalized dir"), 0);
+
+        let normalized = root.join("normalized");
+        fs::create_dir_all(normalized.join("src-a")).expect("create src-a");
+        fs::create_dir_all(normalized.join("src-b")).expect("create src-b");
+        fs::create_dir_all(normalized.join("src-c")).expect("create src-c");
+        // Stray file at the top level should be ignored.
+        fs::write(normalized.join("README"), "ignored").expect("write stray file");
+
+        assert_eq!(
+            count_normalized_sources(root).expect("count after ingest"),
+            3
+        );
+    }
+
+    #[test]
+    fn gather_status_reports_normalized_source_count() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+        fs::create_dir_all(root.join("normalized").join("src-42"))
+            .expect("create normalized source dir");
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(status.normalized_source_count, 1);
     }
 
     #[test]
