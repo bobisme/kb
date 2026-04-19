@@ -147,6 +147,112 @@ fn init_creates_empty_state_files() {
 }
 
 #[test]
+fn init_force_preserves_existing_kb_toml() {
+    // bn-2so: `kb init --force` must preserve a user-customized kb.toml so
+    // re-running init (e.g. after being told to by a manifest-corruption
+    // error) does not wipe publish targets or runner overrides.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let config_path = kb_root.join("kb.toml");
+    let original = fs::read_to_string(&config_path).expect("read kb.toml");
+    let customized =
+        format!("{original}\n[publish.targets.test]\npath = \"/x\"\n");
+    fs::write(&config_path, &customized).expect("write customized kb.toml");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("init").arg("--force");
+    let output = cmd.output().expect("run kb init --force");
+    assert!(
+        output.status.success(),
+        "kb init --force failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = fs::read_to_string(&config_path).expect("read kb.toml after --force");
+    assert_eq!(
+        after, customized,
+        "kb init --force must preserve the existing kb.toml byte-for-byte"
+    );
+    assert!(
+        after.contains("[publish.targets.test]"),
+        "publish target section must still be present after --force"
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("kb.toml preserved"),
+        "stdout should acknowledge preservation; got: {stdout}"
+    );
+
+    // State scaffolding must still be regenerated under --force.
+    assert!(
+        kb_root.join("state/manifest.json").exists(),
+        "manifest.json must be (re)created under --force"
+    );
+}
+
+#[test]
+fn init_force_reset_config_overwrites_kb_toml() {
+    // bn-2so: explicit escape hatch when a user does want a fresh config.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let config_path = kb_root.join("kb.toml");
+    let customized = "# custom marker\n[publish.targets.test]\npath = \"/x\"\n";
+    fs::write(&config_path, customized).expect("write customized kb.toml");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("init").arg("--force").arg("--reset-config");
+    let output = cmd
+        .output()
+        .expect("run kb init --force --reset-config");
+    assert!(
+        output.status.success(),
+        "kb init --force --reset-config failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = fs::read_to_string(&config_path).expect("read kb.toml after reset");
+    assert!(
+        !after.contains("# custom marker"),
+        "--reset-config must overwrite the customized kb.toml; got: {after}"
+    );
+    assert!(
+        !after.contains("[publish.targets.test]"),
+        "--reset-config must drop custom publish targets; got: {after}"
+    );
+}
+
+#[test]
+fn init_force_replaces_unparseable_kb_toml() {
+    // bn-2so: if the existing kb.toml does not parse, --force still writes a
+    // fresh one so the KB becomes usable again.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let config_path = kb_root.join("kb.toml");
+    fs::write(&config_path, "this is not = valid = toml [[[").expect("write broken kb.toml");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("init").arg("--force");
+    let output = cmd.output().expect("run kb init --force on broken config");
+    assert!(
+        output.status.success(),
+        "kb init --force failed on broken config: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = fs::read_to_string(&config_path).expect("read kb.toml after repair");
+    assert!(
+        !after.contains("this is not = valid = toml"),
+        "broken kb.toml must be replaced by --force; got: {after}"
+    );
+    // Sanity: the new file parses as TOML.
+    toml::from_str::<toml::Value>(&after).expect("regenerated kb.toml parses");
+}
+
+#[test]
 fn ask_creates_question_record_and_placeholder_artifact() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);

@@ -87,6 +87,12 @@ enum Command {
     Init {
         /// Path to initialize at
         path: Option<PathBuf>,
+        /// Regenerate kb.toml even if an existing, parseable config is present.
+        /// Without this flag, `--force` preserves user config (publish targets,
+        /// runner overrides, etc.) and only rebuilds the directory scaffold
+        /// and state files.
+        #[arg(long)]
+        reset_config: bool,
     },
     /// Ingest documents into the knowledge base
     Ingest {
@@ -405,7 +411,9 @@ fn run(cli: Cli) -> Result<()> {
             print_status(&status);
             Ok(())
         }
-        Some(Command::Init { path }) => init::init(root, path, cli.force, cli.quiet),
+        Some(Command::Init { path, reset_config }) => {
+            init::init(root, path, cli.force, reset_config, cli.quiet)
+        }
         Some(Command::Search { query, limit }) => {
             let search_root = root
                 .as_deref()

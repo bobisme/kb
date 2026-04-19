@@ -20,6 +20,7 @@ pub fn init(
     root_override: Option<PathBuf>,
     path_arg: Option<PathBuf>,
     force: bool,
+    reset_config: bool,
     quiet: bool,
 ) -> Result<()> {
     let target = if let Some(r) = root_override {
@@ -48,10 +49,26 @@ pub fn init(
     fs::create_dir_all(&target)
         .with_context(|| format!("failed to create directory {}", target.display()))?;
 
-    let default_config = Config::default();
-    let toml = default_config.to_toml_string()?;
-    fs::write(&config_path, toml)
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    // Preserve an existing, parseable kb.toml under --force unless the user
+    // explicitly asked to reset it with --reset-config. A fresh config is
+    // written only when the file is missing, unreadable, or fails to parse.
+    let config_existed = config_path.exists();
+    let existing_config_parses = config_existed
+        && fs::read_to_string(&config_path)
+            .ok()
+            .is_some_and(|contents| Config::from_toml(&contents).is_ok());
+    let preserve_config = config_existed && existing_config_parses && !reset_config;
+
+    if preserve_config {
+        if !quiet {
+            println!("kb.toml preserved");
+        }
+    } else {
+        let default_config = Config::default();
+        let toml = default_config.to_toml_string()?;
+        fs::write(&config_path, toml)
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
 
     let dirs = [
         "raw/inbox",
