@@ -2418,10 +2418,23 @@ fn extract_source_kind(node_id: &str) -> &str {
 /// appear in the compile hash state — i.e. inputs that exist on disk but
 /// have not been compiled yet (or have been changed since the last compile).
 ///
-/// Walks `normalized/*/` under the KB root and flags any directory whose
-/// normalized id is absent from the loaded `HashState`. Missing
-/// `state/hashes.json` is treated as an empty state, so every normalized
-/// source will be reported until `kb compile` runs.
+/// Walks `normalized/*/` under the KB root and flags any directory that is
+/// either
+///
+/// 1. absent from the loaded `HashState` (never compiled), or
+/// 2. whose `normalized/<id>/metadata.json::source_revision_id` differs from
+///    the `source_revision_id` recorded in the corresponding
+///    `wiki/sources/<slug>.md` frontmatter (ingested a new revision since
+///    last compile).
+///
+/// Case (2) catches the common re-ingest flow: a user edits a source file,
+/// re-ingests it (producing a new `source_revision_id`), and expects `kb
+/// status` to tell them the wiki is stale. The `HashState` check alone
+/// misses this because compile *did* run once and recorded a fingerprint —
+/// it just recorded an out-of-date one.
+///
+/// Missing `state/hashes.json` is treated as an empty state, so every
+/// normalized source will be reported until `kb compile` runs.
 fn find_changed_inputs(root: &Path, hash_state: &kb_compile::HashState) -> Result<Vec<PathBuf>> {
     let normalized_dir = root.join("normalized");
     if !normalized_dir.exists() {
@@ -2445,10 +2458,93 @@ fn find_changed_inputs(root: &Path, hash_state: &kb_compile::HashState) -> Resul
         let node_id = format!("normalized/{name}");
         if !hash_state.hashes.contains_key(&node_id) {
             changed.push(entry.path());
+            continue;
+        }
+        if source_revision_mismatched(root, name)? {
+            changed.push(entry.path());
         }
     }
     changed.sort();
     Ok(changed)
+}
+
+/// Return `true` if `normalized/<id>/metadata.json::source_revision_id`
+/// differs from the `source_revision_id` in the matching
+/// `wiki/sources/<slug>.md` frontmatter.
+///
+/// Returns `false` (not mismatched) when:
+/// - the wiki source page doesn't exist yet (caller already handled the
+///   "never compiled" case via the hash-state check),
+/// - the wiki page has no frontmatter or no `source_revision_id` field
+///   (treated as "can't tell" — don't spuriously flag),
+/// - the normalized metadata is unreadable (propagated as an error).
+///
+/// A mismatch here means the user ran `kb ingest` after a successful
+/// `kb compile` and the wiki page is now out of date.
+fn source_revision_mismatched(root: &Path, normalized_id: &str) -> Result<bool> {
+    let metadata_path = root
+        .join("normalized")
+        .join(normalized_id)
+        .join("metadata.json");
+    let Ok(metadata_bytes) = std::fs::read(&metadata_path) else {
+        // Missing or unreadable metadata: don't flag — the hash-state check
+        // above already handles the "never ingested" and "corrupt" cases.
+        return Ok(false);
+    };
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata_bytes)
+        .with_context(|| format!("parse normalized metadata {}", metadata_path.display()))?;
+    let Some(normalized_rev) = metadata
+        .get("source_revision_id")
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(false);
+    };
+
+    let wiki_page = root.join(kb_compile::source_page::source_page_path_for_id(
+        normalized_id,
+    ));
+    let Ok(markdown) = std::fs::read_to_string(&wiki_page) else {
+        // No wiki page yet — not a "mismatch"; already caught by hash state
+        // in the common never-compiled case. If the wiki page was deleted
+        // out from under us, the next compile will regenerate it.
+        return Ok(false);
+    };
+    let Some(frontmatter) = extract_frontmatter(&markdown) else {
+        return Ok(false);
+    };
+    let Ok(parsed) = serde_yaml::from_str::<serde_yaml::Value>(&frontmatter) else {
+        return Ok(false);
+    };
+    let Some(page_rev) = parsed
+        .get("source_revision_id")
+        .and_then(|v| v.as_str())
+    else {
+        return Ok(false);
+    };
+
+    Ok(page_rev != normalized_rev)
+}
+
+/// Extract the YAML frontmatter block from a markdown document.
+///
+/// Returns the frontmatter body (without the fence lines) if the document
+/// starts with a `---` fence and has a closing `---` fence. Otherwise returns
+/// `None`. Mirrors the small parser in `kb_compile::backlinks` but lives here
+/// so `kb status` does not have to depend on compile-internal helpers.
+fn extract_frontmatter(markdown: &str) -> Option<String> {
+    let mut lines = markdown.split_inclusive('\n');
+    let first = lines.next()?;
+    if first != "---\n" && first != "---\r\n" && first != "---" {
+        return None;
+    }
+    let mut fm = String::new();
+    for line in lines {
+        if line == "---\n" || line == "---\r\n" || line == "---" {
+            return Some(fm);
+        }
+        fm.push_str(line);
+    }
+    None
 }
 
 fn print_status(status: &StatusPayload) {
@@ -2634,6 +2730,94 @@ mod tests {
 
         let status = gather_status(&root).expect("gather status");
         assert_eq!(status.normalized_source_count, 1);
+    }
+
+    /// Helper for the re-ingest mismatch tests: fabricate
+    /// `normalized/<id>/metadata.json` with the given revision.
+    fn write_normalized_metadata(root: &Path, id: &str, revision: &str) {
+        let dir = root.join("normalized").join(id);
+        fs::create_dir_all(&dir).expect("create normalized dir");
+        let metadata = serde_json::json!({
+            "metadata": {
+                "id": id,
+                "entity_type": "source-document",
+                "display_name": id,
+                "canonical_path": "inbox/fake.md",
+                "content_hashes": [],
+                "output_paths": [],
+                "status": "Fresh",
+            },
+            "source_revision_id": revision,
+            "normalized_assets": [],
+            "heading_ids": [],
+        });
+        fs::write(dir.join("metadata.json"), metadata.to_string())
+            .expect("write metadata.json");
+        fs::write(dir.join("source.md"), "# body\n").expect("write source.md");
+    }
+
+    /// Helper for the re-ingest mismatch tests: fabricate a minimal
+    /// `wiki/sources/<slug>.md` page with the given frontmatter revision.
+    fn write_wiki_source_page(root: &Path, source_id: &str, revision: &str) {
+        let page_path =
+            root.join(kb_compile::source_page::source_page_path_for_id(source_id));
+        fs::create_dir_all(page_path.parent().expect("parent"))
+            .expect("create wiki sources dir");
+        let markdown = format!(
+            "---\nid: wiki-source-{source_id}\ntype: source\ntitle: {source_id}\n\
+source_document_id: {source_id}\nsource_revision_id: {revision}\n\
+generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
+        );
+        fs::write(&page_path, markdown).expect("write wiki page");
+    }
+
+    /// Regression test for bn-2gn: after a re-ingest changes the normalized
+    /// `source_revision_id`, `kb status` must flag the source as a changed
+    /// input even though a prior compile wrote its hash into `state/hashes.json`.
+    #[test]
+    fn find_changed_inputs_flags_reingested_source_with_stale_wiki_page() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Simulate a previously compiled source: hash state has the node,
+        // wiki page exists with rev-A, normalized metadata still claims rev-A.
+        write_normalized_metadata(root, "src-1", "rev-A");
+        write_wiki_source_page(root, "src-1", "rev-A");
+        let mut hash_state = kb_compile::HashState::default();
+        hash_state
+            .hashes
+            .insert("normalized/src-1".to_string(), "fingerprint-A".to_string());
+
+        // Clean state: not flagged.
+        let changed = find_changed_inputs(root, &hash_state).expect("find changed (clean)");
+        assert!(
+            changed.is_empty(),
+            "clean compile state should not flag any changed inputs: {changed:?}",
+        );
+
+        // Now simulate `kb ingest` of a new revision: metadata.json bumps
+        // to rev-B, wiki page still reflects rev-A. Status must flag it.
+        write_normalized_metadata(root, "src-1", "rev-B");
+        let changed = find_changed_inputs(root, &hash_state).expect("find changed (reingested)");
+        assert_eq!(
+            changed,
+            vec![root.join("normalized").join("src-1")],
+            "re-ingested source with stale wiki page must be reported as changed",
+        );
+    }
+
+    /// First-compile behavior is preserved: normalized dirs without an
+    /// entry in `HashState` are flagged, regardless of wiki page state.
+    #[test]
+    fn find_changed_inputs_flags_never_compiled_source() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write_normalized_metadata(root, "src-fresh", "rev-A");
+
+        let hash_state = kb_compile::HashState::default();
+        let changed =
+            find_changed_inputs(root, &hash_state).expect("find changed (never compiled)");
+        assert_eq!(changed, vec![root.join("normalized").join("src-fresh")]);
     }
 
     #[test]

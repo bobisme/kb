@@ -2229,3 +2229,130 @@ fn broken_kb_toml_fails_read_only_commands() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// Fabricate `normalized/<src_id>/metadata.json` at the given revision,
+/// plus a minimal `source.md`. Used by the bn-2gn re-ingest status test.
+fn write_fake_normalized_source(kb_root: &Path, src_id: &str, revision: &str) {
+    let normalized_dir = kb_root.join("normalized").join(src_id);
+    fs::create_dir_all(&normalized_dir).expect("create normalized dir");
+    let metadata = serde_json::json!({
+        "metadata": {
+            "id": src_id,
+            "entity_type": "source-document",
+            "display_name": src_id,
+            "canonical_path": "inbox/fake.md",
+            "content_hashes": [],
+            "output_paths": [],
+            "status": "Fresh",
+        },
+        "source_revision_id": revision,
+        "normalized_assets": [],
+        "heading_ids": [],
+    });
+    fs::write(normalized_dir.join("metadata.json"), metadata.to_string())
+        .expect("write metadata.json");
+    fs::write(normalized_dir.join("source.md"), "# body\n").expect("write source.md");
+}
+
+/// Fabricate a minimal `wiki/sources/<src_id>.md` with frontmatter pinned
+/// to the given revision. Used by the bn-2gn re-ingest status test.
+fn write_fake_wiki_source_page(kb_root: &Path, src_id: &str, revision: &str) {
+    let wiki_dir = kb_root.join("wiki").join("sources");
+    fs::create_dir_all(&wiki_dir).expect("create wiki/sources dir");
+    let markdown = format!(
+        "---\nid: wiki-source-{src_id}\ntype: source\ntitle: {src_id}\n\
+source_document_id: {src_id}\nsource_revision_id: {revision}\n\
+generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
+    );
+    fs::write(wiki_dir.join(format!("{src_id}.md")), markdown).expect("write wiki page");
+}
+
+/// Fabricate a `state/hashes.json` that claims the given normalized ids were
+/// all compiled at some fingerprint. Values don't matter — `kb status` only
+/// checks for key presence to decide whether a source was ever compiled.
+fn write_fake_hash_state(kb_root: &Path, src_ids: &[&str]) {
+    let state_dir = kb_root.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let mut hashes = serde_json::Map::new();
+    for id in src_ids {
+        hashes.insert(
+            format!("normalized/{id}"),
+            serde_json::Value::String(format!("fingerprint-{id}")),
+        );
+    }
+    let body = serde_json::json!({ "hashes": serde_json::Value::Object(hashes) });
+    fs::write(state_dir.join("hashes.json"), body.to_string())
+        .expect("write state/hashes.json");
+}
+
+/// Run `kb --json status` and return the parsed `changed_inputs_not_compiled` array.
+fn status_changed_inputs(kb_root: &Path) -> Vec<String> {
+    let mut cmd = kb_cmd(kb_root);
+    cmd.arg("--json").arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(
+        output.status.success(),
+        "kb status must succeed; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    envelope["data"]["changed_inputs_not_compiled"]
+        .as_array()
+        .expect("changed_inputs_not_compiled array")
+        .iter()
+        .map(|v| v.as_str().expect("changed entry is string").to_string())
+        .collect()
+}
+
+/// Regression test for bn-2gn. When a user re-ingests a source whose content
+/// changed, `normalized/<src>/metadata.json` gains a new `source_revision_id`
+/// while `wiki/sources/<slug>.md` frontmatter is still pinned to the old
+/// revision until `kb compile` runs. `kb status` must surface this under
+/// "changed inputs not yet compiled" so the user knows the wiki is stale.
+///
+/// We fabricate the on-disk state directly (no `kb ingest`, no LLM) so the
+/// test is deterministic and does not depend on the pipeline.
+#[test]
+fn kb_status_flags_reingested_source_with_stale_wiki_page() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let src_id = "src-2gn";
+
+    // Starting state: fully compiled at rev-A.
+    write_fake_normalized_source(&kb_root, src_id, "rev-A");
+    write_fake_wiki_source_page(&kb_root, src_id, "rev-A");
+    write_fake_hash_state(&kb_root, &[src_id]);
+
+    // Clean compile state → no changed inputs.
+    let changed = status_changed_inputs(&kb_root);
+    assert!(
+        changed.is_empty(),
+        "clean rev-A state should not flag any changed inputs, got: {changed:?}",
+    );
+
+    // Simulate a re-ingest: metadata bumps to rev-B, wiki page still at rev-A.
+    write_fake_normalized_source(&kb_root, src_id, "rev-B");
+
+    let changed = status_changed_inputs(&kb_root);
+    assert_eq!(
+        changed.len(),
+        1,
+        "re-ingested source must be flagged, got: {changed:?}",
+    );
+    assert!(
+        changed[0].ends_with(&format!("normalized/{src_id}")),
+        "reported path should point at normalized/{src_id}, got: {}",
+        changed[0],
+    );
+
+    // After the wiki page is regenerated at rev-B (what `kb compile` does),
+    // the list clears.
+    write_fake_wiki_source_page(&kb_root, src_id, "rev-B");
+
+    let changed = status_changed_inputs(&kb_root);
+    assert!(
+        changed.is_empty(),
+        "after recompile, changed_inputs_not_compiled should clear, got: {changed:?}",
+    );
+}
