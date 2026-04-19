@@ -1001,7 +1001,7 @@ fn run_ingest(root: &Path, sources: &[String], json: bool, dry_run: bool) -> Res
     let mut urls = Vec::new();
     let mut local_paths = Vec::new();
     for source in sources {
-        if source.starts_with("http://") || source.starts_with("https://") {
+        if kb_ingest::is_url(source) {
             urls.push(source.as_str());
         } else {
             local_paths.push(PathBuf::from(source));

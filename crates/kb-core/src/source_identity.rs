@@ -26,8 +26,14 @@ pub fn normalize_file_stable_location(path: impl AsRef<Path>) -> io::Result<Stri
 /// Returns a normalized stable location string for a URL source.
 ///
 /// Normalization rules:
-/// - lowercase scheme and host
-/// - preserve the path produced by URL parsing
+/// - lowercase scheme and host (the `url` crate lowercases the scheme
+///   automatically during parsing, which also covers mixed-case inputs like
+///   `HTTPS://` / `Http://`)
+/// - collapse a single trailing slash on non-root paths so that
+///   `https://foo.com/bar/` and `https://foo.com/bar` are treated as the same
+///   source. The root path `/` is preserved because `https://foo.com/` is the
+///   canonical form produced by URL parsers (empty-path URLs round-trip to a
+///   trailing slash anyway).
 /// - sort query parameters by key then value
 /// - drop fragments because they identify sublocations within a document, not the
 ///   logical source itself
@@ -37,6 +43,18 @@ pub fn normalize_file_stable_location(path: impl AsRef<Path>) -> io::Result<Stri
 pub fn normalize_url_stable_location(raw_url: &str) -> Result<String> {
     let mut url = Url::parse(raw_url).with_context(|| format!("invalid URL: {raw_url}"))?;
     url.set_fragment(None);
+
+    // Collapse a trailing slash on non-root paths. Keep root `/` intact: an
+    // input with no path (e.g. `https://foo.com`) is normalized by the `url`
+    // crate to `https://foo.com/`, which is the canonical root form.
+    let path = url.path().to_owned();
+    if path.len() > 1 && path.ends_with('/') {
+        let trimmed = path.trim_end_matches('/');
+        // `trim_end_matches` would leave an empty string for `////`; fall back
+        // to `/` so we never produce a path-less URL.
+        let new_path = if trimmed.is_empty() { "/" } else { trimmed };
+        url.set_path(new_path);
+    }
 
     let mut query_pairs = url
         .query_pairs()
@@ -50,6 +68,11 @@ pub fn normalize_url_stable_location(raw_url: &str) -> Result<String> {
         for (key, value) in query_pairs {
             pairs.append_pair(&key, &value);
         }
+    }
+    // `query_pairs_mut` always leaves a `?` even when no pairs were appended,
+    // so clear it manually when there were none to avoid a dangling `?`.
+    if url.query() == Some("") {
+        url.set_query(None);
     }
 
     Ok(url.into())
@@ -177,5 +200,61 @@ mod tests {
         let second = source_document_id_for_url("https://example.com/a?a=1&b=2").unwrap();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn url_document_id_ignores_scheme_case() {
+        // Per RFC 3986, URL schemes are case-insensitive. `HTTPS://` and
+        // `https://` must collide, otherwise `kb ingest HTTPS://example.com/foo`
+        // and `kb ingest https://example.com/foo` would mint different
+        // src-ids for the same resource.
+        let upper = source_document_id_for_url("HTTPS://example.com/foo").unwrap();
+        let lower = source_document_id_for_url("https://example.com/foo").unwrap();
+
+        assert_eq!(upper, lower);
+    }
+
+    #[test]
+    fn url_document_id_collapses_trailing_slash_on_nonroot_path() {
+        let with_slash = source_document_id_for_url("https://foo.com/bar/").unwrap();
+        let without_slash = source_document_id_for_url("https://foo.com/bar").unwrap();
+
+        assert_eq!(with_slash, without_slash);
+    }
+
+    #[test]
+    fn url_document_id_preserves_root_slash() {
+        // `https://foo.com/` is the canonical root form that URL parsers
+        // produce from `https://foo.com`. We leave it intact — there's no
+        // shorter non-empty path to collapse it to.
+        let with_slash = source_document_id_for_url("https://foo.com/").unwrap();
+        let implicit = source_document_id_for_url("https://foo.com").unwrap();
+
+        // Both inputs normalize to the same root form, so the IDs still match.
+        assert_eq!(with_slash, implicit);
+
+        // And the stable location keeps the trailing slash rather than
+        // degenerating to `https://foo.com` with no path at all.
+        let loc = normalize_url_stable_location("https://foo.com/").unwrap();
+        assert_eq!(loc, "https://foo.com/");
+    }
+
+    #[test]
+    fn url_document_id_handles_mixed_case_and_trailing_slash_together() {
+        // Exercises both normalization paths in one go, as called out in
+        // bn-nnd. Host lowercasing is already covered by the `url` crate and
+        // is asserted here for completeness.
+        let messy = source_document_id_for_url("HTTPS://FOO.COM/bar/").unwrap();
+        let clean = source_document_id_for_url("https://foo.com/bar").unwrap();
+
+        assert_eq!(messy, clean);
+    }
+
+    #[test]
+    fn url_document_id_collapses_repeated_trailing_slashes() {
+        // Defensive: if a user hand-types `//` at the end, we still collapse
+        // to a single canonical form rather than minting a distinct src-id.
+        let triple = normalize_url_stable_location("https://foo.com/bar///").unwrap();
+        assert_eq!(triple, "https://foo.com/bar");
     }
 }

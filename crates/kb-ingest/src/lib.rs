@@ -58,6 +58,24 @@ enum FileOrigin {
     DirectoryWalk,
 }
 
+/// Returns true if `source` looks like an HTTP(S) URL rather than a local
+/// path.
+///
+/// Per RFC 3986 URL schemes are case-insensitive, so we compare against a
+/// lowercased copy of the scheme prefix. Previously this check used a naive
+/// `starts_with("http://")`, which rejected `HTTPS://example.com/` and sent
+/// it down the file-path branch where it then errored out as
+/// "source path does not exist or is not a regular file/directory".
+#[must_use]
+pub fn is_url(source: &str) -> bool {
+    // Match the longest scheme we recognize (`https`) plus `://`, i.e. up to
+    // 8 bytes. Lowercasing only the prefix avoids allocating for long inputs
+    // and keeps query strings / paths byte-identical.
+    let head_len = source.len().min(8);
+    let head = source.get(..head_len).unwrap_or("").to_ascii_lowercase();
+    head.starts_with("http://") || head.starts_with("https://")
+}
+
 /// Maximum number of bytes inspected when deciding whether a file looks like
 /// text. Larger files are only partially sampled.
 const TEXT_PROBE_BYTES: usize = 8 * 1024;
@@ -698,6 +716,48 @@ mod tests {
 
         assert_eq!(ingested.len(), 1, "only the text file should be ingested");
         assert!(ingested[0].copied_path.ends_with("notes.md"));
+    }
+
+    #[test]
+    fn is_url_matches_lowercase_http_and_https() {
+        assert!(is_url("http://example.com/"));
+        assert!(is_url("https://example.com/foo"));
+    }
+
+    #[test]
+    fn is_url_matches_mixed_case_schemes() {
+        // Regression guard for bn-nnd J4: the dispatcher used to only match
+        // lowercase schemes, so `HTTPS://...` fell through to the file branch
+        // and errored as a missing path.
+        assert!(is_url("HTTPS://example.com/"));
+        assert!(is_url("Http://example.com/"));
+        assert!(is_url("HTTP://foo.com/bar"));
+        assert!(is_url("HtTpS://foo.com/bar?q=1"));
+    }
+
+    #[test]
+    fn is_url_rejects_non_http_schemes_and_paths() {
+        assert!(!is_url("/tmp/notes.md"));
+        assert!(!is_url("./relative.md"));
+        assert!(!is_url("file:///tmp/notes.md"));
+        assert!(!is_url("ftp://example.com/file"));
+        assert!(!is_url(""));
+        assert!(!is_url("http"));
+        assert!(!is_url("https"));
+    }
+
+    #[test]
+    fn mixed_case_url_dispatches_to_url_branch_not_file_branch() {
+        // Integration-style: a mixed-case URL must not be collected as a file
+        // path. The file branch would call `path.is_file()` / `path.is_dir()`
+        // and then bail with "source path does not exist or is not a regular
+        // file/directory". We drive the dispatcher logic the CLI uses.
+        let sources = ["HTTPS://example.com/foo", "./README.md"];
+        let (urls, paths): (Vec<&str>, Vec<&str>) =
+            sources.iter().partition(|s| is_url(s));
+
+        assert_eq!(urls, vec!["HTTPS://example.com/foo"]);
+        assert_eq!(paths, vec!["./README.md"]);
     }
 
     #[test]
