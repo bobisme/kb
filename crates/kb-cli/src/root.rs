@@ -17,9 +17,12 @@ pub struct KbRoot {
 /// Resolve the KB root for command execution.
 ///
 /// Resolution order:
-/// 1. `--root` override (if set)
-/// 2. Walk up from the current directory for `*/kb/kb.toml`
-/// 3. Fall back to `~/kb` when present
+/// 1. `--root` override (if set) — accepts either a dir with `kb.toml` directly,
+///    or a dir containing a `kb/` subdir with `kb.toml`.
+/// 2. Walk up from the current directory. At each ancestor, try
+///    `<ancestor>/kb.toml` first (the ancestor *is* the KB root), then
+///    `<ancestor>/kb/kb.toml` (project layout with a `kb/` subdir).
+/// 3. Fall back to `~/kb` when present.
 /// 4. Fail with an actionable error message.
 pub fn discover_root(explicit_root: Option<&Path>) -> Result<KbRoot> {
     let cwd = env::current_dir().context("failed to resolve current working directory")?;
@@ -29,24 +32,42 @@ pub fn discover_root(explicit_root: Option<&Path>) -> Result<KbRoot> {
 
 fn discover_root_in(explicit_root: Option<&Path>, cwd: &Path, home: &Path) -> Result<KbRoot> {
     if let Some(root_override) = explicit_root {
-        return validate_candidate(resolve_root_override(root_override, cwd)?);
+        return validate_candidate(&resolve_root_override(root_override, cwd)?);
     }
 
     for ancestor in cwd.ancestors() {
-        let candidate = ancestor.join(KB_DIR);
-        if is_kb_root(&candidate) {
-            return Ok(KbRoot { path: candidate });
+        if let Some(path) = find_kb_root_at(ancestor) {
+            return Ok(KbRoot { path });
         }
     }
 
-    let global = home.join(KB_DIR);
-    if is_kb_root(&global) {
-        return Ok(KbRoot { path: global });
+    if is_kb_root(&home.join(KB_DIR)) {
+        return Ok(KbRoot {
+            path: home.join(KB_DIR),
+        });
+    }
+    if is_kb_root(home) {
+        return Ok(KbRoot {
+            path: home.to_path_buf(),
+        });
     }
 
     Err(anyhow!(
         "No KB root found. Initialize one with `kb init` or provide --root."
     ))
+}
+
+/// Look for a KB root at `dir`. Prefers `<dir>/kb.toml` (dir is the root),
+/// falls back to `<dir>/kb/kb.toml` (project layout).
+fn find_kb_root_at(dir: &Path) -> Option<PathBuf> {
+    if is_kb_root(dir) {
+        return Some(dir.to_path_buf());
+    }
+    let subdir = dir.join(KB_DIR);
+    if is_kb_root(&subdir) {
+        return Some(subdir);
+    }
+    None
 }
 
 fn resolve_root_override(explicit_root: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -67,15 +88,16 @@ fn resolve_root_override(explicit_root: &Path, cwd: &Path) -> Result<PathBuf> {
         .with_context(|| format!("failed to resolve --root path '{}'", resolved.display()))
 }
 
-fn validate_candidate(path: PathBuf) -> Result<KbRoot> {
-    if is_kb_root(&path) {
-        Ok(KbRoot { path })
-    } else {
-        Err(anyhow!(
-            "Provided --root '{}' does not contain '{KB_DIR}/{KB_CONFIG}'. Run `kb init` to initialize a KB root.",
-            path.display(),
-        ))
-    }
+fn validate_candidate(path: &Path) -> Result<KbRoot> {
+    find_kb_root_at(path).map_or_else(
+        || {
+            Err(anyhow!(
+                "Provided --root '{}' contains neither '{KB_CONFIG}' nor '{KB_DIR}/{KB_CONFIG}'. Run `kb init` to initialize a KB root.",
+                path.display(),
+            ))
+        },
+        |found| Ok(KbRoot { path: found }),
+    )
 }
 
 fn is_kb_root(candidate: &Path) -> bool {
@@ -141,6 +163,75 @@ mod tests {
         assert_eq!(
             result.expect("discover root").path,
             fallback.canonicalize().expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn discovery_accepts_pwd_as_root_when_kb_toml_present() {
+        // Simulates `kb init` in an arbitrary dir which writes kb.toml directly.
+        let tmp = tempdir().expect("temp root");
+        let root = tmp.path().join("my-kb");
+        touch_kb_toml(&root);
+
+        let result = discover_root_in(None, &root, Path::new("/home/missing"));
+
+        assert_eq!(
+            result.expect("discover root").path,
+            root.canonicalize().expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn discovery_accepts_ancestor_as_root_when_kb_toml_present() {
+        // pwd sits inside a KB root (kb.toml directly in an ancestor).
+        let tmp = tempdir().expect("temp root");
+        let root = tmp.path().join("my-kb");
+        touch_kb_toml(&root);
+        let cwd = root.join("notes/sub");
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let result = discover_root_in(None, &cwd, Path::new("/home/missing"));
+
+        assert_eq!(
+            result.expect("discover root").path,
+            root.canonicalize().expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn root_override_accepts_dir_with_kb_toml_directly() {
+        // `kb --root <dir-with-kb.toml>` accepts the dir itself as root.
+        let tmp = tempdir().expect("temp root");
+        let explicit = tmp.path().join("direct-root");
+        touch_kb_toml(&explicit);
+
+        let cwd = tmp.path().join("elsewhere");
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let result = discover_root_in(Some(explicit.as_path()), &cwd, Path::new("/home/missing"));
+
+        assert_eq!(
+            result.expect("discover root").path,
+            explicit.canonicalize().expect("canonicalize")
+        );
+    }
+
+    #[test]
+    fn root_override_accepts_project_with_kb_subdir() {
+        // `kb --root <project>` where project has a `kb/` subdir still resolves.
+        let tmp = tempdir().expect("temp root");
+        let project = tmp.path().join("project");
+        let kb_root = project.join("kb");
+        touch_kb_toml(&kb_root);
+
+        let cwd = tmp.path().join("elsewhere");
+        fs::create_dir_all(&cwd).expect("create cwd");
+
+        let result = discover_root_in(Some(project.as_path()), &cwd, Path::new("/home/missing"));
+
+        assert_eq!(
+            result.expect("discover root").path,
+            kb_root.canonicalize().expect("canonicalize")
         );
     }
 
