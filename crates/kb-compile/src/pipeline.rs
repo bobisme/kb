@@ -9,7 +9,7 @@ use kb_core::{
 };
 use kb_llm::{ConceptCandidate, LlmAdapter};
 
-use crate::{HashState, StaleNode, detect_stale};
+use crate::{Graph, HashState, StaleNode, detect_stale};
 
 /// Abstract sink that receives per-pass progress events so the compile
 /// pipeline does not need to depend on the CLI job-run machinery directly.
@@ -611,12 +611,263 @@ pub fn run_compile_with_llm(
         state.save_to_root(root)?;
     }
 
+    // Persist the dependency graph so `kb status` and `kb inspect` can see
+    // the compiled corpus. bn-3w0. Individual passes emit `BuildRecord`s but
+    // nothing previously assembled them into the persisted graph used by
+    // status/inspect, so their counters always read zero after a compile.
+    match build_graph_from_state(root) {
+        Ok(graph) => {
+            if let Err(err) = graph.persist_to(root) {
+                tracing::warn!("failed to persist compile graph: {err}");
+            }
+        }
+        Err(err) => {
+            tracing::warn!("failed to assemble compile graph: {err}");
+        }
+    }
+
     Ok(CompileReport {
         total_sources,
         stale_sources,
         build_records_emitted,
         passes,
     })
+}
+
+/// Assemble a dependency graph describing the current compiled state of the KB.
+///
+/// Nodes use the `source-document-*`, `wiki-page-*`, and `concept-*` prefixes
+/// that `gather_status` and `run_inspect` rely on. Edges connect each source
+/// document to its rendered `wiki/sources/*.md` page, and each source page to
+/// every concept that shares a build record with it.
+///
+/// The graph is rebuilt from the filesystem + `state/build_records/` on every
+/// compile so it stays consistent even when passes are skipped or fail; a
+/// missing or malformed build record simply omits its edges rather than
+/// aborting the compile.
+#[allow(clippy::too_many_lines)]
+fn build_graph_from_state(root: &Path) -> Result<Graph> {
+    let mut graph = Graph::default();
+
+    // Source-document nodes: one per `normalized/<src-id>/` directory.
+    let normalized_dir = root.join("normalized");
+    let mut doc_ids: Vec<String> = Vec::new();
+    if normalized_dir.exists() {
+        for entry in std::fs::read_dir(&normalized_dir)
+            .with_context(|| format!("scan {}", normalized_dir.display()))?
+        {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    doc_ids.push(name.to_string());
+                    graph.add_node(format!("source-document-{name}"));
+                }
+            }
+        }
+    }
+
+    // Wiki-page nodes: one per `wiki/sources/*.md` (skip `index.md`). The slug
+    // is the filename stem; `source_page_path_for_id` derives the same slug
+    // for a given doc id, so we match them up to draw edges.
+    let sources_dir = root.join("wiki/sources");
+    let mut wiki_page_slugs: BTreeSet<String> = BTreeSet::new();
+    if sources_dir.exists() {
+        for entry in std::fs::read_dir(&sources_dir)
+            .with_context(|| format!("scan {}", sources_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem == "index" {
+                continue;
+            }
+            wiki_page_slugs.insert(stem.to_string());
+            graph.add_node(format!("wiki-page-{stem}"));
+        }
+    }
+
+    // Concept nodes: one per `wiki/concepts/*.md` (skip `index.md`).
+    let concepts_dir = root.join("wiki/concepts");
+    let mut concept_slugs: BTreeSet<String> = BTreeSet::new();
+    if concepts_dir.exists() {
+        for entry in std::fs::read_dir(&concepts_dir)
+            .with_context(|| format!("scan {}", concepts_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem == "index" {
+                continue;
+            }
+            concept_slugs.insert(stem.to_string());
+            graph.add_node(format!("concept-{stem}"));
+        }
+    }
+
+    // Edges: source-document -> wiki-page. `source_page_path_for_id` uses the
+    // doc id verbatim to derive the filename, so matching the wiki page slug
+    // back to its owning doc id means finding the doc id whose
+    // `source_page_path_for_id` output has the same stem as the wiki page.
+    for doc_id in &doc_ids {
+        let page_path = crate::source_page::source_page_path_for_id(doc_id);
+        let Some(stem) = page_path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if wiki_page_slugs.contains(stem) {
+            graph.add_edge(
+                format!("source-document-{doc_id}"),
+                format!("wiki-page-{stem}"),
+            );
+        }
+    }
+
+    // Edges: wiki-page -> concept. Walk every build record and, for each
+    // record whose output paths fall under `wiki/concepts/`, connect each
+    // input path under `wiki/sources/` to the concept. Records for other
+    // passes (backlinks, lexical index, etc.) are ignored because they do
+    // not reshape the source -> concept topology.
+    let doc_id_set: BTreeSet<String> = doc_ids.iter().cloned().collect();
+    let build_records_dir = kb_core::build_records_dir(root);
+    if build_records_dir.exists() {
+        for entry in std::fs::read_dir(&build_records_dir)
+            .with_context(|| format!("scan {}", build_records_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(err) => {
+                    tracing::warn!("skip build record {}: {err}", path.display());
+                    continue;
+                }
+            };
+            let record: kb_core::BuildRecord = match serde_json::from_str(&raw) {
+                Ok(record) => record,
+                Err(err) => {
+                    tracing::warn!("skip build record {}: {err}", path.display());
+                    continue;
+                }
+            };
+
+            // Inputs/outputs can be a wiki source page slug, a source
+            // document short id (source_summary uses the latter), a concept
+            // slug, or a filesystem path; normalize all known shapes to the
+            // prefixed graph node format used above.
+            let mut raw_outputs: Vec<String> = record.output_ids.clone();
+            for path in &record.metadata.output_paths {
+                if let Some(s) = path.to_str() {
+                    raw_outputs.push(s.to_string());
+                }
+            }
+            let input_nodes: Vec<String> = record
+                .input_ids
+                .iter()
+                .filter_map(|id| {
+                    graph_node_for_id(id, &doc_id_set, &wiki_page_slugs, &concept_slugs)
+                })
+                .collect();
+            let output_nodes: Vec<String> = raw_outputs
+                .iter()
+                .filter_map(|id| {
+                    graph_node_for_id(id, &doc_id_set, &wiki_page_slugs, &concept_slugs)
+                })
+                .collect();
+
+            for input in &input_nodes {
+                for output in &output_nodes {
+                    if input != output {
+                        graph.add_edge(input.clone(), output.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Normalize explicitly: `add_edge` appends without deduping, so repeated
+    // build records between the same pair of nodes would otherwise leave
+    // duplicates in the persisted JSON. `validate()` returns a normalized
+    // clone, which is what callers expect to round-trip via `persist_to`.
+    graph.validate()
+}
+
+/// Map a build-record identifier (node id, wiki path, or source id) onto the
+/// prefixed graph node format used by status/inspect. Returns `None` when the
+/// identifier does not correspond to one of the prefixed node kinds.
+fn graph_node_for_id(
+    id: &str,
+    doc_ids: &BTreeSet<String>,
+    wiki_page_slugs: &BTreeSet<String>,
+    concept_slugs: &BTreeSet<String>,
+) -> Option<String> {
+    if id.starts_with("source-document-")
+        || id.starts_with("wiki-page-")
+        || id.starts_with("concept-")
+    {
+        return Some(id.to_string());
+    }
+
+    // Wiki source/concept markdown paths emitted by build records.
+    if let Some(rest) = id.strip_prefix("wiki/sources/") {
+        let stem = std::path::Path::new(rest)
+            .file_stem()
+            .and_then(|s| s.to_str())?;
+        if stem == "index" {
+            return None;
+        }
+        return Some(format!("wiki-page-{stem}"));
+    }
+    if let Some(rest) = id.strip_prefix("wiki/concepts/") {
+        let stem = std::path::Path::new(rest)
+            .file_stem()
+            .and_then(|s| s.to_str())?;
+        if stem == "index" {
+            return None;
+        }
+        return Some(format!("concept-{stem}"));
+    }
+
+    // Slug-only match against known wiki pages (for passes that reference
+    // the page by frontmatter id like `wiki-source-<slug>`).
+    if let Some(rest) = id.strip_prefix("wiki-source-") {
+        if wiki_page_slugs.contains(rest) {
+            return Some(format!("wiki-page-{rest}"));
+        }
+    }
+
+    // Source document short ids (e.g. `src-abc123`) appear in source_summary
+    // build records' input_ids directly.
+    if doc_ids.contains(id) {
+        return Some(format!("source-document-{id}"));
+    }
+
+    // Fallback: exact slug match against known wiki pages or concepts.
+    if wiki_page_slugs.contains(id) {
+        return Some(format!("wiki-page-{id}"));
+    }
+    if concept_slugs.contains(id) {
+        return Some(format!("concept-{id}"));
+    }
+
+    None
 }
 
 struct PerDocumentReport {
@@ -1727,6 +1978,87 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2,
             "second compile must not call summarize again"
+        );
+    }
+
+    /// bn-3w0: after a successful compile, `state/graph.json` must exist and
+    /// contain nodes under the prefixes that `gather_status` and `run_inspect`
+    /// count. Without this the CLI always reported zero wiki pages/concepts.
+    #[test]
+    fn compile_persists_graph_json_with_prefixed_nodes() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody A"))
+            .expect("write doc-a");
+        write_normalized_document(root, &test_doc("doc-b", "# Beta\nBody B"))
+            .expect("write doc-b");
+
+        let adapter = RecordingAdapter::default();
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+            },
+            Some(&adapter),
+        )
+        .expect("compile with LLM");
+
+        let graph_path = Graph::graph_path(root);
+        assert!(
+            graph_path.exists(),
+            "compile must persist state/graph.json (found nothing at {})",
+            graph_path.display()
+        );
+
+        let graph = Graph::load_from(root).expect("load persisted graph");
+
+        let source_nodes: Vec<&String> = graph
+            .nodes
+            .keys()
+            .filter(|k| k.starts_with("source-document-"))
+            .collect();
+        assert_eq!(
+            source_nodes.len(),
+            2,
+            "expected 2 source-document nodes, got {source_nodes:?}"
+        );
+
+        let wiki_nodes: Vec<&String> = graph
+            .nodes
+            .keys()
+            .filter(|k| k.starts_with("wiki-page-"))
+            .collect();
+        assert_eq!(
+            wiki_nodes.len(),
+            2,
+            "expected 2 wiki-page nodes, got {wiki_nodes:?}"
+        );
+
+        let has_concept_node = graph
+            .nodes
+            .keys()
+            .any(|k| k.starts_with("concept-"));
+        assert!(
+            has_concept_node,
+            "expected at least one concept node after merge; graph: {:?}",
+            graph.nodes.keys().collect::<Vec<_>>()
+        );
+
+        // Each source document should link to its rendered wiki page so
+        // `kb inspect <wiki-page-slug>` can trace back to the source.
+        let src_a = graph
+            .nodes
+            .get("source-document-doc-a")
+            .expect("source-document-doc-a node present");
+        assert!(
+            src_a.outputs.iter().any(|o| o == "wiki-page-doc-a"),
+            "source-document-doc-a must connect to wiki-page-doc-a; outputs: {:?}",
+            src_a.outputs
         );
     }
 
