@@ -166,8 +166,25 @@ fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// How often to emit a "still waiting" progress line while blocked on the
+/// root lock. The interval is intentionally short enough that users and
+/// supervising agents see the lock isn't dead, but long enough to avoid
+/// drowning stderr.
+const WAIT_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
 impl KbLock {
     pub fn acquire(root: &Path, command: &str, timeout: Duration) -> Result<Self> {
+        Self::acquire_with_progress(root, command, timeout, &mut io::stderr())
+    }
+
+    /// Like [`acquire`], but emits wait-progress lines to the provided
+    /// `progress` sink instead of process stderr. Primarily for tests.
+    pub fn acquire_with_progress<W: Write>(
+        root: &Path,
+        command: &str,
+        timeout: Duration,
+        progress: &mut W,
+    ) -> Result<Self> {
         let locks_root = locks_dir(root);
         fs::create_dir_all(&locks_root)
             .with_context(|| format!("create locks dir {}", locks_root.display()))?;
@@ -182,7 +199,9 @@ impl KbLock {
             .open(&lock_path)
             .with_context(|| format!("open root lock file {}", lock_path.display()))?;
 
-        let deadline = Instant::now() + timeout;
+        let wait_start = Instant::now();
+        let deadline = wait_start + timeout;
+        let mut last_progress_at: Option<Instant> = None;
         loop {
             match file.try_lock_exclusive() {
                 Ok(()) => {
@@ -205,7 +224,29 @@ impl KbLock {
                     if reap_stale_metadata(&metadata_path) {
                         continue;
                     }
-                    if Instant::now() >= deadline {
+
+                    let now = Instant::now();
+                    // Emit the first progress line on the very first WouldBlock
+                    // so users immediately know the command is blocked, then
+                    // re-emit every WAIT_PROGRESS_INTERVAL to show it's still
+                    // waiting (and not hung).
+                    let should_emit = last_progress_at
+                        .is_none_or(|prev| now.duration_since(prev) >= WAIT_PROGRESS_INTERVAL);
+                    if should_emit {
+                        let elapsed_secs = now.duration_since(wait_start).as_secs();
+                        let holder = match load_lock_metadata(&metadata_path) {
+                            Ok(m) => format!("{} pid={}", m.command, m.pid),
+                            Err(_) => "unknown".to_string(),
+                        };
+                        let _ = writeln!(
+                            progress,
+                            "waiting for KB root lock (held by {holder}, {elapsed_secs}s elapsed)"
+                        );
+                        let _ = progress.flush();
+                        last_progress_at = Some(now);
+                    }
+
+                    if now >= deadline {
                         // Re-check one last time before building the error so
                         // the message reflects whether the holder is actually
                         // alive right now.
@@ -444,6 +485,37 @@ mod tests {
         assert_ne!(fresh.pid, dead_pid);
 
         drop(lock);
+    }
+
+    /// While blocked on the lock, `acquire` must print at least one
+    /// "waiting for KB root lock" line to its progress sink. This regression
+    /// guards bn-2pk: before the fix, users got an instant 5s-timeout error
+    /// with no indication the command was blocked.
+    #[test]
+    fn acquire_emits_wait_progress_message_while_blocked() {
+        let dir = tempdir().expect("tempdir");
+        let _holder =
+            KbLock::acquire(dir.path(), "compile", Duration::from_secs(1)).expect("first lock");
+
+        let mut captured: Vec<u8> = Vec::new();
+        let err = KbLock::acquire_with_progress(
+            dir.path(),
+            "lint",
+            Duration::from_millis(100),
+            &mut captured,
+        )
+        .expect_err("should time out");
+        assert!(err.to_string().contains("timed out waiting for KB root lock"));
+
+        let out = String::from_utf8(captured).expect("utf8");
+        assert!(
+            out.contains("waiting for KB root lock"),
+            "expected wait progress line, got: {out:?}"
+        );
+        assert!(
+            out.contains("compile"),
+            "progress line should name holder command, got: {out:?}"
+        );
     }
 
     /// If the advisory lock is held by a live process AND the recorded pid is

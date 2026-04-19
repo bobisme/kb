@@ -324,7 +324,14 @@ pub struct LockConfig {
 
 impl Default for LockConfig {
     fn default() -> Self {
-        Self { timeout_ms: 5_000 }
+        // 10 minutes. A single LLM round-trip can take tens of seconds, and
+        // `kb compile` over a large corpus can hold the lock for minutes, so a
+        // short timeout (e.g. 5s) causes overlapping commands to fail
+        // immediately. 10 minutes is long enough to ride out realistic
+        // workloads without hanging forever on a truly stuck holder.
+        Self {
+            timeout_ms: 600_000,
+        }
     }
 }
 
