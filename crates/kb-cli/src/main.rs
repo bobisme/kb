@@ -1048,16 +1048,23 @@ fn run_ingest(root: &Path, sources: &[String], json: bool, dry_run: bool) -> Res
     }
 
     for item in &results {
-        let prefix = if dry_run { "would" } else { "status" };
+        let tag = if dry_run {
+            format!("[would-{}]", outcome_tag(item.outcome))
+        } else {
+            format!("[{}]", outcome_tag(item.outcome))
+        };
+        println!("{tag}  {}", item.input);
         println!(
-            "{prefix} {} {} {} {} {} {}",
-            outcome_label(item.outcome),
-            item.source_kind,
-            item.input,
-            item.source_document_id,
-            item.source_revision_id,
-            item.content_path.display()
+            "  src:        {}  rev: {}",
+            item.source_document_id, item.source_revision_id
         );
+        if !matches!(item.outcome, kb_ingest::IngestOutcome::Skipped) {
+            println!("  saved:      {}", item.content_path.display());
+            println!(
+                "  normalized: {}",
+                normalized_dir_for(item).display()
+            );
+        }
     }
     println!(
         "Summary: {} total | {} new sources | {} new revisions | {} skipped",
@@ -1065,6 +1072,18 @@ fn run_ingest(root: &Path, sources: &[String], json: bool, dry_run: bool) -> Res
     );
 
     Ok(())
+}
+
+fn normalized_dir_for(item: &IngestResult) -> PathBuf {
+    if item.source_kind == "url" {
+        // For URL ingest, content_path already points into normalized/<id>/...
+        // Report the directory containing it.
+        item.content_path
+            .parent()
+            .map_or_else(|| item.content_path.clone(), Path::to_path_buf)
+    } else {
+        PathBuf::from("normalized").join(&item.source_document_id)
+    }
 }
 
 fn summarize_ingest(results: &[IngestResult]) -> IngestSummary {
@@ -1082,10 +1101,10 @@ fn summarize_ingest(results: &[IngestResult]) -> IngestSummary {
     summary
 }
 
-const fn outcome_label(outcome: kb_ingest::IngestOutcome) -> &'static str {
+const fn outcome_tag(outcome: kb_ingest::IngestOutcome) -> &'static str {
     match outcome {
-        kb_ingest::IngestOutcome::NewSource => "new_source",
-        kb_ingest::IngestOutcome::NewRevision => "new_revision",
+        kb_ingest::IngestOutcome::NewSource => "new-source",
+        kb_ingest::IngestOutcome::NewRevision => "new-revision",
         kb_ingest::IngestOutcome::Skipped => "skipped",
     }
 }
