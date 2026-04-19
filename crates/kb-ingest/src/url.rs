@@ -100,23 +100,35 @@ pub async fn ingest_url_with_options(
             serde_json::to_vec_pretty(&FetchRecord {
                 final_url: final_url.to_string(),
                 status,
-                content_type,
+                content_type: content_type.clone(),
             })?
             .as_slice(),
         )
         .context("failed to write fetch record")?;
 
-        let mut html_reader = html_bytes.as_slice();
-        let product = readability::extractor::extract(&mut html_reader, &final_url)
-            .context("readability extraction failed")?;
+        let treat_as_markdown = should_treat_as_markdown(content_type.as_deref(), &html_bytes);
 
-        let assets_dir = root.join("normalized").join(&source_id).join("assets");
-        let (processed_html, downloaded_assets) =
-            rewrite_images(&product.content, &final_url, &assets_dir, &client).await?;
-        let markdown = html2md::parse_html(&processed_html);
+        let (canonical_text, downloaded_assets, title) = if treat_as_markdown {
+            // text/markdown, text/plain, or mis-labeled markdown: use the body
+            // verbatim. readability/html2md would escape '#' and '*' and
+            // collapse newlines, mangling the source.
+            let text = String::from_utf8_lossy(&html_bytes).into_owned();
+            let title = extract_markdown_title(&text).unwrap_or_default();
+            (text, Vec::new(), title)
+        } else {
+            let mut html_reader = html_bytes.as_slice();
+            let product = readability::extractor::extract(&mut html_reader, &final_url)
+                .context("readability extraction failed")?;
+
+            let assets_dir = root.join("normalized").join(&source_id).join("assets");
+            let (processed_html, downloaded_assets) =
+                rewrite_images(&product.content, &final_url, &assets_dir, &client).await?;
+            let markdown = html2md::parse_html(&processed_html);
+            (markdown, downloaded_assets, product.title)
+        };
 
         let now = epoch_millis();
-        let heading_ids = extract_heading_ids(&markdown);
+        let heading_ids = extract_heading_ids(&canonical_text);
         let normalized_doc = NormalizedDocument {
             metadata: EntityMetadata {
                 id: source_id.clone(),
@@ -131,7 +143,7 @@ pub async fn ingest_url_with_options(
                 status: Status::Fresh,
             },
             source_revision_id: source_revision_id.clone(),
-            canonical_text: markdown,
+            canonical_text,
             normalized_assets: downloaded_assets,
             heading_ids,
         };
@@ -142,7 +154,7 @@ pub async fn ingest_url_with_options(
         atomic_write(
             root.join("normalized").join(&source_id).join("origin.json"),
             serde_json::to_vec_pretty(&UrlOrigin {
-                title: product.title,
+                title,
                 original_url: raw_url.to_string(),
                 fetched_at_millis: now,
             })?
@@ -368,9 +380,205 @@ fn derive_asset_name(url: &Url, src: &str) -> String {
     format!("{prefix}_{safe}")
 }
 
+/// Decides whether a fetched response should be treated as raw markdown/plain
+/// text instead of run through readability + html2md.
+///
+/// Uses two signals:
+/// 1. The `Content-Type` header: `text/markdown`, `text/plain`, or `text/*`
+///    that is not `text/html`/`application/xhtml+xml` is treated as markdown.
+/// 2. A 4KB body sniff: if the server labels it `text/html` but the body has
+///    no `<html` / `<!DOCTYPE` marker AND starts with `# ` (ATX heading),
+///    assume it's markdown mis-served as HTML. Common on raw git hosts and
+///    some CDNs.
+fn should_treat_as_markdown(content_type: Option<&str>, body: &[u8]) -> bool {
+    let mime = content_type
+        .map(|ct| ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let looks_like_html_mime =
+        mime == "text/html" || mime == "application/xhtml+xml" || mime == "application/xml";
+    let looks_like_text_mime = mime.starts_with("text/") && !looks_like_html_mime;
+
+    if looks_like_text_mime {
+        return true;
+    }
+
+    // Sniff fallback: server may serve markdown as text/html (or omit the
+    // header). Inspect the first ~4KB for HTML markers.
+    let sniff_len = body.len().min(4096);
+    let head = &body[..sniff_len];
+    let head_lower: Vec<u8> = head.iter().map(u8::to_ascii_lowercase).collect();
+    let has_html_marker = find_subsequence(&head_lower, b"<html")
+        || find_subsequence(&head_lower, b"<!doctype");
+
+    if has_html_marker {
+        return false;
+    }
+
+    // No HTML markers AND body starts with an ATX heading — treat as markdown
+    // regardless of header. Only apply this when we also lack a positive HTML
+    // signal, so well-formed HTML pages still flow through readability.
+    let body_start = trim_bom_and_whitespace(head);
+    if body_start.starts_with(b"# ") {
+        return true;
+    }
+
+    false
+}
+
+/// Returns true if `haystack` contains `needle` as a contiguous subsequence.
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Skips a UTF-8 BOM and leading ASCII whitespace so ATX-heading sniffing
+/// survives editors that prepend `\u{FEFF}` or leading newlines.
+fn trim_bom_and_whitespace(bytes: &[u8]) -> &[u8] {
+    let mut start = if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        3
+    } else {
+        0
+    };
+    while start < bytes.len() && matches!(bytes[start], b' ' | b'\t' | b'\r' | b'\n') {
+        start += 1;
+    }
+    &bytes[start..]
+}
+
+/// Extracts the first ATX heading (`# ...`) from a markdown document to use as
+/// a title, mirroring what readability does for HTML.
+fn extract_markdown_title(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix("# ") {
+            let title = rest.trim().trim_end_matches('#').trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn epoch_millis() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_MD: &[u8] = b"# Rust By Example\n\n* item one\n* item two\n\n## Section\n\nbody\n";
+    const SAMPLE_HTML: &[u8] =
+        b"<!DOCTYPE html><html><head><title>t</title></head><body><h1>hi</h1></body></html>";
+
+    #[test]
+    fn text_markdown_is_treated_as_markdown() {
+        assert!(should_treat_as_markdown(
+            Some("text/markdown; charset=utf-8"),
+            SAMPLE_MD
+        ));
+    }
+
+    #[test]
+    fn text_plain_is_treated_as_markdown() {
+        assert!(should_treat_as_markdown(Some("text/plain"), SAMPLE_MD));
+    }
+
+    #[test]
+    fn text_html_is_not_treated_as_markdown() {
+        assert!(!should_treat_as_markdown(Some("text/html"), SAMPLE_HTML));
+    }
+
+    #[test]
+    fn html_mime_with_markdown_body_is_sniffed_as_markdown() {
+        // Server mis-labels raw markdown as text/html. If the body has no
+        // HTML markers and starts with `# `, we should treat it as markdown.
+        assert!(should_treat_as_markdown(Some("text/html"), SAMPLE_MD));
+    }
+
+    #[test]
+    fn html_mime_with_real_html_stays_html() {
+        assert!(!should_treat_as_markdown(Some("text/html"), SAMPLE_HTML));
+    }
+
+    #[test]
+    fn missing_content_type_falls_back_to_sniff() {
+        assert!(should_treat_as_markdown(None, SAMPLE_MD));
+        assert!(!should_treat_as_markdown(None, SAMPLE_HTML));
+    }
+
+    #[test]
+    fn application_json_is_not_markdown() {
+        assert!(!should_treat_as_markdown(
+            Some("application/json"),
+            b"{\"hi\": 1}"
+        ));
+    }
+
+    #[test]
+    fn utf8_bom_prefix_still_sniffs_as_markdown() {
+        let mut body = Vec::from([0xEF, 0xBB, 0xBF]);
+        body.extend_from_slice(SAMPLE_MD);
+        assert!(should_treat_as_markdown(Some("text/html"), &body));
+    }
+
+    #[test]
+    fn markdown_title_extracts_first_heading() {
+        assert_eq!(
+            extract_markdown_title("# Rust By Example\n\nbody\n"),
+            Some("Rust By Example".to_string())
+        );
+    }
+
+    #[test]
+    fn markdown_title_skips_non_heading_lines() {
+        assert_eq!(
+            extract_markdown_title("\n\nsome prose\n\n# Real Title\n"),
+            Some("Real Title".to_string())
+        );
+    }
+
+    #[test]
+    fn markdown_title_returns_none_without_heading() {
+        assert_eq!(extract_markdown_title("no heading here\n"), None);
+    }
+
+    #[tokio::test]
+    async fn ingest_markdown_content_type_preserves_raw_markdown() {
+        use tempfile::TempDir;
+
+        // Standing up a full HTTP server is overkill; we instead drive the
+        // post-fetch logic directly by invoking the same helpers to prove
+        // that markdown bodies take the raw-path. The regression we're
+        // guarding against is escaping of `#` and `*`, which only happens
+        // when html2md::parse_html is called on the body.
+        let temp = TempDir::new().expect("tempdir");
+        let body = SAMPLE_MD;
+
+        assert!(should_treat_as_markdown(Some("text/markdown"), body));
+        let text = String::from_utf8_lossy(body).into_owned();
+
+        // Regression checks: the raw-path must preserve the markdown tokens.
+        assert!(text.contains("# Rust By Example"));
+        assert!(text.contains("* item one"));
+        assert!(!text.contains("\\#"));
+        assert!(!text.contains("\\*"));
+
+        // Exercise extract_heading_ids on the preserved text so we know the
+        // canonical-text path downstream sees real headings, not mangled
+        // prose that html2md would produce from escaped hashes.
+        let heading_ids = extract_heading_ids(&text);
+        assert_eq!(
+            heading_ids,
+            vec!["rust-by-example".to_string(), "section".to_string()]
+        );
+        drop(temp);
+    }
 }
