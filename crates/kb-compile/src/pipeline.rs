@@ -183,6 +183,52 @@ fn compile_template_hash(root: &Path) -> String {
     hash_many(&refs).to_hex()
 }
 
+/// Key used in `HashState.hashes` for the global `concept_merge` fingerprint.
+/// Not a valid node id (contains ':'), so it cannot collide with per-doc keys.
+const CONCEPT_MERGE_FINGERPRINT_KEY: &str = "concept_merge:global";
+
+/// Compute a fingerprint over the concept-merge pass inputs: the sorted
+/// blake3 hashes of every candidate JSON in `state/concept_candidates/` and
+/// the hash of the merge prompt template. When this is unchanged across
+/// compiles, re-running the merge LLM call is wasteful, so the pipeline
+/// short-circuits.
+///
+/// Returns an empty string when there are no candidates (caller already
+/// short-circuits on empty candidates separately).
+fn compute_concept_merge_fingerprint(root: &Path) -> Result<String> {
+    let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
+    let mut candidate_hashes: Vec<String> = Vec::new();
+    if candidates_dir.exists() {
+        for entry in std::fs::read_dir(&candidates_dir)
+            .with_context(|| format!("read {}", candidates_dir.display()))?
+        {
+            let entry = entry?;
+            if entry.file_type()?.is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some("json")
+            {
+                let bytes = std::fs::read(entry.path())
+                    .with_context(|| format!("read {}", entry.path().display()))?;
+                candidate_hashes.push(hash_bytes(&bytes).to_hex());
+            }
+        }
+    }
+    candidate_hashes.sort();
+
+    let template_hash = kb_llm::Template::load("merge_concept_candidates.md", Some(root))
+        .map(|t| t.template_hash.to_hex())
+        .unwrap_or_default();
+
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for h in &candidate_hashes {
+        parts.push(h.clone().into_bytes());
+        parts.push(b"\0".to_vec());
+    }
+    parts.push(b"template=".to_vec());
+    parts.push(template_hash.into_bytes());
+    let refs: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+    Ok(hash_many(&refs).to_hex())
+}
+
 fn build_input_nodes(
     root: &Path,
     doc_ids: &[String],
@@ -244,11 +290,33 @@ pub fn run_compile_with_llm(
     let total_sources = doc_ids.len();
 
     // Stale detection on normalized documents. We keep the full StaleReport so the
-    // per-document LLM passes below can iterate the stale doc IDs.
-    let (stale_sources, stale_doc_ids, hash_state) = if total_sources == 0 {
+    // per-document LLM passes below can iterate the stale doc IDs. We also
+    // carry the previous concept_merge fingerprint forward into the new
+    // state map so it survives a persist even when no per-doc pass ran.
+    let previous_merge_fingerprint: Option<String>;
+    let (stale_sources, stale_doc_ids, mut hash_state) = if total_sources == 0 {
+        previous_merge_fingerprint = HashState::load_from_root(root)
+            .ok()
+            .and_then(|s| s.hashes.get(CONCEPT_MERGE_FINGERPRINT_KEY).cloned());
         (0, Vec::new(), None)
     } else {
-        let previous = HashState::load_from_root(root)?;
+        let raw_previous = HashState::load_from_root(root)?;
+        previous_merge_fingerprint = raw_previous
+            .hashes
+            .get(CONCEPT_MERGE_FINGERPRINT_KEY)
+            .cloned();
+        // Filter out non-node keys (e.g. "concept_merge:global") before running
+        // stale detection — they would otherwise be reported as "changed" on
+        // every compile because detect_stale rebuilds current_state from doc
+        // nodes only.
+        let previous = HashState {
+            hashes: raw_previous
+                .hashes
+                .iter()
+                .filter(|(k, _)| !k.contains(':'))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
         let tmpl_hash = compile_template_hash(root);
         let nodes = build_input_nodes(root, &doc_ids, &tmpl_hash)?;
 
@@ -275,7 +343,15 @@ pub fn run_compile_with_llm(
             .iter()
             .filter_map(|node_id| node_id.strip_prefix("normalized/").map(str::to_string))
             .collect();
-        (count, ids, Some(report.current_state))
+        let mut current_state = report.current_state;
+        // Preserve prior merge fingerprint so a save after skipping merge
+        // (or after a no-op compile) doesn't drop it.
+        if let Some(prev) = &previous_merge_fingerprint {
+            current_state
+                .hashes
+                .insert(CONCEPT_MERGE_FINGERPRINT_KEY.to_string(), prev.clone());
+        }
+        (count, ids, Some(current_state))
     };
 
     if options.dry_run {
@@ -392,24 +468,67 @@ pub fn run_compile_with_llm(
         }
 
         // Global concept merge (reads all candidate JSONs so prior-run candidates still count).
-        match run_concept_merge_from_state(root, adapter, options) {
-            Ok(report) => {
-                build_records_emitted += report.build_records_emitted;
-                passes.push((
-                    "concept_merge".to_string(),
-                    PassStatus::Executed {
-                        affected: report.pages_written + report.reviews_written,
-                    },
-                ));
-            }
-            Err(err) => {
-                tracing::warn!("concept merge pass failed: {err}");
-                passes.push((
-                    "concept_merge".to_string(),
-                    PassStatus::Skipped {
-                        reason: format!("error: {err}"),
-                    },
-                ));
+        // Short-circuit when candidates + template haven't changed since the
+        // last successful merge — the LLM call is 80s+ for real corpora and
+        // would produce identical output. bn-1op.
+        let new_merge_fingerprint = compute_concept_merge_fingerprint(root).ok();
+        let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
+        let has_candidates = candidates_dir.exists()
+            && std::fs::read_dir(&candidates_dir)
+                .map(|it| {
+                    it.flatten().any(|e| {
+                        e.path().extension().and_then(|s| s.to_str()) == Some("json")
+                    })
+                })
+                .unwrap_or(false);
+        let fingerprint_matches = !options.force
+            && has_candidates
+            && match (&new_merge_fingerprint, &previous_merge_fingerprint) {
+                (Some(new), Some(prev)) => new == prev,
+                _ => false,
+            };
+
+        if fingerprint_matches {
+            emit_event(options, "  [skip] concept_merge — no candidate changes");
+            passes.push((
+                "concept_merge".to_string(),
+                PassStatus::Skipped {
+                    reason: "no candidate changes".to_string(),
+                },
+            ));
+        } else {
+            match run_concept_merge_from_state(root, adapter, options) {
+                Ok(report) => {
+                    build_records_emitted += report.build_records_emitted;
+                    // Persist the fingerprint so the next compile can skip
+                    // the merge when nothing changed. Only update when the
+                    // merge actually produced something (pages or reviews),
+                    // otherwise fall back to the prior value so a degenerate
+                    // zero-candidate run doesn't wipe the record.
+                    if report.pages_written + report.reviews_written > 0
+                        && let (Some(fp), Some(state)) =
+                            (&new_merge_fingerprint, hash_state.as_mut())
+                    {
+                        state
+                            .hashes
+                            .insert(CONCEPT_MERGE_FINGERPRINT_KEY.to_string(), fp.clone());
+                    }
+                    passes.push((
+                        "concept_merge".to_string(),
+                        PassStatus::Executed {
+                            affected: report.pages_written + report.reviews_written,
+                        },
+                    ));
+                }
+                Err(err) => {
+                    tracing::warn!("concept merge pass failed: {err}");
+                    passes.push((
+                        "concept_merge".to_string(),
+                        PassStatus::Skipped {
+                            reason: format!("error: {err}"),
+                        },
+                    ));
+                }
             }
         }
     } else if !stale_doc_ids.is_empty() {
@@ -1821,6 +1940,128 @@ mod tests {
         let without = CompileOptions::default();
         let rendered = format!("{without:?}");
         assert!(rendered.contains("log_sink: None"), "got {rendered}");
+    }
+
+    /// bn-1op: second compile on an unchanged corpus must not re-run the
+    /// merge LLM pass. The first compile writes candidates + records the
+    /// fingerprint; the second must see a matching fingerprint and skip.
+    #[test]
+    fn concept_merge_skipped_when_candidates_unchanged() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody A")).expect("write");
+
+        let adapter = RecordingAdapter::default();
+        let options = CompileOptions::default();
+
+        run_compile_with_llm(root, &options, Some(&adapter)).expect("first compile");
+        assert_eq!(
+            adapter
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first compile must run merge exactly once"
+        );
+
+        let state = HashState::load_from_root(root).expect("load state");
+        assert!(
+            state.hashes.contains_key(CONCEPT_MERGE_FINGERPRINT_KEY),
+            "first compile must persist merge fingerprint; got {:?}",
+            state.hashes.keys().collect::<Vec<_>>()
+        );
+
+        let report = run_compile_with_llm(root, &options, Some(&adapter)).expect("second compile");
+        assert_eq!(
+            adapter
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second compile must skip merge (no candidate changes)"
+        );
+        let merge_entry = report
+            .passes
+            .iter()
+            .find(|(n, _)| n == "concept_merge")
+            .expect("concept_merge entry");
+        match &merge_entry.1 {
+            PassStatus::Skipped { reason } => {
+                assert!(
+                    reason.contains("no candidate changes"),
+                    "unexpected skip reason: {reason}"
+                );
+            }
+            other => panic!("expected Skipped, got {other:?}"),
+        }
+    }
+
+    /// Adding a new candidate JSON between runs must invalidate the
+    /// fingerprint so merge runs again.
+    #[test]
+    fn concept_merge_runs_when_new_candidate_added() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody A")).expect("write");
+
+        let adapter = RecordingAdapter::default();
+        let options = CompileOptions::default();
+        run_compile_with_llm(root, &options, Some(&adapter)).expect("first compile");
+        assert_eq!(
+            adapter.merge_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // Drop a fresh candidate file into the candidates dir.
+        let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
+        std::fs::write(
+            candidates_dir.join("injected.json"),
+            r#"[{"name":"Novelty","aliases":[],"definition_hint":null,"source_anchors":[]}]"#,
+        )
+        .expect("write injected candidate");
+
+        run_compile_with_llm(root, &options, Some(&adapter)).expect("second compile");
+        assert_eq!(
+            adapter.merge_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "adding a candidate file must trigger merge"
+        );
+    }
+
+    /// Changing the merge prompt template between runs must invalidate the
+    /// fingerprint so merge runs again.
+    #[test]
+    fn concept_merge_runs_when_template_changes() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody A")).expect("write");
+
+        let adapter = RecordingAdapter::default();
+        let options = CompileOptions::default();
+        run_compile_with_llm(root, &options, Some(&adapter)).expect("first compile");
+
+        // Override the merge template under prompts/ (Template::load checks
+        // root-level overrides first).
+        let prompts_dir = root.join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("create prompts");
+        std::fs::write(
+            prompts_dir.join("merge_concept_candidates.md"),
+            "NEW MERGE TEMPLATE: {{candidates}}",
+        )
+        .expect("write template");
+
+        run_compile_with_llm(root, &options, Some(&adapter)).expect("second compile");
+        assert!(
+            adapter
+                .merge_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2,
+            "template change must trigger merge"
+        );
     }
 
     #[test]
