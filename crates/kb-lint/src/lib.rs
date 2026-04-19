@@ -110,6 +110,7 @@ pub enum IssueKind {
     FrontmatterBuildRecordMissing,
     BuildRecordOutputMissing,
     MissingCitations,
+    InvalidFrontmatter,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,8 +591,23 @@ struct NormalizedMetadata {
 fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
     let mut issues = Vec::new();
     for page in markdown_files_under(&root.join("wiki"))? {
-        let (frontmatter, _) = read_frontmatter(&page)
-            .with_context(|| format!("read frontmatter for {}", page.display()))?;
+        let (frontmatter, _) = match read_frontmatter(&page) {
+            Ok(v) => v,
+            Err(err) => {
+                issues.push(LintIssue {
+                    kind: IssueKind::InvalidFrontmatter,
+                    severity: IssueSeverity::Error,
+                    referring_page: relative_to_root(root, &page)
+                        .to_string_lossy()
+                        .into_owned(),
+                    line: 0,
+                    target: String::new(),
+                    message: format!("invalid YAML frontmatter: {err}"),
+                    suggested_fix: None,
+                });
+                continue;
+            }
+        };
 
         let doc_ids =
             frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
@@ -732,8 +748,23 @@ fn detect_stale_artifacts(root: &Path) -> Result<Vec<LintIssue>> {
     }
 
     for page in markdown_files_under(&root.join("wiki"))? {
-        let (frontmatter, _) = read_frontmatter(&page)
-            .with_context(|| format!("read frontmatter for {}", page.display()))?;
+        let (frontmatter, _) = match read_frontmatter(&page) {
+            Ok(v) => v,
+            Err(err) => {
+                issues.push(LintIssue {
+                    kind: IssueKind::InvalidFrontmatter,
+                    severity: IssueSeverity::Error,
+                    referring_page: relative_to_root(root, &page)
+                        .to_string_lossy()
+                        .into_owned(),
+                    line: 0,
+                    target: String::new(),
+                    message: format!("invalid YAML frontmatter: {err}"),
+                    suggested_fix: None,
+                });
+                continue;
+            }
+        };
         let Some(build_record_id) = frontmatter_string(&frontmatter, "build_record_id") else {
             continue;
         };
@@ -846,8 +877,23 @@ fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<Lin
     for page in markdown_files_under(&root.join(WIKI_DIR))? {
         let raw = fs::read_to_string(&page)
             .with_context(|| format!("read wiki page {}", page.display()))?;
-        let (frontmatter, body) = read_frontmatter(&page)
-            .with_context(|| format!("read frontmatter for {}", page.display()))?;
+        let (frontmatter, body) = match read_frontmatter(&page) {
+            Ok(v) => v,
+            Err(err) => {
+                issues.push(LintIssue {
+                    kind: IssueKind::InvalidFrontmatter,
+                    severity: IssueSeverity::Error,
+                    referring_page: relative_to_root(root, &page)
+                        .to_string_lossy()
+                        .into_owned(),
+                    line: 0,
+                    target: String::new(),
+                    message: format!("invalid YAML frontmatter: {err}"),
+                    suggested_fix: None,
+                });
+                continue;
+            }
+        };
         let doc_ids =
             frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
         let rev_ids =
@@ -1160,6 +1206,73 @@ mod tests {
 
         let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
         assert!(report.is_clean(), "expected no issues: {report:?}");
+    }
+
+    #[test]
+    fn invalid_frontmatter_is_reported_and_scan_continues() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+        Manifest::default().save(root).expect("save manifest");
+
+        // Bad frontmatter: unterminated quoted scalar.
+        fs::write(
+            root.join("wiki/concepts/broken.md"),
+            "---\n'a: unterminated\n---\n# Hi\n",
+        )
+        .expect("write broken page");
+
+        // Valid page with a broken wiki-link (broken-links check must still run).
+        fs::write(
+            root.join("wiki/sources/page.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Page\n\nSee [[wiki/concepts/missing]].\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::All).expect("lint should not bail");
+
+        // InvalidFrontmatter reported (once per frontmatter-consuming pass; today
+        // that's orphans, stale-artifacts, and missing-citations).
+        let invalid: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == IssueKind::InvalidFrontmatter)
+            .collect();
+        assert!(
+            !invalid.is_empty(),
+            "expected at least one InvalidFrontmatter issue, got: {:?}",
+            report.issues
+        );
+        for issue in &invalid {
+            assert_eq!(issue.severity, IssueSeverity::Error);
+            assert_eq!(issue.line, 0);
+            assert!(issue.referring_page.ends_with("broken.md"));
+            assert!(issue.message.contains("invalid YAML frontmatter"));
+        }
+
+        // Broken-links check still ran.
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.kind == IssueKind::MissingPage),
+            "broken-links check should still run, issues: {:?}",
+            report.issues
+        );
+
+        // Orphans check still ran (doc-1 is missing).
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.kind == IssueKind::SourceDocumentMissing),
+            "orphans check should still run, issues: {:?}",
+            report.issues
+        );
+
+        // And has_errors is true.
+        assert!(report.has_errors());
     }
 
     #[test]
