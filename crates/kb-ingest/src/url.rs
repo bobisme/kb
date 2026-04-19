@@ -234,7 +234,7 @@ async fn fetch_with_retry(
         match do_fetch(client, url).await {
             Ok(result) => return Ok(result),
             Err(FetchError::Fatal(e)) => {
-                return Err(e).context("fetch failed (non-retryable)");
+                return Err(e).with_context(|| format!("fetch {url} failed (non-retryable)"));
             }
             Err(FetchError::Transient(e)) => {
                 warn!("fetch failed ({e}); retrying in {delay_ms}ms");
@@ -247,7 +247,7 @@ async fn fetch_with_retry(
         .map_err(FetchError::into_error)
         .with_context(|| {
             format!(
-                "fetch failed after {} attempts",
+                "fetch {url} failed after {} attempts",
                 BACKOFF_DELAYS_MS.len() + 1
             )
         })
@@ -264,18 +264,29 @@ async fn do_fetch(
         .context("HTTP request failed")
         .map_err(FetchError::Transient)?;
     let status = resp.status();
+    let reason = status.canonical_reason().unwrap_or("");
     if status.is_server_error() {
         return Err(FetchError::Transient(anyhow::anyhow!(
-            "server error {status}"
+            "HTTP {} {}",
+            status.as_u16(),
+            reason
         )));
     }
     if status.is_client_error() {
-        return Err(FetchError::Fatal(anyhow::anyhow!("HTTP {status}")));
+        return Err(FetchError::Fatal(anyhow::anyhow!(
+            "HTTP {} {}",
+            status.as_u16(),
+            reason
+        )));
     }
     if !status.is_success() {
         // Treat other unexpected non-success statuses (e.g. 3xx that reqwest didn't
         // follow) as fatal to avoid confusing retry storms.
-        return Err(FetchError::Fatal(anyhow::anyhow!("HTTP {status}")));
+        return Err(FetchError::Fatal(anyhow::anyhow!(
+            "HTTP {} {}",
+            status.as_u16(),
+            reason
+        )));
     }
     let final_url = resp.url().clone();
     let content_type = resp
@@ -473,6 +484,9 @@ fn epoch_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::thread;
 
     const SAMPLE_MD: &[u8] = b"# Rust By Example\n\n* item one\n* item two\n\n## Section\n\nbody\n";
     const SAMPLE_HTML: &[u8] =
@@ -548,6 +562,58 @@ mod tests {
     #[test]
     fn markdown_title_returns_none_without_heading() {
         assert_eq!(extract_markdown_title("no heading here\n"), None);
+    }
+
+    #[tokio::test]
+    async fn fetch_404_error_includes_url_and_status_phrase() {
+        // Stub a 404 response and assert the surfaced error message names the
+        // URL and the canonical HTTP reason phrase. Regression guard for
+        // bn-361: prior output was a bare "fetch failed (non-retryable)".
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let address = listener.local_addr().expect("local addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buffer = [0_u8; 1024];
+            let _ = stream.read(&mut buffer).expect("read request");
+            let body = "not found";
+            write!(
+                stream,
+                "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write response");
+        });
+
+        let url = format!("http://{address}/missing");
+        let client = Client::builder()
+            .user_agent(FETCH_UA)
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .build()
+            .expect("build client");
+
+        let err = fetch_with_retry(&client, &url)
+            .await
+            .expect_err("404 should surface as error");
+        server.join().expect("join server");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&url),
+            "error should mention URL; got: {msg}"
+        );
+        assert!(
+            msg.contains("404"),
+            "error should mention HTTP 404 status; got: {msg}"
+        );
+        assert!(
+            msg.contains("Not Found"),
+            "error should include canonical reason phrase; got: {msg}"
+        );
+        assert!(
+            msg.contains("non-retryable"),
+            "4xx path should be non-retryable; got: {msg}"
+        );
     }
 
     #[tokio::test]
