@@ -2186,8 +2186,8 @@ fn print_lint_check_report(
 fn print_lint_issues(issues: &[&kb_lint::LintIssue]) {
     for issue in issues {
         println!(
-            "- [{:?}] {}:{} {} ({})",
-            issue.severity, issue.referring_page, issue.line, issue.message, issue.target
+            "- [{:?}] {}:{} {}",
+            issue.severity, issue.referring_page, issue.line, issue.message
         );
         if let Some(suggested_fix) = &issue.suggested_fix {
             println!("  suggested fix: {suggested_fix}");
