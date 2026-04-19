@@ -9,18 +9,53 @@ concept entries for a knowledge base.
 
 ## Task
 
-Group the candidates by semantic identity. Two candidates refer to the same concept when
-they describe the same idea, even if they use different names, phrasing, or abbreviations.
+Group the candidates into canonical concepts. There are TWO kinds of grouping to perform,
+and both should be applied:
 
-For each group:
-- Choose a `canonical_name` (the clearest, most specific, and most commonly used form).
-- List all `aliases` — alternate names, abbreviations, and common shorthand found across
-  the candidate set. Do not repeat the canonical name in aliases.
-- Include every original candidate object that belongs to the group in `members`.
-- Set `confident: true` when the grouping is unambiguous.
-- Set `confident: false` when you are unsure — this routes the group to human review
-  instead of being silently merged.
-- Include a `rationale` string for uncertain groupings explaining the ambiguity.
+### 1. Semantic identity (near-duplicates)
+
+Two candidates refer to the same concept when they describe the same idea, even if they
+use different names, phrasing, or abbreviations. Group these together.
+
+### 2. Parent / child containment (sub-concept folding)
+
+When one candidate names a MEMBER, INSTANCE, or SPECIFIC CASE of another candidate's
+broader idea, fold the narrower candidate into the broader one instead of leaving them
+as separate concepts. The narrower candidate's name becomes an alias of the parent, and
+its `members` entry is preserved under the parent's group.
+
+Examples of parent / child relationships to fold:
+
+- `edit`, `drop`, `pick`, `squash`, `fixup`, `reword` are each MEMBERS of "git rebase
+  todo actions" — fold them into that parent.
+- "5-second busy timeout default" is a SPECIFIC CASE of "SQLite busy timeout" — fold it.
+- "borrowck" and "borrow checker" are the same concept (semantic identity) — merge by
+  identity, not by containment.
+- "WAL mode on NFS" is a SPECIFIC FAILURE CASE of "SQLite WAL journaling" — fold it.
+
+Rule of thumb for containment: if candidate X would reasonably be explained as "a kind of
+Y" or "an example of Y" or "one of the Ys", prefer folding X into Y. The parent (broader)
+concept becomes the canonical name; the child's name goes into `aliases`.
+
+Do NOT fold sibling concepts together. Two distinct children of the same parent should
+still merge with the PARENT, not with each other. If the parent is not present among the
+candidates, emit ONE merged group named after the parent concept (e.g. "git rebase todo
+actions") rather than leaving six separate children ungrouped.
+
+### For each group, output:
+
+- `canonical_name` — the clearest, most general form that covers every member. When
+  folding children into a parent, this is the parent name.
+- `aliases` — alternate names, abbreviations, shorthand, and folded child names. Do not
+  repeat the canonical name in aliases.
+- `members` — every original candidate object that belongs to the group, whether by
+  semantic identity or by parent/child folding.
+- `confident: true` when the grouping is unambiguous.
+- `confident: false` when you are unsure — this routes the group to human review instead
+  of being silently merged. Prefer routing to review when containment is plausible but
+  not clear-cut.
+- `rationale` — for uncertain groupings, briefly explain the ambiguity (e.g. "X could be
+  a member of Y or an independent concept").
 
 Return only valid JSON in this exact shape — no other text before or after:
 {
