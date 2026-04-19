@@ -99,6 +99,9 @@ enum Command {
         /// Files, directories, or URLs to ingest
         #[arg(required = true)]
         sources: Vec<String>,
+        /// Ingest files even if they are empty or contain only YAML frontmatter
+        #[arg(long)]
+        allow_empty: bool,
     },
     /// Compile the knowledge base
     Compile,
@@ -353,13 +356,13 @@ fn run(cli: Cli) -> Result<()> {
                 execute_mutating_command(Some(ask_root), "ask", action)
             }
         }
-        Some(Command::Ingest { sources }) => {
+        Some(Command::Ingest { sources, allow_empty }) => {
             let ingest_root = root.clone();
             let action = move || {
                 let root = ingest_root
                     .as_deref()
                     .expect("root resolved for non-init commands");
-                run_ingest(root, &sources, cli.json, cli.dry_run)
+                run_ingest(root, &sources, cli.json, cli.dry_run, allow_empty)
             };
 
             if cli.dry_run {
@@ -1022,7 +1025,13 @@ struct IngestSummary {
     skipped: usize,
 }
 
-fn run_ingest(root: &Path, sources: &[String], json: bool, dry_run: bool) -> Result<()> {
+fn run_ingest(
+    root: &Path,
+    sources: &[String],
+    json: bool,
+    dry_run: bool,
+    allow_empty: bool,
+) -> Result<()> {
     let mut urls = Vec::new();
     let mut local_paths = Vec::new();
     for source in sources {
@@ -1034,7 +1043,9 @@ fn run_ingest(root: &Path, sources: &[String], json: bool, dry_run: bool) -> Res
     }
 
     let mut results = Vec::new();
-    for report in kb_ingest::ingest_paths_with_options(root, &local_paths, dry_run)? {
+    for report in
+        kb_ingest::ingest_paths_with_flags(root, &local_paths, dry_run, allow_empty)?
+    {
         results.push(IngestResult {
             input: report.source_path.display().to_string(),
             source_kind: "file",

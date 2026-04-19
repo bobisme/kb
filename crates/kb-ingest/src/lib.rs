@@ -134,6 +134,75 @@ const fn is_text_byte(b: u8) -> bool {
     matches!(b, 0x09 | 0x0A | 0x0C | 0x0D | 0x20..=0x7E) || b >= 0x80
 }
 
+/// Strips a leading YAML frontmatter block (delimited by `---` lines) and
+/// returns the remaining body as a string slice.
+///
+/// If the first non-empty line is not `---`, the whole input is treated as
+/// body. If the opening `---` is present but the closing `---` is missing,
+/// everything after the opener is treated as (malformed) frontmatter and the
+/// returned body is empty — the caller will classify this as empty, which is
+/// the safer default.
+#[must_use]
+fn strip_yaml_frontmatter(text: &str) -> &str {
+    // Skip any leading blank lines before looking for an opening fence.
+    let mut rest = text;
+    loop {
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        if let Some(after_nl) = trimmed.strip_prefix('\n') {
+            rest = after_nl;
+            continue;
+        }
+        if let Some(after_nl) = trimmed.strip_prefix("\r\n") {
+            rest = after_nl;
+            continue;
+        }
+        break;
+    }
+
+    // The opener must be exactly `---` on its own line. Accept CRLF or LF
+    // line endings, and optional trailing whitespace on the fence line.
+    let after_open = rest
+        .strip_prefix("---\n")
+        .or_else(|| rest.strip_prefix("---\r\n"));
+    let Some(after_open) = after_open else {
+        return text;
+    };
+
+    // Find the closing fence. Scan line by line so we match only `---` on its
+    // own line, not `---` appearing inside a YAML scalar.
+    let mut cursor = 0usize;
+    for line in after_open.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if trimmed == "---" {
+            let body_start = cursor + line.len();
+            return &after_open[body_start..];
+        }
+        cursor += line.len();
+    }
+
+    // No closing fence found: treat the remainder as frontmatter and return
+    // an empty body so `is_semantically_empty` classifies the file as empty.
+    ""
+}
+
+/// Returns true if the file's content has no semantically meaningful body
+/// after stripping an optional YAML frontmatter block.
+///
+/// "Semantically empty" means: zero bytes, all-whitespace, or only a
+/// frontmatter block with no body. Invalid-UTF8 content is treated as
+/// non-empty (the binary check will have already handled binary files).
+#[must_use]
+pub fn is_semantically_empty(content: &[u8]) -> bool {
+    if content.is_empty() {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(content) else {
+        return false;
+    };
+    let body = strip_yaml_frontmatter(text);
+    body.chars().all(char::is_whitespace)
+}
+
 /// # Errors
 /// Returns an error if any source path cannot be read, walked, or ingested.
 pub fn ingest_paths(root: &Path, sources: &[PathBuf]) -> Result<Vec<IngestedSource>> {
@@ -150,6 +219,20 @@ pub fn ingest_paths_with_options(
     sources: &[PathBuf],
     dry_run: bool,
 ) -> Result<Vec<LocalIngestReport>> {
+    ingest_paths_with_flags(root, sources, dry_run, false)
+}
+
+/// # Errors
+/// Returns an error if any source path cannot be read, walked, or ingested.
+///
+/// `allow_empty` disables the semantic-emptiness gate: files with no body
+/// content will still be ingested.
+pub fn ingest_paths_with_flags(
+    root: &Path,
+    sources: &[PathBuf],
+    dry_run: bool,
+    allow_empty: bool,
+) -> Result<Vec<LocalIngestReport>> {
     let mut files: Vec<(PathBuf, FileOrigin)> = Vec::new();
     for source in sources {
         collect_files(source, &mut files)?;
@@ -158,7 +241,7 @@ pub fn ingest_paths_with_options(
 
     let mut ingested = Vec::with_capacity(files.len());
     for (file, origin) in files {
-        match ingest_file(root, &file, dry_run, origin) {
+        match ingest_file(root, &file, dry_run, origin, allow_empty) {
             Ok(Some(report)) => ingested.push(report),
             Ok(None) => {}
             Err(err) => return Err(err),
@@ -232,6 +315,7 @@ fn ingest_file(
     source_path: &Path,
     dry_run: bool,
     origin: FileOrigin,
+    allow_empty: bool,
 ) -> Result<Option<LocalIngestReport>> {
     let canonical_source = fs::canonicalize(source_path)
         .with_context(|| format!("failed to canonicalize {}", source_path.display()))?;
@@ -243,6 +327,14 @@ fn ingest_file(
         .with_context(|| format!("failed to read metadata for {}", canonical_source.display()))?;
 
     if !check_text_or_skip(&canonical_source, &content, origin)? {
+        return Ok(None);
+    }
+
+    if !allow_empty && is_semantically_empty(&content) {
+        eprintln!(
+            "warning: skipping empty source {} (use --allow-empty to override)",
+            canonical_source.display()
+        );
         return Ok(None);
     }
 
@@ -758,6 +850,104 @@ mod tests {
 
         assert_eq!(urls, vec!["HTTPS://example.com/foo"]);
         assert_eq!(paths, vec!["./README.md"]);
+    }
+
+    #[test]
+    fn is_semantically_empty_detects_blank_and_frontmatter_only() {
+        // Zero bytes.
+        assert!(is_semantically_empty(b""));
+        // Only whitespace.
+        assert!(is_semantically_empty(b"   \n\t\r\n"));
+        // Only a frontmatter block.
+        assert!(is_semantically_empty(b"---\ntitle: x\n---\n"));
+        // Frontmatter with trailing whitespace-only body.
+        assert!(is_semantically_empty(b"---\ntitle: x\n---\n\n  \n"));
+        // Frontmatter with CRLF line endings.
+        assert!(is_semantically_empty(b"---\r\ntitle: x\r\n---\r\n"));
+        // Frontmatter preceded by blank lines.
+        assert!(is_semantically_empty(b"\n\n---\ntitle: x\n---\n"));
+        // Unterminated frontmatter is treated as empty (defensive default).
+        assert!(is_semantically_empty(b"---\ntitle: x\n"));
+
+        // Non-empty cases.
+        assert!(!is_semantically_empty(b"hello\n"));
+        assert!(!is_semantically_empty(b"---\ntitle: x\n---\nBody text\n"));
+        assert!(!is_semantically_empty(b"# Heading\n"));
+        // A triple-dash in the middle of text is not a frontmatter fence and
+        // does not strip the surrounding body.
+        assert!(!is_semantically_empty(b"Pre\n---\nPost\n"));
+    }
+
+    #[test]
+    fn ingest_skips_empty_file_with_warning() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let file = source_root.path().join("empty.md");
+        fs::write(&file, b"").expect("write empty file");
+
+        let reports = ingest_paths_with_options(kb_root.path(), &[file], false)
+            .expect("ingest succeeds");
+        assert!(reports.is_empty(), "empty file should not be ingested");
+        // No normalized/ or raw/ entries should have been created.
+        assert!(
+            fs::read_dir(kb_root.path().join("raw/inbox"))
+                .expect("read raw inbox")
+                .next()
+                .is_none()
+        );
+        assert!(!kb_root.path().join("normalized").exists());
+    }
+
+    #[test]
+    fn ingest_skips_frontmatter_only_file() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let file = source_root.path().join("only-frontmatter.md");
+        fs::write(&file, b"---\ntitle: x\n---\n").expect("write fm-only file");
+
+        let reports = ingest_paths_with_options(kb_root.path(), &[file], false)
+            .expect("ingest succeeds");
+        assert!(
+            reports.is_empty(),
+            "frontmatter-only file should not be ingested"
+        );
+    }
+
+    #[test]
+    fn ingest_allows_empty_with_flag() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let file = source_root.path().join("empty.md");
+        fs::write(&file, b"").expect("write empty file");
+
+        let reports = ingest_paths_with_flags(kb_root.path(), &[file], false, true)
+            .expect("ingest succeeds with --allow-empty");
+        assert_eq!(reports.len(), 1);
+    }
+
+    #[test]
+    fn ingest_directory_skips_empty_and_keeps_non_empty() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        fs::write(source_root.path().join("notes.md"), "real content\n")
+            .expect("write non-empty file");
+        fs::write(source_root.path().join("blank.md"), b"")
+            .expect("write blank file");
+        fs::write(
+            source_root.path().join("fm-only.md"),
+            b"---\ntitle: x\n---\n",
+        )
+        .expect("write fm-only file");
+
+        let reports = ingest_paths_with_options(
+            kb_root.path(),
+            &[source_root.path().to_path_buf()],
+            false,
+        )
+        .expect("directory ingest succeeds");
+
+        assert_eq!(reports.len(), 1, "only the non-empty file should ingest");
+        assert!(reports[0].ingested.copied_path.ends_with("notes.md"));
     }
 
     #[test]

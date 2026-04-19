@@ -509,6 +509,122 @@ fn ingest_dry_run_makes_no_filesystem_changes() {
     assert_eq!(before, after);
 }
 
+#[test]
+fn ingest_skips_empty_file_with_warning_and_exit_zero() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Zero-byte file.
+    let empty = kb_root.join("empty.md");
+    fs::write(&empty, b"").expect("write empty");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ingest").arg(&empty);
+    let output = cmd.output().expect("run kb ingest on empty");
+
+    assert!(
+        output.status.success(),
+        "kb ingest on empty file should exit 0, got stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: skipping empty source"),
+        "expected emptiness warning on stderr, got: {stderr}"
+    );
+    assert!(
+        !kb_root.join("normalized").exists()
+            || fs::read_dir(kb_root.join("normalized"))
+                .expect("read normalized dir")
+                .next()
+                .is_none(),
+        "no normalized/ entries should be created for an empty source"
+    );
+}
+
+#[test]
+fn ingest_skips_frontmatter_only_file() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let fm = kb_root.join("only-fm.md");
+    fs::write(&fm, "---\ntitle: x\n---\n").expect("write fm-only");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ingest").arg(&fm);
+    let output = cmd.output().expect("run kb ingest on fm-only");
+
+    assert!(output.status.success(), "should exit 0");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: skipping empty source"),
+        "expected emptiness warning, got: {stderr}"
+    );
+}
+
+#[test]
+fn ingest_allow_empty_accepts_zero_byte_file() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let empty = kb_root.join("placeholder.md");
+    fs::write(&empty, b"").expect("write placeholder");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ingest")
+        .arg("--allow-empty")
+        .arg(&empty);
+    let output = cmd.output().expect("run kb ingest --allow-empty");
+
+    assert!(
+        output.status.success(),
+        "kb ingest --allow-empty should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    let items = envelope["data"]["results"]
+        .as_array()
+        .expect("results array");
+    assert_eq!(items.len(), 1, "empty file should be ingested with --allow-empty");
+}
+
+#[test]
+fn ingest_mixed_directory_keeps_non_empty_and_warns_on_empty() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let corpus = kb_root.join("corpus");
+    fs::create_dir_all(&corpus).expect("mkdir");
+    fs::write(corpus.join("good.md"), "# real\n\ncontent\n").expect("write good");
+    fs::write(corpus.join("empty.md"), b"").expect("write empty");
+    fs::write(corpus.join("fm-only.md"), "---\ntitle: x\n---\n").expect("write fm-only");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("ingest").arg(&corpus);
+    let output = cmd.output().expect("run mixed ingest");
+
+    assert!(
+        output.status.success(),
+        "mixed ingest should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.matches("warning: skipping empty source").count() >= 2,
+        "expected two emptiness warnings (empty.md + fm-only.md), got: {stderr}"
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let items = envelope["data"]["results"]
+        .as_array()
+        .expect("results array");
+    assert_eq!(items.len(), 1, "only good.md should be ingested");
+    let content_path = items[0]["content_path"]
+        .as_str()
+        .expect("content_path str");
+    assert!(content_path.ends_with("good.md"), "got: {content_path}");
+}
+
 fn test_metadata(id: &str) -> EntityMetadata {
     EntityMetadata {
         id: id.to_string(),
