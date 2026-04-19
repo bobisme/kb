@@ -381,6 +381,15 @@ fn index_path(root: &Path) -> PathBuf {
     root.join(INDEX_SUBPATH)
 }
 
+/// Returns the filesystem path for the lexical search index under `root`.
+///
+/// The file is written at `state/indexes/lexical.json`. The path is returned
+/// even when the file does not yet exist.
+#[must_use]
+pub fn lexical_index_path(root: &Path) -> PathBuf {
+    index_path(root)
+}
+
 fn scan_wiki_dir(dir: &Path, mut visit: impl FnMut(&Path)) -> Result<()> {
     if !dir.exists() {
         return Ok(());

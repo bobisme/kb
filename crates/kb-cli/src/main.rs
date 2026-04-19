@@ -415,6 +415,9 @@ fn run(cli: Cli) -> Result<()> {
             init::init(root, path, cli.force, reset_config, cli.quiet)
         }
         Some(Command::Search { query, limit }) => {
+            if query.trim().is_empty() {
+                bail!("search: query cannot be empty");
+            }
             let search_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
@@ -425,7 +428,13 @@ fn run(cli: Cli) -> Result<()> {
                 emit_json("search", &results)?;
             } else if results.is_empty() {
                 println!("No results for '{query}'");
-                println!("Tip: run 'kb compile' to build the search index.");
+                if kb_query::lexical_index_path(search_root).exists() {
+                    println!(
+                        "Tip: try a broader query or `kb search --json` for ranking details."
+                    );
+                } else {
+                    println!("Tip: run 'kb compile' to build the search index.");
+                }
             } else {
                 for result in &results {
                     println!("{} [score: {}]", result.title, result.score);

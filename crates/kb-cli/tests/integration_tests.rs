@@ -712,6 +712,93 @@ fn inspect_rejects_whitespace_only_target() {
 }
 
 #[test]
+fn search_rejects_empty_query() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("search").arg("");
+    let output = cmd.output().expect("run kb search with empty query");
+
+    assert!(
+        !output.status.success(),
+        "kb search with empty query unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected stderr to mention 'empty', got: {stderr}"
+    );
+}
+
+#[test]
+fn search_rejects_whitespace_only_query() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("search").arg("   ");
+    let output = cmd
+        .output()
+        .expect("run kb search with whitespace-only query");
+
+    assert!(
+        !output.status.success(),
+        "kb search with whitespace-only query unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected stderr to mention 'empty', got: {stderr}"
+    );
+}
+
+#[test]
+fn search_without_matches_after_compile_omits_compile_tip() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_source_page(
+        &kb_root,
+        "rust-overview",
+        "Rust Overview",
+        "An introduction to the Rust programming language.",
+    );
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    let compile_output = compile_cmd.output().expect("run kb compile");
+    assert!(
+        compile_output.status.success(),
+        "kb compile failed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    // Confirm the lexical index was written.
+    assert!(
+        kb_root.join("state/indexes/lexical.json").exists(),
+        "compile should have produced a lexical index"
+    );
+
+    let mut search_cmd = kb_cmd(&kb_root);
+    search_cmd.arg("search").arg("nonexistentqueryvalue");
+    let output = search_cmd
+        .output()
+        .expect("run kb search for a term with no matches");
+    assert!(output.status.success());
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No results"),
+        "expected zero-result message, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("run 'kb compile'"),
+        "should not suggest running compile after a successful compile: {stdout}"
+    );
+}
+
+#[test]
 fn inspect_missing_target_has_actionable_error() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
