@@ -114,7 +114,7 @@ pub fn run_concept_merge_pass<A: LlmAdapter + ?Sized>(
     };
     let (response, provenance) = adapter.merge_concept_candidates(request)?;
 
-    let concept_pages = build_concept_pages(&response, root);
+    let concept_pages = build_concept_pages(&response, root)?;
     let review_records =
         build_review_records(&response, root, &provenance).map_err(ConceptMergeError::Serialize)?;
     let build_record = build_record_for_merge(
@@ -132,7 +132,10 @@ pub fn run_concept_merge_pass<A: LlmAdapter + ?Sized>(
     })
 }
 
-fn build_concept_pages(response: &MergeConceptCandidatesResponse, root: &Path) -> Vec<ConceptPage> {
+fn build_concept_pages(
+    response: &MergeConceptCandidatesResponse,
+    root: &Path,
+) -> Result<Vec<ConceptPage>, ConceptMergeError> {
     response
         .groups
         .iter()
@@ -154,7 +157,12 @@ fn build_review_records(
         .collect()
 }
 
-fn render_concept_page(group: &MergeGroup, root: &Path) -> ConceptPage {
+fn render_concept_page(
+    group: &MergeGroup,
+    root: &Path,
+) -> Result<ConceptPage, ConceptMergeError> {
+    use serde_yaml::{Mapping, Value};
+
     let slug = slug_from_title(&group.canonical_name);
     let concept_id = format!("concept:{slug}");
     let path = root.join(WIKI_CONCEPTS_DIR).join(format!("{slug}.md"));
@@ -170,33 +178,49 @@ fn render_concept_page(group: &MergeGroup, root: &Path) -> ConceptPage {
         .iter()
         .find_map(|m| m.definition_hint.as_deref());
 
-    let mut content = format!("---\nid: {concept_id}\nname: {}\n", group.canonical_name);
+    let mut fm = Mapping::new();
+    fm.insert(Value::String("id".into()), Value::String(concept_id));
+    fm.insert(
+        Value::String("name".into()),
+        Value::String(group.canonical_name.clone()),
+    );
 
     if !group.aliases.is_empty() {
-        content.push_str("aliases:\n");
-        for alias in &group.aliases {
-            writeln!(content, "  - {alias}").expect("infallible write to String");
-        }
+        let aliases: Vec<Value> = group
+            .aliases
+            .iter()
+            .map(|a| Value::String(a.clone()))
+            .collect();
+        fm.insert(Value::String("aliases".into()), Value::Sequence(aliases));
     }
 
     if !source_anchors.is_empty() {
-        content.push_str("sources:\n");
-        for anchor in &source_anchors {
-            if let Some(heading) = &anchor.heading_anchor {
-                writeln!(content, "  - heading_anchor: {heading}").expect("infallible");
-                if let Some(quote) = &anchor.quote {
-                    let escaped = quote.replace('"', "\\\"");
-                    writeln!(content, "    quote: \"{escaped}\"").expect("infallible");
+        let sources: Vec<Value> = source_anchors
+            .iter()
+            .map(|a| {
+                let mut map = Mapping::new();
+                if let Some(h) = &a.heading_anchor {
+                    map.insert(
+                        Value::String("heading_anchor".into()),
+                        Value::String(h.clone()),
+                    );
                 }
-            } else if let Some(quote) = &anchor.quote {
-                let escaped = quote.replace('"', "\\\"");
-                writeln!(content, "  - quote: \"{escaped}\"").expect("infallible");
-            }
-        }
+                if let Some(q) = &a.quote {
+                    map.insert(Value::String("quote".into()), Value::String(q.clone()));
+                }
+                Value::Mapping(map)
+            })
+            .collect();
+        fm.insert(Value::String("sources".into()), Value::Sequence(sources));
     }
 
-    content.push_str("---\n\n");
-    writeln!(content, "# {}", group.canonical_name).expect("infallible write to String");
+    let frontmatter_yaml = serde_yaml::to_string(&fm)
+        .map_err(|e| ConceptMergeError::Serialize(e.to_string()))?;
+
+    let mut content = format!(
+        "---\n{frontmatter_yaml}---\n\n# {}\n",
+        group.canonical_name
+    );
 
     if let Some(hint) = definition_hint {
         content.push('\n');
@@ -204,13 +228,13 @@ fn render_concept_page(group: &MergeGroup, root: &Path) -> ConceptPage {
         content.push('\n');
     }
 
-    ConceptPage {
+    Ok(ConceptPage {
         slug,
         path,
         content,
         canonical_name: group.canonical_name.clone(),
         aliases: group.aliases.clone(),
-    }
+    })
 }
 
 fn render_review_record(
@@ -667,6 +691,73 @@ mod tests {
         persist_concept_page(&page).expect("persist concept page");
         let written = std::fs::read_to_string(&page.path).expect("read file");
         assert_eq!(written, page.content);
+    }
+
+    #[test]
+    fn yaml_sensitive_aliases_produce_valid_frontmatter() {
+        let dir = tempdir().expect("tempdir");
+        let tricky_aliases = vec![
+            "'a".to_string(),
+            "'static".to_string(),
+            "foo: bar".to_string(),
+            "hash#tag".to_string(),
+            "line\nwith\nnewlines".to_string(),
+        ];
+        let adapter = FakeAdapter {
+            response: MergeConceptCandidatesResponse {
+                groups: vec![MergeGroup {
+                    canonical_name: "Named lifetime parameter".to_string(),
+                    aliases: tricky_aliases.clone(),
+                    members: vec![borrow_checker_candidate()],
+                    confident: true,
+                    rationale: None,
+                }],
+            },
+            provenance: provenance(),
+        };
+
+        let artifact =
+            run_concept_merge_pass(&adapter, vec![borrow_checker_candidate()], dir.path())
+                .expect("run merge pass");
+
+        assert_eq!(artifact.concept_pages.len(), 1);
+        let page = &artifact.concept_pages[0];
+
+        // Extract the frontmatter between the `---` fences and verify it parses.
+        let body = page
+            .content
+            .strip_prefix("---\n")
+            .expect("page starts with frontmatter fence");
+        let end = body.find("\n---\n").expect("closing frontmatter fence");
+        let frontmatter = &body[..=end];
+
+        let parsed: serde_yaml::Mapping =
+            serde_yaml::from_str(frontmatter).expect("frontmatter parses as YAML mapping");
+
+        // Round-trip: every alias we put in must come back out exactly.
+        let aliases = parsed
+            .get(serde_yaml::Value::String("aliases".into()))
+            .and_then(|v| v.as_sequence())
+            .expect("aliases sequence present");
+        let recovered: Vec<String> = aliases
+            .iter()
+            .map(|v| v.as_str().expect("alias is a string").to_string())
+            .collect();
+        assert_eq!(recovered, tricky_aliases);
+
+        // id / name round-trip too.
+        assert_eq!(
+            parsed
+                .get(serde_yaml::Value::String("id".into()))
+                .and_then(|v| v.as_str()),
+            Some("concept:named-lifetime-parameter")
+        );
+        assert_eq!(
+            parsed
+                .get(serde_yaml::Value::String("name".into()))
+                .and_then(|v| v.as_str()),
+            Some("Named lifetime parameter")
+        );
     }
 
     #[test]
