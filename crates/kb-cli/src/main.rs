@@ -57,17 +57,9 @@ struct Cli {
     #[arg(global = true, long)]
     root: Option<PathBuf>,
 
-    /// Output format
-    #[arg(global = true, long, value_parser = ["md", "marp", "json", "png"])]
-    format: Option<String>,
-
     /// LLM model to use
     #[arg(global = true, long)]
     model: Option<String>,
-
-    /// Filter results since a given time
-    #[arg(global = true, long)]
-    since: Option<String>,
 
     /// Perform a dry-run without making changes
     #[arg(global = true, long)]
@@ -80,10 +72,6 @@ struct Cli {
     /// Force operation (overwrite, skip confirmations, etc.)
     #[arg(global = true, long)]
     force: bool,
-
-    /// Enable review mode
-    #[arg(global = true, long)]
-    review: bool,
 
     /// Suppress non-essential output (e.g. post-command hints)
     #[arg(global = true, long)]
@@ -112,6 +100,10 @@ enum Command {
     Ask {
         /// Question to ask (reads from stdin if omitted or "-")
         query: Option<String>,
+
+        /// Artifact format for the answer (md, marp, json, png)
+        #[arg(long, value_parser = ["md", "marp", "json", "png"])]
+        format: Option<String>,
 
         /// Propose promoting the answer into the wiki
         #[arg(long)]
@@ -312,12 +304,11 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             run_doctor_command(root, cli.json, cli.model.as_deref())
         }
-        Some(Command::Ask { query, promote }) => {
+        Some(Command::Ask { query, format, promote }) => {
             let ask_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
             let query = resolve_query(query)?;
-            let format = cli.format.clone();
             let model = cli.model.clone();
             let dry_run = cli.dry_run;
             let json = cli.json;
@@ -2556,13 +2547,10 @@ mod tests {
         let started = Instant::now();
         run(Cli {
             root: Some(root),
-            format: None,
             model: None,
-            since: None,
             dry_run: false,
             json: false,
             force: false,
-            review: false,
             quiet: false,
             command: Some(Command::Status),
         })
