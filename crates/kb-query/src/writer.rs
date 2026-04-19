@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -5,11 +6,12 @@ use serde_yaml::Mapping;
 use serde_yaml::Value;
 
 use kb_core::fs::atomic_write;
-use kb_core::{Artifact, Question};
+use kb_core::frontmatter::read_frontmatter;
+use kb_core::{Artifact, Question, extract_managed_regions};
 use kb_llm::ProvenanceRecord;
 
 use crate::ArtifactResult;
-use crate::lexical::RetrievalPlan;
+use crate::lexical::{RetrievalCandidate, RetrievalPlan};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactSidecar {
@@ -68,12 +70,7 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
     let answer_md = render_answer_frontmatter(input).map_err(yaml_io_err)?;
     atomic_write(input.root.join(&answer_rel), answer_md.as_bytes())?;
 
-    let source_doc_ids: Vec<String> = input
-        .retrieval_plan
-        .candidates
-        .iter()
-        .map(|c| c.id.clone())
-        .collect();
+    let source_doc_ids = resolve_source_document_ids(input.root, &input.retrieval_plan.candidates);
 
     let (valid_citations, invalid_citations, has_uncertainty_banner) =
         input.artifact_result.map_or_else(
@@ -108,6 +105,112 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
         metadata_path: metadata_rel,
         retrieval_plan_path: plan_rel,
     })
+}
+
+/// Resolves retrieval candidate paths to the underlying `source_document_id`
+/// values recorded in each page's frontmatter.
+///
+/// The retrieval plan identifies candidates by their wiki page path (e.g.
+/// `wiki/sources/foo.md` or `wiki/concepts/bar.md`). Downstream consumers —
+/// particularly `kb lint orphans` — expect `source_document_ids` to contain
+/// real source-document identifiers that map to `normalized/<id>/`.
+///
+/// For each candidate this function:
+/// - Reads the candidate's frontmatter.
+/// - If the page is a source wiki (`source_document_id` present as string or
+///   `source_document_ids` as list), returns those IDs.
+/// - If the page is a concept wiki, walks its `backlinks` managed region,
+///   parses each `[[wiki/sources/<slug>]]` link, and recursively extracts the
+///   referenced source page's `source_document_id`.
+///
+/// Unreadable or unresolvable candidates are silently skipped — this mirrors
+/// existing lint behaviour, which already reports missing sources.
+/// Results are deduplicated and sorted for stable output.
+fn resolve_source_document_ids(root: &Path, candidates: &[RetrievalCandidate]) -> Vec<String> {
+    let mut resolved: BTreeSet<String> = BTreeSet::new();
+    for candidate in candidates {
+        collect_source_document_ids_for_path(root, &candidate.id, &mut resolved, 0);
+    }
+    resolved.into_iter().collect()
+}
+
+const MAX_RESOLVE_DEPTH: usize = 2;
+
+fn collect_source_document_ids_for_path(
+    root: &Path,
+    rel_path: &str,
+    out: &mut BTreeSet<String>,
+    depth: usize,
+) {
+    if depth > MAX_RESOLVE_DEPTH {
+        return;
+    }
+    let abs_path = root.join(rel_path);
+    let Ok((frontmatter, body)) = read_frontmatter(&abs_path) else {
+        return;
+    };
+
+    // Source pages store a single `source_document_id` string.
+    if let Some(Value::String(id)) = frontmatter.get(Value::String("source_document_id".into())) {
+        out.insert(id.clone());
+    }
+
+    // Some pages (including prior answer artifacts) carry a list.
+    if let Some(Value::Sequence(seq)) =
+        frontmatter.get(Value::String("source_document_ids".into()))
+    {
+        for item in seq {
+            if let Value::String(s) = item {
+                // Heuristic: only accept entries that aren't themselves wiki paths.
+                // Paths would just re-introduce the bug this function is fixing.
+                if !s.starts_with("wiki/") {
+                    out.insert(s.clone());
+                }
+            }
+        }
+    }
+
+    // Concept pages don't carry source_document_id directly — walk their
+    // backlinks region to the source pages they were extracted from, and
+    // recursively resolve those.
+    if rel_path.starts_with("wiki/concepts/") {
+        for linked in source_links_in_backlinks(&body) {
+            collect_source_document_ids_for_path(root, &linked, out, depth + 1);
+        }
+    }
+}
+
+fn source_links_in_backlinks(body: &str) -> Vec<String> {
+    let mut links = Vec::new();
+    for region in extract_managed_regions(body) {
+        if region.id != "backlinks" {
+            continue;
+        }
+        let content = region.body(body);
+        for line in content.lines() {
+            // Look for `[[wiki/sources/<slug>]]` or `[[wiki/sources/<slug>|label]]`.
+            let mut cursor = line;
+            while let Some(open_idx) = cursor.find("[[") {
+                let after_open = &cursor[open_idx + 2..];
+                if let Some(close_idx) = after_open.find("]]") {
+                    let inner = &after_open[..close_idx];
+                    // Strip any `|label` suffix.
+                    let target = inner.split('|').next().unwrap_or(inner).trim();
+                    if let Some(stripped) = target.strip_prefix("wiki/sources/") {
+                        // Normalize: the stored form omits `.md`; ensure we read the file.
+                        let slug = stripped.trim_end_matches(".md");
+                        if !slug.is_empty() {
+                            links.push(format!("wiki/sources/{slug}.md"));
+                        }
+                    }
+                    cursor = &after_open[close_idx + 2..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    links
 }
 
 fn render_answer_frontmatter(input: &WriteArtifactInput<'_>) -> Result<String, serde_yaml::Error> {
@@ -147,12 +250,11 @@ fn render_answer_frontmatter(input: &WriteArtifactInput<'_>) -> Result<String, s
         );
     }
 
-    let source_ids: Vec<Value> = input
-        .retrieval_plan
-        .candidates
-        .iter()
-        .map(|c| Value::String(c.id.clone()))
-        .collect();
+    let source_ids: Vec<Value> =
+        resolve_source_document_ids(input.root, &input.retrieval_plan.candidates)
+            .into_iter()
+            .map(Value::String)
+            .collect();
     fm.insert(
         Value::String("source_document_ids".into()),
         Value::Sequence(source_ids),
@@ -264,6 +366,17 @@ mod tests {
         }
     }
 
+    /// Seed a source wiki page at `wiki/sources/<slug>.md` with frontmatter
+    /// carrying the given `source_document_id`.
+    fn seed_source_page(root: &Path, slug: &str, source_document_id: &str) {
+        let path = root.join("wiki/sources").join(format!("{slug}.md"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let content = format!(
+            "---\nid: {slug}\ntype: source\ntitle: {slug}\nsource_document_id: {source_document_id}\nsource_revision_id: rev-1\n---\n\n# {slug}\n",
+        );
+        std::fs::write(&path, content).unwrap();
+    }
+
     #[test]
     fn writes_all_files_atomically() {
         let tmp = TempDir::new().unwrap();
@@ -334,6 +447,8 @@ mod tests {
         let question = sample_question("q3");
         let artifact = sample_artifact("q3");
         let plan = sample_plan();
+        // Seed the source page so the resolver can recover the real doc id.
+        seed_source_page(root, "rust-overview", "src-rust-overview");
 
         let prov = ProvenanceRecord {
             harness: "opencode".into(),
@@ -375,7 +490,7 @@ mod tests {
         assert!(sidecar.provenance.is_some());
         assert_eq!(sidecar.valid_citations, vec![1]);
         assert_eq!(sidecar.invalid_citations, vec![99]);
-        assert_eq!(sidecar.source_document_ids, vec!["wiki/sources/rust-overview.md"]);
+        assert_eq!(sidecar.source_document_ids, vec!["src-rust-overview"]);
     }
 
     #[test]
@@ -481,5 +596,92 @@ mod tests {
         let sidecar_str = std::fs::read_to_string(root.join(&output.metadata_path)).unwrap();
         let sidecar: ArtifactSidecar = serde_json::from_str(&sidecar_str).unwrap();
         assert_eq!(sidecar.build_record_id.as_deref(), Some("build:ask:q6"));
+    }
+
+    /// Regression: retrieval candidates are wiki page paths. The promoted
+    /// artifact's `source_document_ids` must contain the real `src-*` IDs
+    /// pulled from each candidate's frontmatter — not the paths themselves —
+    /// so `kb lint orphans` can resolve them against `normalized/<id>/`.
+    #[test]
+    fn source_document_ids_resolve_to_frontmatter_ids_not_paths() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // A plain source page with its own `source_document_id`.
+        seed_source_page(root, "ownership-guide", "src-aaaa1111");
+
+        // A second source page; the concept page will link to it via backlinks.
+        seed_source_page(root, "borrow-checker", "src-bbbb2222");
+
+        // A concept page whose backlinks region references the second source.
+        // The resolver must walk through and pick up `src-bbbb2222`.
+        let concept_path = root.join("wiki/concepts/ownership.md");
+        std::fs::create_dir_all(concept_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &concept_path,
+            "---\nid: c-ownership\nname: Ownership\n---\n\n# Ownership\n\n## Backlinks\n\
+             <!-- kb:begin id=backlinks -->\n- [[wiki/sources/borrow-checker|Borrow Checker]]\n\
+             <!-- kb:end id=backlinks -->\n",
+        )
+        .unwrap();
+
+        let question = sample_question("q-resolve");
+        let artifact = sample_artifact("q-resolve");
+        let plan = RetrievalPlan {
+            query: "ownership".into(),
+            token_budget: 1024,
+            estimated_tokens: 256,
+            candidates: vec![
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/ownership-guide.md".into(),
+                    title: "Ownership Guide".into(),
+                    score: 10,
+                    estimated_tokens: 128,
+                    reasons: vec![],
+                },
+                crate::RetrievalCandidate {
+                    id: "wiki/concepts/ownership.md".into(),
+                    title: "Ownership".into(),
+                    score: 8,
+                    estimated_tokens: 128,
+                    reasons: vec![],
+                },
+            ],
+        };
+
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &question,
+            artifact: &artifact,
+            retrieval_plan: &plan,
+            artifact_result: None,
+            provenance: None,
+            artifact_body: "Body.",
+            build_record_id: None,
+        })
+        .unwrap();
+
+        // Sidecar must carry only real src-* identifiers, deduplicated + sorted.
+        let sidecar_str = std::fs::read_to_string(root.join(&output.metadata_path)).unwrap();
+        let sidecar: ArtifactSidecar = serde_json::from_str(&sidecar_str).unwrap();
+        assert_eq!(
+            sidecar.source_document_ids,
+            vec!["src-aaaa1111".to_string(), "src-bbbb2222".to_string()],
+            "expected resolved src-* IDs, got: {:?}",
+            sidecar.source_document_ids
+        );
+        for entry in &sidecar.source_document_ids {
+            assert!(
+                !entry.starts_with("wiki/"),
+                "source_document_ids must not contain wiki paths: {entry}"
+            );
+        }
+
+        // Frontmatter of the answer must agree with the sidecar.
+        let answer_md = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
+        assert!(answer_md.contains("- src-aaaa1111"));
+        assert!(answer_md.contains("- src-bbbb2222"));
+        assert!(!answer_md.contains("wiki/sources/ownership-guide.md"));
+        assert!(!answer_md.contains("wiki/concepts/ownership.md"));
     }
 }
