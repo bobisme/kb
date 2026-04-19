@@ -2,14 +2,14 @@ default:
     @just --list
 
 check:
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo test --workspace --no-run
+    cargo clippy --locked --workspace --all-targets -- -D warnings
+    cargo test --locked --workspace --no-run
 
 build:
-    cargo build --workspace
+    cargo build --locked --workspace
 
 test:
-    cargo test --workspace
+    cargo test --locked --workspace
 
 install:
-    cargo install --path crates/kb-cli
+    cargo install --locked --path crates/kb-cli
