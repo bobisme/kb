@@ -46,7 +46,10 @@ impl BacklinksArtifact {
 /// 2. Scan every concept page's YAML frontmatter for `sources: [{ heading_anchor, quote }]`
 ///    entries. Each `heading_anchor` is resolved against `normalized/<src>/metadata.json`
 ///    to recover the contributing `source_document_id`, which maps to a `wiki/sources/<src>.md`
-///    page slug.
+///    page slug. Additionally, the concept's `source_document_ids: [...]` frontmatter
+///    field is consulted as a no-anchor fallback — `concept_merge` can emit
+///    `sources: [{quote: "..."}]` entries without a `heading_anchor`, and this field
+///    preserves the source attribution those entries would otherwise lose.
 ///
 /// Concept pages receive a `backlinks` region listing referring wiki pages (both
 /// wiki-link and frontmatter-source-backed references). Source pages receive a
@@ -257,17 +260,41 @@ fn collect_frontmatter_source_backlinks(
         let Ok(parsed) = serde_yaml::from_str::<Value>(&fm) else {
             continue;
         };
-        let Some(sources) = parsed.get("sources").and_then(|v| v.as_sequence()) else {
-            continue;
-        };
-        for entry in sources {
-            let Some(anchor) = entry.get("heading_anchor").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            let Some(candidate_docs) = anchor_to_source_docs.get(anchor) else {
-                continue;
-            };
-            for doc_id in candidate_docs {
+        if let Some(sources) = parsed.get("sources").and_then(|v| v.as_sequence()) {
+            for entry in sources {
+                let Some(anchor) = entry.get("heading_anchor").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(candidate_docs) = anchor_to_source_docs.get(anchor) else {
+                    continue;
+                };
+                for doc_id in candidate_docs {
+                    let Some(source_page_id) = source_doc_to_page.get(doc_id) else {
+                        continue;
+                    };
+                    if let Some(referers) = concept_backlinks.get_mut(concept_id) {
+                        referers.insert(source_page_id.clone());
+                    }
+                    if let Some(referers) = source_referenced_by.get_mut(source_page_id) {
+                        referers.insert(concept_id.clone());
+                    }
+                }
+            }
+        }
+
+        // No-anchor fallback: concept's `source_document_ids:` frontmatter field
+        // lists every source document that contributed to this concept, regardless
+        // of whether the merged `sources:` entries carried heading anchors.
+        // This ensures concepts with `sources: [{quote: "..."}]` (no heading_anchor)
+        // still cross-link with their source pages.
+        if let Some(doc_ids) = parsed
+            .get("source_document_ids")
+            .and_then(|v| v.as_sequence())
+        {
+            for doc_id_val in doc_ids {
+                let Some(doc_id) = doc_id_val.as_str() else {
+                    continue;
+                };
                 let Some(source_page_id) = source_doc_to_page.get(doc_id) else {
                     continue;
                 };
@@ -615,5 +642,103 @@ mod tests {
             "source should list referencing concept, got:\n{}",
             source.updated_markdown
         );
+    }
+
+    #[test]
+    fn source_document_ids_backfill_when_heading_anchor_absent() {
+        let root = tempdir().expect("tempdir");
+
+        // Source page carrying a source_document_id in frontmatter.
+        // No normalized/ dir at all — exercising the no-anchor fallback path.
+        write(
+            &root.path().join("wiki/sources/src-4846dd29.md"),
+            "---\nid: wiki-source-src-4846dd29\ntype: source\ntitle: Rust repo\nsource_document_id: src-4846dd29\nsource_revision_id: rev-9\n---\n# Source\n\nSome content.\n",
+        );
+
+        // Concept page with sources: entries lacking heading_anchor but with
+        // source_document_ids: fallback.
+        write(
+            &root.path().join("wiki/concepts/rust.md"),
+            "---\nid: concept:rust\nname: Rust\nsources:\n- quote: This is the main source code repository for Rust.\n- quote: It contains the compiler, standard library, and documentation.\nsource_document_ids:\n- src-4846dd29\n---\n\n# Rust\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/rust.md"))
+            .expect("concept artifact");
+        assert!(
+            concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-4846dd29]]"),
+            "concept should backlink to source via source_document_ids fallback, got:\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            !concept.updated_markdown.contains("- _None yet._"),
+            "concept Backlinks should not be empty, got:\n{}",
+            concept.updated_markdown
+        );
+
+        let source = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/sources/src-4846dd29.md"))
+            .expect("source artifact");
+        assert!(
+            source
+                .updated_markdown
+                .contains("- [[wiki/concepts/rust]]"),
+            "source should list referencing concept, got:\n{}",
+            source.updated_markdown
+        );
+    }
+
+    #[test]
+    fn heading_anchor_and_source_document_ids_paths_combine_without_duplicates() {
+        let root = tempdir().expect("tempdir");
+
+        // Normalized metadata so heading_anchor path resolves.
+        write(
+            &root.path().join("normalized/src-abc/metadata.json"),
+            r#"{
+                "metadata": {"id": "src-abc"},
+                "source_revision_id": "rev-123",
+                "heading_ids": ["gil"]
+            }"#,
+        );
+        write(
+            &root.path().join("wiki/sources/src-abc.md"),
+            "---\nid: wiki-source-src-abc\ntype: source\ntitle: GIL\nsource_document_id: src-abc\nsource_revision_id: rev-123\n---\n# Source\n",
+        );
+        // Second source document only reachable via source_document_ids.
+        write(
+            &root.path().join("wiki/sources/src-def.md"),
+            "---\nid: wiki-source-src-def\ntype: source\ntitle: Extra\nsource_document_id: src-def\nsource_revision_id: rev-456\n---\n# Source\n",
+        );
+
+        write(
+            &root.path().join("wiki/concepts/gil.md"),
+            "---\nid: concept:gil\nname: GIL\nsources:\n- heading_anchor: gil\n  quote: GIL locks things.\n- quote: Only anchor-less quote.\nsource_document_ids:\n- src-abc\n- src-def\n---\n\n# GIL\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/gil.md"))
+            .expect("concept artifact");
+        // Both sources present; each listed once (BTreeSet dedupes).
+        assert!(
+            concept.updated_markdown.contains("- [[wiki/sources/src-abc]]"),
+            "missing src-abc backlink:\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            concept.updated_markdown.contains("- [[wiki/sources/src-def]]"),
+            "missing src-def backlink:\n{}",
+            concept.updated_markdown
+        );
+        let abc_count = concept.updated_markdown.matches("- [[wiki/sources/src-abc]]").count();
+        assert_eq!(abc_count, 1, "src-abc should appear exactly once");
     }
 }
