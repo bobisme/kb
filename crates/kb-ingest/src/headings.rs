@@ -5,15 +5,23 @@
 //! inside fenced code blocks are ignored so that indented `#` lines in code
 //! examples don't masquerade as section anchors.
 
+use std::collections::HashMap;
+
 use kb_core::slug_from_title;
 
 /// Extract slugs for H1/H2/H3 ATX headings from `markdown`.
 ///
-/// Returns slugs in document order. Duplicates are preserved — callers that
-/// need uniqueness should dedupe with their own disambiguation rules.
+/// Returns slugs in document order. Duplicate slugs are disambiguated by
+/// suffixing repeats with `-2`, `-3`, ... — matching GitHub Flavored
+/// Markdown and common static-site-generator conventions. This keeps
+/// `heading_anchor` citations unambiguous.
 #[must_use]
 pub fn extract_heading_ids(markdown: &str) -> Vec<String> {
     let mut ids = Vec::new();
+    // Case-insensitive counter: `slug_from_title` already lowercases its
+    // output, but we lowercase the key explicitly to be defensive against
+    // any future slug-function change.
+    let mut counts: HashMap<String, u32> = HashMap::new();
     let mut in_fence = false;
 
     for line in markdown.lines() {
@@ -39,8 +47,17 @@ pub fn extract_heading_ids(markdown: &str) -> Vec<String> {
             continue;
         }
         let slug = slug_from_title(title);
-        if !slug.is_empty() {
+        if slug.is_empty() {
+            continue;
+        }
+
+        let key = slug.to_lowercase();
+        let count = counts.entry(key).or_insert(0);
+        *count += 1;
+        if *count == 1 {
             ids.push(slug);
+        } else {
+            ids.push(format!("{slug}-{count}"));
         }
     }
 
@@ -112,5 +129,40 @@ mod tests {
     fn requires_space_after_hash() {
         let md = "#notaheading\n#tagline\n# real\n";
         assert_eq!(extract_heading_ids(md), vec!["real".to_string()]);
+    }
+
+    #[test]
+    fn unique_headings_are_unchanged() {
+        let md = "# Intro\n\n## Setup\n\n## Conclusion\n";
+        assert_eq!(
+            extract_heading_ids(md),
+            vec![
+                "intro".to_string(),
+                "setup".to_string(),
+                "conclusion".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_headings_get_numeric_suffix() {
+        let md = "## Overview\n\n## Overview\n\n## Overview\n";
+        assert_eq!(
+            extract_heading_ids(md),
+            vec![
+                "overview".to_string(),
+                "overview-2".to_string(),
+                "overview-3".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn dedup_is_case_insensitive() {
+        let md = "## Overview\n\n## overview\n";
+        assert_eq!(
+            extract_heading_ids(md),
+            vec!["overview".to_string(), "overview-2".to_string()]
+        );
     }
 }
