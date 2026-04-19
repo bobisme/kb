@@ -48,6 +48,74 @@ pub struct LocalIngestReport {
     pub ingested: IngestedSource,
 }
 
+/// Origin of a collected file — whether it was named explicitly on the command
+/// line, or discovered via a directory walk. Binary rejection behavior differs
+/// between the two: explicit files fail hard, directory-walk files are skipped
+/// with a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileOrigin {
+    Explicit,
+    DirectoryWalk,
+}
+
+/// Maximum number of bytes inspected when deciding whether a file looks like
+/// text. Larger files are only partially sampled.
+const TEXT_PROBE_BYTES: usize = 8 * 1024;
+
+/// Fraction of non-printable, non-whitespace bytes (in the probed prefix) at
+/// which we decide a file is binary. Kept as a ratio out of 1000 so all math
+/// stays in integers.
+const NON_PRINTABLE_THRESHOLD_PER_THOUSAND: usize = 300;
+
+/// Heuristic: does the first slice of a file look like UTF-8 text?
+///
+/// Rejects on any of:
+/// - a NUL byte in the probed prefix
+/// - the probed prefix is not valid UTF-8
+/// - more than ~30% of the probed bytes are non-printable and not common
+///   whitespace (space, tab, newline, carriage return, form feed)
+#[must_use]
+pub fn looks_like_text(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let probe_len = bytes.len().min(TEXT_PROBE_BYTES);
+    let probe = &bytes[..probe_len];
+
+    if probe.contains(&0) {
+        return false;
+    }
+
+    // Must be valid UTF-8 up to the probe boundary. A multibyte char may be
+    // sliced at the boundary, so accept a trailing-invalid error whose valid
+    // prefix covers everything except a short tail.
+    match std::str::from_utf8(probe) {
+        Ok(_) => {}
+        Err(err) => {
+            let valid_up_to = err.valid_up_to();
+            let tail = probe_len - valid_up_to;
+            // Allow up to 3 trailing bytes (max UTF-8 continuation) to be cut
+            // off only when we actually truncated (bytes longer than probe).
+            if tail > 3 || bytes.len() <= probe_len {
+                return false;
+            }
+        }
+    }
+
+    let non_printable = probe
+        .iter()
+        .filter(|&&b| !is_text_byte(b))
+        .count();
+    // non_printable / probe_len > threshold/1000
+    non_printable * 1000 <= NON_PRINTABLE_THRESHOLD_PER_THOUSAND * probe_len
+}
+
+const fn is_text_byte(b: u8) -> bool {
+    // Printable ASCII, common whitespace, or the high bit (possible UTF-8
+    // continuation — UTF-8 validity was already checked above).
+    matches!(b, 0x09 | 0x0A | 0x0C | 0x0D | 0x20..=0x7E) || b >= 0x80
+}
+
 /// # Errors
 /// Returns an error if any source path cannot be read, walked, or ingested.
 pub fn ingest_paths(root: &Path, sources: &[PathBuf]) -> Result<Vec<IngestedSource>> {
@@ -64,23 +132,27 @@ pub fn ingest_paths_with_options(
     sources: &[PathBuf],
     dry_run: bool,
 ) -> Result<Vec<LocalIngestReport>> {
-    let mut files = Vec::new();
+    let mut files: Vec<(PathBuf, FileOrigin)> = Vec::new();
     for source in sources {
         collect_files(source, &mut files)?;
     }
-    files.sort();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut ingested = Vec::with_capacity(files.len());
-    for file in files {
-        ingested.push(ingest_file(root, &file, dry_run)?);
+    for (file, origin) in files {
+        match ingest_file(root, &file, dry_run, origin) {
+            Ok(Some(report)) => ingested.push(report),
+            Ok(None) => {}
+            Err(err) => return Err(err),
+        }
     }
 
     Ok(ingested)
 }
 
-fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn collect_files(path: &Path, files: &mut Vec<(PathBuf, FileOrigin)>) -> Result<()> {
     if path.is_file() {
-        files.push(path.to_path_buf());
+        files.push((path.to_path_buf(), FileOrigin::Explicit));
         return Ok(());
     }
 
@@ -97,7 +169,7 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with('.'));
             if entry.file_type().is_some_and(|kind| kind.is_file()) && !is_hidden {
-                files.push(entry.into_path());
+                files.push((entry.into_path(), FileOrigin::DirectoryWalk));
             }
         }
         return Ok(());
@@ -109,7 +181,40 @@ fn collect_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     )
 }
 
-fn ingest_file(root: &Path, source_path: &Path, dry_run: bool) -> Result<LocalIngestReport> {
+/// Returns `Ok(true)` if the file should be ingested, `Ok(false)` if it was a
+/// binary file from a directory walk that should be silently skipped, and
+/// `Err` if it was an explicit binary file that should abort the run.
+fn check_text_or_skip(
+    canonical_source: &Path,
+    content: &[u8],
+    origin: FileOrigin,
+) -> Result<bool> {
+    if looks_like_text(content) {
+        return Ok(true);
+    }
+    match origin {
+        FileOrigin::Explicit => {
+            bail!(
+                "{} does not appear to be text (binary content detected)",
+                canonical_source.display()
+            );
+        }
+        FileOrigin::DirectoryWalk => {
+            eprintln!(
+                "warning: skipping {} (binary content detected)",
+                canonical_source.display()
+            );
+            Ok(false)
+        }
+    }
+}
+
+fn ingest_file(
+    root: &Path,
+    source_path: &Path,
+    dry_run: bool,
+    origin: FileOrigin,
+) -> Result<Option<LocalIngestReport>> {
     let canonical_source = fs::canonicalize(source_path)
         .with_context(|| format!("failed to canonicalize {}", source_path.display()))?;
     let stable_location = normalize_file_stable_location(&canonical_source)
@@ -118,6 +223,10 @@ fn ingest_file(root: &Path, source_path: &Path, dry_run: bool) -> Result<LocalIn
         .with_context(|| format!("failed to read {}", canonical_source.display()))?;
     let fs_metadata = fs::metadata(&canonical_source)
         .with_context(|| format!("failed to read metadata for {}", canonical_source.display()))?;
+
+    if !check_text_or_skip(&canonical_source, &content, origin)? {
+        return Ok(None);
+    }
 
     let imported_at_millis = now_millis()?;
     let modified_at_millis = fs_metadata.modified().ok().and_then(system_time_to_millis);
@@ -204,7 +313,7 @@ fn ingest_file(root: &Path, source_path: &Path, dry_run: bool) -> Result<LocalIn
         IngestOutcome::Skipped
     };
 
-    Ok(LocalIngestReport {
+    Ok(Some(LocalIngestReport {
         source_path: canonical_source,
         outcome,
         ingested: IngestedSource {
@@ -213,7 +322,7 @@ fn ingest_file(root: &Path, source_path: &Path, dry_run: bool) -> Result<LocalIn
             copied_path: relative_copied_path,
             metadata_sidecar_path: relative_metadata_sidecar_path,
         },
-    })
+    }))
 }
 
 fn build_document(
@@ -538,6 +647,57 @@ mod tests {
             ]
         );
         assert!(doc.normalized_assets.is_empty());
+    }
+
+    #[test]
+    fn looks_like_text_handles_common_cases() {
+        assert!(looks_like_text(b""));
+        assert!(looks_like_text(b"hello world\n"));
+        assert!(looks_like_text(b"# Heading\n\nPara\twith\ttabs\r\n"));
+        assert!(looks_like_text("utf-8 text: café — résumé".as_bytes()));
+
+        // NUL byte -> binary
+        assert!(!looks_like_text(b"oops\0still text"));
+        // Invalid UTF-8 (lone continuation)
+        assert!(!looks_like_text(&[0x80, 0x80, 0x80, 0x80]));
+        // Mostly control bytes -> binary
+        let binary: Vec<u8> = (0..100u8).map(|i| i % 32).collect();
+        assert!(!looks_like_text(&binary));
+    }
+
+    #[test]
+    fn ingest_rejects_binary_file() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let file = source_root.path().join("program.bin");
+        // ELF-ish: contains NUL bytes
+        let bytes: Vec<u8> = vec![0x7f, b'E', b'L', b'F', 0, 0, 0, 1, 2, 3, 0, 0, 0, 0xff];
+        fs::write(&file, &bytes).expect("write binary file");
+
+        let err = ingest_paths(kb_root.path(), &[file]).expect_err("ingest should fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not appear to be text"),
+            "error should mention binary detection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn ingest_directory_skips_binary_files_and_keeps_text() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        fs::write(source_root.path().join("notes.md"), "hello text\n")
+            .expect("write text file");
+        let binary: Vec<u8> = vec![0x7f, b'E', b'L', b'F', 0, 0, 0, 1, 2, 3];
+        fs::write(source_root.path().join("program.bin"), &binary)
+            .expect("write binary file");
+
+        let ingested =
+            ingest_paths(kb_root.path(), &[source_root.path().to_path_buf()])
+                .expect("directory ingest succeeds despite binary file");
+
+        assert_eq!(ingested.len(), 1, "only the text file should be ingested");
+        assert!(ingested[0].copied_path.ends_with("notes.md"));
     }
 
     #[test]
