@@ -4,3 +4,11 @@ assertion_line: 82
 expression: normalized
 ---
 Initialized empty knowledge base at /tmp/tmpXXXXXX
+
+Next:
+  kb ingest <path-or-url>  add a document
+  kb compile               build source/concept pages
+  kb ask "your question"   generate an answer grounded in your corpus
+  kb doctor                verify your LLM backend is reachable
+
+Config: /tmp/tmpXXXXXX/kb.toml

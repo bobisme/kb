@@ -85,6 +85,10 @@ struct Cli {
     #[arg(global = true, long)]
     review: bool,
 
+    /// Suppress non-essential output (e.g. post-command hints)
+    #[arg(global = true, long)]
+    quiet: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -379,7 +383,7 @@ fn run(cli: Cli) -> Result<()> {
             print_status(&status);
             Ok(())
         }
-        Some(Command::Init { path }) => init::init(root, path, cli.force),
+        Some(Command::Init { path }) => init::init(root, path, cli.force, cli.quiet),
         Some(Command::Search { query, limit }) => {
             let search_root = root
                 .as_deref()
@@ -2376,6 +2380,7 @@ mod tests {
             json: false,
             force: false,
             review: false,
+            quiet: false,
             command: Some(Command::Status),
         })
         .expect("status command succeeds");

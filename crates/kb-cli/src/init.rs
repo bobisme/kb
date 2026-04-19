@@ -16,7 +16,12 @@ const MANAGED_STUB: &str = "\
 This is the root index of your knowledge base. Run `kb compile` to populate.
 ";
 
-pub fn init(root_override: Option<PathBuf>, path_arg: Option<PathBuf>, force: bool) -> Result<()> {
+pub fn init(
+    root_override: Option<PathBuf>,
+    path_arg: Option<PathBuf>,
+    force: bool,
+    quiet: bool,
+) -> Result<()> {
     let target = if let Some(r) = root_override {
         r
     } else if let Some(p) = path_arg {
@@ -96,6 +101,17 @@ pub fn init(root_override: Option<PathBuf>, path_arg: Option<PathBuf>, force: bo
     }
 
     println!("Initialized empty knowledge base at {}", target.display());
+
+    if !quiet {
+        println!();
+        println!("Next:");
+        println!("  kb ingest <path-or-url>  add a document");
+        println!("  kb compile               build source/concept pages");
+        println!("  kb ask \"your question\"   generate an answer grounded in your corpus");
+        println!("  kb doctor                verify your LLM backend is reachable");
+        println!();
+        println!("Config: {}", target.join(Config::FILE_NAME).display());
+    }
 
     Ok(())
 }
