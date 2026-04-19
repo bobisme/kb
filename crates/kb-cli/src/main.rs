@@ -1571,9 +1571,31 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
         if candidate.exists() {
             build_file_report(root, target, &candidate, &jobs)?
         } else {
-            bail!(
-                "'{target}' was not found. Try an exact ID, a unique graph suffix, a build record ID, a job ID, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
-            );
+            let frontmatter_matches = find_by_frontmatter_id(root, target);
+            match frontmatter_matches.len() {
+                1 => {
+                    let path = &frontmatter_matches[0];
+                    build_file_report(root, target, path, &jobs)?
+                }
+                0 => bail!(
+                    "'{target}' was not found. Try an exact ID, a unique graph suffix, a build record ID, a job ID, a frontmatter id, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
+                ),
+                _ => {
+                    let paths: Vec<String> = frontmatter_matches
+                        .iter()
+                        .map(|path| {
+                            path.strip_prefix(root)
+                                .unwrap_or(path)
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .collect();
+                    bail!(
+                        "'{target}' is ambiguous - matches multiple files: [{}]. Pass the full path to disambiguate.",
+                        paths.join(", ")
+                    );
+                }
+            }
         }
     };
 
@@ -1678,6 +1700,51 @@ fn build_job_report(target: &str, job: &JobRun) -> InspectReport {
         build_records: Vec::new(),
         generating_jobs: vec![summarize_job(job)],
         trace: None,
+    }
+}
+
+/// Recursively scan `wiki/` and `outputs/` for `.md` files whose frontmatter `id:`
+/// field matches `target`. Returns absolute paths of all matches.
+///
+/// Used as a fallback resolver in `run_inspect` so users can inspect entities
+/// by their frontmatter id (e.g. `wiki-source-manual`, `artifact-question-abcd`)
+/// without having to hunt for the file path.
+fn find_by_frontmatter_id(root: &Path, target: &str) -> Vec<PathBuf> {
+    let mut matches = Vec::new();
+    for subdir in ["wiki", "outputs"] {
+        let base = root.join(subdir);
+        if base.exists() {
+            collect_frontmatter_id_matches(&base, target, &mut matches);
+        }
+    }
+    matches
+}
+
+fn collect_frontmatter_id_matches(dir: &Path, target: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_frontmatter_id_matches(&path, target, out);
+        } else if file_type.is_file()
+            && path.extension().and_then(|ext| ext.to_str()) == Some("md")
+        {
+            if let Ok((frontmatter, _body)) = kb_core::frontmatter::read_frontmatter(&path) {
+                if let Some(id) = frontmatter
+                    .get(serde_yaml::Value::String("id".to_string()))
+                    .and_then(serde_yaml::Value::as_str)
+                {
+                    if id == target {
+                        out.push(path);
+                    }
+                }
+            }
+        }
     }
 }
 

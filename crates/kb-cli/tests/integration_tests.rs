@@ -511,6 +511,66 @@ fn inspect_missing_target_has_actionable_error() {
 }
 
 #[test]
+fn inspect_resolves_by_frontmatter_id() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    let wiki_file = sources_dir.join("foo.md");
+    fs::write(
+        &wiki_file,
+        "---\nid: my-test-id\n---\n\n# Foo\n\nSome body.\n",
+    )
+    .expect("write wiki file");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("my-test-id");
+    let output = cmd.output().expect("run kb inspect my-test-id");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("resolved_id: wiki/sources/foo.md"),
+        "expected resolved_id to point at foo.md, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn inspect_ambiguous_frontmatter_id_reports_matches() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    fs::write(
+        sources_dir.join("one.md"),
+        "---\nid: dup-id\n---\n\n# One\n",
+    )
+    .expect("write one.md");
+    fs::write(
+        sources_dir.join("two.md"),
+        "---\nid: dup-id\n---\n\n# Two\n",
+    )
+    .expect("write two.md");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("dup-id");
+    let output = cmd.output().expect("run kb inspect dup-id");
+
+    assert!(!output.status.success(), "kb inspect unexpectedly succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous"), "stderr was: {stderr}");
+    assert!(stderr.contains("wiki/sources/one.md"), "stderr was: {stderr}");
+    assert!(stderr.contains("wiki/sources/two.md"), "stderr was: {stderr}");
+}
+
+#[test]
 fn ingest_mixed_file_directory_and_url_reports_summary() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
