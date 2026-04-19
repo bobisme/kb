@@ -1,3 +1,4 @@
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -104,9 +105,33 @@ pub fn persist_merge_review(root: &Path, record: &MergeReviewRecord) -> Result<(
 /// serialized, or the system clock cannot be read for build-record timestamps.
 pub fn run_concept_merge_pass<A: LlmAdapter + ?Sized>(
     adapter: &A,
-    mut candidates: Vec<ConceptCandidate>,
+    candidates: Vec<ConceptCandidate>,
     root: &Path,
 ) -> Result<ConceptMergeArtifact, ConceptMergeError> {
+    run_concept_merge_pass_with_origins(adapter, candidates, root, &HashMap::new())
+}
+
+/// Same as [`run_concept_merge_pass`] but threads an origin side-map.
+///
+/// The map `candidate_name -> source_document_ids` lets confident concept pages
+/// emit a `source_document_ids:` frontmatter field. Missing entries are
+/// silently ignored — tests and callers without provenance fall back to the
+/// empty map.
+///
+/// # Errors
+///
+/// Returns [`ConceptMergeError`] when the LLM call fails, the response cannot be
+/// serialized, or the system clock cannot be read for build-record timestamps.
+pub fn run_concept_merge_pass_with_origins<A, S>(
+    adapter: &A,
+    mut candidates: Vec<ConceptCandidate>,
+    root: &Path,
+    candidate_origins: &HashMap<String, Vec<String>, S>,
+) -> Result<ConceptMergeArtifact, ConceptMergeError>
+where
+    A: LlmAdapter + ?Sized,
+    S: std::hash::BuildHasher,
+{
     candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
     let request = MergeConceptCandidatesRequest {
@@ -114,7 +139,7 @@ pub fn run_concept_merge_pass<A: LlmAdapter + ?Sized>(
     };
     let (response, provenance) = adapter.merge_concept_candidates(request)?;
 
-    let concept_pages = build_concept_pages(&response, root)?;
+    let concept_pages = build_concept_pages(&response, root, candidate_origins)?;
     let review_records =
         build_review_records(&response, root, &provenance).map_err(ConceptMergeError::Serialize)?;
     let build_record = build_record_for_merge(
@@ -132,15 +157,16 @@ pub fn run_concept_merge_pass<A: LlmAdapter + ?Sized>(
     })
 }
 
-fn build_concept_pages(
+fn build_concept_pages<S: std::hash::BuildHasher>(
     response: &MergeConceptCandidatesResponse,
     root: &Path,
+    candidate_origins: &HashMap<String, Vec<String>, S>,
 ) -> Result<Vec<ConceptPage>, ConceptMergeError> {
     response
         .groups
         .iter()
         .filter(|g| g.confident)
-        .map(|group| render_concept_page(group, root))
+        .map(|group| render_concept_page(group, root, candidate_origins))
         .collect()
 }
 
@@ -157,9 +183,10 @@ fn build_review_records(
         .collect()
 }
 
-fn render_concept_page(
+fn render_concept_page<S: std::hash::BuildHasher>(
     group: &MergeGroup,
     root: &Path,
+    candidate_origins: &HashMap<String, Vec<String>, S>,
 ) -> Result<ConceptPage, ConceptMergeError> {
     use serde_yaml::{Mapping, Value};
 
@@ -171,6 +198,23 @@ fn render_concept_page(
         .members
         .iter()
         .flat_map(|m| m.source_anchors.iter())
+        .collect();
+
+    // Resolve contributing source_document_ids by looking each member's name up
+    // in the origin side-map. Missing members (tests, or candidates without
+    // recorded provenance) simply contribute nothing. Sorted + de-duplicated so
+    // the frontmatter is deterministic across runs.
+    let source_document_ids: Vec<String> = group
+        .members
+        .iter()
+        .flat_map(|m| {
+            candidate_origins
+                .get(&m.name)
+                .map_or(&[][..], Vec::as_slice)
+        })
+        .cloned()
+        .collect::<BTreeSet<String>>()
+        .into_iter()
         .collect();
 
     let definition_hint: Option<&str> = group
@@ -192,6 +236,17 @@ fn render_concept_page(
             .map(|a| Value::String(a.clone()))
             .collect();
         fm.insert(Value::String("aliases".into()), Value::Sequence(aliases));
+    }
+
+    if !source_document_ids.is_empty() {
+        let ids: Vec<Value> = source_document_ids
+            .iter()
+            .map(|id| Value::String(id.clone()))
+            .collect();
+        fm.insert(
+            Value::String("source_document_ids".into()),
+            Value::Sequence(ids),
+        );
     }
 
     if !source_anchors.is_empty() {
@@ -757,6 +812,108 @@ mod tests {
                 .get(serde_yaml::Value::String("name".into()))
                 .and_then(|v| v.as_str()),
             Some("Named lifetime parameter")
+        );
+    }
+
+    #[test]
+    fn confident_pages_carry_source_document_ids_from_origins() {
+        use std::collections::HashMap;
+
+        let dir = tempdir().expect("tempdir");
+        let adapter = FakeAdapter {
+            response: MergeConceptCandidatesResponse {
+                groups: vec![MergeGroup {
+                    canonical_name: "Borrow checker".to_string(),
+                    aliases: vec!["borrowck".to_string()],
+                    members: vec![borrow_checker_candidate(), borrowck_candidate()],
+                    confident: true,
+                    rationale: None,
+                }],
+            },
+            provenance: provenance(),
+        };
+
+        let mut origins: HashMap<String, Vec<String>> = HashMap::new();
+        origins.insert("borrow checker".to_string(), vec!["src-aaa".to_string()]);
+        origins.insert("borrowck".to_string(), vec!["src-bbb".to_string()]);
+
+        let candidates = vec![borrow_checker_candidate(), borrowck_candidate()];
+        let artifact = run_concept_merge_pass_with_origins(
+            &adapter,
+            candidates,
+            dir.path(),
+            &origins,
+        )
+        .expect("run merge pass with origins");
+
+        assert_eq!(artifact.concept_pages.len(), 1);
+        let page = &artifact.concept_pages[0];
+
+        // Frontmatter must contain a deterministic, sorted, de-duplicated
+        // `source_document_ids:` list covering both contributing sources so
+        // `kb lint --check missing-citations` accepts the page as grounded.
+        assert!(
+            page.content.contains("source_document_ids:"),
+            "missing source_document_ids field; got:\n{}",
+            page.content
+        );
+
+        let body = page
+            .content
+            .strip_prefix("---\n")
+            .expect("starts with frontmatter fence");
+        let end = body.find("\n---\n").expect("closing fence");
+        let frontmatter = &body[..=end];
+
+        let parsed: serde_yaml::Mapping =
+            serde_yaml::from_str(frontmatter).expect("valid yaml");
+        let ids = parsed
+            .get(serde_yaml::Value::String("source_document_ids".into()))
+            .and_then(|v| v.as_sequence())
+            .expect("source_document_ids sequence present");
+        let recovered: Vec<String> = ids
+            .iter()
+            .map(|v| v.as_str().expect("id is string").to_string())
+            .collect();
+        assert_eq!(recovered, vec!["src-aaa".to_string(), "src-bbb".to_string()]);
+    }
+
+    #[test]
+    fn concept_page_omits_source_document_ids_when_origins_empty() {
+        use std::collections::HashMap;
+
+        // Default run_concept_merge_pass (no origin provenance) must NOT emit an
+        // empty `source_document_ids: []` — we only add the field when we have
+        // real source ids. Preserves the existing frontmatter shape for tests
+        // and callers that don't thread origin data.
+        let dir = tempdir().expect("tempdir");
+        let adapter = FakeAdapter {
+            response: MergeConceptCandidatesResponse {
+                groups: vec![MergeGroup {
+                    canonical_name: "Borrow checker".to_string(),
+                    aliases: vec![],
+                    members: vec![borrow_checker_candidate()],
+                    confident: true,
+                    rationale: None,
+                }],
+            },
+            provenance: provenance(),
+        };
+
+        let origins: HashMap<String, Vec<String>> = HashMap::new();
+        let artifact = run_concept_merge_pass_with_origins(
+            &adapter,
+            vec![borrow_checker_candidate()],
+            dir.path(),
+            &origins,
+        )
+        .expect("run merge pass");
+
+        let page = &artifact.concept_pages[0];
+        assert!(
+            !page.content.contains("source_document_ids"),
+            "unexpected source_document_ids with empty origins:\n{}",
+            page.content
         );
     }
 

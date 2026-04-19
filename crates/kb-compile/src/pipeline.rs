@@ -791,6 +791,13 @@ fn run_concept_merge_from_state(
 ) -> Result<MergeRunReport> {
     let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
     let mut all_candidates: Vec<ConceptCandidate> = Vec::new();
+    // Side-map of candidate.name -> sorted list of originating source document IDs
+    // (the filename stem of each `state/concept_candidates/<src-id>.json`). Same
+    // candidate name can show up under multiple sources, so we accumulate a set
+    // rather than overwriting. Passed into the merge pass so concept pages can
+    // emit `source_document_ids:` in frontmatter for the missing-citations lint.
+    let mut candidate_origins: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
     if candidates_dir.exists() {
         for entry in std::fs::read_dir(&candidates_dir)
             .with_context(|| format!("read {}", candidates_dir.display()))?
@@ -799,14 +806,31 @@ fn run_concept_merge_from_state(
             if entry.file_type()?.is_file()
                 && entry.path().extension().and_then(|s| s.to_str()) == Some("json")
             {
-                let text = std::fs::read_to_string(entry.path())
-                    .with_context(|| format!("read {}", entry.path().display()))?;
+                let path = entry.path();
+                let src_id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(std::string::ToString::to_string);
+                let text = std::fs::read_to_string(&path)
+                    .with_context(|| format!("read {}", path.display()))?;
                 let mut batch: Vec<ConceptCandidate> = serde_json::from_str(&text)
-                    .with_context(|| format!("parse {}", entry.path().display()))?;
+                    .with_context(|| format!("parse {}", path.display()))?;
+                if let Some(src_id) = src_id {
+                    for c in &batch {
+                        candidate_origins
+                            .entry(c.name.clone())
+                            .or_default()
+                            .insert(src_id.clone());
+                    }
+                }
                 all_candidates.append(&mut batch);
             }
         }
     }
+    let candidate_origins: std::collections::HashMap<String, Vec<String>> = candidate_origins
+        .into_iter()
+        .map(|(k, v)| (k, v.into_iter().collect()))
+        .collect();
 
     if all_candidates.is_empty() {
         return Ok(MergeRunReport {
@@ -824,10 +848,11 @@ fn run_concept_merge_from_state(
         ),
     );
     let merge_started = Instant::now();
-    let artifact = match crate::concept_merge::run_concept_merge_pass(
+    let artifact = match crate::concept_merge::run_concept_merge_pass_with_origins(
         adapter,
         all_candidates,
         root,
+        &candidate_origins,
     ) {
         Ok(a) => a,
         Err(err) => {
