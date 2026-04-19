@@ -53,7 +53,10 @@ fn discover_root_in(explicit_root: Option<&Path>, cwd: &Path, home: &Path) -> Re
     }
 
     Err(anyhow!(
-        "No KB root found. Initialize one with `kb init` or provide --root."
+        "no KB root found.\n  \
+         Looked for '{KB_CONFIG}' (global-style root) and '{KB_DIR}/{KB_CONFIG}' (project-style root) from '{}' up to filesystem root.\n  \
+         Run 'kb init' here, or set '--root <path>'.",
+        cwd.display(),
     ))
 }
 
@@ -79,8 +82,10 @@ fn resolve_root_override(explicit_root: &Path, cwd: &Path) -> Result<PathBuf> {
 
     if !resolved.is_dir() {
         return Err(anyhow!(
-            "Provided --root '{}' is not an existing directory. Run `kb init` to create it.",
-            resolved.display()
+            "'--root {}' is not an existing directory.\n  \
+             Run 'kb init {}' to initialize a KB root there.",
+            resolved.display(),
+            resolved.display(),
         ));
     }
 
@@ -92,7 +97,12 @@ fn validate_candidate(path: &Path) -> Result<KbRoot> {
     find_kb_root_at(path).map_or_else(
         || {
             Err(anyhow!(
-                "Provided --root '{}' contains neither '{KB_CONFIG}' nor '{KB_DIR}/{KB_CONFIG}'. Run `kb init` to initialize a KB root.",
+                "'{}' is not a KB root.\n  \
+                 Looked for '{}/{KB_CONFIG}' (global-style root) or '{}/{KB_DIR}/{KB_CONFIG}' (project-style root).\n  \
+                 Run 'kb init {}' to initialize one.",
+                path.display(),
+                path.display(),
+                path.display(),
                 path.display(),
             ))
         },
@@ -246,6 +256,56 @@ mod tests {
         assert!(
             err.to_string().contains("kb init"),
             "missing-root error should mention kb init"
+        );
+    }
+
+    #[test]
+    fn discovery_error_message_names_both_layouts() {
+        // Both walk-up-from-cwd and --root failures should name both valid
+        // layouts so the user isn't misled into thinking only one works.
+        let cwd_tmp = tempdir().expect("temp cwd");
+        let home_tmp = tempdir().expect("temp home");
+
+        // Case 1: walk-up failure.
+        let walkup_err = discover_root_in(None, cwd_tmp.path(), home_tmp.path())
+            .expect_err("walk-up should fail");
+        let walkup_msg = walkup_err.to_string();
+        assert!(
+            walkup_msg.contains("kb.toml"),
+            "walk-up error should mention 'kb.toml': {walkup_msg}"
+        );
+        assert!(
+            walkup_msg.contains("kb/kb.toml"),
+            "walk-up error should mention 'kb/kb.toml': {walkup_msg}"
+        );
+        assert!(
+            walkup_msg.contains(&cwd_tmp.path().display().to_string()),
+            "walk-up error should cite cwd '{}': {walkup_msg}",
+            cwd_tmp.path().display()
+        );
+
+        // Case 2: --root points at an existing dir with no kb config.
+        let empty = tempdir().expect("temp empty root");
+        let override_err =
+            discover_root_in(Some(empty.path()), cwd_tmp.path(), home_tmp.path())
+                .expect_err("override should fail");
+        let override_msg = override_err.to_string();
+        assert!(
+            override_msg.contains("kb.toml"),
+            "--root error should mention 'kb.toml': {override_msg}"
+        );
+        assert!(
+            override_msg.contains("kb/kb.toml"),
+            "--root error should mention 'kb/kb.toml': {override_msg}"
+        );
+        let empty_canon = empty
+            .path()
+            .canonicalize()
+            .expect("canonicalize empty root");
+        assert!(
+            override_msg.contains(&empty_canon.display().to_string()),
+            "--root error should cite provided path '{}': {override_msg}",
+            empty_canon.display()
         );
     }
 }
