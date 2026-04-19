@@ -7,8 +7,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
 use kb_core::{
-    EntityMetadata, SourceDocument, SourceKind, SourceRevision, Status, mint_source_document_id,
-    mint_source_revision_id, normalize_file_stable_location, source_revision_content_hash,
+    EntityMetadata, NormalizedDocument, SourceDocument, SourceKind, SourceRevision, Status,
+    mint_source_document_id, mint_source_revision_id, normalize_file_stable_location,
+    source_revision_content_hash, write_normalized_document,
 };
 use serde::{Deserialize, Serialize};
 
@@ -187,6 +188,12 @@ fn ingest_file(root: &Path, source_path: &Path, dry_run: bool) -> Result<LocalIn
                 &revision,
             )?;
         }
+
+        // Also produce the canonical NormalizedDocument so downstream passes
+        // (compile, query) can consume the ingested source. The raw/ tree
+        // remains the immutable source archive; normalized/ is the derived
+        // view keyed by source-document id.
+        write_normalized_for_file(root, &document, &revision, &content)?;
     }
 
     let outcome = if !document_exists {
@@ -309,6 +316,59 @@ fn write_new_revision(
     };
     write_json(metadata_sidecar_path, &sidecar)?;
     write_json(revision_record_path, revision)?;
+    Ok(())
+}
+
+/// Writes a canonical `NormalizedDocument` for an ingested local file so that
+/// `kb compile` and other downstream passes can consume it from `normalized/`.
+///
+/// The raw file already lives under `raw/inbox/<src>/<rev>/`; here we produce
+/// the derived view keyed by the source-document id. For non-UTF8 files we
+/// fall back to lossy decoding rather than refusing ingest — the upstream
+/// archive copy still preserves exact bytes.
+fn write_normalized_for_file(
+    root: &Path,
+    document: &SourceDocument,
+    revision: &SourceRevision,
+    content: &[u8],
+) -> Result<()> {
+    let canonical_text = std::str::from_utf8(content).map_or_else(
+        |_| String::from_utf8_lossy(content).into_owned(),
+        ToOwned::to_owned,
+    );
+    let heading_ids = extract_heading_ids(&canonical_text);
+
+    let now = now_millis()?;
+    let normalized_metadata = EntityMetadata {
+        id: document.metadata.id.clone(),
+        created_at_millis: document.metadata.created_at_millis,
+        updated_at_millis: now,
+        source_hashes: vec![revision.fetched_revision_hash.clone()],
+        model_version: None,
+        tool_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        prompt_template_hash: None,
+        dependencies: vec![revision.metadata.id.clone()],
+        output_paths: vec![
+            PathBuf::from("normalized")
+                .join(&document.metadata.id)
+                .join("source.md"),
+            PathBuf::from("normalized")
+                .join(&document.metadata.id)
+                .join("metadata.json"),
+        ],
+        status: Status::Fresh,
+    };
+
+    let normalized = NormalizedDocument {
+        metadata: normalized_metadata,
+        source_revision_id: revision.metadata.id.clone(),
+        canonical_text,
+        normalized_assets: Vec::new(),
+        heading_ids,
+    };
+
+    write_normalized_document(root, &normalized)
+        .with_context(|| format!("failed to write normalized document {}", document.metadata.id))?;
     Ok(())
 }
 
@@ -448,6 +508,39 @@ mod tests {
     }
 
     #[test]
+    fn file_ingest_writes_normalized_document_roundtrip() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let file = source_root.path().join("notes.md");
+        fs::write(
+            &file,
+            "# Alpha\n\nBody text.\n\n## Beta section\n\nmore\n\n### Gamma\n",
+        )
+        .expect("write source file");
+
+        let ingested = ingest_paths(kb_root.path(), &[file]).expect("ingest succeeds");
+        let src_id = ingested[0].document.metadata.id.clone();
+        let rev_id = ingested[0].revision.metadata.id.clone();
+
+        // The on-disk metadata.json must deserialize via the canonical reader.
+        let doc = kb_core::read_normalized_document(kb_root.path(), &src_id)
+            .expect("read_normalized_document round-trip");
+
+        assert_eq!(doc.metadata.id, src_id);
+        assert_eq!(doc.source_revision_id, rev_id);
+        assert!(doc.canonical_text.starts_with("# Alpha"));
+        assert_eq!(
+            doc.heading_ids,
+            vec![
+                "alpha".to_string(),
+                "beta-section".to_string(),
+                "gamma".to_string(),
+            ]
+        );
+        assert!(doc.normalized_assets.is_empty());
+    }
+
+    #[test]
     fn dry_run_reports_changes_without_writing_files() {
         let kb_root = init_kb_root();
         let source_root = TempDir::new().expect("create source tempdir");
@@ -474,6 +567,8 @@ mod tests {
     }
 }
 
+mod headings;
 mod url;
 
+pub use headings::extract_heading_ids;
 pub use url::{UrlIngestReport, ingest_url, ingest_url_with_options};
