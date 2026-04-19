@@ -164,6 +164,32 @@ fn format_lock_holder(path: &Path) -> String {
     }
 }
 
+/// Build the full wait-progress line printed while blocked on the root
+/// lock. Reads the sidecar metadata file every call so we never cache a
+/// stale holder name across iterations of the acquire loop.
+///
+/// When the metadata parses, we render "held by pid N running `cmd`" so
+/// operators can see exactly which process and invocation is blocking
+/// them. When the file is missing or unparseable, we render
+/// "holder metadata missing" without the "held by" prefix — the previous
+/// fallback said "held by unknown", which looked like a parse bug and
+/// gave operators no next action. "holder metadata missing" says what
+/// actually went wrong (the sidecar file isn't there or isn't parseable).
+///
+/// Extracted so tests can exercise formatting without racing the acquire
+/// loop.
+fn format_wait_message(metadata_path: &Path, elapsed_secs: u64) -> String {
+    match load_lock_metadata(metadata_path) {
+        Ok(metadata) => format!(
+            "waiting for KB root lock (held by pid {} running `{}`, {}s elapsed)",
+            metadata.pid, metadata.command, elapsed_secs
+        ),
+        Err(_) => format!(
+            "waiting for KB root lock (holder metadata missing, {elapsed_secs}s elapsed)"
+        ),
+    }
+}
+
 /// If the sidecar metadata records a dead pid, remove it so the next acquire
 /// attempt does not report a ghost holder. Returns true when stale metadata
 /// was cleaned up.
@@ -271,14 +297,8 @@ impl KbLock {
                         .is_none_or(|prev| now.duration_since(prev) >= WAIT_PROGRESS_INTERVAL);
                     if should_emit {
                         let elapsed_secs = now.duration_since(wait_start).as_secs();
-                        let holder = match load_lock_metadata(&metadata_path) {
-                            Ok(m) => format!("{} pid={}", m.command, m.pid),
-                            Err(_) => "unknown".to_string(),
-                        };
-                        let _ = writeln!(
-                            progress,
-                            "waiting for KB root lock (held by {holder}, {elapsed_secs}s elapsed)"
-                        );
+                        let line = format_wait_message(&metadata_path, elapsed_secs);
+                        let _ = writeln!(progress, "{line}");
                         let _ = progress.flush();
                         last_progress_at = Some(now);
                     }
@@ -603,6 +623,105 @@ mod tests {
         assert!(
             out.contains("compile"),
             "progress line should name holder command, got: {out:?}"
+        );
+    }
+
+    /// The wait-progress line must name the holder's pid and command, read
+    /// from the sidecar metadata file on disk. Regression for bn-90d: the
+    /// previous formatting fell back to the literal string "unknown" when
+    /// rendering the holder, even though the metadata file was right there.
+    #[test]
+    fn format_wait_message_names_pid_and_command_from_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let locks_root = locks_dir(dir.path());
+        fs::create_dir_all(&locks_root).expect("create locks dir");
+
+        let metadata_path = root_lock_metadata_path(dir.path());
+        let seeded = LockMetadata {
+            command: "kb compile".to_string(),
+            pid: 12345,
+            started_at_millis: 1,
+        };
+        write_lock_metadata(&metadata_path, &seeded).expect("seed metadata");
+
+        let rendered = format_wait_message(&metadata_path, 3);
+        assert_eq!(
+            rendered,
+            "waiting for KB root lock (held by pid 12345 running `kb compile`, 3s elapsed)"
+        );
+        // Must never render the literal "unknown" when metadata exists.
+        assert!(!rendered.contains("unknown"), "got: {rendered}");
+    }
+
+    /// When the sidecar metadata file is absent, the wait-progress line must
+    /// say so explicitly — not "held by unknown", which looked indistinguish-
+    /// able from a parse bug.
+    #[test]
+    fn format_wait_message_reports_missing_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let locks_root = locks_dir(dir.path());
+        fs::create_dir_all(&locks_root).expect("create locks dir");
+
+        // Do NOT write a metadata file — exercise the missing-file path.
+        let metadata_path = root_lock_metadata_path(dir.path());
+        assert!(!metadata_path.exists());
+
+        let rendered = format_wait_message(&metadata_path, 0);
+        assert_eq!(
+            rendered,
+            "waiting for KB root lock (holder metadata missing, 0s elapsed)"
+        );
+        assert!(!rendered.contains("unknown"), "got: {rendered}");
+    }
+
+    /// If the metadata file exists but can't be parsed (truncated, corrupt,
+    /// wrong schema), we still must not print "unknown" — the waiter should
+    /// surface that the holder record is unreadable.
+    #[test]
+    fn format_wait_message_reports_unparseable_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let locks_root = locks_dir(dir.path());
+        fs::create_dir_all(&locks_root).expect("create locks dir");
+
+        let metadata_path = root_lock_metadata_path(dir.path());
+        fs::write(&metadata_path, b"not json at all").expect("write junk");
+
+        let rendered = format_wait_message(&metadata_path, 7);
+        assert_eq!(
+            rendered,
+            "waiting for KB root lock (holder metadata missing, 7s elapsed)"
+        );
+    }
+
+    /// Integration-style check: run the real acquire loop against a live
+    /// holder and confirm the emitted progress line names the holder's pid
+    /// and command, not "unknown". This is the user-visible symptom the
+    /// bone was filed against.
+    #[test]
+    fn acquire_progress_line_names_live_holder_pid_and_command() {
+        let dir = tempdir().expect("tempdir");
+        let _holder = KbLock::acquire(dir.path(), "kb compile", Duration::from_secs(1))
+            .expect("first lock");
+        let holder_pid = process::id();
+
+        let mut captured: Vec<u8> = Vec::new();
+        let _ = KbLock::acquire_with_progress(
+            dir.path(),
+            "kb ingest",
+            Duration::from_millis(100),
+            &mut captured,
+        )
+        .expect_err("should time out");
+
+        let out = String::from_utf8(captured).expect("utf8");
+        let expected_fragment = format!("pid {holder_pid} running `kb compile`");
+        assert!(
+            out.contains(&expected_fragment),
+            "progress should name holder pid+command, got: {out:?}",
+        );
+        assert!(
+            !out.contains("held by unknown"),
+            "progress must never render the legacy \"held by unknown\" literal, got: {out:?}",
         );
     }
 
