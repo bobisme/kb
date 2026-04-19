@@ -66,7 +66,7 @@ static CITATION_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub fn postprocess_answer(
     raw_answer: &str,
     manifest: &CitationManifest,
-    ctx: &AssembledContext,
+    _ctx: &AssembledContext,
 ) -> ArtifactResult {
     let mut valid = Vec::new();
     let mut invalid = Vec::new();
@@ -85,7 +85,7 @@ pub fn postprocess_answer(
         }
     }
 
-    let needs_banner = should_show_uncertainty_banner(ctx, &valid, manifest);
+    let needs_banner = should_show_uncertainty_banner(&valid, &invalid);
 
     let mut body = String::new();
 
@@ -112,21 +112,25 @@ pub fn postprocess_answer(
     }
 }
 
-fn should_show_uncertainty_banner(
-    ctx: &AssembledContext,
+/// Decide whether the final answer needs an uncertainty banner.
+///
+/// The banner should only fire when the answer is truly weakly grounded:
+///
+/// - No valid citations at all (the model didn't cite any real source), or
+/// - More hallucinated citation keys than valid ones (answer references
+///   sources that do not exist in the manifest more often than real ones).
+///
+/// Heuristics based purely on candidate count or token-budget utilization
+/// are intentionally absent: a short, well-cited answer with a small
+/// context is not uncertain.
+const fn should_show_uncertainty_banner(
     valid_citations: &[u32],
-    manifest: &CitationManifest,
+    invalid_citations: &[u32],
 ) -> bool {
-    if ctx.manifest.is_empty() {
+    if valid_citations.is_empty() {
         return true;
     }
-    if ctx.token_budget > 0 && ctx.estimated_tokens < ctx.token_budget / 10 {
-        return true;
-    }
-    if valid_citations.is_empty() && !manifest.entries.is_empty() {
-        return true;
-    }
-    false
+    invalid_citations.len() > valid_citations.len()
 }
 
 #[cfg(test)]
@@ -206,6 +210,9 @@ mod tests {
 
     #[test]
     fn uncertainty_banner_when_low_coverage() {
+        // Low coverage now means no valid citations at all — a tiny context
+        // with a manifest entry but a raw answer that cites nothing real
+        // should still fire the banner.
         let ctx = AssembledContext {
             text: "tiny".to_string(),
             token_budget: 10000,
@@ -219,7 +226,7 @@ mod tests {
             }],
         };
         let manifest = build_citation_manifest(&ctx);
-        let raw = "Some answer [1].";
+        let raw = "Some answer with no citations at all.";
         let result = postprocess_answer(raw, &manifest, &ctx);
         assert!(result.has_uncertainty_banner);
         assert!(result.body.contains("limited coverage"));
@@ -245,6 +252,69 @@ mod tests {
         let manifest = build_citation_manifest(&ctx);
         let raw = "Well-grounded answer [1] with evidence [2].";
         let result = postprocess_answer(raw, &manifest, &ctx);
+        assert!(!result.has_uncertainty_banner);
+    }
+
+    #[test]
+    fn no_banner_with_five_valid_zero_invalid() {
+        // Regression: 5 valid citations, 0 invalid should never show the
+        // banner regardless of context size vs token budget.
+        let ctx = AssembledContext {
+            text: "context".to_string(),
+            // A big budget with relatively few estimated tokens used to
+            // trip the old "low coverage" heuristic — verify it no longer does.
+            token_budget: 100_000,
+            estimated_tokens: 500,
+            manifest: (0..5)
+                .map(|i| ContextManifestEntry {
+                    start_offset: i * 10,
+                    end_offset: i * 10 + 10,
+                    source_id: format!("wiki/sources/doc-{i}.md"),
+                    anchor: None,
+                    chunk_kind: ContextChunkKind::Section,
+                })
+                .collect(),
+        };
+        let manifest = build_citation_manifest(&ctx);
+        let raw = "Rust has three ownership rules [1][2][3][4][5].";
+        let result = postprocess_answer(raw, &manifest, &ctx);
+        assert_eq!(result.valid_citations.len(), 5);
+        assert!(result.invalid_citations.is_empty());
+        assert!(!result.has_uncertainty_banner);
+        assert!(!result.body.contains("limited coverage"));
+    }
+
+    #[test]
+    fn banner_with_zero_valid_citations() {
+        let ctx = sample_context();
+        let manifest = build_citation_manifest(&ctx);
+        let raw = "Ungrounded claim with no citations.";
+        let result = postprocess_answer(raw, &manifest, &ctx);
+        assert!(result.valid_citations.is_empty());
+        assert!(result.has_uncertainty_banner);
+    }
+
+    #[test]
+    fn banner_when_invalid_exceeds_valid() {
+        // 1 valid, 3 invalid — more hallucinated than grounded.
+        let ctx = sample_context();
+        let manifest = build_citation_manifest(&ctx);
+        let raw = "Claim [1] plus fabrications [42], [77], and [99].";
+        let result = postprocess_answer(raw, &manifest, &ctx);
+        assert_eq!(result.valid_citations, vec![1]);
+        assert_eq!(result.invalid_citations, vec![42, 77, 99]);
+        assert!(result.has_uncertainty_banner);
+    }
+
+    #[test]
+    fn no_banner_when_valid_equals_or_exceeds_invalid() {
+        // 2 valid, 1 invalid — majority grounded, no banner.
+        let ctx = sample_context();
+        let manifest = build_citation_manifest(&ctx);
+        let raw = "Grounded [1] and [2] with one stray [99].";
+        let result = postprocess_answer(raw, &manifest, &ctx);
+        assert_eq!(result.valid_citations, vec![1, 2]);
+        assert_eq!(result.invalid_citations, vec![99]);
         assert!(!result.has_uncertainty_banner);
     }
 
