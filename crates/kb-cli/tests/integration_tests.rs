@@ -1860,3 +1860,63 @@ fn approved_promotion_passes_orphan_lint_with_real_source_ids() {
         serde_json::to_string_pretty(orphans).unwrap_or_default()
     );
 }
+
+/// Regression test for bn-2sv: a syntactically broken kb.toml must cause every
+/// command to fail upfront (not silently run with defaults on read-only commands).
+/// `kb init --force` is the documented escape hatch and must still succeed.
+#[test]
+fn broken_kb_toml_fails_read_only_commands() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Corrupt kb.toml so the parser will reject it.
+    let config_path = kb_root.join("kb.toml");
+    fs::write(&config_path, "invalid toml ===").expect("write broken kb.toml");
+
+    // `kb status` is a read-only command that previously ignored config errors.
+    // It must now exit non-zero with an error naming the file and the parse error.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(
+        !output.status.success(),
+        "kb status must fail with broken kb.toml; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("kb.toml"),
+        "stderr should name the offending file path, got: {stderr}"
+    );
+    // The TOML parser reports a line/column range like "1:15" for the bad token;
+    // accept either the explicit locator or the underlying "invalid" description.
+    assert!(
+        stderr.contains("line")
+            || stderr.contains("column")
+            || stderr.contains("invalid")
+            || stderr.contains("expected"),
+        "stderr should include parse error details, got: {stderr}"
+    );
+
+    // `kb init --force` is the documented way to recover — it must succeed
+    // even when the existing kb.toml is unparseable, because it overwrites it.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("init");
+    let output = cmd.output().expect("run kb init --force");
+    assert!(
+        output.status.success(),
+        "kb init --force must succeed even with broken kb.toml; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // After `init --force`, the config is valid again and status works.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status after recovery");
+    assert!(
+        output.status.success(),
+        "kb status should succeed after init --force; stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

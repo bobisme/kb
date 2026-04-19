@@ -219,6 +219,23 @@ fn run(cli: Cli) -> Result<()> {
         Some(root::discover_root(cli.root.as_deref())?.path)
     };
 
+    // Validate kb.toml upfront for every command except `kb init`. A broken
+    // config is always a bug worth surfacing immediately — otherwise
+    // read-only commands like `status`, `search`, and `inspect` would run
+    // silently against defaults and the user wouldn't learn their config
+    // is broken until they try `ask` or `compile`. `kb init --force` is
+    // allowed to overwrite a broken config, so init skips this check.
+    if !matches!(cli.command, Some(Command::Init { .. }) | None)
+        && let Some(root_path) = root.as_deref()
+    {
+        Config::load_from_root(root_path, None).with_context(|| {
+            format!(
+                "kb.toml is invalid at {}/kb.toml — fix it manually or run `kb init --force` to regenerate",
+                root_path.display()
+            )
+        })?;
+    }
+
     match cli.command {
         Some(Command::Compile) => {
             let compile_root = root
