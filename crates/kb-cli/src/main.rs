@@ -1630,12 +1630,33 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
     if target.trim().is_empty() {
         bail!("inspect: target cannot be empty");
     }
+
+    // I2: reject absolute paths that resolve outside the KB root. `root.join(abs)`
+    // silently replaces the base on Unix, so without this check `/etc/hosts`
+    // would be treated as a KB entity. Relative targets are still joined to
+    // root below and may escape via `..`; we also reject those.
+    if let Some(reason) = path_outside_root(root, target) {
+        bail!("'{target}' is outside the KB root ({reason}); inspect only accepts ids or paths under {}", root.display());
+    }
+
     let graph = Graph::load_from(root)?;
     let hash_state = kb_compile::HashState::load_from_root(root)?;
     let changed_inputs = find_changed_inputs(root, &hash_state)?;
     let jobs = jobs::recent_jobs(root, 1_000)?;
 
-    let mut report = if let Some(id) = graph.resolve_node_id(target) {
+    let mut report = if let Some(path) = resolve_source_id(root, target) {
+        // I1: bare `src-<hex>` identifiers resolve to their wiki/sources page
+        // (preferred) or their normalized/<id>/source.md.
+        build_file_report(
+            root,
+            target,
+            &path,
+            &jobs,
+            &graph,
+            &changed_inputs,
+            &hash_state,
+        )?
+    } else if let Some(id) = graph.resolve_node_id(target) {
         build_graph_inspect_report(root, &graph, target, &id, &changed_inputs, &jobs)?
     } else if let Some(record) = kb_core::load_build_record(root, target)? {
         build_build_record_report(root, target, &record, &jobs)?
@@ -1644,13 +1665,29 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
     } else {
         let candidate = root.join(target);
         if candidate.exists() {
-            build_file_report(root, target, &candidate, &jobs)?
+            build_file_report(
+                root,
+                target,
+                &candidate,
+                &jobs,
+                &graph,
+                &changed_inputs,
+                &hash_state,
+            )?
         } else {
             let frontmatter_matches = find_by_frontmatter_id(root, target);
             match frontmatter_matches.len() {
                 1 => {
                     let path = &frontmatter_matches[0];
-                    build_file_report(root, target, path, &jobs)?
+                    build_file_report(
+                        root,
+                        target,
+                        path,
+                        &jobs,
+                        &graph,
+                        &changed_inputs,
+                        &hash_state,
+                    )?
                 }
                 0 => bail!(
                     "'{target}' was not found. Try an exact ID, a unique graph suffix, a build record ID, a job ID, a frontmatter id, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
@@ -1823,22 +1860,32 @@ fn collect_frontmatter_id_matches(dir: &Path, target: &str, out: &mut Vec<PathBu
     }
 }
 
-fn build_file_report(root: &Path, target: &str, path: &Path, jobs: &[JobRun]) -> Result<InspectReport> {
+fn build_file_report(
+    root: &Path,
+    target: &str,
+    path: &Path,
+    jobs: &[JobRun],
+    graph: &Graph,
+    changed_inputs: &[PathBuf],
+    hash_state: &kb_compile::HashState,
+) -> Result<InspectReport> {
     let rel = path
         .strip_prefix(root)
         .unwrap_or(path)
         .to_string_lossy()
         .into_owned();
     let body = fs::read_to_string(path).unwrap_or_default();
+    let exists = path.exists();
+    let freshness = file_freshness(root, path, &rel, graph, changed_inputs, hash_state, exists);
     Ok(InspectReport {
         target: target.to_string(),
         resolved_id: rel.clone(),
         kind: inspect_kind(&rel),
         metadata: file_metadata(root, Some(path))?,
-        freshness: "unknown".to_string(),
+        freshness,
         graph: None,
         citations: extract_citations(&body),
-        build_records: kb_core::find_build_records_for_output(root, &rel)?
+        build_records: find_build_records_for_path(root, &rel)?
             .into_iter()
             .map(summarize_build_record)
             .collect(),
@@ -1885,12 +1932,188 @@ fn extract_citations(body: &str) -> Vec<String> {
             continue;
         }
         if trimmed.contains("[[") || (trimmed.contains('[') && trimmed.contains("](")) {
-            citations.push(trimmed.to_string());
+            // I5: strip any leading markdown list prefix ("- ", "* ", "+ ") so
+            // the inspect renderer does not emit a "- - [[...]]" double-bullet.
+            let cleaned = strip_list_prefix(trimmed).to_string();
+            if !cleaned.is_empty() {
+                citations.push(cleaned);
+            }
         }
     }
     citations.sort();
     citations.dedup();
     citations
+}
+
+fn strip_list_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return rest.trim_start();
+        }
+    }
+    trimmed
+}
+
+/// Return `Some(reason)` if `target` resolves outside the KB root.
+///
+/// - An absolute path outside `root` returns a reason. `root.join(abs)`
+///   discards `root` on Unix and would otherwise let `/etc/hosts` succeed.
+/// - A relative path that escapes via `..` returns a reason.
+/// - Anything else (ids, relative paths under root) returns `None`.
+fn path_outside_root(root: &Path, target: &str) -> Option<String> {
+    let candidate = Path::new(target);
+    if candidate.is_absolute() {
+        let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let canon_target = candidate.canonicalize().unwrap_or_else(|_| candidate.to_path_buf());
+        if !canon_target.starts_with(&canon_root) {
+            return Some(format!("absolute path {} does not start with root", candidate.display()));
+        }
+        return None;
+    }
+
+    // Relative target: walk the candidate's components and track depth. Any
+    // `..` that would take us above the join point means the target escapes
+    // root. Lexical (not filesystem) so non-existent targets still work.
+    let mut depth: i32 = 0;
+    for comp in candidate.components() {
+        match comp {
+            std::path::Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return Some(format!("relative target {target} escapes root via '..'"));
+                }
+            }
+            std::path::Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// I1: resolve a bare `src-<hex>` identifier to the wiki/sources page (if any)
+/// or to `normalized/<id>/source.md` (if any). Returns the file path for use
+/// in the standard file report.
+fn resolve_source_id(root: &Path, target: &str) -> Option<PathBuf> {
+    if !is_source_id(target) {
+        return None;
+    }
+    let wiki_page = root.join("wiki/sources").join(format!("{target}.md"));
+    if wiki_page.exists() {
+        return Some(wiki_page);
+    }
+    let normalized = root.join("normalized").join(target).join("source.md");
+    if normalized.exists() {
+        return Some(normalized);
+    }
+    None
+}
+
+fn is_source_id(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix("src-") else {
+        return false;
+    };
+    !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Extend `kb_core::find_build_records_for_output` with a fallback match on
+/// `metadata.output_paths` so build records that only list the output as a
+/// `PathBuf` (e.g. concept-merge and promotion passes) are still surfaced by
+/// inspect. Results are deduplicated by record id and sorted newest-first.
+fn find_build_records_for_path(root: &Path, rel: &str) -> Result<Vec<kb_core::BuildRecord>> {
+    let dir = kb_core::build_records_dir(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = kb_core::find_build_records_for_output(root, rel)?;
+    let mut seen: std::collections::BTreeSet<String> =
+        out.iter().map(|r| r.metadata.id.clone()).collect();
+    for entry in fs::read_dir(&dir).with_context(|| format!("scan {}", dir.display()))? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("read build record {}", path.display()))?;
+            let record: kb_core::BuildRecord = serde_json::from_str(&raw)
+                .with_context(|| format!("deserialize build record {}", path.display()))?;
+            if seen.contains(&record.metadata.id) {
+                continue;
+            }
+            let matches_path = record
+                .metadata
+                .output_paths
+                .iter()
+                .any(|p| p.to_string_lossy() == rel);
+            if matches_path {
+                seen.insert(record.metadata.id.clone());
+                out.push(record);
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        b.metadata
+            .created_at_millis
+            .cmp(&a.metadata.created_at_millis)
+    });
+    Ok(out)
+}
+
+/// I3: compute freshness for a file-based inspect report.
+///
+/// - If the file is a graph node, delegate to `inspect_freshness` so concept
+///   and wiki pages get "fresh"/"stale" from the HashState-backed logic.
+/// - Otherwise, for a `wiki/sources/*.md` page, compare the page's frontmatter
+///   `source_revision_id` to the normalized document's current
+///   `source_revision_id`. Equal → fresh, different → stale.
+/// - Fall back to `"unknown"` when no signal is available.
+fn file_freshness(
+    root: &Path,
+    abs_path: &Path,
+    rel: &str,
+    graph: &Graph,
+    changed_inputs: &[PathBuf],
+    _hash_state: &kb_compile::HashState,
+    exists: bool,
+) -> String {
+    if !exists {
+        return "missing".to_string();
+    }
+    if graph.node(rel).is_some() {
+        return inspect_freshness(graph, rel, changed_inputs, true);
+    }
+    if rel.starts_with("wiki/sources/") {
+        if let Some(status) = source_page_freshness(root, abs_path) {
+            return status;
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Compare a source wiki page's frontmatter `source_revision_id` against the
+/// current one in `normalized/<source_document_id>/metadata.json`. Returns
+/// `None` when either side is missing so the caller can fall back to
+/// `"unknown"` rather than lying about freshness.
+fn source_page_freshness(root: &Path, page_path: &Path) -> Option<String> {
+    let (frontmatter, _) = kb_core::frontmatter::read_frontmatter(page_path).ok()?;
+    let source_doc_id = frontmatter
+        .get(serde_yaml::Value::String("source_document_id".into()))
+        .and_then(serde_yaml::Value::as_str)?;
+    let page_revision = frontmatter
+        .get(serde_yaml::Value::String("source_revision_id".into()))
+        .and_then(serde_yaml::Value::as_str)?;
+
+    let metadata_path = root
+        .join("normalized")
+        .join(source_doc_id)
+        .join("metadata.json");
+    let raw = fs::read_to_string(&metadata_path).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let current_revision = meta.get("source_revision_id").and_then(|v| v.as_str())?;
+
+    Some(if current_revision == page_revision {
+        "fresh".to_string()
+    } else {
+        "stale".to_string()
+    })
 }
 
 fn inspect_freshness(graph: &Graph, id: &str, changed_inputs: &[PathBuf], exists_on_disk: bool) -> String {

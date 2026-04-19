@@ -718,7 +718,9 @@ fn inspect_json_trace_and_build_records_are_reported() {
     assert_eq!(payload["kind"], "wiki_page");
     assert_eq!(payload["freshness"], "fresh");
     assert_eq!(payload["graph"]["direct_inputs"][0], "wiki/sources/example.md");
-    assert_eq!(payload["citations"][0], "- [[wiki/sources/example.md]]");
+    // I5: citations are parsed clean of their list-marker prefix so the
+    // inspect renderer does not emit "- - [[...]]".
+    assert_eq!(payload["citations"][0], "[[wiki/sources/example.md]]");
     assert_eq!(payload["build_records"][0]["id"], "build-index");
     assert_eq!(payload["trace"][0]["id"], "wiki/sources/example.md");
 }
@@ -987,6 +989,253 @@ fn inspect_ambiguous_frontmatter_id_reports_matches() {
     assert!(stderr.contains("ambiguous"), "stderr was: {stderr}");
     assert!(stderr.contains("wiki/sources/one.md"), "stderr was: {stderr}");
     assert!(stderr.contains("wiki/sources/two.md"), "stderr was: {stderr}");
+}
+
+// I1: bare `src-<hex>` identifier resolves to the wiki/sources page.
+#[test]
+fn inspect_resolves_bare_src_id_to_wiki_sources_page() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    fs::write(
+        sources_dir.join("src-302b46ff.md"),
+        "---\nid: wiki-source-src-302b46ff\nsource_document_id: src-302b46ff\nsource_revision_id: rev-1\n---\n\n# Src\n",
+    )
+    .expect("write source page");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-302b46ff");
+    let output = cmd.output().expect("run kb inspect src-302b46ff");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("resolved_id: wiki/sources/src-302b46ff.md"),
+        "expected resolved_id to point at wiki/sources page, got:\n{stdout}"
+    );
+}
+
+// I1 fallback: bare `src-<hex>` identifier with no wiki page falls back to
+// the normalized/<id>/source.md file.
+#[test]
+fn inspect_resolves_bare_src_id_to_normalized_dir() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let normalized_dir = kb_root.join("normalized/src-deadbeef");
+    fs::create_dir_all(&normalized_dir).expect("create normalized dir");
+    fs::write(normalized_dir.join("source.md"), "# Only normalized\n")
+        .expect("write source.md");
+    fs::write(
+        normalized_dir.join("metadata.json"),
+        r#"{"metadata":{"id":"src-deadbeef","created_at_millis":0,"updated_at_millis":0,"source_hashes":[],"dependencies":[],"output_paths":[],"status":"fresh"},"source_revision_id":"rev-1","normalized_assets":[],"heading_ids":[]}"#,
+    )
+    .expect("write metadata.json");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-deadbeef");
+    let output = cmd.output().expect("run kb inspect src-deadbeef");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("resolved_id: normalized/src-deadbeef/source.md"),
+        "expected resolved_id to point at normalized source, got:\n{stdout}"
+    );
+}
+
+// I2: absolute paths outside the KB root must error.
+#[test]
+fn inspect_rejects_paths_outside_kb_root() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("/etc/hosts");
+    let output = cmd
+        .output()
+        .expect("run kb inspect on absolute path outside root");
+
+    assert!(
+        !output.status.success(),
+        "kb inspect on /etc/hosts unexpectedly succeeded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("outside the KB root"),
+        "expected 'outside the KB root' in stderr, got: {stderr}"
+    );
+}
+
+// I3: source-wiki page freshness reflects the normalized document's current
+// source_revision_id.
+#[test]
+fn inspect_reports_fresh_when_source_revision_matches_normalized() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    fs::write(
+        sources_dir.join("src-abcd1234.md"),
+        "---\nid: wiki-source-src-abcd1234\nsource_document_id: src-abcd1234\nsource_revision_id: rev-match\n---\n\n# Src\n",
+    )
+    .expect("write source page");
+
+    let normalized_dir = kb_root.join("normalized/src-abcd1234");
+    fs::create_dir_all(&normalized_dir).expect("create normalized dir");
+    fs::write(normalized_dir.join("source.md"), "# body\n").expect("write source");
+    fs::write(
+        normalized_dir.join("metadata.json"),
+        r#"{"metadata":{"id":"src-abcd1234","created_at_millis":0,"updated_at_millis":0,"source_hashes":[],"dependencies":[],"output_paths":[],"status":"fresh"},"source_revision_id":"rev-match","normalized_assets":[],"heading_ids":[]}"#,
+    )
+    .expect("write metadata");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-abcd1234");
+    let output = cmd.output().expect("run kb inspect src-abcd1234");
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("freshness: fresh"),
+        "expected fresh, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn inspect_reports_stale_when_source_revision_diverges() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    fs::write(
+        sources_dir.join("src-aaaa1111.md"),
+        "---\nid: wiki-source-src-aaaa1111\nsource_document_id: src-aaaa1111\nsource_revision_id: rev-old\n---\n\n# Src\n",
+    )
+    .expect("write source page");
+
+    let normalized_dir = kb_root.join("normalized/src-aaaa1111");
+    fs::create_dir_all(&normalized_dir).expect("create normalized dir");
+    fs::write(normalized_dir.join("source.md"), "# body\n").expect("write source");
+    fs::write(
+        normalized_dir.join("metadata.json"),
+        r#"{"metadata":{"id":"src-aaaa1111","created_at_millis":0,"updated_at_millis":0,"source_hashes":[],"dependencies":[],"output_paths":[],"status":"fresh"},"source_revision_id":"rev-new","normalized_assets":[],"heading_ids":[]}"#,
+    )
+    .expect("write metadata");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-aaaa1111");
+    let output = cmd.output().expect("run kb inspect src-aaaa1111");
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("freshness: stale"),
+        "expected stale, got:\n{stdout}"
+    );
+}
+
+// I4: build records whose metadata.output_paths name the inspected file are
+// surfaced, even when output_ids is empty.
+#[test]
+fn inspect_surfaces_build_records_matched_by_output_paths() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let concepts_dir = kb_root.join("wiki/concepts");
+    fs::create_dir_all(&concepts_dir).expect("create wiki/concepts");
+    fs::write(
+        concepts_dir.join("tokio.md"),
+        "---\nid: concept:tokio\n---\n\n# Tokio\n",
+    )
+    .expect("write concept page");
+
+    let mut record_metadata = test_metadata("build-concept-tokio");
+    record_metadata.output_paths = vec![PathBuf::from("wiki/concepts/tokio.md")];
+    save_build_record(
+        &kb_root,
+        &BuildRecord {
+            metadata: record_metadata,
+            pass_name: "concept_extraction".to_string(),
+            input_ids: vec!["wiki/sources/example.md".to_string()],
+            output_ids: Vec::new(),
+            manifest_hash: "manifest-concept".to_string(),
+        },
+    )
+    .expect("save build record");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("wiki/concepts/tokio.md");
+    let output = cmd.output().expect("run kb inspect concept");
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("id: build-concept-tokio"),
+        "expected build-concept-tokio in build records, got:\n{stdout}"
+    );
+}
+
+// I5: the citations section must not emit double-bullet artifacts when the
+// source markdown already includes a `- ` list prefix.
+#[test]
+fn inspect_citations_do_not_double_bullet() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    fs::write(
+        sources_dir.join("src-cafe9999.md"),
+        "---\nid: wiki-source-src-cafe9999\nsource_document_id: src-cafe9999\nsource_revision_id: rev-1\n---\n\n## Citations\n\n- [[wiki/sources/src-cafe9999]]\n",
+    )
+    .expect("write source page");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-cafe9999");
+    let output = cmd.output().expect("run kb inspect src-cafe9999");
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("- - [["),
+        "citations should not double-bullet, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("- [[wiki/sources/src-cafe9999]]"),
+        "expected single-bullet citation, got:\n{stdout}"
+    );
 }
 
 #[test]
