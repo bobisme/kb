@@ -73,6 +73,74 @@ The following categories have been frequent false positives. Skip them:
    creation". A standalone fact about a system call is not a concept; the system call or
    the higher-level pattern may be.
 
+### Worked examples
+
+These are real false positives observed on prior compile runs. Use them as a guide when
+deciding whether to spawn a new concept or to fold material into an existing one.
+
+**Example 1 — trade-offs are not concepts.**
+
+Source text (from a `regularization.md`) reads:
+
+> ## Trade-offs
+>
+> Regularizers cost some training-set fit in exchange for generalization.
+
+- WRONG: extract a new concept named "regularization-generalization trade-off".
+- RIGHT: this is a property of `regularization` and `overfitting`, not a reusable thing.
+  Mention the trade-off inside the `definition_hint` of `regularization` (e.g. "a family
+  of techniques that trade training-set fit for generalization"). Do not spawn a new
+  concept for the trade-off itself.
+
+**Example 2 — single bullets are not concepts.**
+
+Source text (from a `dropout.md` "Why it works" section) reads:
+
+> - Co-adaptation prevention — features can't rely on specific others being present.
+
+- WRONG: extract a new concept named "feature co-adaptation".
+- RIGHT: fold it into the `definition_hint` of `dropout` (e.g. "stochastic unit masking
+  that prevents feature co-adaptation"). A single bullet point is not a paragraph of
+  conceptual substance (rule #3 above).
+
+**Example 3 — one-line mechanism notes are not concepts.**
+
+Source text (from an `attention.md`) reads:
+
+> For autoregressive generation, mask the upper triangle of the score matrix.
+
+- WRONG: extract a new concept named "causal masking".
+- RIGHT: mention causal masking in the `definition_hint` of `attention`, or add
+  "causal masking" / "causal attention" to its `aliases`. A one-sentence mechanism note
+  does not meet the reusability bar.
+
+**Example 4 — "X of Y" observations are not concepts.**
+
+Source text (from a `batch-norm.md`) reads:
+
+> Batch normalization smooths the loss landscape, which is one hypothesis for why it
+> accelerates training.
+
+- WRONG: extract a new concept named "loss landscape smoothing".
+- RIGHT: this phrase describes an *observed effect* of batch normalization, not a named,
+  reusable idea that another document would link to. Mention it in the `definition_hint`
+  of `batch normalization` if relevant; otherwise omit.
+
+**Example 5 — named, reusable ideas SHOULD be extracted.**
+
+Source text (from an `adam.md`):
+
+> Adam is an adaptive-learning-rate optimizer combining momentum (first moment) with
+> RMSProp-style second-moment scaling.
+
+- RIGHT: extract `adam` (with aliases like `adam optimizer`). It is a named technique,
+  discussed at paragraph length, and would plausibly be linked from unrelated documents.
+
+The pattern: if the candidate's name reads like "X of Y", "X-handling", "X behavior",
+"X implementation", "X considerations", "X trade-off", or "X approach", it is almost
+certainly a meta-observation about the source — not a concept — and should be folded
+into an existing concept instead.
+
 ### Positive guidance
 
 - Prefer durable concepts (named techniques, systems, patterns, data structures,
