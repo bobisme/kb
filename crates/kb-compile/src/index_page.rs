@@ -43,26 +43,85 @@ pub fn generate_indexes(root: &Path) -> Result<Vec<IndexArtifact>> {
 
     let mut artifacts = Vec::with_capacity(3);
 
+    let global_path = root.join("wiki/index.md");
+    let global_parent = global_path
+        .parent()
+        .context("wiki/index.md has no parent")?
+        .to_path_buf();
     artifacts.push(IndexArtifact {
-        path: root.join("wiki/index.md"),
-        content: render_global_index(&sources, &concepts),
+        content: render_global_index(&sources, &concepts, root, &global_parent),
+        path: global_path,
     });
 
     if !sources.is_empty() {
+        let path = root.join("wiki/sources/index.md");
+        let parent = path
+            .parent()
+            .context("wiki/sources/index.md has no parent")?
+            .to_path_buf();
         artifacts.push(IndexArtifact {
-            path: root.join("wiki/sources/index.md"),
-            content: render_category_index("Sources", &sources),
+            content: render_category_index("Sources", &sources, root, &parent),
+            path,
         });
     }
 
     if !concepts.is_empty() {
+        let path = root.join("wiki/concepts/index.md");
+        let parent = path
+            .parent()
+            .context("wiki/concepts/index.md has no parent")?
+            .to_path_buf();
         artifacts.push(IndexArtifact {
-            path: root.join("wiki/concepts/index.md"),
-            content: render_category_index("Concepts", &concepts),
+            content: render_category_index("Concepts", &concepts, root, &parent),
+            path,
         });
     }
 
     Ok(artifacts)
+}
+
+/// Compute a forward-slash markdown link target for an entry whose path is
+/// stored relative to `root`, rewriting it to be relative to `index_parent`
+/// so that markdown renderers (Obsidian, GitHub, VS Code preview) resolve it
+/// correctly.
+fn link_target(entry: &IndexEntry, root: &Path, index_parent: &Path) -> String {
+    let abs_target = root.join(&entry.relative_path);
+    let rel = relative_from(&abs_target, index_parent)
+        .unwrap_or_else(|| PathBuf::from(&entry.relative_path));
+    rel.to_string_lossy().replace('\\', "/")
+}
+
+/// Compute `target` expressed relative to `base`, walking up with `..` as
+/// needed. Returns `None` if the two paths have different absolute/relative
+/// kinds (so prefixes cannot be compared).
+fn relative_from(target: &Path, base: &Path) -> Option<PathBuf> {
+    if target.is_absolute() != base.is_absolute() {
+        return None;
+    }
+
+    let mut t = target.components();
+    let mut b = base.components();
+    loop {
+        match (t.clone().next(), b.clone().next()) {
+            (Some(tc), Some(bc)) if tc == bc => {
+                t.next();
+                b.next();
+            }
+            _ => break,
+        }
+    }
+
+    let mut rel = PathBuf::new();
+    for _ in b {
+        rel.push("..");
+    }
+    for c in t {
+        rel.push(c.as_os_str());
+    }
+    if rel.as_os_str().is_empty() {
+        rel.push(".");
+    }
+    Some(rel)
 }
 
 /// Persist index artifacts to disk using atomic writes.
@@ -157,7 +216,12 @@ fn title_from_filename(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-fn render_global_index(sources: &[IndexEntry], concepts: &[IndexEntry]) -> String {
+fn render_global_index(
+    sources: &[IndexEntry],
+    concepts: &[IndexEntry],
+    root: &Path,
+    index_parent: &Path,
+) -> String {
     let mut out = String::from("# Knowledge Base\n");
 
     out.push_str("\n## Sources\n\n");
@@ -166,7 +230,13 @@ fn render_global_index(sources: &[IndexEntry], concepts: &[IndexEntry]) -> Strin
     } else {
         write!(out, "{} source(s) indexed.\n\n", sources.len()).expect("infallible");
         for entry in sources {
-            writeln!(out, "- [{}]({})", entry.title, entry.relative_path).expect("infallible");
+            writeln!(
+                out,
+                "- [{}]({})",
+                entry.title,
+                link_target(entry, root, index_parent)
+            )
+            .expect("infallible");
         }
     }
 
@@ -176,19 +246,36 @@ fn render_global_index(sources: &[IndexEntry], concepts: &[IndexEntry]) -> Strin
     } else {
         write!(out, "{} concept(s) indexed.\n\n", concepts.len()).expect("infallible");
         for entry in concepts {
-            writeln!(out, "- [{}]({})", entry.title, entry.relative_path).expect("infallible");
+            writeln!(
+                out,
+                "- [{}]({})",
+                entry.title,
+                link_target(entry, root, index_parent)
+            )
+            .expect("infallible");
         }
     }
 
     out
 }
 
-fn render_category_index(category: &str, entries: &[IndexEntry]) -> String {
+fn render_category_index(
+    category: &str,
+    entries: &[IndexEntry],
+    root: &Path,
+    index_parent: &Path,
+) -> String {
     let mut out = String::new();
     writeln!(out, "# {category}\n").expect("infallible");
     writeln!(out, "{} page(s).\n", entries.len()).expect("infallible");
     for entry in entries {
-        writeln!(out, "- [{}]({})", entry.title, entry.relative_path).expect("infallible");
+        writeln!(
+            out,
+            "- [{}]({})",
+            entry.title,
+            link_target(entry, root, index_parent)
+        )
+        .expect("infallible");
     }
     out
 }
@@ -292,16 +379,127 @@ mod tests {
     }
 
     #[test]
-    fn links_use_relative_paths() {
+    fn global_index_links_are_relative_to_wiki_dir() {
         let root = tempdir().expect("tempdir");
         write_file(
             &root.path().join("wiki/sources/example.md"),
             "---\ntitle: Example\n---\n",
         );
+        write_file(
+            &root.path().join("wiki/concepts/foo.md"),
+            "---\nname: Foo\n---\n",
+        );
 
         let artifacts = generate_indexes(root.path()).expect("generate");
-        let global = &artifacts[0];
-        assert!(global.content.contains("(wiki/sources/example.md)"));
+        let global = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/index.md"))
+            .expect("global index");
+
+        // Link targets must be relative to the index file's parent directory
+        // (`wiki/`), not the KB root.
+        assert!(
+            global.content.contains("(sources/example.md)"),
+            "expected file-relative source link; got:\n{}",
+            global.content
+        );
+        assert!(
+            global.content.contains("(concepts/foo.md)"),
+            "expected file-relative concept link; got:\n{}",
+            global.content
+        );
+        assert!(
+            !global.content.contains("(wiki/sources/"),
+            "global index must not contain wiki/-prefixed links"
+        );
+        assert!(
+            !global.content.contains("(wiki/concepts/"),
+            "global index must not contain wiki/-prefixed links"
+        );
+    }
+
+    #[test]
+    fn category_index_links_are_relative_to_category_dir() {
+        let root = tempdir().expect("tempdir");
+        write_file(
+            &root.path().join("wiki/sources/example.md"),
+            "---\ntitle: Example\n---\n",
+        );
+        write_file(
+            &root.path().join("wiki/concepts/foo.md"),
+            "---\nname: Foo\n---\n",
+        );
+
+        let artifacts = generate_indexes(root.path()).expect("generate");
+
+        let sources = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/sources/index.md"))
+            .expect("sources index");
+        assert!(
+            sources.content.contains("(example.md)"),
+            "expected bare filename in sources index; got:\n{}",
+            sources.content
+        );
+        assert!(!sources.content.contains("(wiki/"));
+        assert!(!sources.content.contains("(sources/"));
+
+        let concepts = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/index.md"))
+            .expect("concepts index");
+        assert!(
+            concepts.content.contains("(foo.md)"),
+            "expected bare filename in concepts index; got:\n{}",
+            concepts.content
+        );
+        assert!(!concepts.content.contains("(wiki/"));
+        assert!(!concepts.content.contains("(concepts/"));
+    }
+
+    #[test]
+    fn every_index_link_resolves_from_its_parent_dir() {
+        // Integration-style check: build a wiki, generate + persist indexes,
+        // parse each markdown link, and assert the target exists when joined
+        // with the index file's parent directory.
+        let root = tempdir().expect("tempdir");
+        for name in ["alpha", "beta", "gamma"] {
+            write_file(
+                &root.path().join(format!("wiki/sources/src-{name}.md")),
+                &format!("---\ntitle: {name}\n---\n"),
+            );
+        }
+        for name in ["one", "two"] {
+            write_file(
+                &root.path().join(format!("wiki/concepts/{name}.md")),
+                &format!("---\nname: {name}\n---\n"),
+            );
+        }
+
+        let artifacts = generate_indexes(root.path()).expect("generate");
+        persist_index_artifacts(&artifacts).expect("persist");
+
+        let link_re = regex::Regex::new(r"\]\(([^)]+)\)").expect("regex");
+        for artifact in &artifacts {
+            let parent = artifact.path.parent().expect("index has parent");
+            let content = fs::read_to_string(&artifact.path).expect("read index");
+            let mut link_count = 0usize;
+            for cap in link_re.captures_iter(&content) {
+                let target = &cap[1];
+                link_count += 1;
+                let resolved = parent.join(target);
+                assert!(
+                    resolved.exists(),
+                    "link {target:?} in {:?} does not resolve ({resolved:?} missing)",
+                    artifact.path
+                );
+            }
+            assert!(
+                link_count > 0,
+                "expected at least one link in {:?}",
+                artifact.path
+            );
+        }
     }
 
     #[test]
