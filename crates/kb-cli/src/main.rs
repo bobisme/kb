@@ -2910,6 +2910,20 @@ struct ChangedInput {
     original_path: Option<String>,
 }
 
+/// Result of scanning `normalized/*/` for inputs needing recompile.
+///
+/// `entries` is the full list of uncompiled sources (both never-compiled and
+/// revision-mismatched), and `revision_mismatched` is the subset count where
+/// a previously-compiled source has been re-ingested with a new revision —
+/// the primary signal surfaced by `kb status` as "stale artifacts".
+struct ChangedInputsScan {
+    entries: Vec<ChangedInput>,
+    /// Number of `entries` that represent a wiki page out of date relative
+    /// to a newer normalized revision (bn-2m2). Never-compiled sources are
+    /// NOT counted here — those are "new", not "stale".
+    revision_mismatched: usize,
+}
+
 /// Maximum number of failed jobs shown in text `kb status` output. Additional
 /// failures are summarized with a "... and N more" hint. Kept small because
 /// typo/bad-path failures accrue indefinitely and would otherwise drown the
@@ -2945,8 +2959,34 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     // source — so we keep it in lockstep with the disk-walked total.
     let wiki_pages = source_counts.total;
     let concepts = count_wiki_concept_pages(root)?;
-    let mut stale_count = 0;
 
+    // bn-2m2: `stale_count` now reflects the primary user-visible staleness
+    // signal — ingested sources whose wiki page is out of date relative to
+    // the normalized `source_revision_id`. Previously this counter walked
+    // the persisted graph looking for leaf outputs with non-raw inputs,
+    // which was a graph-topology heuristic that never reacted to re-ingest
+    // and always reported 0 in the common "edit file, re-ingest, forget to
+    // compile" flow. See `/tmp/kb-pass9/findings/n-stale-count.md`.
+    //
+    // The scan is shared with `changed_inputs_not_compiled` below so we
+    // walk `normalized/*/` exactly once per `kb status` invocation.
+    //
+    // TODO(bn-2m2-followup): extend `stale_count` with (#2) orphan concept
+    // pages whose `source_document_ids` reference a missing `normalized/`
+    // source-id, and (#3) build records naming output paths that no longer
+    // exist on disk. The shape (a u64 count) already accommodates both; we
+    // just need additional one-shot passes and de-duplication against the
+    // revision-mismatch set so the same src-id isn't counted twice.
+    let changed_scan = scan_changed_inputs(root, &hash_state)?;
+    let mut stale_count = changed_scan.revision_mismatched;
+
+    // Preserve the original graph-topology heuristic as a non-overlapping
+    // additive signal. It fires on graph-level inconsistencies (missing
+    // intermediate outputs, etc.) that aren't captured by the per-source
+    // revision check — e.g. a concept page whose inputs were all deleted.
+    // De-duplication is unnecessary because this branch inspects `graph`
+    // outputs keyed by `Manifest::artifacts`, which never includes the
+    // normalized-source entities counted above.
     for artifact_record in manifest.artifacts.values() {
         for output_id in &artifact_record.output_ids {
             if let Ok(inspection) = graph.inspect(output_id) {
@@ -3006,7 +3046,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         .cloned()
         .collect();
 
-    let changed_inputs_not_compiled = find_changed_inputs(root, &hash_state)?;
+    let changed_inputs_not_compiled = changed_scan.entries;
     let sources_with_missing_origin = find_missing_origins(root)?;
 
     Ok(StatusPayload {
@@ -3224,12 +3264,31 @@ fn find_changed_inputs(
     root: &Path,
     hash_state: &kb_compile::HashState,
 ) -> Result<Vec<ChangedInput>> {
+    Ok(scan_changed_inputs(root, hash_state)?.entries)
+}
+
+/// Single-pass walk of `normalized/*/` that classifies each source as
+/// "never compiled" or "revision-mismatched" (or neither — the clean case).
+///
+/// Shared by [`find_changed_inputs`] (which drops the classification and
+/// returns just the entries) and [`gather_status`] (which needs the
+/// revision-mismatched count to populate `StatusPayload::stale_count`).
+/// Factoring this out avoids duplicating the `read_dir` walk between the
+/// "changed inputs not yet compiled" list and the stale-artifact count.
+fn scan_changed_inputs(
+    root: &Path,
+    hash_state: &kb_compile::HashState,
+) -> Result<ChangedInputsScan> {
     let normalized_dir = root.join("normalized");
     if !normalized_dir.exists() {
-        return Ok(Vec::new());
+        return Ok(ChangedInputsScan {
+            entries: Vec::new(),
+            revision_mismatched: 0,
+        });
     }
 
-    let mut changed = Vec::new();
+    let mut entries = Vec::new();
+    let mut revision_mismatched = 0;
     for entry in std::fs::read_dir(&normalized_dir)
         .with_context(|| format!("read normalized dir {}", normalized_dir.display()))?
     {
@@ -3246,7 +3305,7 @@ fn find_changed_inputs(
         let node_id = format!("normalized/{name}");
         if !hash_state.hashes.contains_key(&node_id) {
             let original_path = lookup_source_origin(root, name);
-            changed.push(ChangedInput {
+            entries.push(ChangedInput {
                 normalized_path: entry.path(),
                 src_id: name.to_string(),
                 original_path,
@@ -3255,15 +3314,19 @@ fn find_changed_inputs(
         }
         if source_revision_mismatched(root, name)? {
             let original_path = lookup_source_origin(root, name);
-            changed.push(ChangedInput {
+            entries.push(ChangedInput {
                 normalized_path: entry.path(),
                 src_id: name.to_string(),
                 original_path,
             });
+            revision_mismatched += 1;
         }
     }
-    changed.sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
-    Ok(changed)
+    entries.sort_by(|a, b| a.normalized_path.cmp(&b.normalized_path));
+    Ok(ChangedInputsScan {
+        entries,
+        revision_mismatched,
+    })
 }
 
 /// Return `true` if `normalized/<id>/metadata.json::source_revision_id`
@@ -3780,6 +3843,60 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
         let changed_paths: Vec<PathBuf> =
             changed.into_iter().map(|c| c.normalized_path).collect();
         assert_eq!(changed_paths, vec![root.join("normalized").join("src-fresh")]);
+    }
+
+    /// Regression test for bn-2m2: `gather_status` must count sources whose
+    /// normalized `source_revision_id` has diverged from the corresponding
+    /// wiki page as "stale artifacts". Pre-fix, `stale_count` was computed
+    /// from a graph-topology heuristic that always yielded 0 in the common
+    /// "edit file, re-ingest, forget to compile" flow.
+    #[test]
+    fn gather_status_counts_revision_mismatched_sources_as_stale() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        // Simulate a previously compiled source: hashes.json records the
+        // node, wiki page pins rev-A, normalized metadata now claims rev-B
+        // (i.e. the user re-ingested after compile). Status must flag it.
+        write_normalized_metadata(&root, "src-1", "rev-B");
+        write_wiki_source_page(&root, "src-1", "rev-A");
+        let mut hash_state = kb_compile::HashState::default();
+        hash_state
+            .hashes
+            .insert("normalized/src-1".to_string(), "fingerprint-A".to_string());
+        hash_state
+            .save_to_root(&root)
+            .expect("persist hash state");
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(
+            status.stale_count, 1,
+            "re-ingested source with stale wiki page must be counted in stale_count",
+        );
+        // The "changed inputs" list must stay in sync with the count.
+        assert_eq!(status.changed_inputs_not_compiled.len(), 1);
+    }
+
+    /// After compile reconciles the revisions, `stale_count` drops back to 0.
+    #[test]
+    fn gather_status_stale_count_clears_when_revisions_match() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        write_normalized_metadata(&root, "src-1", "rev-A");
+        write_wiki_source_page(&root, "src-1", "rev-A");
+        let mut hash_state = kb_compile::HashState::default();
+        hash_state
+            .hashes
+            .insert("normalized/src-1".to_string(), "fingerprint-A".to_string());
+        hash_state
+            .save_to_root(&root)
+            .expect("persist hash state");
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(status.stale_count, 0);
     }
 
     #[test]
