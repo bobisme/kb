@@ -146,7 +146,7 @@ pub struct GenerateConceptBodyResponse {
 }
 
 /// Request to answer a user question.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AnswerQuestionRequest {
     /// The user's question.
     pub question: String,
@@ -154,6 +154,17 @@ pub struct AnswerQuestionRequest {
     pub context: Vec<String>,
     /// Optional format instruction (e.g. "concise", "detailed").
     pub format: Option<String>,
+    /// Optional prompt template name to load. Defaults to `ask.md` when `None`.
+    /// Used by alternative ask pipelines (e.g. `--format=chart` -> `ask_chart.md`)
+    /// to swap the prompt without adding a separate adapter method.
+    #[serde(default)]
+    pub template_name: Option<String>,
+    /// Optional output-path directive (substituted into `{{output_path}}` in
+    /// the template). Used by chart/figure pipelines to tell the LLM the exact
+    /// file path it must write, so the post-run check can assert the file
+    /// landed where kb expects it.
+    #[serde(default)]
+    pub output_path: Option<String>,
 }
 
 /// Response containing the answer to a question.

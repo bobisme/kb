@@ -368,8 +368,9 @@ impl LlmAdapter for ClaudeCliAdapter {
         &self,
         request: AnswerQuestionRequest,
     ) -> Result<(AnswerQuestionResponse, ProvenanceRecord), LlmAdapterError> {
+        let template_name = request.template_name.as_deref().unwrap_or("ask.md");
         let template =
-            Template::load("ask.md", self.config.project_root.as_deref()).map_err(|err| {
+            Template::load(template_name, self.config.project_root.as_deref()).map_err(|err| {
                 LlmAdapterError::Other(format!("load ask template: {err}"))
             })?;
 
@@ -380,6 +381,9 @@ impl LlmAdapter for ClaudeCliAdapter {
             "citation_manifest".to_string(),
             request.format.unwrap_or_default(),
         );
+        if let Some(path) = request.output_path.as_ref() {
+            context.insert("output_path".to_string(), path.clone());
+        }
 
         let rendered = template
             .render(&context)

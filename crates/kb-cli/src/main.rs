@@ -114,8 +114,8 @@ enum Command {
         /// Question to ask (reads from stdin if omitted or "-")
         query: Option<String>,
 
-        /// Artifact format for the answer (md, marp, json, png)
-        #[arg(long, value_parser = ["md", "marp", "json", "png"])]
+        /// Artifact format for the answer (md, marp, json, chart, figure, png)
+        #[arg(long, value_parser = ["md", "marp", "json", "chart", "figure", "png"])]
         format: Option<String>,
 
         /// Propose promoting the answer into the wiki
@@ -1553,7 +1553,7 @@ fn run_ask(
     let question_id = generate_question_id(root, timestamp, query);
 
     // Filename tracks the requested format. JSON gets `.json`; everything
-    // else (md/marp) stays as `.md`. Keep in sync with `kb_query::write_artifact`.
+    // else (md/marp/chart) stays as `.md`. Keep in sync with `kb_query::write_artifact`.
     let answer_file_name = match requested_format {
         "json" => "answer.json",
         _ => "answer.md",
@@ -1568,25 +1568,108 @@ fn run_ask(
         .join(&question_id)
         .join("retrieval_plan.json");
 
+    // Chart-format plumbing: resolve the PNG path the LLM will be told to
+    // write to. The directory has to exist before the LLM runs so its bash
+    // tool can drop the file without `mkdir -p`.
+    let (chart_rel, chart_abs) = if requested_format == "chart" {
+        let rel = PathBuf::from("outputs/questions")
+            .join(&question_id)
+            .join("chart.png");
+        let abs = root.join(&rel);
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("create chart output directory {}", parent.display())
+            })?;
+        }
+        (Some(rel), Some(abs))
+    } else {
+        (None, None)
+    };
+
     let assembled = kb_query::assemble_context(root, &retrieval_plan)?;
     let citation_manifest = kb_query::build_citation_manifest(&assembled);
     let manifest_text = kb_query::render_manifest_for_prompt(&citation_manifest);
 
-    let llm_outcome = try_generate_answer(&cfg, root, query, &assembled, &manifest_text);
+    let (template_override, output_path_override) = if requested_format == "chart" {
+        (
+            Some("ask_chart.md"),
+            chart_abs
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        )
+    } else {
+        (None, None)
+    };
+
+    let llm_outcome = try_generate_answer(
+        &cfg,
+        root,
+        query,
+        &assembled,
+        &manifest_text,
+        template_override,
+        output_path_override.as_deref(),
+    );
+
+    // Chart format rejects silent fallbacks. If the LLM call failed OR the
+    // expected PNG is missing, we bail with a clean error and do not write
+    // any question / artifact / metadata. The LLM's own reply is also checked
+    // for an explicit `ERROR:` prefix, which the prompt asks for when the
+    // sources don't support a chart.
+    if requested_format == "chart" {
+        match &llm_outcome {
+            Err(err) => {
+                bail!("--format chart: LLM call failed: {err}");
+            }
+            Ok((result, _)) => {
+                let trimmed = result.body.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("ERROR:") {
+                    bail!(
+                        "--format chart: LLM declined to produce a chart: {}",
+                        rest.trim()
+                    );
+                }
+                let expected = chart_abs.as_ref().expect("chart_abs set for chart format");
+                if !expected.exists() {
+                    bail!(
+                        "--format chart: LLM did not produce chart at expected path {}",
+                        expected.display()
+                    );
+                }
+            }
+        }
+    }
 
     let (model_version, template_hash, artifact_status, artifact_body, llm_info) =
         match llm_outcome {
-            Ok((result, provenance)) => (
-                Some(provenance.model.clone()),
-                Some(provenance.prompt_template_hash.to_hex()),
-                if result.invalid_citations.is_empty() {
-                    Status::Fresh
+            Ok((result, provenance)) => {
+                // For chart format, the artifact body is the LLM's caption
+                // followed by a markdown image reference to the PNG. The PNG
+                // itself was already verified to exist above. All other
+                // formats render the raw post-processed body as-is.
+                let body = if requested_format == "chart" {
+                    let caption = result.body.trim().to_string();
+                    let image_line = "![chart](chart.png)";
+                    if caption.is_empty() {
+                        format!("{image_line}\n")
+                    } else {
+                        format!("{caption}\n\n{image_line}\n")
+                    }
                 } else {
-                    Status::NeedsReview
-                },
-                result.body.clone(),
-                Some((result, provenance)),
-            ),
+                    result.body.clone()
+                };
+                (
+                    Some(provenance.model.clone()),
+                    Some(provenance.prompt_template_hash.to_hex()),
+                    if result.invalid_citations.is_empty() {
+                        Status::Fresh
+                    } else {
+                        Status::NeedsReview
+                    },
+                    body,
+                    Some((result, provenance)),
+                )
+            }
             Err(err) => (
                 None,
                 None,
@@ -1599,6 +1682,11 @@ fn run_ask(
             ),
         };
 
+    let mut question_output_paths = vec![question_rel, answer_rel.clone(), plan_rel];
+    if let Some(rel) = chart_rel.as_ref() {
+        question_output_paths.push(rel.clone());
+    }
+
     let question = Question {
         metadata: EntityMetadata {
             id: question_id.clone(),
@@ -1609,7 +1697,7 @@ fn run_ask(
             tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
             prompt_template_hash: template_hash,
             dependencies: Vec::new(),
-            output_paths: vec![question_rel, answer_rel.clone(), plan_rel],
+            output_paths: question_output_paths,
             status: artifact_status,
         },
         raw_query: query.to_string(),
@@ -1620,6 +1708,11 @@ fn run_ask(
         ),
         token_budget: Some(cfg.ask.token_budget),
     };
+
+    let mut artifact_output_paths = vec![answer_rel];
+    if let Some(rel) = chart_rel.as_ref() {
+        artifact_output_paths.push(rel.clone());
+    }
 
     let artifact = Artifact {
         metadata: EntityMetadata {
@@ -1634,12 +1727,12 @@ fn run_ask(
             tool_version: Some(format!("kb/{}", env!("CARGO_PKG_VERSION"))),
             prompt_template_hash: None,
             dependencies: vec![question_id.clone()],
-            output_paths: vec![answer_rel],
+            output_paths: artifact_output_paths,
             status: artifact_status,
         },
         question_id: question_id.clone(),
         artifact_kind: match requested_format {
-            "png" => ArtifactKind::Figure,
+            "png" | "chart" => ArtifactKind::Figure,
             "marp" => ArtifactKind::SlideDeck,
             "json" => ArtifactKind::JsonSpec,
             _ => ArtifactKind::AnswerNote,
@@ -1827,6 +1920,8 @@ fn try_generate_answer(
     query: &str,
     assembled: &kb_query::AssembledContext,
     manifest_text: &str,
+    template_name: Option<&str>,
+    output_path: Option<&str>,
 ) -> Result<(kb_query::ArtifactResult, kb_llm::ProvenanceRecord)> {
     let adapter = create_ask_adapter(cfg, root)?;
 
@@ -1834,6 +1929,8 @@ fn try_generate_answer(
         question: query.to_string(),
         context: vec![assembled.text.clone()],
         format: Some(manifest_text.to_string()),
+        template_name: template_name.map(str::to_string),
+        output_path: output_path.map(str::to_string),
     };
 
     let (llm_response, provenance) = adapter
@@ -2220,7 +2317,9 @@ fn read_interactive_multiline() -> Result<String> {
 fn normalize_ask_format(format: &str) -> Result<&str> {
     match format {
         "markdown" => Ok("md"),
-        "md" | "marp" | "json" | "png" => Ok(format),
+        // `figure` is an alias for `chart`; both map to the matplotlib pipeline.
+        "figure" => Ok("chart"),
+        "md" | "marp" | "json" | "chart" | "png" => Ok(format),
         other => bail!("unsupported ask format: {other}"),
     }
 }

@@ -1143,6 +1143,201 @@ fn ask_format_json_writes_structured_artifact() {
     );
 }
 
+// bn-35ap: `kb ask --format=chart` drives the LLM through the `ask_chart.md`
+// prompt, expects a PNG at `outputs/questions/<q-id>/chart.png`, and writes an
+// `answer.md` containing a caption + markdown image reference.
+//
+// Mock LLM adapter: a shell script standing in for `opencode` that scans the
+// prompt for the chart.png path the template told it to write, drops a tiny
+// fixture PNG there, and prints a deterministic caption.
+fn install_fake_chart_harness(root: &Path) -> PathBuf {
+    let bin_dir = root.join("fake-chart-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake chart bin dir");
+    // The prompt is the last positional arg. Grep it for the absolute path
+    // ending in `chart.png`, write a non-empty byte sequence there (minimal
+    // PNG signature + IHDR/IEND; real matplotlib output is much larger but the
+    // only thing kb verifies is that the file exists), and emit a caption.
+    let script = r#"#!/bin/sh
+set -e
+# The prompt is the final positional argument. Shift to it portably.
+prompt=""
+for arg in "$@"; do
+    prompt="$arg"
+done
+png_path="$(printf '%s' "$prompt" | grep -oE '/[^ ]+chart\.png' | head -n1)"
+if [ -z "$png_path" ]; then
+    echo "fake-chart-opencode: no chart.png path found in prompt" >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$png_path")"
+# Minimal PNG signature + some bytes. kb only asserts existence + non-empty.
+printf '\x89PNG\r\n\x1a\nFAKE-PNG-DATA' > "$png_path"
+printf 'A chart showing the requested comparison.\n'
+"#;
+    write_executable(bin_dir.join("opencode").as_path(), script);
+    // Claude is present so `kb doctor` stays happy if the test ever needs it.
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+    bin_dir
+}
+
+#[test]
+fn ask_format_chart_produces_png_and_answer_with_image_ref() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let fake_bin = install_fake_chart_harness(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("chart")
+        .arg("Compare timings across backends");
+    let output = cmd.output().expect("run kb ask --format=chart");
+    assert!(
+        output.status.success(),
+        "kb ask --format=chart failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    assert_eq!(envelope["command"], "ask");
+    let data = &envelope["data"];
+    assert_eq!(data["requested_format"], "chart");
+
+    let artifact_path = kb_root.join(
+        data["artifact_path"]
+            .as_str()
+            .expect("artifact_path"),
+    );
+    // Caption lands in answer.md (not answer.png).
+    assert_eq!(
+        artifact_path.extension().and_then(|e| e.to_str()),
+        Some("md"),
+        "chart format writes the caption to answer.md, got: {}",
+        artifact_path.display()
+    );
+    let answer_md = fs::read_to_string(&artifact_path).expect("read answer.md");
+    assert!(
+        answer_md.contains("requested_format: chart"),
+        "answer.md frontmatter should record requested_format=chart, got:\n{answer_md}"
+    );
+    assert!(
+        answer_md.contains("![chart](chart.png)"),
+        "answer.md must embed a markdown image reference to chart.png, got:\n{answer_md}"
+    );
+    assert!(
+        answer_md.contains("A chart showing the requested comparison."),
+        "answer.md must include the LLM's caption, got:\n{answer_md}"
+    );
+
+    // chart.png exists next to answer.md and is non-empty.
+    let chart_png = artifact_path.with_file_name("chart.png");
+    assert!(
+        chart_png.exists(),
+        "chart.png must be written at {}",
+        chart_png.display()
+    );
+    let bytes = fs::read(&chart_png).expect("read chart.png");
+    assert!(!bytes.is_empty(), "chart.png must not be empty");
+
+    // metadata.json records requested_format: chart.
+    let metadata_path = artifact_path.with_file_name("metadata.json");
+    let metadata: Value = serde_json::from_str(
+        &fs::read_to_string(&metadata_path).expect("read metadata.json"),
+    )
+    .expect("parse metadata.json");
+    let question_id = metadata["question_id"].as_str().expect("question_id");
+    assert!(question_id.starts_with("q-"));
+
+    // question.json records requested_format=chart too.
+    let question_path = artifact_path.with_file_name("question.json");
+    let question: Value = serde_json::from_str(
+        &fs::read_to_string(&question_path).expect("read question.json"),
+    )
+    .expect("parse question.json");
+    assert_eq!(question["requested_format"], "chart");
+}
+
+#[test]
+fn ask_format_chart_errors_when_llm_produces_no_png() {
+    // When the LLM runs successfully but never writes the PNG to the exact
+    // path, kb must refuse to write a stale answer.md. No silent fallback to
+    // markdown.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Fake opencode that prints a caption but never writes chart.png.
+    let bin_dir = kb_root.join("fake-no-png-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin");
+    write_executable(
+        bin_dir.join("opencode").as_path(),
+        "#!/bin/sh\nprintf 'A nice caption but no png.\\n'",
+    );
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&bin_dir));
+    cmd.arg("ask")
+        .arg("--format")
+        .arg("chart")
+        .arg("Compare timings across backends");
+    let output = cmd.output().expect("run kb ask --format=chart without png");
+
+    assert!(
+        !output.status.success(),
+        "kb ask --format=chart should fail when no PNG is produced"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format chart"),
+        "stderr should mention --format chart, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("chart.png") || stderr.contains("did not produce"),
+        "stderr should explain the missing PNG, got: {stderr}"
+    );
+}
+
+#[test]
+fn ask_format_figure_is_alias_for_chart() {
+    // `--format=figure` is a synonym for `--format=chart`; both must hit the
+    // same prompt + PNG post-check pipeline.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let fake_bin = install_fake_chart_harness(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("figure")
+        .arg("Same thing please");
+    let output = cmd.output().expect("run kb ask --format=figure");
+    assert!(
+        output.status.success(),
+        "kb ask --format=figure failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    // `figure` normalizes to `chart` at the artifact layer.
+    assert_eq!(envelope["data"]["requested_format"], "chart");
+    let artifact_path = kb_root.join(
+        envelope["data"]["artifact_path"]
+            .as_str()
+            .expect("artifact_path"),
+    );
+    assert!(artifact_path.with_file_name("chart.png").exists());
+}
+
 // bn-1m02: `kb ask` renders the answer body to stdout after generation. These
 // tests exercise the opt-out paths; rendered-body coverage requires a real LLM
 // and is captured by gold_harness.
