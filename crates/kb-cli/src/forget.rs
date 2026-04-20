@@ -169,15 +169,33 @@ pub fn resolve_target(root: &Path, target: &str) -> Result<(String, Option<Strin
     if is_src_id(target) {
         let raw_dir = root.join("raw/inbox").join(target);
         let normalized_dir = root.join("normalized").join(target);
-        if !raw_dir.exists() && !normalized_dir.exists() {
-            bail!(
-                "no source with id '{target}' found under {} or {}",
-                raw_dir.display(),
-                normalized_dir.display()
-            );
+        if raw_dir.exists() || normalized_dir.exists() {
+            let origin = read_stable_location(root, target);
+            return Ok((target.to_string(), origin));
         }
-        let origin = read_stable_location(root, target);
-        return Ok((target.to_string(), origin));
+        // bn-1525: the target looks like a src-id but isn't on disk as-is.
+        // Try prefix resolution against known src ids before bailing — users
+        // often type `src-a7` expecting to hit `src-a7x3q9`.
+        match crate::id_resolve::resolve(root, target) {
+            Ok(resolved) if resolved.kind == crate::id_resolve::IdKind::Source => {
+                let origin = read_stable_location(root, &resolved.id);
+                return Ok((resolved.id, origin));
+            }
+            Err(err) if err.to_string().contains("ambiguous") => {
+                // Surface the candidate list verbatim; the user needs to type
+                // a longer prefix.
+                return Err(err);
+            }
+            // Resolver found a concept/question instead (forget only
+            // operates on sources), or came up empty — fall through to the
+            // regular "no source with id" error.
+            Ok(_) | Err(_) => {}
+        }
+        bail!(
+            "no source with id '{target}' found under {} or {}",
+            raw_dir.display(),
+            normalized_dir.display()
+        );
     }
 
     // Path target: canonicalize + normalize like ingest does, then scan

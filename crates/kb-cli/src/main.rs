@@ -2,6 +2,7 @@
 
 mod config;
 mod forget;
+mod id_resolve;
 mod init;
 mod jobs;
 mod jobs_cmd;
@@ -2059,6 +2060,7 @@ struct InspectTraceNode {
     inputs: Vec<Self>,
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()> {
     if target.trim().is_empty() {
         bail!("inspect: target cannot be empty");
@@ -2127,9 +2129,39 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
                         &hash_state,
                     )?
                 }
-                0 => bail!(
-                    "'{target}' was not found. Try an exact ID, a unique graph suffix, a build record ID, a job ID, a frontmatter id, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
-                ),
+                0 => {
+                    // bn-1525: last-resort short-prefix resolution. If `target`
+                    // is a partial id (e.g. `src-a7` for `src-a7x3q9`), delegate
+                    // to `id_resolve`, which tries src → concept → question and
+                    // propagates an ambiguity error verbatim when two full ids
+                    // share the prefix. Ambiguity here ALWAYS wins over "not
+                    // found" even if a later kind would uniquely match — users
+                    // who typed a prefix expect "longer prefix, please", not a
+                    // silent fall-through.
+                    match id_resolve::resolve(root, target) {
+                        Ok(resolved) => build_report_for_resolved(
+                            root,
+                            target,
+                            &resolved,
+                            &jobs,
+                            &graph,
+                            &changed_inputs,
+                            &hash_state,
+                        )?,
+                        Err(err) => {
+                            let msg = err.to_string();
+                            if msg.contains("ambiguous") {
+                                // Short-circuit: re-raise the candidate list
+                                // instead of the generic "was not found"
+                                // message.
+                                return Err(err);
+                            }
+                            bail!(
+                                "'{target}' was not found. Try an exact ID, a unique prefix (e.g. 'src-a7' for 'src-a7x3q9'), a unique graph suffix, a build record ID, a job ID, a frontmatter id, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
+                            );
+                        }
+                    }
+                }
                 _ => {
                     let paths: Vec<String> = frontmatter_matches
                         .iter()
@@ -2296,6 +2328,43 @@ fn collect_frontmatter_id_matches(dir: &Path, target: &str, out: &mut Vec<PathBu
             }
         }
     }
+}
+
+/// bn-1525: dispatch a resolved [`id_resolve::ResolvedId`] to the right
+/// report-building path. Each kind maps to a concrete on-disk file the
+/// existing [`build_file_report`] understands.
+fn build_report_for_resolved(
+    root: &Path,
+    target: &str,
+    resolved: &id_resolve::ResolvedId,
+    jobs: &[JobRun],
+    graph: &Graph,
+    changed_inputs: &[ChangedInput],
+    hash_state: &kb_compile::HashState,
+) -> Result<InspectReport> {
+    let path = match resolved.kind {
+        id_resolve::IdKind::Source => resolve_source_id(root, &resolved.id).unwrap_or_else(|| {
+            // If neither the wiki page nor the normalized source.md exists yet
+            // (rare — implies an in-progress compile), fall back to the
+            // normalized dir itself so the report still surfaces something.
+            root.join("normalized").join(&resolved.id)
+        }),
+        id_resolve::IdKind::Concept => root.join("wiki/concepts").join(format!("{}.md", resolved.id)),
+        id_resolve::IdKind::Question => {
+            // Prefer the answer artifact when it exists, otherwise point at
+            // the output dir. `build_file_report` copes with both.
+            let answer = root
+                .join("outputs/questions")
+                .join(&resolved.id)
+                .join("answer.md");
+            if answer.is_file() {
+                answer
+            } else {
+                root.join("outputs/questions").join(&resolved.id)
+            }
+        }
+    };
+    build_file_report(root, target, &path, jobs, graph, changed_inputs, hash_state)
 }
 
 fn build_file_report(

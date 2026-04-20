@@ -5752,3 +5752,192 @@ fn approve_refreshes_indexes_and_renders_question_title() {
         "questions index leaked slug as title:\n{questions_index}"
     );
 }
+
+// -- bn-1525: short-prefix id resolution (terseid::IdResolver) ---------------
+
+/// Helper: lay down a minimal normalized+wiki pair for a src id so the inspect
+/// file-report code has something to read. Kept local to the bn-1525 tests to
+/// avoid cross-test coupling.
+fn seed_src(kb_root: &Path, src_id: &str) {
+    let normalized = kb_root.join("normalized").join(src_id);
+    fs::create_dir_all(&normalized).expect("create normalized dir");
+    fs::write(normalized.join("source.md"), "# seed\n").expect("write source.md");
+    fs::write(
+        normalized.join("metadata.json"),
+        format!(
+            r#"{{"metadata":{{"id":"{src_id}","created_at_millis":0,"updated_at_millis":0,"source_hashes":[],"dependencies":[],"output_paths":[],"status":"fresh"}},"source_revision_id":"rev-1","normalized_assets":[],"heading_ids":[]}}"#
+        ),
+    )
+    .expect("write metadata.json");
+}
+
+#[test]
+fn inspect_resolves_unique_src_prefix() {
+    // `kb inspect src-a7` should route to the unique `src-a7x3q9` when that's
+    // the only src whose hash starts with `a7`.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    seed_src(&kb_root, "src-a7x3q9");
+    seed_src(&kb_root, "src-b2k1m5");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-a7");
+    let output = cmd.output().expect("run kb inspect src-a7");
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("src-a7x3q9"),
+        "expected prefix to resolve to src-a7x3q9; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn inspect_reports_ambiguous_src_prefix_with_candidates() {
+    // Two srcs share the `a7` prefix → ambiguity error lists both and hints
+    // at typing a longer prefix.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    seed_src(&kb_root, "src-a7x3q9");
+    seed_src(&kb_root, "src-a7b2k1");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-a7");
+    let output = cmd.output().expect("run kb inspect src-a7");
+    assert!(
+        !output.status.success(),
+        "ambiguous prefix must fail; stdout=\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous"), "expected ambiguity: {stderr}");
+    assert!(stderr.contains("src-a7x3q9"), "candidates: {stderr}");
+    assert!(stderr.contains("src-a7b2k1"), "candidates: {stderr}");
+    assert!(stderr.contains("longer prefix"), "hint: {stderr}");
+}
+
+#[test]
+fn inspect_no_match_reports_clearly() {
+    // Nothing on disk matches — the error should point at the actual problem,
+    // not silently succeed.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    seed_src(&kb_root, "src-a7x3q9");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-zzzz");
+    let output = cmd.output().expect("run kb inspect src-zzzz");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("was not found"),
+        "expected not-found error: {stderr}"
+    );
+}
+
+#[test]
+fn inspect_exact_full_src_id_still_matches_after_bn_1525() {
+    // Regression guard: the existing exact-id path must still resolve to the
+    // wiki/sources page without invoking the new prefix resolver.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    fs::write(
+        sources_dir.join("src-bb550011.md"),
+        "---\nid: wiki-source-src-bb550011\nsource_document_id: src-bb550011\nsource_revision_id: rev-1\n---\n\n# Src\n",
+    )
+    .expect("write source page");
+    seed_src(&kb_root, "src-bb550011");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("src-bb550011");
+    let output = cmd.output().expect("run kb inspect");
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("resolved_id: wiki/sources/src-bb550011.md"),
+        "full id should hit wiki page first; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn forget_resolves_unique_src_prefix_and_confirms_src_id() {
+    // `kb forget src-a7 --dry-run` should route to the full id in its plan
+    // even though the user typed a prefix.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    seed_src(&kb_root, "src-a7x3q9");
+    seed_src(&kb_root, "src-b2k1m5");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run").arg("forget").arg("src-a7");
+    let output = cmd.output().expect("run kb forget --dry-run");
+    assert!(
+        output.status.success(),
+        "kb forget dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("forget src-a7x3q9"),
+        "plan must mention full id; got:\n{stdout}"
+    );
+    // The plan should show the normalized dir about to move.
+    assert!(
+        stdout.contains("normalized/src-a7x3q9"),
+        "plan should list normalized dir; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn forget_reports_ambiguous_src_prefix_with_candidates() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    seed_src(&kb_root, "src-a7x3q9");
+    seed_src(&kb_root, "src-a7b2k1");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run").arg("forget").arg("src-a7");
+    let output = cmd.output().expect("run kb forget --dry-run");
+    assert!(
+        !output.status.success(),
+        "ambiguous prefix must fail; stdout=\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous"), "expected ambiguity: {stderr}");
+    assert!(stderr.contains("src-a7x3q9"), "candidates: {stderr}");
+    assert!(stderr.contains("src-a7b2k1"), "candidates: {stderr}");
+}
+
+#[test]
+fn forget_exact_full_src_id_still_works_after_bn_1525() {
+    // Regression guard: `kb forget src-<full>` must continue to work without
+    // touching the prefix resolver.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    seed_src(&kb_root, "src-cc770033");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run").arg("forget").arg("src-cc770033");
+    let output = cmd.output().expect("run kb forget --dry-run");
+    assert!(
+        output.status.success(),
+        "kb forget dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("forget src-cc770033"),
+        "plan must mention full id; got:\n{stdout}"
+    );
+}
