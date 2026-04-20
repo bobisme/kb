@@ -328,6 +328,20 @@ fn build_frontmatter(
         Value::String("type".into()),
         Value::String("question_answer".into()),
     );
+    // Surface the raw, properly-cased user question so `wiki/index.md` and
+    // `wiki/questions/index.md` can render "How does ARC cache compare to LRU?"
+    // instead of falling back to the URL-safe slug ("how does arc cache
+    // compare to lru"). The review item's comment is always
+    // `"Promote answer for: {query}"` (see `kb-cli/src/main.rs`); strip the
+    // known prefix and emit the remainder as `question:`. The
+    // `kb_compile::index_page` extractor reads `title > question > name`, so
+    // this populates the link text without fighting any existing `title:`.
+    if let Some(raw) = extract_raw_question(&item.comment) {
+        fm.insert(
+            Value::String("question".into()),
+            Value::String(raw.to_string()),
+        );
+    }
     fm.insert(
         Value::String("promoted_at".into()),
         Value::Number(promoted_at.into()),
@@ -400,6 +414,22 @@ fn build_frontmatter(
     }
 
     fm
+}
+
+/// Pull the raw user question out of a promotion review item's `comment`.
+///
+/// `kb ask --promote` writes the comment as `"Promote answer for: {query}"`.
+/// Returns `Some(query)` when the prefix matches and the remainder is
+/// non-empty; `None` otherwise so callers fall through to other sources.
+fn extract_raw_question(comment: &str) -> Option<&str> {
+    let trimmed = comment
+        .strip_prefix("Promote answer for:")
+        .map(str::trim_start)?;
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
 }
 
 fn build_body(artifact_body: &str, citations: &[String], existing_page: Option<&str>) -> String {
@@ -843,5 +873,54 @@ mod tests {
     fn strip_frontmatter_preserves_body_without_frontmatter() {
         let md = "Just plain text.\n";
         assert_eq!(strip_frontmatter(md), "Just plain text.\n");
+    }
+
+    #[test]
+    fn render_promotion_emits_question_field_from_comment() {
+        // Index rendering (kb_compile::index_page) reads `title > question >
+        // name`. We emit `question:` so the index link text is the
+        // properly-cased raw question rather than the URL-safe slug.
+        let mut item = test_review_item("review-title-1");
+        item.comment = "Promote answer for: How does ARC cache compare to LRU?".to_string();
+        let input = test_input(&item, "Answer body.", 12_000);
+
+        let result = render_promotion(&input, None).expect("render");
+        assert!(
+            result.markdown.contains("question: How does ARC cache compare to LRU?"),
+            "expected raw question in frontmatter; got:\n{}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn render_promotion_omits_question_field_when_comment_has_no_prefix() {
+        // If the comment doesn't start with `"Promote answer for:"` (e.g.
+        // reviewer rewrote it), we'd rather emit no `question:` than the
+        // wrong text — the extractor will then fall back to the slug.
+        let mut item = test_review_item("review-title-2");
+        item.comment = "Custom reviewer note".to_string();
+        let input = test_input(&item, "Answer body.", 13_000);
+
+        let result = render_promotion(&input, None).expect("render");
+        assert!(
+            !result.markdown.contains("question:"),
+            "should not emit question field when prefix missing; got:\n{}",
+            result.markdown
+        );
+    }
+
+    #[test]
+    fn extract_raw_question_strips_known_prefix() {
+        assert_eq!(
+            extract_raw_question("Promote answer for: What is Rust?"),
+            Some("What is Rust?")
+        );
+        assert_eq!(
+            extract_raw_question("Promote answer for:   Leading spaces?"),
+            Some("Leading spaces?")
+        );
+        assert_eq!(extract_raw_question("Promote answer for:"), None);
+        assert_eq!(extract_raw_question("Promote answer for: "), None);
+        assert_eq!(extract_raw_question("Other comment"), None);
     }
 }

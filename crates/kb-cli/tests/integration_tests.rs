@@ -5646,3 +5646,109 @@ fn real_failure_is_still_recorded_as_failed_job() {
         "expected the seeded real failure to show up in failed_jobs; got: {ids:?}"
     );
 }
+
+/// bn-2zy acceptance (Part A + Part B):
+///
+/// Approving a promotion must refresh `wiki/index.md` and
+/// `wiki/questions/index.md` inline — no follow-up `kb compile` required —
+/// and both must render the properly-cased raw question (from the promoted
+/// page's `question:` frontmatter), not the URL-safe slug.
+#[test]
+fn approve_refreshes_indexes_and_renders_question_title() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed the answer artifact that `execute_promotion` reads.
+    let question_id = "question-arc-vs-lru";
+    let artifact_id = "artifact-arc-vs-lru";
+    let q_dir = kb_root.join("outputs/questions").join(question_id);
+    fs::create_dir_all(&q_dir).expect("create question dir");
+    fs::write(
+        q_dir.join("answer.md"),
+        format!(
+            "---\nid: {artifact_id}\ntype: question_answer\nquestion_id: {question_id}\n---\n\nARC keeps a ghost list of evicted entries; LRU does not.\n"
+        ),
+    )
+    .expect("write answer.md");
+
+    // Seed the pending ReviewItem. The `comment` prefix is the contract the
+    // writer uses to recover the raw question for the `question:` frontmatter.
+    let raw_question = "How does ARC cache compare to LRU?";
+    let destination = PathBuf::from("wiki/questions/how-does-arc-cache-compare-to-lru.md");
+    let review_id = "review-arc-vs-lru";
+    let review_item = ReviewItem {
+        metadata: EntityMetadata {
+            id: review_id.to_string(),
+            created_at_millis: 1_000,
+            updated_at_millis: 1_000,
+            source_hashes: vec!["hash-arc".to_string()],
+            model_version: None,
+            tool_version: Some("kb-test".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec![question_id.to_string(), artifact_id.to_string()],
+            output_paths: vec![
+                PathBuf::from(format!("outputs/questions/{question_id}/answer.md")),
+                destination.clone(),
+            ],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::Promotion,
+        target_entity_id: artifact_id.to_string(),
+        proposed_destination: Some(destination.clone()),
+        citations: vec![],
+        affected_pages: vec![destination.clone()],
+        created_at_millis: 1_000,
+        status: ReviewStatus::Pending,
+        comment: format!("Promote answer for: {raw_question}"),
+    };
+    save_review_item(&kb_root, &review_item).expect("save review item");
+
+    // Approve.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg(review_id);
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        output.status.success(),
+        "kb review approve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The promoted page must carry the raw question in frontmatter.
+    let promoted = fs::read_to_string(kb_root.join(&destination)).expect("read promoted page");
+    assert!(
+        promoted.contains(&format!("question: {raw_question}")),
+        "promoted page missing raw-question frontmatter: {promoted}"
+    );
+
+    // Part A: indexes must be refreshed inline.
+    let global_index = fs::read_to_string(kb_root.join("wiki/index.md"))
+        .expect("wiki/index.md should exist after approve");
+    assert!(
+        global_index.contains("## Questions"),
+        "global index missing Questions section after approve:\n{global_index}"
+    );
+    let questions_index = fs::read_to_string(kb_root.join("wiki/questions/index.md"))
+        .expect("wiki/questions/index.md should exist after approve");
+
+    // Part B: both indexes must render the properly-cased question title,
+    // not the slug.
+    assert!(
+        global_index.contains(&format!("[{raw_question}]")),
+        "global index should show proper-cased title [{raw_question}]; got:\n{global_index}"
+    );
+    assert!(
+        questions_index.contains(&format!("[{raw_question}]")),
+        "questions index should show proper-cased title [{raw_question}]; got:\n{questions_index}"
+    );
+    // Slug-as-title should NOT appear as link text in either index.
+    assert!(
+        !global_index.contains("[how-does-arc-cache-compare-to-lru]")
+            && !global_index.contains("[how does arc cache compare to lru]"),
+        "global index leaked slug as title:\n{global_index}"
+    );
+    assert!(
+        !questions_index.contains("[how-does-arc-cache-compare-to-lru]")
+            && !questions_index.contains("[how does arc cache compare to lru]"),
+        "questions index leaked slug as title:\n{questions_index}"
+    );
+}

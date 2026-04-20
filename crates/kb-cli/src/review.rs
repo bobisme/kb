@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use kb_compile::concept_merge::{AppliedMerge, WIKI_CONCEPTS_DIR, apply_concept_merge};
+use kb_compile::index_page;
 use kb_compile::promotion::execute_promotion;
 use kb_core::{
     ReviewItem, ReviewKind, ReviewStatus, list_review_items, load_review_item, save_review_item,
@@ -257,6 +258,15 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
             let result = execute_promotion(root, &item, now)
                 .with_context(|| format!("execute promotion for review '{id}'"))?;
 
+            // Refresh `wiki/index.md` + `wiki/questions/index.md` (and the
+            // sources/concepts indexes) so the new question shows up in the
+            // wiki entry points without needing a follow-up `kb compile`.
+            // This is layout-only — no LLM passes, just file walks + atomic
+            // writes. Failure here must not fail the promotion itself (the
+            // page has already been written atomically), so we log a warning
+            // and continue; mirrors the pattern in `kb forget` (bn-i5r).
+            let index_pages_refreshed = refresh_wiki_indexes(root);
+
             if json {
                 emit_json("review.approve", serde_json::json!({
                     "id": id,
@@ -264,11 +274,15 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
                     "kind": "promotion",
                     "destination": result.destination.display().to_string(),
                     "build_record_id": result.build_record.metadata.id,
+                    "index_pages_refreshed": index_pages_refreshed,
                 }))?;
             } else {
                 println!("Approved: {id}");
                 println!("  Promoted to: {}", result.destination.display());
                 println!("  Build record: {}", result.build_record.metadata.id);
+                if index_pages_refreshed {
+                    println!("  Wiki indexes refreshed.");
+                }
             }
         }
         ReviewKind::ConceptMerge => {
@@ -331,6 +345,30 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
     }
 
     Ok(())
+}
+
+/// Regenerate the wiki's global + per-category index pages from current
+/// on-disk state. Returns `true` on success, `false` (with a warning printed)
+/// on any failure. Never propagates the error — index refresh is best-effort
+/// layout maintenance that should not mask a successful promotion.
+fn refresh_wiki_indexes(root: &Path) -> bool {
+    match index_page::generate_indexes(root) {
+        Ok(artifacts) => match index_page::persist_index_artifacts(&artifacts) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "warning: wiki index refresh failed after approve: {err:#}"
+                );
+                false
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "warning: wiki index refresh failed after approve: {err:#}"
+            );
+            false
+        }
+    }
 }
 
 /// Rewrite a `lint:duplicate-concepts:<a_id>:<b_id>` review item into the shape
