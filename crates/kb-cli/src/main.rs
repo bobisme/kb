@@ -100,12 +100,27 @@ enum Command {
     },
     /// Ingest documents into the knowledge base
     Ingest {
-        /// Files, directories, or URLs to ingest
+        /// Files, directories, URLs, or git repo URLs to ingest
         #[arg(required = true)]
         sources: Vec<String>,
         /// Ingest files even if they are empty or contain only YAML frontmatter
         #[arg(long)]
         allow_empty: bool,
+        /// Git repo only: override the default doc-walk filter with these
+        /// glob patterns. Can be specified multiple times.
+        #[arg(long = "include", value_name = "GLOB")]
+        include: Vec<String>,
+        /// Git repo only: exclude paths matching this glob from the walk.
+        /// Can be specified multiple times.
+        #[arg(long = "exclude", value_name = "GLOB")]
+        exclude: Vec<String>,
+        /// Git repo only: check out this branch after cloning (default: the
+        /// remote's default branch).
+        #[arg(long = "branch", value_name = "NAME")]
+        branch: Option<String>,
+        /// Git repo only: pin to this commit SHA after cloning.
+        #[arg(long = "commit", value_name = "SHA")]
+        commit: Option<String>,
     },
     /// Compile the knowledge base
     Compile,
@@ -448,13 +463,20 @@ fn run(cli: Cli) -> Result<()> {
                 execute_mutating_command(Some(ask_root), "ask", action)
             }
         }
-        Some(Command::Ingest { sources, allow_empty }) => {
+        Some(Command::Ingest {
+            sources,
+            allow_empty,
+            include,
+            exclude,
+            branch,
+            commit,
+        }) => {
             // bn-1jx: validate local source paths exist before we acquire
             // the root lock and start a job manifest. `kb_ingest::collect_files`
             // bails with the same message, but doing it here means a bad
             // path never leaves a "failed" job behind in `state/jobs/`.
             for source in &sources {
-                if kb_ingest::is_url(source) {
+                if kb_ingest::is_git_url(source) || kb_ingest::is_url(source) {
                     continue;
                 }
                 let path = Path::new(source);
@@ -465,12 +487,39 @@ fn run(cli: Cli) -> Result<()> {
                     .into());
                 }
             }
+
+            // Repo-only flags only make sense when at least one source is a
+            // git URL. Fail fast otherwise so users don't silently pass them
+            // to local/URL ingest.
+            let has_git = sources.iter().any(|s| kb_ingest::is_git_url(s));
+            if !has_git
+                && (!include.is_empty()
+                    || !exclude.is_empty()
+                    || branch.is_some()
+                    || commit.is_some())
+            {
+                return Err(ValidationError::new(
+                    "--include/--exclude/--branch/--commit require a git URL source",
+                )
+                .into());
+            }
+
             let ingest_root = root.clone();
             let action = move || {
                 let root = ingest_root
                     .as_deref()
                     .expect("root resolved for non-init commands");
-                run_ingest(root, &sources, cli.json, cli.dry_run, allow_empty)
+                run_ingest(
+                    root,
+                    &sources,
+                    cli.json,
+                    cli.dry_run,
+                    allow_empty,
+                    &include,
+                    &exclude,
+                    branch.as_deref(),
+                    commit.as_deref(),
+                )
             };
 
             if cli.dry_run {
@@ -1351,17 +1400,27 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_ingest(
     root: &Path,
     sources: &[String],
     json: bool,
     dry_run: bool,
     allow_empty: bool,
+    include: &[String],
+    exclude: &[String],
+    branch: Option<&str>,
+    commit: Option<&str>,
 ) -> Result<()> {
+    let mut git_urls = Vec::new();
     let mut urls = Vec::new();
     let mut local_paths = Vec::new();
     for source in sources {
-        if kb_ingest::is_url(source) {
+        if kb_ingest::is_git_url(source) {
+            // Test git URLs ahead of plain URLs: `https://github.com/foo/bar`
+            // matches both predicates but should route to repo ingest.
+            git_urls.push(source.as_str());
+        } else if kb_ingest::is_url(source) {
             urls.push(source.as_str());
         } else {
             local_paths.push(PathBuf::from(source));
@@ -1381,6 +1440,33 @@ fn run_ingest(
             content_path: report.ingested.copied_path,
             metadata_path: report.ingested.metadata_sidecar_path,
         });
+    }
+
+    if !git_urls.is_empty() {
+        let options = kb_ingest::RepoIngestOptions {
+            includes: include.to_vec(),
+            excludes: exclude.to_vec(),
+            branch: branch.map(ToOwned::to_owned),
+            commit: commit.map(ToOwned::to_owned),
+            dry_run,
+            allow_empty,
+        };
+        for url in &git_urls {
+            let report = kb_ingest::ingest_repo(root, url, &options)?;
+            // One IngestResult per ingested file, so the JSON summary and
+            // per-item output stay structurally identical to local/URL ingest.
+            for file in report.files {
+                results.push(IngestResult {
+                    input: format!("{}#{}", report.normalized_url, file.repo_path),
+                    source_kind: "repo",
+                    outcome: file.outcome,
+                    source_document_id: file.source_document_id,
+                    source_revision_id: file.source_revision_id,
+                    content_path: file.content_path,
+                    metadata_path: file.metadata_path,
+                });
+            }
+        }
     }
 
     if !urls.is_empty() {

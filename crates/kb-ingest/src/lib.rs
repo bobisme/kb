@@ -1358,8 +1358,12 @@ mod tests {
 
 mod headings;
 mod image_refs;
+mod repo;
 mod url;
 
 pub use headings::extract_heading_ids;
 pub use image_refs::{CopiedImages, rewrite_asset_refs, scan_and_stage};
+pub use repo::{
+    RepoFileReport, RepoIngestOptions, RepoIngestReport, ingest_repo, is_git_url,
+};
 pub use url::{UrlIngestReport, ingest_url, ingest_url_with_options};
