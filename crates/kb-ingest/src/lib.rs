@@ -260,6 +260,7 @@ fn collect_files(path: &Path, files: &mut Vec<(PathBuf, FileOrigin)>) -> Result<
     if path.is_dir() {
         for entry in WalkBuilder::new(path)
             .standard_filters(true)
+            .add_custom_ignore_filename(".kbignore")
             .require_git(false)
             .build()
         {
@@ -790,6 +791,39 @@ mod tests {
         fs::write(source_root.path().join("kept.md"), "keep me\n").expect("write kept file");
         fs::write(source_root.path().join("ignored.md"), "ignore me\n")
             .expect("write ignored file");
+
+        let ingested = ingest_paths(kb_root.path(), &[source_root.path().to_path_buf()])
+            .expect("directory ingest succeeds");
+
+        assert_eq!(ingested.len(), 1);
+        assert!(ingested[0].copied_path.ends_with("kept.md"));
+    }
+
+    #[test]
+    fn directory_ingest_honors_kbignore() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        fs::write(source_root.path().join(".kbignore"), "ignored.md\n").expect("write kbignore");
+        fs::write(source_root.path().join("kept.md"), "keep me\n").expect("write kept file");
+        fs::write(source_root.path().join("ignored.md"), "ignore me\n")
+            .expect("write ignored file");
+
+        let ingested = ingest_paths(kb_root.path(), &[source_root.path().to_path_buf()])
+            .expect("directory ingest succeeds");
+
+        assert_eq!(ingested.len(), 1);
+        assert!(ingested[0].copied_path.ends_with("kept.md"));
+    }
+
+    #[test]
+    fn directory_ingest_honors_nested_kbignore() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let sub = source_root.path().join("sub");
+        fs::create_dir_all(&sub).expect("create subdir");
+        fs::write(sub.join(".kbignore"), "secret.md\n").expect("write nested kbignore");
+        fs::write(sub.join("kept.md"), "keep me\n").expect("write kept file");
+        fs::write(sub.join("secret.md"), "hide me\n").expect("write secret file");
 
         let ingested = ingest_paths(kb_root.path(), &[source_root.path().to_path_buf()])
             .expect("directory ingest succeeds");

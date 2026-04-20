@@ -492,6 +492,46 @@ fn ingest_directory_respects_gitignore() {
 }
 
 #[test]
+fn ingest_directory_respects_kbignore_and_gitignore_cumulatively() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let corpus = kb_root.join("corpus");
+    fs::create_dir_all(&corpus).expect("create corpus dir");
+    fs::write(corpus.join(".gitignore"), "git-ignored.md\n").expect("write gitignore");
+    fs::write(corpus.join(".kbignore"), "kb-ignored.md\n").expect("write kbignore");
+    fs::write(corpus.join("kept.md"), "keep\n").expect("write kept");
+    fs::write(corpus.join("git-ignored.md"), "git-ignored\n").expect("write git-ignored");
+    fs::write(corpus.join("kb-ignored.md"), "kb-ignored\n").expect("write kb-ignored");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("ingest").arg(&corpus);
+    let output = cmd.output().expect("run kb ingest directory");
+
+    assert!(
+        output.status.success(),
+        "kb ingest directory failed with stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ingest json");
+    let payload = &envelope["data"];
+    let items = payload["results"]
+        .as_array()
+        .expect("ingest results should be an array");
+    assert_eq!(items.len(), 1, "only kept.md should be ingested");
+    assert_eq!(
+        items[0]["content_path"]
+            .as_str()
+            .expect("content_path should be a string")
+            .rsplit('/')
+            .next()
+            .expect("content_path should have a filename"),
+        "kept.md"
+    );
+}
+
+#[test]
 fn ingest_dry_run_makes_no_filesystem_changes() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
