@@ -51,18 +51,19 @@ concept + source + question pages.
 ## The loop
 
 ```
+
      ┌────────────┐      ┌─────────────────┐      ┌──────────────┐
  md  │ kb ingest  │ raw/ │   kb compile    │ wiki/│   kb ask     │ answer
-────▶│            │─────▶│  (LLM pipeline) │─────▶│   kb chat    │──────▶
+────>│            │─────>│  (LLM pipeline) │─────>│   kb chat    │──────>
      └────────────┘      └─────────────────┘      │   kb search  │
-           ▲                      │                └──────────────┘
-           │                      ▼                       │
+           ^                      │               └──────────────┘
+           │                      v                       │
            │              review queue                    │
            │                      │                       │
-           │                      ▼                       │
-           │              kb review approve ◀─────────────┘
+           │                      v                       │
+           │              kb review approve <─────────────┘
            │                      │
-           │                      ▼
+           │                      v
            │              wiki/questions/
            │                      │
            └──────────────────────┘
@@ -213,15 +214,15 @@ through their referring markdown file.
 
 ## Supported inputs
 
-| Type              | Status |
-|-------------------|--------|
-| Markdown (.md, .txt, .rst) | ✅ |
-| Plain text        | ✅ |
-| URLs              | ✅ (text extracted) |
-| Images referenced from markdown | ✅ (copied, multimodal consumption planned) |
-| PDF, Word, Excel  | planned via [markitdown](https://github.com/microsoft/markitdown) preprocessing |
-| Git repos (`kb ingest <git-url>`) | planned |
-| Standalone images | ❌ (binary rejection) |
+| Type                              | Status                                                                          |
+| --------------------------------- | ------------------------------------------------------------------------------- |
+| Markdown (.md, .txt, .rst)        | ✅                                                                              |
+| Plain text                        | ✅                                                                              |
+| URLs                              | ✅ (text extracted)                                                             |
+| Images referenced from markdown   | ✅ (copied, multimodal consumption planned)                                     |
+| PDF, Word, Excel                  | planned via [markitdown](https://github.com/microsoft/markitdown) preprocessing |
+| Git repos (`kb ingest <git-url>`) | planned                                                                         |
+| Standalone images                 | ❌ (binary rejection)                                                           |
 
 ## LLM backends
 
