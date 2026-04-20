@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod chat;
 mod config;
 mod forget;
 mod id_resolve;
@@ -183,6 +184,15 @@ enum Command {
         #[command(subcommand)]
         action: Option<JobsAction>,
     },
+    /// Open an interactive chat session about the knowledge base
+    ///
+    /// Launches opencode's TUI with a read-only KB agent injected at
+    /// startup. Requires an `[llm.runners.opencode]` block in kb.toml.
+    Chat {
+        /// LLM model to use (overrides kb.toml default)
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -304,13 +314,13 @@ impl std::error::Error for ExitCodeError {}
 /// compile pass, file write), stick with `bail!`/`ExitCodeError` so the
 /// failure is recorded. See bn-1jx.
 #[derive(Debug)]
-struct ValidationError {
+pub(crate) struct ValidationError {
     exit_code: i32,
     message: String,
 }
 
 impl ValidationError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             exit_code: 1,
             message: message.into(),
@@ -652,6 +662,19 @@ fn run(cli: Cli) -> Result<()> {
                     })
                 }
             }
+        }
+        Some(Command::Chat { model }) => {
+            let chat_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            // Chat is an interactive TUI session — no job manifest, no
+            // root lock. The underlying agent is read-only (tools_write
+            // and tools_edit are forced false in the generated config),
+            // so it can't mutate KB state even if the user asks it to.
+            // --model CLI flag wins over --model subcommand flag; either
+            // threads through to the opencode agent config.
+            let model_override = model.as_deref().or(cli.model.as_deref());
+            chat::run_chat(chat_root, model_override)
         }
         None => {
             println!("kb: a personal knowledge base compiler");
