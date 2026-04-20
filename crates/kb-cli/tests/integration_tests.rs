@@ -4167,3 +4167,373 @@ fn review_approve_lint_duplicate_concepts_missing_canonical_bails() {
     assert_eq!(saved["status"], "pending");
     assert!(merged_from.exists(), "merged-from page must not be deleted");
 }
+
+// ---------------------------------------------------------------------------
+// `kb forget` — bn-1fq F1 + F2
+// ---------------------------------------------------------------------------
+
+/// Return the single `src-<hex>` id produced by an ingest of `source` via
+/// `kb --json ingest`. Panics on any missing structure, because every test
+/// that calls this expects a successful ingest before proceeding.
+fn ingest_single_and_get_src_id(kb_root: &Path, source: &Path) -> String {
+    let mut cmd = kb_cmd(kb_root);
+    cmd.arg("--json").arg("ingest").arg(source);
+    let output = cmd.output().expect("run kb ingest");
+    assert!(
+        output.status.success(),
+        "ingest failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse ingest envelope");
+    envelope["data"]["results"][0]["source_document_id"]
+        .as_str()
+        .expect("source_document_id in ingest result")
+        .to_string()
+}
+
+/// Drop a minimal `wiki/sources/<src>.md` file so `kb forget` has a wiki
+/// page to remove. Avoids needing a full `kb compile` in the test path.
+fn stub_wiki_source_page(kb_root: &Path, src_id: &str) {
+    let dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&dir).expect("mkdir wiki/sources");
+    let markdown = format!(
+        "---\nid: wiki-source-{src_id}\ntype: source\ntitle: {src_id}\n\
+source_document_id: {src_id}\nsource_revision_id: rev-stub\n\
+generated_at: 0\nbuild_record_id: build-stub\n---\n\n# Source\n"
+    );
+    fs::write(dir.join(format!("{src_id}.md")), markdown).expect("write wiki source page");
+}
+
+/// F1: `kb forget src-xxxx` moves normalized/ + raw/inbox/ + wiki/sources/
+/// entries into `trash/<src>-<ts>/` and records a succeeded job run.
+#[test]
+fn forget_by_src_id_moves_entries_to_trash_and_succeeds() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("note.md");
+    fs::write(&source, "# hi\n\ncontent\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let normalized_dir = kb_root.join("normalized").join(&src_id);
+    let raw_dir = kb_root.join("raw/inbox").join(&src_id);
+    let wiki_page = kb_root.join("wiki/sources").join(format!("{src_id}.md"));
+    assert!(normalized_dir.exists());
+    assert!(raw_dir.exists());
+    assert!(wiki_page.exists());
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!normalized_dir.exists(), "normalized dir should be moved");
+    assert!(!raw_dir.exists(), "raw/inbox dir should be moved");
+    assert!(!wiki_page.exists(), "wiki source page should be moved");
+
+    // A `trash/<src_id>-*` dir should exist and contain the three entries
+    // preserved under their original parent names.
+    let trash_root = kb_root.join("trash");
+    let trash_entries: Vec<_> = fs::read_dir(&trash_root)
+        .expect("read trash dir")
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{src_id}-"))
+        })
+        .collect();
+    assert_eq!(trash_entries.len(), 1, "exactly one trash bundle expected");
+    let bundle = trash_entries
+        .into_iter()
+        .next()
+        .expect("first trash bundle")
+        .path();
+    assert!(bundle.join("normalized").join(&src_id).exists());
+    assert!(bundle.join("raw/inbox").join(&src_id).exists());
+    assert!(
+        bundle
+            .join("wiki/sources")
+            .join(format!("{src_id}.md"))
+            .exists()
+    );
+
+    // The forget job must be recorded as succeeded in `kb --json status`.
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let status_output = status_cmd.output().expect("run kb status");
+    assert!(
+        status_output.status.success(),
+        "kb status failed: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let envelope: Value =
+        serde_json::from_slice(&status_output.stdout).expect("parse status json");
+    let recent = envelope["data"]["recent_jobs"]
+        .as_array()
+        .expect("recent_jobs");
+    let forget_jobs: Vec<&Value> = recent
+        .iter()
+        .filter(|j| j["command"] == "forget")
+        .collect();
+    assert_eq!(forget_jobs.len(), 1, "exactly one forget job expected");
+    assert_eq!(forget_jobs[0]["status"], "succeeded");
+
+    // After forget, neither normalized nor wiki source listings should
+    // include the removed src_id.
+    assert_eq!(envelope["data"]["normalized_source_count"], 0);
+}
+
+/// F1: `kb forget <path>` resolves the path to the right src-id and
+/// removes exactly the same entries as the bare-id form.
+#[test]
+fn forget_by_path_resolves_and_removes_source() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("byhand.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&source);
+    let output = cmd.output().expect("run kb forget by path");
+    assert!(
+        output.status.success(),
+        "kb forget by path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!kb_root.join("normalized").join(&src_id).exists());
+    assert!(!kb_root.join("raw/inbox").join(&src_id).exists());
+}
+
+/// F1: `kb forget --dry-run <src-id>` prints the plan and touches no files.
+#[test]
+fn forget_dry_run_prints_plan_and_keeps_disk_intact() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("kept.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let normalized_dir = kb_root.join("normalized").join(&src_id);
+    let raw_dir = kb_root.join("raw/inbox").join(&src_id);
+    let wiki_page = kb_root.join("wiki/sources").join(format!("{src_id}.md"));
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run")
+        .arg("--json")
+        .arg("forget")
+        .arg(&src_id);
+    let output = cmd.output().expect("run kb forget --dry-run");
+    assert!(
+        output.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse forget json");
+    assert_eq!(envelope["command"], "forget");
+    assert_eq!(envelope["data"]["dry_run"], true);
+    assert_eq!(envelope["data"]["plan"]["src_id"], src_id);
+    let moves = envelope["data"]["plan"]["moves"]
+        .as_array()
+        .expect("moves array");
+    assert_eq!(moves.len(), 3, "expected 3 moves (normalized/raw/wiki)");
+
+    // Nothing should have been moved.
+    assert!(normalized_dir.exists(), "normalized must still exist");
+    assert!(raw_dir.exists(), "raw/inbox must still exist");
+    assert!(wiki_page.exists(), "wiki page must still exist");
+    // `kb init` seeds an empty trash/ dir, so we can't assert it's absent;
+    // assert instead that no src-id-prefixed bundle got created under it.
+    let trash_dir = kb_root.join("trash");
+    if trash_dir.exists() {
+        let stray_bundles: Vec<_> = fs::read_dir(&trash_dir)
+            .expect("read trash")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{src_id}-"))
+            })
+            .collect();
+        assert!(
+            stray_bundles.is_empty(),
+            "dry-run must not create trash bundles, got: {:?}",
+            stray_bundles
+                .iter()
+                .map(std::fs::DirEntry::path)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+/// F1: `kb forget` with no target is a clap usage error (exits non-zero).
+#[test]
+fn forget_without_target_is_usage_error() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("forget");
+    let output = cmd.output().expect("run kb forget with no arg");
+
+    assert!(
+        !output.status.success(),
+        "kb forget without target unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // clap emits a "required ... <TARGET>" style error. Accept either
+    // "required" or "usage" so we don't over-fit to clap's exact phrasing.
+    assert!(
+        stderr.to_lowercase().contains("required")
+            || stderr.to_lowercase().contains("usage"),
+        "expected clap required/usage error, got: {stderr}"
+    );
+}
+
+/// F1: running `kb compile` after `kb forget` must NOT recreate the
+/// removed wiki/sources page — normalized/ is gone, so compile has no
+/// input to regenerate from.
+#[test]
+fn compile_after_forget_does_not_recreate_source_pages() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("once.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(output.status.success());
+
+    // Run compile; it must exit 0 and leave the wiki source page absent.
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("--dry-run").arg("compile");
+    let compile_output = compile_cmd.output().expect("run kb compile --dry-run");
+    assert!(
+        compile_output.status.success(),
+        "kb compile after forget failed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let wiki_page = kb_root.join("wiki/sources").join(format!("{src_id}.md"));
+    assert!(
+        !wiki_page.exists(),
+        "wiki source page must not be recreated after forget"
+    );
+}
+
+/// F2: after the origin file is deleted, `kb --json status` exposes the
+/// src-id under `sources_with_missing_origin`.
+#[test]
+fn status_surfaces_sources_with_missing_origin() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("vanishing.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+
+    // Sanity: no missing origins yet.
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let output = status_cmd.output().expect("run kb status");
+    assert!(output.status.success());
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse status");
+    assert!(
+        envelope["data"]["sources_with_missing_origin"]
+            .as_array()
+            .expect("array")
+            .is_empty(),
+        "origin still present: {:?}",
+        envelope["data"]["sources_with_missing_origin"]
+    );
+
+    // Remove the original source file on disk and re-check.
+    fs::remove_file(&source).expect("rm source");
+
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let output = status_cmd.output().expect("run kb status after rm");
+    assert!(output.status.success());
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse status");
+    let missing = envelope["data"]["sources_with_missing_origin"]
+        .as_array()
+        .expect("missing array");
+    assert_eq!(missing.len(), 1, "expected exactly one missing origin");
+    assert_eq!(missing[0]["src_id"], src_id);
+
+    // Text output must include the hint line pointing at kb forget.
+    let mut text_cmd = kb_cmd(&kb_root);
+    text_cmd.arg("status");
+    let text_output = text_cmd.output().expect("run kb status text");
+    assert!(text_output.status.success());
+    let stdout = String::from_utf8_lossy(&text_output.stdout);
+    assert!(
+        stdout.contains("sources with missing origin"),
+        "status text must mention missing origins, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("kb forget"),
+        "status text must point at kb forget, got:\n{stdout}"
+    );
+}
+
+/// F1/F2: after `kb forget`, `kb status` must no longer list the removed
+/// source — both `normalized_source_count` and `sources_with_missing_origin`
+/// should be empty with respect to it.
+#[test]
+fn status_after_forget_does_not_list_source() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("gone.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+    // Simulate a deleted origin so missing_origin would have flagged it.
+    fs::remove_file(&source).expect("rm source");
+
+    let mut forget_cmd = kb_cmd(&kb_root);
+    forget_cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = forget_cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let status_output = status_cmd.output().expect("run kb status");
+    assert!(status_output.status.success());
+    let envelope: Value =
+        serde_json::from_slice(&status_output.stdout).expect("parse status");
+    assert_eq!(envelope["data"]["normalized_source_count"], 0);
+    assert_eq!(envelope["data"]["wiki_pages"], 0);
+    let missing = envelope["data"]["sources_with_missing_origin"]
+        .as_array()
+        .expect("missing array");
+    assert!(
+        missing.is_empty(),
+        "forgotten source should not linger in sources_with_missing_origin: {missing:?}"
+    );
+}

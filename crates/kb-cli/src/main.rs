@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod config;
+mod forget;
 mod init;
 mod jobs;
 mod jobs_cmd;
@@ -153,6 +154,14 @@ enum Command {
         trace: bool,
 
         /// Document or entity to inspect
+        #[arg(required = true)]
+        target: String,
+    },
+    /// Remove an ingested source (moves files into `trash/` for safety)
+    Forget {
+        /// `src-<hex>` id or a path to the source file that was ingested.
+        /// The path is canonicalized and matched against each
+        /// `raw/inbox/<src>/source_document.json::stable_location`.
         #[arg(required = true)]
         target: String,
     },
@@ -452,6 +461,29 @@ fn run(cli: Cli) -> Result<()> {
                 .as_deref()
                 .expect("root resolved for non-init commands");
             run_inspect(root, &target, cli.json, trace)
+        }
+        Some(Command::Forget { target }) => {
+            let forget_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands")
+                .to_path_buf();
+            let flags = ForgetFlags {
+                dry_run: cli.dry_run,
+                json: cli.json,
+                force: cli.force,
+                quiet: cli.quiet,
+            };
+
+            // Dry-run is a pure read: no lock, no job manifest, no writes.
+            // Matches `ingest`'s dry-run handling above.
+            if flags.dry_run {
+                return run_forget(&forget_root, &target, flags);
+            }
+
+            let forget_root_for_lock = forget_root.clone();
+            execute_mutating_command(Some(&forget_root_for_lock), "forget", move || {
+                run_forget(&forget_root, &target, flags)
+            })
         }
         Some(Command::Review { action }) => {
             let review_root = root
@@ -1059,6 +1091,100 @@ struct IngestSummary {
     new_sources: usize,
     new_revisions: usize,
     skipped: usize,
+}
+
+/// Flags extracted from `Cli` that `run_forget` cares about.
+///
+/// Packed into a struct (instead of passed as four separate `bool`s) to
+/// keep the handler signature under clippy's `fn_params_excessive_bools`
+/// threshold. All four flags come from global top-level CLI flags:
+/// `--dry-run`, `--json`, `--force`, `--quiet`. The top-level `Cli` struct
+/// already carries the same four bools and is allow-listed for the same
+/// reason; mirroring that here is a deliberate choice, not an oversight.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy)]
+struct ForgetFlags {
+    dry_run: bool,
+    json: bool,
+    force: bool,
+    quiet: bool,
+}
+
+/// Implement `kb forget <target>`. See `forget.rs` for the helpers.
+///
+/// `flags.dry_run` prints the plan without touching disk. The confirmation
+/// prompt is skipped in three cases: `--force` (explicit opt-out), `--quiet`
+/// (non-interactive contexts like scripts), and `--json` (callers parsing
+/// output can't answer `y/N`; a typo-protection prompt would just deadlock
+/// them).
+fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
+    let (src_id, origin) = forget::resolve_target(root, target)?;
+    let plan = forget::plan(root, &src_id, origin)?;
+
+    // Dry-run and JSON paths emit the plan and return without touching disk.
+    if flags.dry_run {
+        if flags.json {
+            emit_json(
+                "forget",
+                forget::ForgetOutcome {
+                    plan,
+                    dry_run: true,
+                    backlinks_refreshed: false,
+                },
+            )?;
+        } else {
+            print!("{}", forget::render_plan(&plan, true));
+        }
+        return Ok(());
+    }
+
+    if plan.moves.is_empty() {
+        // Nothing to remove. Report so users don't wonder whether the op
+        // silently failed. No job manifest needed — we already opened one
+        // around this handler, and "nothing to do" is a legitimate success.
+        if flags.json {
+            emit_json(
+                "forget",
+                forget::ForgetOutcome {
+                    plan,
+                    dry_run: false,
+                    backlinks_refreshed: false,
+                },
+            )?;
+        } else {
+            println!(
+                "forget {src_id}: nothing to remove (no normalized/, raw/inbox/, or wiki/sources/ entry)"
+            );
+        }
+        return Ok(());
+    }
+
+    if !flags.force
+        && !flags.quiet
+        && !flags.json
+        && !forget::confirm_on_stderr(&plan)?
+    {
+        bail!("forget aborted by user");
+    }
+
+    let backlinks_refreshed = forget::execute(root, &plan)?;
+
+    if flags.json {
+        emit_json(
+            "forget",
+            forget::ForgetOutcome {
+                plan,
+                dry_run: false,
+                backlinks_refreshed,
+            },
+        )?;
+    } else {
+        print!("{}", forget::render_plan(&plan, false));
+        if backlinks_refreshed {
+            println!("  backlinks refreshed");
+        }
+    }
+    Ok(())
 }
 
 fn run_ingest(
@@ -2742,6 +2868,20 @@ struct StatusPayload {
     /// source was ingested from so users can grep by filename — not just the
     /// opaque `src-<id>` hash.
     changed_inputs_not_compiled: Vec<ChangedInput>,
+    /// Ingested sources whose original file no longer exists on disk.
+    /// URL-backed sources are excluded — they don't live on local disk.
+    /// Users can run `kb forget <src-id>` to retire these cleanly.
+    sources_with_missing_origin: Vec<MissingOrigin>,
+}
+
+/// One ingested source whose `stable_location` path no longer exists on disk.
+#[derive(Debug, Serialize)]
+struct MissingOrigin {
+    /// Source-document id (e.g. `src-0639ebb0`).
+    src_id: String,
+    /// The original filesystem path as recorded in
+    /// `raw/inbox/<src>/source_document.json::stable_location`.
+    origin: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -2863,6 +3003,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         .collect();
 
     let changed_inputs_not_compiled = find_changed_inputs(root, &hash_state)?;
+    let sources_with_missing_origin = find_missing_origins(root)?;
 
     Ok(StatusPayload {
         normalized_source_count,
@@ -2876,7 +3017,50 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         interrupted_jobs,
         interrupted_jobs_total,
         changed_inputs_not_compiled,
+        sources_with_missing_origin,
     })
+}
+
+/// Walk `normalized/*/` and flag every source whose recorded
+/// `stable_location` is a local filesystem path that no longer exists.
+///
+/// URL-backed sources (and any non-local stable-location scheme) are
+/// skipped — we don't try to HEAD the URL in `kb status`. A missing
+/// `raw/inbox/<src>/source_document.json` is treated as "can't tell": we
+/// don't flag it, because a legacy / hand-placed normalized dir has no
+/// origin to miss.
+fn find_missing_origins(root: &Path) -> Result<Vec<MissingOrigin>> {
+    let normalized_dir = root.join("normalized");
+    if !normalized_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    for entry in fs::read_dir(&normalized_dir)
+        .with_context(|| format!("read {}", normalized_dir.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("read entry in {}", normalized_dir.display()))?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(origin) = lookup_source_origin(root, &name) else {
+            continue;
+        };
+        if !forget::origin_is_local_path(&origin) {
+            continue;
+        }
+        if !Path::new(&origin).exists() {
+            out.push(MissingOrigin {
+                src_id: name,
+                origin,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.src_id.cmp(&b.src_id));
+    Ok(out)
 }
 
 /// Count ingested sources by listing subdirectories of `normalized/`.
@@ -3179,6 +3363,7 @@ fn lookup_source_origin(root: &Path, src_id: &str) -> Option<String> {
 }
 
 
+#[allow(clippy::too_many_lines)]
 fn print_status(status: &StatusPayload) {
     println!("kb status");
     println!();
@@ -3221,6 +3406,18 @@ fn print_status(status: &StatusPayload) {
                     println!("  - {}  ({})", input.normalized_path.display(), input.src_id);
                 }
             }
+        }
+        println!();
+    }
+
+    if !status.sources_with_missing_origin.is_empty() {
+        println!("sources with missing origin (run `kb forget <src-id>` to remove):");
+        for missing in &status.sources_with_missing_origin {
+            let display = origin_display_name(&missing.origin);
+            println!(
+                "  - {display}  ({}, origin {} deleted)",
+                missing.src_id, missing.origin
+            );
         }
         println!();
     }
