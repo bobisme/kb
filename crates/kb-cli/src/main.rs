@@ -2621,25 +2621,19 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
 
     let normalized_source_count = count_normalized_sources(root)?;
 
-    let mut source_counts = SourceCounts {
-        total: 0,
-        by_kind: std::collections::BTreeMap::new(),
-    };
-    let mut wiki_pages = 0;
-    let mut concepts = 0;
+    // Counts come from a direct disk walk of `wiki/sources/` and
+    // `wiki/concepts/`, NOT from `graph.nodes`. The persisted graph is
+    // written atomically at the *end* of compile, so any mid-compile or
+    // partial-failure state would under-report (often as 0) while
+    // `wiki/sources/*.md` files are already visible on disk. A disk walk
+    // is O(<few hundred files) for realistic KBs and gives users an
+    // always-truthful count. See bn-1iw / l-status-stale.
+    let source_counts = count_wiki_source_pages(root)?;
+    // `wiki_pages` in the JSON payload is the same set — one wiki page per
+    // source — so we keep it in lockstep with the disk-walked total.
+    let wiki_pages = source_counts.total;
+    let concepts = count_wiki_concept_pages(root)?;
     let mut stale_count = 0;
-
-    for node_id in graph.nodes.keys() {
-        if node_id.starts_with("source-document-") {
-            let kind = extract_source_kind(node_id);
-            *source_counts.by_kind.entry(kind.to_string()).or_insert(0) += 1;
-            source_counts.total += 1;
-        } else if node_id.starts_with("wiki-page-") {
-            wiki_pages += 1;
-        } else if node_id.starts_with("concept-") {
-            concepts += 1;
-        }
-    }
 
     for artifact_record in manifest.artifacts.values() {
         for output_id in &artifact_record.output_ids {
@@ -2726,6 +2720,92 @@ fn count_normalized_sources(root: &Path) -> Result<usize> {
         if entry.file_type()?.is_dir() {
             count += 1;
         }
+    }
+    Ok(count)
+}
+
+/// Count wiki source pages by walking `wiki/sources/*.md` directly.
+///
+/// Returns a fresh count plus a by-kind breakdown. The total is the single
+/// source of truth users see on the `wiki source pages: N` line in `kb
+/// status`; deriving it from the persisted graph is unsafe because the graph
+/// is only written atomically at end-of-compile and would report 0 mid-run
+/// (or stay under-reported after a killed compile until the next successful
+/// one). See bn-1iw / l-status-stale.
+///
+/// `wiki/sources/index.md` is excluded — it's the auto-generated index of
+/// source pages, not itself a source page. A missing `wiki/sources/` dir is
+/// treated as zero: freshly-initialized KBs have no wiki tree yet.
+///
+/// The per-kind breakdown is best-effort: it reuses `extract_source_kind` on
+/// the filename stem. For today's source IDs (e.g. `src-0639ebb0`) no kind
+/// token is present in the filename, so everything falls into the `other`
+/// bucket, which `print_status` then collapses into the header line. When
+/// ingest later plumbs kind info into the filename the breakdown will
+/// light up automatically.
+fn count_wiki_source_pages(root: &Path) -> Result<SourceCounts> {
+    let mut counts = SourceCounts {
+        total: 0,
+        by_kind: std::collections::BTreeMap::new(),
+    };
+    let dir = root.join("wiki/sources");
+    if !dir.exists() {
+        return Ok(counts);
+    }
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem == "index" {
+            continue;
+        }
+        let kind = extract_source_kind(stem);
+        *counts.by_kind.entry(kind.to_string()).or_insert(0) += 1;
+        counts.total += 1;
+    }
+    Ok(counts)
+}
+
+/// Count wiki concept pages by walking `wiki/concepts/*.md` directly.
+///
+/// Same rationale as `count_wiki_source_pages`: avoid relying on the
+/// end-of-compile graph snapshot so the number reflects what's actually on
+/// disk right now. `wiki/concepts/index.md` is excluded. A missing dir is
+/// zero.
+fn count_wiki_concept_pages(root: &Path) -> Result<usize> {
+    let dir = root.join("wiki/concepts");
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for entry in
+        std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem == "index" {
+            continue;
+        }
+        count += 1;
     }
     Ok(count)
 }
@@ -3152,6 +3232,73 @@ mod tests {
 
         let status = gather_status(&root).expect("gather status");
         assert_eq!(status.normalized_source_count, 1);
+    }
+
+    /// Regression test for bn-1iw: `kb status` must count wiki source pages
+    /// by walking `wiki/sources/*.md` on disk, not by reading the end-of-
+    /// compile graph snapshot. Drop 5 wiki source pages onto disk with no
+    /// state/graph.json or state/manifest.json present (simulating mid-
+    /// compile or a killed finalize), and verify status reports 5 — not 0.
+    #[test]
+    fn gather_status_counts_wiki_source_pages_from_disk() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        let sources_dir = root.join("wiki/sources");
+        fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+        for i in 0..5 {
+            fs::write(
+                sources_dir.join(format!("src-{i:04x}.md")),
+                "---\nid: wiki-source-x\n---\n\n# body\n",
+            )
+            .expect("write wiki source page");
+        }
+        // `index.md` must NOT be counted — it's the auto-generated index.
+        fs::write(sources_dir.join("index.md"), "# index\n").expect("write index");
+        // Non-markdown files must be ignored.
+        fs::write(sources_dir.join("notes.txt"), "scratch").expect("write stray txt");
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(
+            status.sources.total, 5,
+            "should count the 5 .md pages, excluding index.md and notes.txt",
+        );
+        assert_eq!(
+            status.wiki_pages, 5,
+            "wiki_pages field must stay in lockstep with sources.total",
+        );
+    }
+
+    /// `wiki/concepts/*.md` is counted the same way and `index.md` is
+    /// similarly excluded.
+    #[test]
+    fn gather_status_counts_wiki_concept_pages_from_disk() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        let concepts_dir = root.join("wiki/concepts");
+        fs::create_dir_all(&concepts_dir).expect("create wiki/concepts");
+        fs::write(concepts_dir.join("rust.md"), "# rust\n").expect("rust");
+        fs::write(concepts_dir.join("lifetime.md"), "# lifetime\n").expect("lifetime");
+        fs::write(concepts_dir.join("index.md"), "# index\n").expect("index");
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(status.concepts, 2);
+    }
+
+    /// A fresh KB with no `wiki/` tree at all must not error — counts are 0.
+    #[test]
+    fn gather_status_reports_zero_when_wiki_tree_missing() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(status.sources.total, 0);
+        assert_eq!(status.wiki_pages, 0);
+        assert_eq!(status.concepts, 0);
     }
 
     /// Helper for the re-ingest mismatch tests: fabricate
