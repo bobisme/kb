@@ -212,10 +212,19 @@ struct NormalizedDraft {
     first_pass_body: String,
 }
 
+/// Literal fallback category used when the LLM returns no category (or an
+/// empty/whitespace-only string). Matches the existing "Uncategorized"
+/// bucket rendered by bn-eqx7's `wiki/concepts/index.md` grouper — the
+/// index normalizes category values case-insensitively, so the literal
+/// lowercase string lands alongside other pages missing a real category.
+const UNCATEGORIZED_FALLBACK: &str = "uncategorized";
+
 /// Trim + sanitize the raw adapter response: pick a non-empty canonical
 /// name (fallback to the candidate term), de-dupe aliases, clamp alias
 /// count at 5, drop aliases that equal the canonical, normalize the
-/// category (empty → None), and trim the first-pass body.
+/// category (empty → literal "uncategorized" fallback so the page still
+/// lands in the concept index's Uncategorized bucket rather than being
+/// absent from the index), and trim the first-pass body.
 fn normalize_draft(
     draft: kb_llm::GenerateConceptFromCandidateResponse,
     candidate_name: String,
@@ -245,12 +254,18 @@ fn normalize_draft(
     }
     let aliases: Vec<String> = alias_set.into_iter().collect();
 
-    let category = draft
-        .category
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
+    // bn-39fw: fall back to a literal "uncategorized" when the LLM returns
+    // no category. The frontmatter field is always written so bn-eqx7's
+    // index-page renderer groups the concept into its existing
+    // Uncategorized bucket instead of dropping it from the index.
+    let category = Some(
+        draft
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| UNCATEGORIZED_FALLBACK.to_string(), ToString::to_string),
+    );
 
     let first_pass_body = draft.definition.trim().to_string();
 
@@ -778,6 +793,110 @@ mod tests {
                 .all(|s| s.snippet.to_lowercase().contains("foobar system")),
             "each snippet must include the candidate term: {:?}",
             req.source_snippets
+        );
+    }
+
+    #[test]
+    fn apply_falls_back_to_uncategorized_when_llm_returns_no_category() {
+        // bn-39fw: the LLM may legitimately return category: None when the
+        // snippets are uninformative. The writer must still emit a
+        // `category:` field so bn-eqx7's index groups the page into the
+        // existing Uncategorized bucket rather than dropping it.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        seed_source(
+            root,
+            "doc-a",
+            "# A\n\nThe FooBar System is interesting. FooBar System has many parts.\n",
+        );
+
+        let stub = StubAdapter::new(GenerateConceptFromCandidateResponse {
+            canonical_name: "FooBar System".to_string(),
+            aliases: vec![],
+            category: None,
+            definition:
+                "FooBar System is a distributed architecture described across multiple sources covering its partitioning, consistency, and recovery semantics."
+                    .to_string(),
+        });
+
+        let item = review_item("FooBar System", "foobar-system", &["doc-a"]);
+        let applied = apply_concept_candidate(&stub, root, &item).expect("apply");
+
+        assert_eq!(
+            applied.category.as_deref(),
+            Some("uncategorized"),
+            "writer must fall back to literal 'uncategorized' when LLM returns None"
+        );
+
+        let page_path = root.join("wiki/concepts/foobar-system.md");
+        let content = std::fs::read_to_string(&page_path).expect("read page");
+        assert!(
+            content.contains("category: uncategorized"),
+            "written page must emit `category: uncategorized` frontmatter field:\n{content}"
+        );
+    }
+
+    #[test]
+    fn apply_falls_back_to_uncategorized_when_llm_returns_whitespace_category() {
+        // bn-39fw: whitespace-only categories are treated the same as None
+        // — the normalizer must not emit them verbatim.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        seed_source(
+            root,
+            "doc-a",
+            "# A\n\nFooBar System is a thing people talk about. FooBar System!\n",
+        );
+
+        let stub = StubAdapter::new(GenerateConceptFromCandidateResponse {
+            canonical_name: "FooBar System".to_string(),
+            aliases: vec![],
+            category: Some("   ".to_string()),
+            definition:
+                "FooBar System is a distributed architecture described across multiple sources covering its partitioning, consistency, and recovery semantics."
+                    .to_string(),
+        });
+
+        let item = review_item("FooBar System", "foobar-system", &["doc-a"]);
+        let applied = apply_concept_candidate(&stub, root, &item).expect("apply");
+
+        assert_eq!(applied.category.as_deref(), Some("uncategorized"));
+        let page_path = root.join("wiki/concepts/foobar-system.md");
+        let content = std::fs::read_to_string(&page_path).expect("read page");
+        assert!(content.contains("category: uncategorized"));
+    }
+
+    #[test]
+    fn apply_preserves_llm_assigned_category_verbatim() {
+        // bn-39fw: regression guard — the fallback must not clobber a
+        // real category returned by the LLM.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        seed_source(
+            root,
+            "doc-a",
+            "# A\n\nThe FooBar System is interesting. FooBar System has many parts.\n",
+        );
+
+        let stub = StubAdapter::new(GenerateConceptFromCandidateResponse {
+            canonical_name: "FooBar System".to_string(),
+            aliases: vec![],
+            category: Some("storage".to_string()),
+            definition:
+                "FooBar System is a distributed architecture described across multiple sources covering its partitioning, consistency, and recovery semantics."
+                    .to_string(),
+        });
+
+        let item = review_item("FooBar System", "foobar-system", &["doc-a"]);
+        let applied = apply_concept_candidate(&stub, root, &item).expect("apply");
+
+        assert_eq!(applied.category.as_deref(), Some("storage"));
+        let page_path = root.join("wiki/concepts/foobar-system.md");
+        let content = std::fs::read_to_string(&page_path).expect("read page");
+        assert!(content.contains("category: storage"));
+        assert!(
+            !content.contains("category: uncategorized"),
+            "LLM-assigned category must not be clobbered by fallback:\n{content}"
         );
     }
 
