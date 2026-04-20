@@ -14,6 +14,11 @@ const QUESTIONS_DIR: &str = "wiki/questions";
 pub struct IndexEntry {
     pub title: String,
     pub relative_path: String,
+    /// Optional category tag read from concept frontmatter. Only concept
+    /// pages populate this; source and question pages always carry `None`.
+    /// Empty-string `category:` values are treated as `None` so the page
+    /// lands under the "Uncategorized" bucket.
+    pub category: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,7 +32,14 @@ struct PageFrontmatter {
     title: Option<String>,
     name: Option<String>,
     question: Option<String>,
+    category: Option<String>,
 }
+
+/// Label used for concepts missing a `category:` frontmatter field in the
+/// rendered concepts index. A separate sentinel (rather than sorting
+/// "uncategorized" alphabetically among real categories) lets us pin the
+/// bucket to the end and keep categorized groups on top.
+const UNCATEGORIZED_LABEL: &str = "Uncategorized";
 
 /// Generate global and per-category index pages from the wiki directory.
 ///
@@ -79,7 +91,7 @@ pub fn generate_indexes(root: &Path) -> Result<Vec<IndexArtifact>> {
             .context("wiki/concepts/index.md has no parent")?
             .to_path_buf();
         artifacts.push(IndexArtifact {
-            content: render_category_index("Concepts", &concepts, root, &parent),
+            content: render_concepts_index(&concepts, root, &parent),
             path,
         });
     }
@@ -193,11 +205,21 @@ fn discover_entries(root: &Path, relative_dir: &str) -> Result<Vec<IndexEntry>> 
             .to_string_lossy()
             .replace('\\', "/");
 
-        let title = extract_title(path).unwrap_or_else(|| title_from_filename(path));
+        let parsed = parse_frontmatter(path);
+        let title = parsed
+            .as_ref()
+            .and_then(|fm| fm.title.clone().or_else(|| fm.question.clone()).or_else(|| fm.name.clone()))
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| title_from_filename(path));
+        let category = parsed
+            .and_then(|fm| fm.category)
+            .map(|c| c.trim().to_string())
+            .filter(|c| !c.is_empty());
 
         entries.push(IndexEntry {
             title,
             relative_path,
+            category,
         });
     }
 
@@ -205,14 +227,10 @@ fn discover_entries(root: &Path, relative_dir: &str) -> Result<Vec<IndexEntry>> 
     Ok(entries)
 }
 
-fn extract_title(path: &Path) -> Option<String> {
+fn parse_frontmatter(path: &Path) -> Option<PageFrontmatter> {
     let raw = std::fs::read_to_string(path).ok()?;
     let yaml = extract_frontmatter_yaml(&raw)?;
-    let fm: PageFrontmatter = serde_yaml::from_str(&yaml).ok()?;
-    fm.title
-        .or(fm.question)
-        .or(fm.name)
-        .filter(|t| !t.is_empty())
+    serde_yaml::from_str(&yaml).ok()
 }
 
 fn extract_frontmatter_yaml(markdown: &str) -> Option<String> {
@@ -315,6 +333,94 @@ fn render_category_index(
             link_target(entry, root, index_parent)
         )
         .expect("infallible");
+    }
+    out
+}
+
+/// Render `wiki/concepts/index.md`, grouping concept pages by their
+/// `category:` frontmatter field.
+///
+/// Categories are sorted alphabetically (case-insensitive). Concepts missing
+/// a category are collected under a final "Uncategorized" heading — pinned to
+/// the end regardless of alphabetical order so categorized groups stay on top.
+/// When every concept is uncategorized, we still render the heading rather
+/// than fall back to a flat list, so the structure is consistent across
+/// knowledge bases that are mid-migration.
+///
+/// The header records both the total page count and the number of categories
+/// (including "Uncategorized" only when it holds pages) so readers can tell at
+/// a glance how the KB is organized.
+fn render_concepts_index(entries: &[IndexEntry], root: &Path, index_parent: &Path) -> String {
+    use std::collections::BTreeMap;
+
+    // Group by a case-preserving but case-insensitive-sorted key. BTreeMap
+    // gives deterministic ordering across builds without extra sort calls.
+    // Keyed by lowercased category so "Async" and "async" collapse into one
+    // bucket; we keep the first-seen display form.
+    let mut groups: BTreeMap<String, (String, Vec<&IndexEntry>)> = BTreeMap::new();
+    let mut uncategorized: Vec<&IndexEntry> = Vec::new();
+
+    for entry in entries {
+        match entry.category.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            Some(category) => {
+                let key = category.to_ascii_lowercase();
+                groups
+                    .entry(key)
+                    .or_insert_with(|| (category.to_string(), Vec::new()))
+                    .1
+                    .push(entry);
+            }
+            None => uncategorized.push(entry),
+        }
+    }
+
+    let mut category_count = groups.len();
+    if !uncategorized.is_empty() {
+        category_count += 1;
+    }
+
+    let mut out = String::new();
+    writeln!(out, "# Concepts\n").expect("infallible");
+    writeln!(
+        out,
+        "{} page(s) in {} categor{}.\n",
+        entries.len(),
+        category_count,
+        if category_count == 1 { "y" } else { "ies" },
+    )
+    .expect("infallible");
+
+    for (display, bucket) in groups.values() {
+        writeln!(out, "## {display}\n").expect("infallible");
+        for entry in bucket {
+            writeln!(
+                out,
+                "- [{}]({})",
+                entry.title,
+                link_target(entry, root, index_parent)
+            )
+            .expect("infallible");
+        }
+        out.push('\n');
+    }
+
+    if !uncategorized.is_empty() {
+        writeln!(out, "## {UNCATEGORIZED_LABEL}\n").expect("infallible");
+        for entry in &uncategorized {
+            writeln!(
+                out,
+                "- [{}]({})",
+                entry.title,
+                link_target(entry, root, index_parent)
+            )
+            .expect("infallible");
+        }
+        out.push('\n');
+    }
+
+    // Trim trailing blank line — keep a single newline at EOF.
+    while out.ends_with("\n\n") {
+        out.pop();
     }
     out
 }

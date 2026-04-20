@@ -48,6 +48,19 @@ actions") rather than leaving six separate children ungrouped.
   folding children into a parent, this is the parent name.
 - `aliases` — alternate names, abbreviations, shorthand, and folded child names. Do not
   repeat the canonical name in aliases.
+- `category` — a short 1-3 word tag that places the concept in a high-level bucket used
+  by the concepts index. Pick freely from a domain-relevant taxonomy; the system infers
+  the taxonomy from whatever tags you emit across concepts. Examples:
+    - Rust topic: `concurrency`, `async`, `macros`, `ownership`, `ffi`
+    - Distributed systems: `consensus`, `storage`, `networking`, `observability`
+  Rules:
+    - Keep it short — a tag, not a description.
+    - Prefer lowercase kebab-case or single words (e.g. `async`, `distributed-systems`).
+    - Use flat category names only — do NOT include slashes.
+    - If nothing obvious fits, set `category: null` and the concept will be placed under
+      an "Uncategorized" bucket. Do not invent a category just to avoid null.
+    - Reuse existing category names across concepts when they fit — do not spawn a new
+      tag per concept.
 - `members` — every original candidate object that belongs to the group, whether by
   semantic identity or by parent/child folding.
 - `confident: true` when the grouping is unambiguous.
@@ -71,6 +84,7 @@ Return only valid JSON in this exact shape — no other text before or after:
     {
       "canonical_name": "Borrow checker",
       "aliases": ["borrowck"],
+      "category": "ownership",
       "members": [],
       "confident": true,
       "rationale": null

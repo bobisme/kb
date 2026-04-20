@@ -33,6 +33,9 @@ pub struct ConceptPage {
     pub content: String,
     pub canonical_name: String,
     pub aliases: Vec<String>,
+    /// Optional high-level category assigned by the LLM during merge.
+    /// `None` means the concept lands under "Uncategorized" in the index.
+    pub category: Option<String>,
 }
 
 /// An uncertain merge queued for human review.
@@ -754,6 +757,23 @@ where
         fm.insert(Value::String("aliases".into()), Value::Sequence(aliases));
     }
 
+    // Normalize category: trim whitespace, drop if empty. `None` (or effectively
+    // empty) means the concept will land under "Uncategorized" in the index.
+    // We deliberately do NOT emit an empty `category:` field so pages without
+    // a category stay visibly un-tagged in their frontmatter.
+    let normalized_category = group
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    if let Some(category) = &normalized_category {
+        fm.insert(
+            Value::String("category".into()),
+            Value::String(category.clone()),
+        );
+    }
+
     if !source_document_ids.is_empty() {
         let ids: Vec<Value> = source_document_ids
             .iter()
@@ -805,6 +825,7 @@ where
         content,
         canonical_name: group.canonical_name.clone(),
         aliases: group.aliases.clone(),
+        category: normalized_category,
     })
 }
 
@@ -1081,12 +1102,20 @@ pub fn apply_concept_merge(root: &Path, item: &ReviewItem) -> Result<AppliedMerg
 
     let added_aliases: Vec<String> = additions.aliases.into_iter().collect();
     let added_source_document_ids: Vec<String> = additions.source_ids.into_iter().collect();
+    let canonical_adopts_category =
+        existing.category.is_none() && additions.adopted_category.is_some();
     let canonical_updated = !added_aliases.is_empty()
         || !added_source_document_ids.is_empty()
-        || !additions.sources.is_empty();
+        || !additions.sources.is_empty()
+        || canonical_adopts_category;
 
     if canonical_updated {
-        existing.union_additions(&added_aliases, &added_source_document_ids, additions.sources);
+        existing.union_additions(
+            &added_aliases,
+            &added_source_document_ids,
+            additions.sources,
+            additions.adopted_category,
+        );
         existing.write_into(&mut fm);
         write_frontmatter(&canonical_path, &fm, body.as_str())
             .with_context(|| format!("rewrite canonical concept page {}", canonical_path.display()))?;
@@ -1107,6 +1136,10 @@ struct CanonicalFields {
     aliases: Vec<String>,
     source_ids: Vec<String>,
     sources: Vec<Value>,
+    /// Canonical's own `category:` field, if any. Preserved across cascades:
+    /// if the canonical already has a category, we keep it; if it has none
+    /// and a folded member supplies one, we adopt that.
+    category: Option<String>,
 }
 
 impl CanonicalFields {
@@ -1119,6 +1152,11 @@ impl CanonicalFields {
                 .and_then(|v| v.as_sequence())
                 .cloned()
                 .unwrap_or_default(),
+            category: fm
+                .get(Value::String("category".into()))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
         }
     }
 
@@ -1127,6 +1165,7 @@ impl CanonicalFields {
         added_aliases: &[String],
         added_source_ids: &[String],
         added_sources: Vec<Value>,
+        adopted_category: Option<String>,
     ) {
         self.aliases.extend(added_aliases.iter().cloned());
         self.aliases.sort();
@@ -1137,6 +1176,12 @@ impl CanonicalFields {
         self.source_ids.dedup();
 
         self.sources.extend(added_sources);
+
+        // Only adopt a member-supplied category when the canonical has none —
+        // an existing canonical category is authoritative.
+        if self.category.is_none() {
+            self.category = adopted_category;
+        }
     }
 
     fn write_into(&self, fm: &mut Mapping) {
@@ -1163,6 +1208,12 @@ impl CanonicalFields {
                 Value::Sequence(self.sources.clone()),
             );
         }
+        if let Some(category) = &self.category {
+            fm.insert(
+                Value::String("category".into()),
+                Value::String(category.clone()),
+            );
+        }
     }
 }
 
@@ -1171,6 +1222,9 @@ struct MergeAdditions {
     aliases: BTreeSet<String>,
     source_ids: BTreeSet<String>,
     sources: Vec<Value>,
+    /// First non-empty `category:` encountered while absorbing members.
+    /// Only used when the canonical's own category is `None`.
+    adopted_category: Option<String>,
 }
 
 impl MergeAdditions {
@@ -1213,6 +1267,16 @@ fn absorb_member_frontmatter(
     {
         for entry in seq {
             additions.add_source_entry(&existing.sources, entry);
+        }
+    }
+    if existing.category.is_none() && additions.adopted_category.is_none() {
+        if let Some(category) = member_fm
+            .get(Value::String("category".into()))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            additions.adopted_category = Some(category);
         }
     }
     Ok(())
@@ -1367,6 +1431,7 @@ mod tests {
                     canonical_name: "Borrow checker".to_string(),
                     aliases: vec!["borrowck".to_string()],
                     members: vec![borrow_checker_candidate(), borrowck_candidate()],
+                    category: None,
                     confident: true,
                     rationale: None,
                 }],
@@ -1409,6 +1474,7 @@ mod tests {
                     canonical_name: "Lifetime elision".to_string(),
                     aliases: vec![],
                     members: vec![uncertain_candidate()],
+                    category: None,
                     confident: false,
                     rationale: Some(
                         "Ambiguous whether this is the same as lifetime rules.".to_string(),
@@ -1472,6 +1538,7 @@ mod tests {
                         canonical_name: "Borrow checker".to_string(),
                         aliases: vec!["borrowck".to_string()],
                         members: vec![borrow_checker_candidate()],
+                        category: None,
                         confident: true,
                         rationale: None,
                     },
@@ -1479,6 +1546,7 @@ mod tests {
                         canonical_name: "Lifetime elision".to_string(),
                         aliases: vec![],
                         members: vec![uncertain_candidate()],
+                        category: None,
                         confident: false,
                         rationale: Some("Uncertain".to_string()),
                     },
@@ -1517,6 +1585,7 @@ mod tests {
             content: "---\nid: concept:borrow-checker\n---\n".to_string(),
             canonical_name: "Borrow checker".to_string(),
             aliases: vec![],
+            category: None,
         };
 
         persist_concept_page(&page).expect("persist concept page");
@@ -1540,6 +1609,7 @@ mod tests {
                     canonical_name: "Named lifetime parameter".to_string(),
                     aliases: tricky_aliases.clone(),
                     members: vec![borrow_checker_candidate()],
+                    category: None,
                     confident: true,
                     rationale: None,
                 }],
@@ -1602,6 +1672,7 @@ mod tests {
                     canonical_name: "Borrow checker".to_string(),
                     aliases: vec!["borrowck".to_string()],
                     members: vec![borrow_checker_candidate(), borrowck_candidate()],
+                    category: None,
                     confident: true,
                     rationale: None,
                 }],
@@ -1669,6 +1740,7 @@ mod tests {
                     canonical_name: "Borrow checker".to_string(),
                     aliases: vec![],
                     members: vec![borrow_checker_candidate()],
+                    category: None,
                     confident: true,
                     rationale: None,
                 }],
@@ -1832,6 +1904,7 @@ mod tests {
                         multi.clone(),
                         cheap.clone(),
                     ],
+                    category: None,
                     confident: true,
                     rationale: None,
                 }],
@@ -2092,6 +2165,7 @@ mod tests {
                 definition_hint: Some(body.to_string()),
                 source_anchors: vec![],
             }],
+            category: None,
             confident: true,
             rationale: None,
         }
@@ -2382,6 +2456,7 @@ mod tests {
                         arc.clone(),
                         twoq.clone(),
                     ],
+                    category: None,
                     confident: true,
                     rationale: None,
                 }],
@@ -2462,6 +2537,7 @@ mod tests {
                     canonical_name: "Borrow checker".to_string(),
                     aliases: vec!["borrowck".to_string()],
                     members: vec![borrow_checker_candidate(), borrowck_candidate()],
+                    category: None,
                     confident: true,
                     rationale: None,
                 }],

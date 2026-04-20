@@ -1998,6 +1998,7 @@ mod tests {
                 .map(|c| kb_llm::MergeGroup {
                     canonical_name: c.name.clone(),
                     aliases: c.aliases.clone(),
+                    category: None,
                     confident: true,
                     rationale: None,
                     members: vec![c],

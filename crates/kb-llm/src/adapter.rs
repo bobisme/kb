@@ -98,6 +98,15 @@ pub struct MergeGroup {
     pub canonical_name: String,
     /// Alternate names, abbreviations, or spellings collapsed into this concept.
     pub aliases: Vec<String>,
+    /// Optional 1-3 word tag grouping related concepts under a common heading
+    /// (e.g. "async", "consensus"). Emitted into concept frontmatter as
+    /// `category:` and used by `wiki/concepts/index.md` to bucket entries.
+    ///
+    /// Serialized field is flattened and defaults to `None` so older
+    /// adapter responses (and hand-written fixtures) parse without a
+    /// `category` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     /// Original candidates clustered into this group.
     pub members: Vec<ConceptCandidate>,
     /// True when the merge is unambiguous; false routes the group to human review.
@@ -438,5 +447,58 @@ mod tests {
             parsed.concepts[0].source_anchors[0].quote.as_deref(),
             Some("The borrow checker validates references.")
         );
+    }
+
+    #[test]
+    fn parse_merge_response_reads_optional_category() {
+        let response = parse_merge_concept_candidates_json(
+            r#"{
+                "groups": [
+                    {
+                        "canonical_name": "Tokio runtime",
+                        "aliases": ["tokio"],
+                        "category": "async",
+                        "members": [],
+                        "confident": true,
+                        "rationale": null
+                    },
+                    {
+                        "canonical_name": "Ambient concept",
+                        "aliases": [],
+                        "category": null,
+                        "members": [],
+                        "confident": true,
+                        "rationale": null
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse merge response with categories");
+
+        assert_eq!(response.groups.len(), 2);
+        assert_eq!(response.groups[0].category.as_deref(), Some("async"));
+        assert_eq!(response.groups[1].category, None);
+    }
+
+    #[test]
+    fn parse_merge_response_tolerates_missing_category_key() {
+        // Old responses without a `category` field must still parse — the
+        // field defaults to None. This protects backwards compatibility
+        // with fixtures recorded before the field was added.
+        let response = parse_merge_concept_candidates_json(
+            r#"{
+                "groups": [
+                    {
+                        "canonical_name": "Borrow checker",
+                        "aliases": [],
+                        "members": [],
+                        "confident": true,
+                        "rationale": null
+                    }
+                ]
+            }"#,
+        )
+        .expect("parse legacy merge response");
+        assert_eq!(response.groups[0].category, None);
     }
 }
