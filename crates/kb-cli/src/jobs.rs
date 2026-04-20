@@ -102,16 +102,81 @@ fn now_nanos() -> u128 {
         .map_or(0, |since_epoch| since_epoch.as_nanos())
 }
 
-fn next_job_id(command: &str) -> String {
+/// Normalize a command label for embedding inside a job id. We want the
+/// command token to stay visible in `ls state/jobs/` (bn-221i Option B:
+/// `job-{command}-{terseid}`), but the raw command string can contain
+/// characters that would confuse filename scanning or terseid parsing —
+/// spaces (none today, but cheap to guard), dots (`review.approve`,
+/// `jobs.prune`), or anything else non-alphanumeric. Collapse those to
+/// single dashes and lowercase so the resulting id is a clean
+/// `[a-z0-9-]+` token.
+fn sanitize_command_token(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut last_was_dash = false;
+    for ch in command.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_was_dash = false;
+        } else if !last_was_dash {
+            out.push('-');
+            last_was_dash = true;
+        }
+    }
+    // Trim leading/trailing dashes so we don't emit `job--foo` or `job-foo-`.
+    out.trim_matches('-').to_string()
+}
+
+/// Scan `state/jobs/` for existing manifest ids (file stems of `*.json`).
+/// Used as the `exists` input to [`terseid::IdGenerator::generate`] so a
+/// new job id never collides with one already on disk. Missing directory
+/// is treated as "no existing ids".
+fn existing_job_ids(jobs_root: &Path) -> std::collections::HashSet<String> {
+    let mut ids = std::collections::HashSet::new();
+    let Ok(read) = fs::read_dir(jobs_root) else {
+        return ids;
+    };
+    for entry in read.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "json")
+            && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+        {
+            ids.insert(stem.to_string());
+        }
+    }
+    ids
+}
+
+/// Generate a fresh job id of the shape `job-{command}-{hash}`
+/// (Option B from bn-221i), e.g. `job-ingest-a7x`.
+///
+/// The terseid seed mixes now-nanos, pid, and the raw command so two
+/// concurrent invocations of the same subcommand produce distinct hashes
+/// deterministically. The command token is also embedded in the prefix
+/// so `ls state/jobs/` is grep-friendly at a glance; the actual process
+/// id still lives on the manifest (see `JobRun::pid`), so the stale-job
+/// reaper continues to work without parsing the id.
+fn next_job_id(jobs_root: &Path, command: &str) -> String {
     let pid = process::id();
     let now = now_nanos();
-    let command_part = command.replace(' ', "-");
-    format!("{now}-{pid}-{command_part}")
+    let token = sanitize_command_token(command);
+    let prefix = if token.is_empty() {
+        "job".to_string()
+    } else {
+        format!("job-{token}")
+    };
+
+    let existing = existing_job_ids(jobs_root);
+    let generator = terseid::IdGenerator::new(terseid::IdConfig::new(prefix));
+    generator.generate(
+        |nonce| format!("{now}|{pid}|{command}|{nonce}").into_bytes(),
+        existing.len(),
+        |candidate| existing.contains(candidate),
+    )
 }
 
 fn manifest_path_for(root: &Path, command: &str) -> (String, PathBuf, PathBuf) {
     let jobs_root = jobs_dir(root);
-    let id = next_job_id(command);
+    let id = next_job_id(&jobs_root, command);
     (
         id.clone(),
         jobs_root.join(format!("{id}.json")),
@@ -545,6 +610,59 @@ pub fn recent_jobs(root: &Path, limit: usize) -> Result<Vec<JobRun>> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// bn-221i: job ids must follow the `job-{command}-{hash}` shape.
+    /// The command token stays visible so `ls state/jobs/` is greppable,
+    /// and the trailing hash is short (no more 32-char nanos-pid slugs).
+    #[test]
+    fn next_job_id_uses_job_command_terseid_shape() {
+        let dir = tempdir().expect("tempdir");
+        let jobs_root = jobs_dir(dir.path());
+        fs::create_dir_all(&jobs_root).expect("create jobs dir");
+
+        let id = next_job_id(&jobs_root, "ingest");
+        assert!(id.starts_with("job-ingest-"), "got: {id}");
+        // Hash after `job-ingest-` must be short (terseid defaults are
+        // 3..=8 base36 chars) — definitely shorter than the old nanos+pid
+        // slug which ran to 32 chars.
+        let hash = id.strip_prefix("job-ingest-").expect("prefix");
+        assert!(!hash.is_empty());
+        assert!(hash.len() <= 8, "hash too long: {hash}");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase()),
+            "hash must be base36: {hash}"
+        );
+    }
+
+    /// Commands with dots (`review.approve`, `jobs.prune`) must not leak
+    /// dots into the id — that would collide with terseid's child-path
+    /// syntax and confuse grepping.
+    #[test]
+    fn next_job_id_sanitizes_dotted_commands() {
+        let dir = tempdir().expect("tempdir");
+        let jobs_root = jobs_dir(dir.path());
+        fs::create_dir_all(&jobs_root).expect("create jobs dir");
+
+        let id = next_job_id(&jobs_root, "review.approve");
+        assert!(id.starts_with("job-review-approve-"), "got: {id}");
+        assert!(!id.contains('.'), "id must not contain dots: {id}");
+    }
+
+    /// Two back-to-back invocations at the same pid for the same command
+    /// still produce distinct ids (nanos differ, and if they don't the
+    /// generator escalates nonces via the `exists` closure).
+    #[test]
+    fn next_job_id_is_unique_across_calls() {
+        let dir = tempdir().expect("tempdir");
+        let jobs_root = jobs_dir(dir.path());
+        fs::create_dir_all(&jobs_root).expect("create jobs dir");
+
+        let a = next_job_id(&jobs_root, "ingest");
+        // Seed the directory with `a` so the next call sees it as taken.
+        fs::write(jobs_root.join(format!("{a}.json")), b"{}").expect("seed manifest");
+        let b = next_job_id(&jobs_root, "ingest");
+        assert_ne!(a, b, "ids must differ even with the seed file present");
+    }
 
     #[test]
     fn lock_metadata_is_visible_while_held() {
