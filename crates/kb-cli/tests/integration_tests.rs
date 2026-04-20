@@ -876,6 +876,39 @@ fn ask_stdin_empty_still_errors() {
 }
 
 #[test]
+fn ask_no_arg_piped_empty_stdin_is_validation_error_no_failed_job() {
+    // bn-ozj5: `kb ask` with no arg and non-TTY stdin must fall through to
+    // the piped-stdin reader (NOT the interactive reedline editor). Empty
+    // piped stdin must surface the same "no question provided" error and
+    // — crucially — must not leave a failed-job manifest behind, since
+    // this is a pure validation rejection that never reaches the LLM.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask").write_stdin("");
+    let output = cmd
+        .output()
+        .expect("run kb ask (no arg) with empty piped stdin");
+
+    assert!(
+        !output.status.success(),
+        "kb ask (no arg) with empty piped stdin unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no question provided"),
+        "expected stderr to mention 'no question provided', got: {stderr}"
+    );
+
+    assert_eq!(
+        count_job_manifests(&kb_root),
+        0,
+        "empty piped-stdin ask must not write a job manifest"
+    );
+}
+
+#[test]
 fn ask_format_png_refuses_cleanly() {
     // Regression (bn-iiq): `--format png` used to silently produce `answer.md`.
     // It now errors with a clear "not yet supported" message and writes no files.

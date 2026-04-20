@@ -17,7 +17,7 @@ use std::io::{IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
@@ -1971,8 +1971,8 @@ fn create_ask_adapter(
 fn resolve_query(query: Option<String>, editor: bool) -> Result<String> {
     // bn-1dar: `--editor`/`-e` always opens $VISUAL/$EDITOR/vi on a tempfile,
     // regardless of whether a query arg, stdin, or TTY is present. This is
-    // the dedicated multi-line authoring path; the rustyline quick-path
-    // (bn-3iq4) stays the default when `--editor` is not set.
+    // the dedicated multi-line authoring path; the reedline quick-path
+    // (bn-3iq4, bn-ozj5) stays the default when `--editor` is not set.
     if editor {
         return read_from_editor();
     }
@@ -2065,33 +2065,75 @@ fn read_stdin_to_end() -> Result<String> {
 }
 
 /// Interactive multi-line readline editor for `kb ask` with no query arg
-/// on a TTY (bn-3iq4). Ctrl-D submits, Ctrl-C aborts. Empty submit is
-/// a `ValidationError` so it doesn't pollute `kb status` — though since
-/// this runs before `execute_mutating_command` opens a job manifest,
-/// any error here is fine.
+/// on a TTY (bn-3iq4, bn-ozj5). Enter inserts a newline, Ctrl-D submits,
+/// Ctrl-C aborts. Arrow-up/down move the cursor within the current buffer
+/// — there is no cross-invocation history, so up/down are bound to plain
+/// line movement (not history navigation).
+///
+/// Any error here bubbles up out of `resolve_query` BEFORE
+/// `execute_mutating_command` is invoked, so the empty/aborted cases
+/// never leave a failed-job manifest behind (bn-1jx semantics).
 fn read_interactive_multiline() -> Result<String> {
-    use rustyline::{DefaultEditor, error::ReadlineError};
+    use reedline::{
+        default_emacs_keybindings, DefaultPrompt, DefaultPromptSegment, EditCommand, Emacs,
+        KeyCode, KeyModifiers, Reedline, ReedlineEvent, Signal,
+    };
 
     eprintln!("Enter your question (multi-line; Ctrl-D to submit, Ctrl-C to abort):");
-    let mut rl = DefaultEditor::new().context("init readline")?;
-    let mut lines: Vec<String> = Vec::new();
-    loop {
-        let prompt = if lines.is_empty() { "> " } else { "... " };
-        match rl.readline(prompt) {
-            Ok(line) => {
-                let _ = rl.add_history_entry(line.as_str());
-                lines.push(line);
+
+    let mut keybindings = default_emacs_keybindings();
+    // Enter inserts a newline instead of submitting. Reedline's default is
+    // `ReedlineEvent::Enter` which submits (or runs the validator, if one is
+    // configured); replace it with an explicit InsertNewline edit.
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Enter,
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
+    // Ctrl-D unconditionally submits (reedline's default `CtrlD` only submits
+    // on an *empty* line — on a non-empty line it deletes a character). We
+    // want "submit whatever you've got" regardless of cursor position.
+    keybindings.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('d'),
+        ReedlineEvent::Submit,
+    );
+    // Arrow-up/down stay as cursor movement only. Reedline's default `Up`/
+    // `Down` events fall back to history navigation when the cursor is on
+    // the first/last line of the buffer; we never want that here (no history
+    // is attached anyway, but being explicit is safer).
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Up,
+        ReedlineEvent::Edit(vec![EditCommand::MoveLineUp { select: false }]),
+    );
+    keybindings.add_binding(
+        KeyModifiers::NONE,
+        KeyCode::Down,
+        ReedlineEvent::Edit(vec![EditCommand::MoveLineDown { select: false }]),
+    );
+
+    let edit_mode = Box::new(Emacs::new(keybindings));
+    let mut line_editor = Reedline::create().with_edit_mode(edit_mode);
+    let prompt = DefaultPrompt::new(
+        DefaultPromptSegment::Basic("ask".to_string()),
+        DefaultPromptSegment::Empty,
+    );
+
+    match line_editor.read_line(&prompt) {
+        Ok(Signal::Success(text)) => {
+            if text.trim().is_empty() {
+                bail!("ask: question cannot be empty");
             }
-            Err(ReadlineError::Eof) => break,
-            Err(ReadlineError::Interrupted) => bail!("ask: aborted"),
-            Err(e) => return Err(e).context("readline"),
+            Ok(text)
         }
+        Ok(Signal::CtrlD) => bail!("ask: question cannot be empty"),
+        // `Signal` is non_exhaustive (reedline reserves room for future
+        // variants). Treat Ctrl-C and anything new alike as a clean abort
+        // rather than falling through.
+        Ok(Signal::CtrlC | _) => bail!("ask: aborted"),
+        Err(e) => Err(anyhow!("readline: {e}")),
     }
-    let query = lines.join("\n");
-    if query.trim().is_empty() {
-        bail!("ask: question cannot be empty");
-    }
-    Ok(query)
 }
 
 fn normalize_ask_format(format: &str) -> Result<&str> {
