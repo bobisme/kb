@@ -468,6 +468,29 @@ impl JobHandle {
         &self.log_path
     }
 
+    /// Tear down a job without recording it in `state/jobs/`.
+    ///
+    /// Used when a command rejects user input *before* doing any real
+    /// work (empty query, unknown publish target, nonexistent path):
+    /// the rejection is not a system failure, so we delete the
+    /// optimistically-written manifest + log rather than mark it
+    /// `status: failed`. Pairs with `ValidationError` detection in
+    /// `execute_mutating_command_with_handle`. See bn-1jx.
+    ///
+    /// Missing files are ignored — this is best-effort cleanup and the
+    /// caller already has a real error to propagate.
+    pub fn discard(self) {
+        // Log path first: the manifest is the "is this a recorded job?"
+        // marker, so it goes last to keep the on-disk invariant that a
+        // surviving manifest implies a surviving log.
+        if self.log_path.exists() {
+            let _ = fs::remove_file(&self.log_path);
+        }
+        if self.manifest_path.exists() {
+            let _ = fs::remove_file(&self.manifest_path);
+        }
+    }
+
     pub fn finish(
         mut self,
         status: JobRunStatus,

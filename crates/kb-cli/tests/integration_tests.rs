@@ -5184,3 +5184,187 @@ fn lint_after_cascade_forget_has_no_orphan_errors() {
         "lint still flags orphaned concepts after cascade forget:\n{stdout}"
     );
 }
+
+/// Count job manifests (`state/jobs/*.json`) under a KB root. Used by the
+/// bn-1jx acceptance tests to assert that validation rejections leave no
+/// trace in the jobs directory.
+fn count_job_manifests(root: &Path) -> usize {
+    let jobs_dir = root.join("state/jobs");
+    if !jobs_dir.exists() {
+        return 0;
+    }
+    fs::read_dir(&jobs_dir)
+        .expect("read state/jobs")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                == Some("json")
+        })
+        .count()
+}
+
+/// bn-1jx acceptance: `kb ask --format=png` is a pure input-validation
+/// rejection (we reject before any LLM call or file write). It must exit
+/// 1 with a clear message AND leave no failed-job manifest behind, so
+/// `kb status` / `kb doctor` stay clean.
+#[test]
+fn ask_format_png_leaves_no_failed_job_manifest() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask").arg("--format").arg("png").arg("x");
+    let output = cmd.output().expect("run kb ask --format=png");
+    assert!(
+        !output.status.success(),
+        "kb ask --format=png must still exit non-zero"
+    );
+    assert_eq!(
+        count_job_manifests(&kb_root),
+        0,
+        "validation rejection must not write a job manifest; manifests present: {:?}",
+        fs::read_dir(kb_root.join("state/jobs"))
+            .ok()
+            .map(|iter| iter.filter_map(Result::ok).map(|e| e.file_name()).collect::<Vec<_>>())
+    );
+
+    // `kb status --json` reports zero failed jobs.
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let status_output = status_cmd.output().expect("run kb --json status");
+    assert!(status_output.status.success(), "kb status failed");
+    let envelope: Value =
+        serde_json::from_slice(&status_output.stdout).expect("parse status json");
+    assert_eq!(
+        envelope["data"]["failed_jobs_total"], 0,
+        "validation rejection must not appear as a failed job"
+    );
+    assert!(
+        envelope["data"]["failed_jobs"]
+            .as_array()
+            .expect("failed_jobs array")
+            .is_empty(),
+        "failed_jobs list must be empty after a pure validation rejection"
+    );
+}
+
+/// bn-1jx acceptance: `kb ingest /nonexistent` — the path-does-not-exist
+/// check fires before any normalize work. Must not count as a failed job.
+#[test]
+fn ingest_nonexistent_path_leaves_no_failed_job_manifest() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let missing = kb_root.join("does-not-exist.md");
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ingest").arg(&missing);
+    let output = cmd.output().expect("run kb ingest");
+    assert!(
+        !output.status.success(),
+        "kb ingest <missing> must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("does not exist"),
+        "error message must mention the missing path; got: {stderr}"
+    );
+    assert_eq!(
+        count_job_manifests(&kb_root),
+        0,
+        "missing-path rejection must not write a job manifest"
+    );
+}
+
+/// bn-1jx acceptance: `kb publish <unknown-target>` rejects in the CLI
+/// dispatch, before the publish job would otherwise acquire the root
+/// lock. No manifest should be left behind.
+#[test]
+fn publish_unknown_target_leaves_no_failed_job_manifest() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("publish").arg("no-such-target");
+    let output = cmd.output().expect("run kb publish");
+    assert!(
+        !output.status.success(),
+        "kb publish <unknown> must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no-such-target") && stderr.contains("not found"),
+        "error message must name the target and say 'not found'; got: {stderr}"
+    );
+    assert_eq!(
+        count_job_manifests(&kb_root),
+        0,
+        "unknown publish target must not write a job manifest"
+    );
+}
+
+/// bn-1jx acceptance: `kb review approve <unknown-id>` rejects up front.
+/// No manifest should be left behind.
+#[test]
+fn review_approve_unknown_id_leaves_no_failed_job_manifest() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg("review-no-such-id");
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        !output.status.success(),
+        "kb review approve <unknown> must exit non-zero"
+    );
+    assert_eq!(
+        count_job_manifests(&kb_root),
+        0,
+        "unknown review id must not write a job manifest"
+    );
+}
+
+/// bn-1jx acceptance: real system failures (not validation) MUST still
+/// be recorded as failed jobs. This is the contrast case for the tests
+/// above — we must not over-classify and hide actual bugs.
+///
+/// We simulate a system failure by seeding a `JobRun` manifest directly
+/// on disk (same shape the CLI writes when the action's closure bubbles
+/// a non-`ValidationError`). `kb status --json` must count it.
+#[test]
+fn real_failure_is_still_recorded_as_failed_job() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed a system-failure manifest directly — the same shape
+    // `execute_mutating_command_with_handle` writes when the inner
+    // action returns a non-validation error (e.g. an LLM timeout).
+    seed_failed_job(&kb_root, "fail-real-llm-timeout", 1_000);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("status");
+    let output = cmd.output().expect("run kb --json status");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    assert_eq!(
+        envelope["data"]["failed_jobs_total"], 1,
+        "a real system failure must be counted in failed_jobs_total"
+    );
+    let ids: Vec<String> = envelope["data"]["failed_jobs"]
+        .as_array()
+        .expect("failed_jobs array")
+        .iter()
+        .map(|job| {
+            job["metadata"]["id"]
+                .as_str()
+                .expect("metadata.id")
+                .to_string()
+        })
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == "fail-real-llm-timeout"),
+        "expected the seeded real failure to show up in failed_jobs; got: {ids:?}"
+    );
+}

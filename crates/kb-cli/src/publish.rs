@@ -219,15 +219,20 @@ fn rewrite_links(content: &str, kb_root: &Path, source_rel: &Path) -> String {
     .into_owned()
 }
 
-pub fn target_not_found_error(target_name: &str, available: &[String]) -> anyhow::Error {
+/// Plain-string error message for an unknown publish target. Callers wrap
+/// this in whatever error type fits their pipeline (`anyhow::anyhow!` for
+/// system-failure paths, `ValidationError` for the CLI dispatch that
+/// rejects before writing any job manifest — see bn-1jx).
+#[must_use]
+pub fn target_not_found_message(target_name: &str, available: &[String]) -> String {
     if available.is_empty() {
-        anyhow::anyhow!(
+        format!(
             "publish target '{target_name}' not found — \
              add a [publish.targets.{target_name}] section to kb.toml"
         )
     } else {
         let list = available.join(", ");
-        anyhow::anyhow!(
+        format!(
             "publish target '{target_name}' not found — \
              available targets: {list}"
         )

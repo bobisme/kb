@@ -261,7 +261,12 @@ fn main() {
     if let Err(err) = run(cli) {
         let exit_code = err
             .downcast_ref::<ExitCodeError>()
-            .map_or(1, |err| err.exit_code);
+            .map(|err| err.exit_code)
+            .or_else(|| {
+                err.downcast_ref::<ValidationError>()
+                    .map(|err| err.exit_code)
+            })
+            .unwrap_or(1);
         eprintln!("error: {err:#}");
         std::process::exit(exit_code);
     }
@@ -280,6 +285,45 @@ impl std::fmt::Display for ExitCodeError {
 }
 
 impl std::error::Error for ExitCodeError {}
+
+/// User-input validation error.
+///
+/// Returned by command handlers when a request is rejected *before* any
+/// mutating work begins (empty query, unsupported format, nonexistent
+/// ingest path, unknown publish target, unknown review id). The outer
+/// CLI exits 1 with the message — same as [`ExitCodeError`] — but
+/// [`execute_mutating_command_with_handle`] treats these specially:
+/// instead of recording a `status: failed` job manifest, it deletes
+/// the manifest entirely so the rejection never pollutes
+/// `kb status` / `kb doctor` failed-job counts.
+///
+/// Rule of thumb: if the check fires before the job has actually opened
+/// any downstream locks or touched the KB state, it's a
+/// `ValidationError`. If the job has started mutating work (LLM call,
+/// compile pass, file write), stick with `bail!`/`ExitCodeError` so the
+/// failure is recorded. See bn-1jx.
+#[derive(Debug)]
+struct ValidationError {
+    exit_code: i32,
+    message: String,
+}
+
+impl ValidationError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            exit_code: 1,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ValidationError {}
 
 
 #[allow(clippy::too_many_lines)]
@@ -371,6 +415,22 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Some(Command::Ingest { sources, allow_empty }) => {
+            // bn-1jx: validate local source paths exist before we acquire
+            // the root lock and start a job manifest. `kb_ingest::collect_files`
+            // bails with the same message, but doing it here means a bad
+            // path never leaves a "failed" job behind in `state/jobs/`.
+            for source in &sources {
+                if kb_ingest::is_url(source) {
+                    continue;
+                }
+                let path = Path::new(source);
+                if !path.exists() {
+                    return Err(ValidationError::new(format!(
+                        "source path does not exist or is not a regular file/directory: {source}"
+                    ))
+                    .into());
+                }
+            }
             let ingest_root = root.clone();
             let action = move || {
                 let root = ingest_root
@@ -399,19 +459,20 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             let dry_run = cli.dry_run;
             let json = cli.json;
+            // bn-1jx: pre-validate the target exists in kb.toml before we
+            // enter `execute_mutating_command`. A bad target name is user
+            // error, not a system failure — no job should be recorded.
+            let cfg = config::Config::load_from_root(publish_root, None)?;
+            let mut available: Vec<String> =
+                cfg.publish.targets.keys().cloned().collect();
+            available.sort();
+            let Some(target_cfg) = cfg.publish.targets.get(&target).cloned() else {
+                return Err(ValidationError::new(
+                    publish::target_not_found_message(&target, &available),
+                )
+                .into());
+            };
             execute_mutating_command(Some(publish_root), "publish", move || {
-                let cfg = config::Config::load_from_root(publish_root, None)?;
-                let mut available: Vec<String> =
-                    cfg.publish.targets.keys().cloned().collect();
-                available.sort();
-                let target_cfg = cfg
-                    .publish
-                    .targets
-                    .get(&target)
-                    .ok_or_else(|| {
-                        publish::target_not_found_error(&target, &available)
-                    })?
-                    .clone();
                 publish::run_publish(publish_root, &target, &target_cfg, dry_run, json)
             })
         }
@@ -526,11 +587,27 @@ fn run(cli: Cli) -> Result<()> {
                     review::run_review_show(review_root, &id, json, &json_emitter)
                 }
                 ReviewAction::Approve { id } => {
+                    // bn-1jx: an unknown review id is user error, not a system
+                    // failure. Check for it before entering the mutating-
+                    // command wrapper so no failed-job manifest is left behind.
+                    if kb_core::load_review_item(review_root, &id)?.is_none() {
+                        return Err(ValidationError::new(format!(
+                            "review item '{id}' not found"
+                        ))
+                        .into());
+                    }
                     execute_mutating_command(Some(review_root), "review.approve", move || {
                         review::run_review_approve(review_root, &id, json, &json_emitter)
                     })
                 }
                 ReviewAction::Reject { id, reason } => {
+                    // Same treatment as Approve above — see bn-1jx.
+                    if kb_core::load_review_item(review_root, &id)?.is_none() {
+                        return Err(ValidationError::new(format!(
+                            "review item '{id}' not found"
+                        ))
+                        .into());
+                    }
                     execute_mutating_command(Some(review_root), "review.reject", move || {
                         review::run_review_reject(review_root, &id, reason.as_deref(), json, &json_emitter)
                     })
@@ -1374,7 +1451,10 @@ fn run_ask(
     promote: bool,
 ) -> Result<()> {
     if query.trim().is_empty() {
-        bail!("ask: question cannot be empty");
+        // bn-1jx: validation rejection — never reaches the LLM, never writes
+        // a question page. Return `ValidationError` so the outer mutating-
+        // command wrapper discards the optimistic job manifest.
+        return Err(ValidationError::new("ask: question cannot be empty").into());
     }
     let cfg = Config::load_from_root(root, cli_model)?;
     let requested_format =
@@ -1383,12 +1463,13 @@ fn run_ask(
     // `png` is accepted by clap (so `--help` keeps advertising it as a
     // placeholder for future support) but we refuse it cleanly rather than
     // silently writing markdown under a `.png` label. See bn-iiq.
+    //
+    // bn-1jx: this rejection runs before any retrieval/LLM work — mark it
+    // as validation so `kb status` doesn't count it as a failed run.
     if requested_format == "png" {
-        return Err(ExitCodeError {
-            exit_code: 1,
-            message: "--format png is not yet supported; supported formats: md, marp, json"
-                .to_string(),
-        }
+        return Err(ValidationError::new(
+            "--format png is not yet supported; supported formats: md, marp, json",
+        )
         .into());
     }
 
@@ -3647,7 +3728,18 @@ fn execute_mutating_command_with_handle(
             Ok(())
         }
         Err(err) => {
-            handle.finish(JobRunStatus::Failed, Vec::new())?;
+            // bn-1jx: user-input validation errors must not pollute the
+            // failed-jobs list. If the action rejected early (empty query,
+            // unknown publish target, nonexistent review id, etc.), delete
+            // the manifest we optimistically created in `start_job` so
+            // `kb status` / `kb doctor` stay clean. Real system failures
+            // (LLM timeout, I/O error, compile pass crash) still finish as
+            // Failed and show up as expected.
+            if err.is::<ValidationError>() {
+                handle.discard();
+            } else {
+                handle.finish(JobRunStatus::Failed, Vec::new())?;
+            }
             Err(err)
         }
     }
