@@ -33,6 +33,19 @@ fn fixture() -> TempDir {
         &root.join("wiki/concepts/rust.md"),
         "# Rust\n\nRust is a systems programming language.\n",
     );
+    // A page with YAML frontmatter — used by the regression test for the
+    // bn-125l bug where `kb serve` was leaking frontmatter keys into the
+    // rendered body.
+    write(
+        &root.join("wiki/concepts/aries.md"),
+        "---\n\
+         id: concept:aries\n\
+         name: ARIES\n\
+         aliases:\n  - recovery\n  - durability\n\
+         ---\n\
+         # ARIES\n\n\
+         ARIES is a recovery algorithm.\n",
+    );
 
     // Hand-build a lexical index so /search returns something deterministic
     // without needing to run `kb compile`.
@@ -111,6 +124,43 @@ async fn wiki_page_renders_markdown() {
     let html = body_string(resp).await;
     assert!(html.contains("<h1>Rust</h1>"));
     assert!(html.contains("systems programming language"));
+}
+
+#[tokio::test]
+async fn wiki_page_strips_yaml_frontmatter() {
+    // Regression test for bn-125l: YAML frontmatter must not leak into the
+    // rendered HTML body.
+    let tmp = fixture();
+    let app = make_app(&tmp);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/wiki/concepts/aries.md")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_string(resp).await;
+    // The real body must render.
+    assert!(html.contains("<h1>ARIES</h1>"));
+    assert!(html.contains("recovery algorithm"));
+    // But the frontmatter keys must not appear anywhere in the response.
+    assert!(
+        !html.contains("id: concept:aries"),
+        "frontmatter id leaked into body: {html}"
+    );
+    assert!(
+        !html.contains("name: ARIES"),
+        "frontmatter name leaked into body: {html}"
+    );
+    assert!(
+        !html.contains("aliases:"),
+        "frontmatter aliases leaked into body: {html}"
+    );
 }
 
 #[tokio::test]
