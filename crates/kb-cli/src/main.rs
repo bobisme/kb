@@ -254,75 +254,27 @@ fn run(cli: Cli) -> Result<()> {
             let dry_run = cli.dry_run;
             let json = cli.json;
             let cli_model = cli.model.clone();
-            execute_mutating_command_with_handle(Some(compile_root), "compile", move |handle| {
-                // Stream per-pass events into `state/jobs/<id>.log` so a hung
-                // or failing compile leaves a useful trail. Dry-run skips the
-                // sink because it performs no real passes — nothing to log.
-                let log_sink = if dry_run { None } else { Some(handle.log_sink()) };
-                let options = kb_compile::pipeline::CompileOptions {
-                    force,
-                    dry_run,
-                    // Progress lines go to stderr so `--json` stdout stays clean.
-                    // Suppress entirely under --json to avoid log noise.
-                    progress: !json,
-                    log_sink,
-                };
-
-                // Dry-run does not call the LLM; skip adapter construction so users can
-                // preview the stale set without needing a configured backend.
-                let report = if dry_run {
-                    kb_compile::pipeline::run_compile(compile_root, &options)?
-                } else {
-                    match build_compile_adapter(compile_root, cli_model.as_deref()) {
-                        Ok(adapter) => kb_compile::pipeline::run_compile_with_llm(
-                            compile_root,
-                            &options,
-                            Some(adapter.as_ref()),
-                        )?,
-                        Err(err) => {
-                            tracing::warn!(
-                                "LLM adapter unavailable — running compile without per-document passes: {err}"
-                            );
-                            kb_compile::pipeline::run_compile(compile_root, &options)?
-                        }
-                    }
-                };
-
-                // Near-duplicate concept detection as a safety net after merge:
-                // emits review items for concept pairs that slipped past the LLM merge.
-                // Dry-run skips this (no writes).
-                let duplicate_review_items = if dry_run {
-                    0
-                } else {
-                    let review_items = kb_lint::check_duplicate_concepts(
+            if dry_run {
+                // Dry-run reads graph/hashes and prints what would happen; it
+                // writes nothing. Bypass `execute_mutating_command_with_handle`
+                // so we neither block on the root lock (held by an in-flight
+                // real compile) nor leave a job manifest behind if the caller
+                // SIGPIPEs us (e.g. `kb compile --dry-run | head`).
+                run_compile_action(compile_root, force, true, json, cli_model.as_deref(), None)
+            } else {
+                execute_mutating_command_with_handle(Some(compile_root), "compile", move |handle| {
+                    // Stream per-pass events into `state/jobs/<id>.log` so a
+                    // hung or failing compile leaves a useful trail.
+                    run_compile_action(
                         compile_root,
-                        &kb_lint::DuplicateConceptsConfig::default(),
-                    )?;
-                    for item in &review_items {
-                        kb_core::save_review_item(compile_root, item)?;
-                    }
-                    review_items.len()
-                };
-
-                if json {
-                    emit_json("compile", serde_json::json!({
-                        "total_sources": report.total_sources,
-                        "stale_sources": report.stale_sources,
-                        "build_records_emitted": report.build_records_emitted,
-                        "duplicate_review_items": duplicate_review_items,
-                        "dry_run": dry_run,
-                    }))?;
-                } else {
-                    println!("{}", report.render());
-                    if duplicate_review_items > 0 {
-                        println!(
-                            "  [ok] duplicate_concepts ({duplicate_review_items} review item(s) queued)"
-                        );
-                    }
-                }
-
-                Ok(())
-            })
+                        force,
+                        false,
+                        json,
+                        cli_model.as_deref(),
+                        Some(handle.log_sink()),
+                    )
+                })
+            }
         }
         Some(Command::Doctor) => {
             let root = root
@@ -1454,6 +1406,90 @@ fn try_generate_answer(
         kb_query::postprocess_answer(&llm_response.answer, &citation_manifest, assembled);
 
     Ok((result, provenance))
+}
+
+/// Execute one `kb compile` invocation (dry-run or real) against `root`.
+///
+/// Split out of the `Command::Compile` dispatch arm so the dry-run path can
+/// skip `execute_mutating_command_with_handle` entirely — dry-run never
+/// writes, so it must not acquire the root lock or emit a job manifest.
+///
+/// `log_sink` is `Some` only for real compiles (streamed into the job's
+/// on-disk log); dry-run passes `None`.
+fn run_compile_action(
+    compile_root: &Path,
+    force: bool,
+    dry_run: bool,
+    json: bool,
+    cli_model: Option<&str>,
+    log_sink: Option<std::sync::Arc<dyn kb_compile::pipeline::LogSink>>,
+) -> Result<()> {
+    let options = kb_compile::pipeline::CompileOptions {
+        force,
+        dry_run,
+        // Progress lines go to stderr so `--json` stdout stays clean.
+        // Suppress entirely under --json to avoid log noise.
+        progress: !json,
+        log_sink,
+    };
+
+    // Dry-run does not call the LLM; skip adapter construction so users can
+    // preview the stale set without needing a configured backend.
+    let report = if dry_run {
+        kb_compile::pipeline::run_compile(compile_root, &options)?
+    } else {
+        match build_compile_adapter(compile_root, cli_model) {
+            Ok(adapter) => kb_compile::pipeline::run_compile_with_llm(
+                compile_root,
+                &options,
+                Some(adapter.as_ref()),
+            )?,
+            Err(err) => {
+                tracing::warn!(
+                    "LLM adapter unavailable — running compile without per-document passes: {err}"
+                );
+                kb_compile::pipeline::run_compile(compile_root, &options)?
+            }
+        }
+    };
+
+    // Near-duplicate concept detection as a safety net after merge:
+    // emits review items for concept pairs that slipped past the LLM merge.
+    // Dry-run skips this (no writes).
+    let duplicate_review_items = if dry_run {
+        0
+    } else {
+        let review_items = kb_lint::check_duplicate_concepts(
+            compile_root,
+            &kb_lint::DuplicateConceptsConfig::default(),
+        )?;
+        for item in &review_items {
+            kb_core::save_review_item(compile_root, item)?;
+        }
+        review_items.len()
+    };
+
+    if json {
+        emit_json(
+            "compile",
+            serde_json::json!({
+                "total_sources": report.total_sources,
+                "stale_sources": report.stale_sources,
+                "build_records_emitted": report.build_records_emitted,
+                "duplicate_review_items": duplicate_review_items,
+                "dry_run": dry_run,
+            }),
+        )?;
+    } else {
+        println!("{}", report.render());
+        if duplicate_review_items > 0 {
+            println!(
+                "  [ok] duplicate_concepts ({duplicate_review_items} review item(s) queued)"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Build an adapter for use by `kb compile`. Shares construction logic with `ask`
@@ -3422,5 +3458,58 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
             .expect("second command acquires lock");
         assert!(acquired_at.elapsed() < Duration::from_secs(1));
         worker.join().expect("join worker");
+    }
+
+    /// Regression test for bn-2vm: `kb compile --dry-run` is read-only and
+    /// must not block on the root lock held by an in-flight real compile,
+    /// nor leave a job manifest behind under `state/jobs/`.
+    #[test]
+    fn compile_dry_run_does_not_block_on_root_lock_or_emit_job_manifest() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+
+        // Simulate a real `kb compile` running in another shell by holding
+        // the root lock for the duration of the dry-run invocation.
+        let lock =
+            jobs::KbLock::acquire(&root, "compile", Duration::from_secs(1)).expect("acquire lock");
+
+        let started = Instant::now();
+        run(Cli {
+            root: Some(root.clone()),
+            model: None,
+            dry_run: true,
+            json: true,
+            force: false,
+            quiet: false,
+            command: Some(Command::Compile),
+        })
+        .expect("compile --dry-run succeeds");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "dry-run should not wait for the root lock (took {:?})",
+            started.elapsed()
+        );
+
+        // No job manifest should have been written — dry-run skips the
+        // job lifecycle entirely so SIGPIPE / Ctrl-C can't orphan a run.
+        let jobs_dir = root.join("state").join("jobs");
+        if jobs_dir.exists() {
+            let manifests: Vec<_> = fs::read_dir(&jobs_dir)
+                .expect("read jobs dir")
+                .filter_map(|entry| {
+                    let entry = entry.ok()?;
+                    let path = entry.path();
+                    (path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+                        .then_some(path)
+                })
+                .collect();
+            assert!(
+                manifests.is_empty(),
+                "dry-run should not emit a job manifest, found: {manifests:?}"
+            );
+        }
+
+        drop(lock);
     }
 }
