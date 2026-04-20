@@ -270,6 +270,266 @@ fn body_narrow_noun_is_canonical(
     matches_canonical && !matches_alias
 }
 
+/// Extract the first sentence of a concept body for inspection.
+///
+/// Stops at the first period, question mark, exclamation point, or newline.
+/// The canonical/alias checks below are intentionally scoped to the first
+/// sentence because that is where variant-scoping leaks in practice: the
+/// subject of the opening clause tells the reader what concept the page is
+/// actually about.
+fn first_sentence(body: &str) -> &str {
+    let trimmed = body.trim_start();
+    trimmed
+        .split_once(['.', '?', '!', '\n'])
+        .map_or(trimmed, |(head, _)| head)
+}
+
+/// Post-check 1 — canonical-prefix check.
+///
+/// Returns `true` when the first sentence's opening tokens do NOT start with
+/// the canonical concept name (case-insensitive, word-boundary aware). This
+/// flags bodies like "A Raft safety property stating …" where the canonical
+/// is "Raft" but the sentence is actually about Leader Completeness.
+///
+/// Leading articles ("A", "An", "The") are tolerated so that "The borrow
+/// checker validates references" still counts as canonical-prefixed when the
+/// canonical is "Borrow checker".
+///
+/// The canonical name must also be followed by a non-word byte (or the end of
+/// the sentence) so that "Raft" does NOT match "Raft safety property …" —
+/// the byte after "raft" there is a space followed by "safety property",
+/// which is the variant-scoping bug. Contrast "Raft is a consensus
+/// algorithm" where the byte after "raft" is " is ..." and the subject is
+/// genuinely "Raft". We differentiate these by looking at whether the token
+/// immediately after the canonical name is a linking verb ("is", "are",
+/// "refers", "means", "represents", "denotes") or a punctuation/end-of-
+/// sentence marker.
+fn body_missing_canonical_prefix(body: &str, canonical_name: &str) -> bool {
+    let sentence = first_sentence(body);
+    let lower = sentence.to_ascii_lowercase();
+    let canonical_lower = canonical_name.trim().to_ascii_lowercase();
+    if canonical_lower.is_empty() {
+        return false;
+    }
+
+    // Strip a single leading article so "The borrow checker ..." and
+    // "A borrow checker ..." both count as canonical-prefixed.
+    let stripped = ["the ", "a ", "an "]
+        .iter()
+        .find_map(|article| lower.strip_prefix(article))
+        .unwrap_or(lower.as_str())
+        .trim_start();
+
+    if !stripped.starts_with(&canonical_lower) {
+        return true;
+    }
+
+    // Canonical name is a prefix — but is the subject actually the canonical,
+    // or is the canonical just part of a longer noun phrase like
+    // "raft safety property"? Look at the next token.
+    let after = stripped[canonical_lower.len()..].trim_start();
+    if after.is_empty() {
+        return false;
+    }
+    // Accept standard linking/declarative verbs that mean the sentence's
+    // subject is the canonical itself. If the canonical is followed by one
+    // of LINKING_VERBS, the first sentence is about the canonical.
+    // Otherwise, the canonical appears as an adjective/modifier inside a
+    // longer noun phrase (e.g. "Raft safety property …") and the subject
+    // is NOT the canonical.
+    if LINKING_VERBS.iter().any(|v| after.starts_with(v)) {
+        return false;
+    }
+    // Explicit compound-noun markers: if the canonical is followed by one
+    // of these, we know for sure it's a variant-scoping compound.
+    if COMPOUND_NOUN_MARKERS.iter().any(|n| after.starts_with(n)) {
+        return true;
+    }
+    // Otherwise be conservative: if the next token doesn't look like a
+    // verb (via a simple inflection heuristic), flag it — the sentence's
+    // subject is probably a longer noun phrase.
+    !next_token_looks_like_verb(after)
+}
+
+/// Verbs/phrases that, when following the canonical name, indicate the
+/// sentence's subject is the canonical itself (not a longer noun phrase).
+const LINKING_VERBS: &[&str] = &[
+    "is ",
+    "are ",
+    "was ",
+    "were ",
+    "refers ",
+    "means ",
+    "represents ",
+    "denotes ",
+    "describes ",
+    "covers ",
+    "provides ",
+    "defines ",
+    "is,",
+    "refers,",
+    "stands ",
+    "validates ",
+    "holds ",
+    "ensures ",
+    "enforces ",
+    "prevents ",
+    "returns ",
+    "yields ",
+    "checks ",
+    "runs ",
+    "performs ",
+    "operates ",
+    "executes ",
+    "serves ",
+    "handles ",
+    "manages ",
+    "maintains ",
+    "applies ",
+    "works ",
+    "supports ",
+    "requires ",
+];
+
+/// Common noun markers that, when they follow the canonical name, mean the
+/// canonical is being used as an adjective inside a compound noun phrase —
+/// i.e. the subject is not the canonical itself but a variant/sub-concept.
+const COMPOUND_NOUN_MARKERS: &[&str] = &[
+    "safety property",
+    "liveness property",
+    "variant",
+    "instance",
+    "procedure",
+    "protocol",
+    "algorithm",
+    "component",
+    "subcomponent",
+    "subtype",
+    "subclass",
+    "phase",
+    "step",
+    "rule",
+];
+
+/// Keywords that, when present in a multi-alias concept body, signal the
+/// body acknowledges its umbrella scope rather than scoping to one variant.
+const VARIANT_SCOPING_KEYWORDS: &[&str] = &[
+    "variant",
+    "variants",
+    "family",
+    "include",
+    "includes",
+    "including",
+];
+
+/// Post-check 2 — variant-scoping coverage check.
+///
+/// For concepts with three or more aliases, the body must either mention one
+/// of the family/variants keywords ("variant", "variants", "family",
+/// "include", "includes", "including") OR name at least two of the aliases
+/// verbatim. Returns `true` when neither condition holds — i.e. a multi-alias
+/// concept's body failed to signal its umbrella scope.
+fn body_missing_variant_scoping(body: &str, aliases: &[String]) -> bool {
+    if aliases.len() < 3 {
+        return false;
+    }
+    let lower = body.to_ascii_lowercase();
+    if VARIANT_SCOPING_KEYWORDS
+        .iter()
+        .any(|k| contains_word(&lower, k))
+    {
+        return false;
+    }
+    let mentioned = aliases
+        .iter()
+        .filter(|a| contains_word(&lower, &a.to_ascii_lowercase()))
+        .count();
+    mentioned < 2
+}
+
+/// Post-check 3 — alias-in-first-sentence check.
+///
+/// Returns `Some(alias)` when the first sentence contains the name of a
+/// non-canonical alias as a standalone word (case-insensitive, word
+/// boundary). That strongly signals the body is about a specific variant
+/// rather than the canonical concept — e.g. "Byzantine quorums ..." on a
+/// page whose canonical is "Quorum" with aliases [Byzantine quorum, …].
+///
+/// Aliases that are substrings of the canonical name itself (e.g. canonical
+/// "Paxos" with alias "Paxos" — shouldn't happen, but defensive) are
+/// ignored so we don't double-count the canonical.
+fn first_sentence_names_alias<'a>(
+    body: &str,
+    canonical_name: &str,
+    aliases: &'a [String],
+) -> Option<&'a str> {
+    let sentence = first_sentence(body).to_ascii_lowercase();
+    let canonical_lower = canonical_name.to_ascii_lowercase();
+    for alias in aliases {
+        let alias_lower = alias.to_ascii_lowercase();
+        if alias_lower == canonical_lower {
+            continue;
+        }
+        // Match the alias, or a trivial English plural of it ("quorum" →
+        // "quorums"). Without the plural fallback we'd miss the Quorum
+        // regression whose body reads "Byzantine quorums ..." against an
+        // alias of "Byzantine quorum".
+        let alias_plural = format!("{alias_lower}s");
+        if contains_word(&sentence, &alias_lower)
+            || contains_word(&sentence, &alias_plural)
+        {
+            return Some(alias.as_str());
+        }
+    }
+    None
+}
+
+/// True when `haystack` contains `needle` delimited by non-word characters
+/// (or string boundaries). Case-sensitive — callers lowercase both sides
+/// before calling. Matching is simple and allocation-free: we scan byte
+/// positions and inspect the char before/after for ASCII word-ness.
+fn contains_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let nlen = needle.len();
+    let mut start = 0usize;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let pos = start + rel;
+        let left_ok = pos == 0
+            || !is_word_byte(bytes[pos - 1]);
+        let right_end = pos + nlen;
+        let right_ok = right_end == bytes.len()
+            || !is_word_byte(bytes[right_end]);
+        if left_ok && right_ok {
+            return true;
+        }
+        start = pos + 1;
+    }
+    false
+}
+
+const fn is_word_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Heuristic: does the next whitespace-delimited token in `after` look like
+/// a verb? We accept tokens ending in common verbal inflections ("s", "es",
+/// "ed", "ing") when they're short enough to plausibly be a verb rather
+/// than a multi-word noun phrase. Conservative — prefer false positives
+/// here since the post-check is warn-only and the cost of a missed warning
+/// is a rendering with no post-check review.
+fn next_token_looks_like_verb(after: &str) -> bool {
+    let token = after.split_whitespace().next().unwrap_or("").trim_end_matches(',');
+    if token.is_empty() || token.len() > 14 {
+        return false;
+    }
+    let lower = token.to_ascii_lowercase();
+    lower.ends_with('s') || lower.ends_with("ed") || lower.ends_with("ing")
+}
+
+#[allow(clippy::too_many_lines)]
 fn render_concept_page<S: std::hash::BuildHasher>(
     group: &MergeGroup,
     root: &Path,
@@ -309,20 +569,73 @@ fn render_concept_page<S: std::hash::BuildHasher>(
         .iter()
         .find_map(|m| m.definition_hint.as_deref());
 
-    // Post-check: if the merged body looks like it copied a narrow variant's
+    // Post-checks: if the merged body looks like it copied a narrow variant's
     // definition (e.g. "A Paxos variant ...") instead of synthesizing across
     // aliases, warn. Do NOT block the write — a wrong body is better than a
     // missing concept page, and a human can fix it via `kb review`.
-    if let Some(hint) = definition_hint
-        && let Some(pattern) = narrow_variant_body_match(hint, &group.canonical_name, &group.aliases)
-    {
-        tracing::warn!(
-            concept = %group.canonical_name,
-            matched_pattern = pattern,
-            body_start = %hint.chars().take(80).collect::<String>(),
-            "merged concept body looks like it describes a narrow variant, not the \
-             canonical concept; review via `kb review` if wrong"
-        );
+    //
+    // Four stacked checks; any of them can trip independently because the
+    // observed pass-10 regressions slipped bn-2tw's single regex by using
+    // different phrasings (safety-property-prefix, alias-subject, variant-
+    // specific without the word "variant", etc.).
+    if let Some(hint) = definition_hint {
+        // 1. bn-2tw's existing narrow-variant regex (e.g. "A Cheap Paxos variant …").
+        if let Some(pattern) =
+            narrow_variant_body_match(hint, &group.canonical_name, &group.aliases)
+        {
+            tracing::warn!(
+                concept = %group.canonical_name,
+                matched_pattern = pattern,
+                body_start = %hint.chars().take(80).collect::<String>(),
+                "merged concept body looks like it describes a narrow variant, not the \
+                 canonical concept; review via `kb review` if wrong"
+            );
+        }
+
+        // 2. Canonical-prefix check. Catches "A Raft safety property stating …"
+        //    on a page whose canonical is "Raft" — the subject is a folded
+        //    alias (Leader Completeness), not the canonical itself.
+        if body_missing_canonical_prefix(hint, &group.canonical_name) {
+            tracing::warn!(
+                concept = %group.canonical_name,
+                matched_pattern = "canonical_prefix_missing",
+                body_start = %hint.chars().take(80).collect::<String>(),
+                "merged concept body's first sentence does not start with the canonical \
+                 concept name; review via `kb review` if the scope is wrong"
+            );
+        }
+
+        // 3. Variant-scoping coverage check. For concepts with ≥3 aliases, the
+        //    body must mention "variant"/"family"/"includes" or name ≥2
+        //    aliases. Catches a Paxos body that silently describes only Basic
+        //    Paxos even though aliases span Basic/Multi/Cheap Paxos.
+        if body_missing_variant_scoping(hint, &group.aliases) {
+            tracing::warn!(
+                concept = %group.canonical_name,
+                matched_pattern = "variant_scoping_missing",
+                alias_count = group.aliases.len(),
+                body_start = %hint.chars().take(80).collect::<String>(),
+                "merged concept body covers ≥3 aliases but does not mention \
+                 'variant'/'family'/'includes' or name at least two aliases; \
+                 review via `kb review` if the scope is wrong"
+            );
+        }
+
+        // 4. Alias-in-first-sentence check. Catches "Byzantine quorums are sized
+        //    to tolerate f Byzantine failures" on a page whose canonical is
+        //    "Quorum" — the first sentence's subject is a non-canonical alias.
+        if let Some(alias) =
+            first_sentence_names_alias(hint, &group.canonical_name, &group.aliases)
+        {
+            tracing::warn!(
+                concept = %group.canonical_name,
+                matched_pattern = "first_sentence_names_alias",
+                alias = alias,
+                body_start = %hint.chars().take(80).collect::<String>(),
+                "merged concept body's first sentence names a non-canonical alias; \
+                 probable variant-scoping — review via `kb review` if the scope is wrong"
+            );
+        }
     }
 
     let mut fm = Mapping::new();
@@ -1454,6 +1767,331 @@ mod tests {
             body_after_heading.contains("family of consensus algorithms"),
             "body missing general definition:\n{body_after_heading}"
         );
+    }
+
+    #[test]
+    fn canonical_prefix_check_flags_raft_leader_completeness_body() {
+        // Observed pass-10 failure: wiki/concepts/raft.md body was "A Raft
+        // safety property stating that any entry committed in a term must
+        // appear in the logs of all leaders elected in later terms." — that
+        // describes Leader Completeness, not Raft. The body starts with
+        // "A Raft safety property …", which means the subject after the
+        // leading article is "Raft safety property", not "Raft" alone, so
+        // the canonical-prefix check must flag it.
+        assert!(body_missing_canonical_prefix(
+            "A Raft safety property stating that any entry committed in a term \
+             must appear in the logs of all leaders elected in later terms.",
+            "Raft",
+        ));
+        // A body that actually opens with the canonical name passes.
+        assert!(!body_missing_canonical_prefix(
+            "Raft is a consensus algorithm for managing a replicated log.",
+            "Raft",
+        ));
+        // Leading article before the canonical is tolerated.
+        assert!(!body_missing_canonical_prefix(
+            "The borrow checker validates references at compile time.",
+            "Borrow checker",
+        ));
+    }
+
+    #[test]
+    fn variant_scoping_check_flags_paxos_basic_only_body() {
+        // Observed pass-10 failure: wiki/concepts/paxos.md body described
+        // Basic Paxos's single-value agreement even though aliases included
+        // Multi-Paxos, Cheap Paxos, EPaxos, Flexible Paxos. No "variant" /
+        // "family" / "includes" keyword, and only one alias (Basic Paxos) is
+        // named, so the variant-scoping check must flag it.
+        let aliases = vec![
+            "Basic Paxos".to_string(),
+            "Multi-Paxos".to_string(),
+            "Cheap Paxos".to_string(),
+            "EPaxos".to_string(),
+            "Flexible Paxos".to_string(),
+        ];
+        assert!(body_missing_variant_scoping(
+            "Paxos is a two-phase consensus protocol where proposers and \
+             acceptors agree on a single value using a Basic Paxos exchange.",
+            &aliases,
+        ));
+        // Mentioning ≥ 2 aliases (without the keyword) is enough to pass.
+        assert!(!body_missing_variant_scoping(
+            "Paxos covers Basic Paxos and Multi-Paxos under a single umbrella \
+             name.",
+            &aliases,
+        ));
+        // The keyword alone is enough to pass.
+        assert!(!body_missing_variant_scoping(
+            "Paxos is a family of consensus algorithms.",
+            &aliases,
+        ));
+        // Fewer than 3 aliases — the check is suppressed regardless.
+        assert!(!body_missing_variant_scoping(
+            "Paxos is a consensus protocol.",
+            &["Basic Paxos".to_string()],
+        ));
+    }
+
+    #[test]
+    fn alias_in_first_sentence_flags_byzantine_quorum_body() {
+        // Observed pass-10 failure: wiki/concepts/quorum.md body led with
+        // "Byzantine quorums ..." on a page whose canonical is "Quorum" and
+        // aliases are [majority quorum, Byzantine quorum, uniform quorum].
+        // The alias-in-first-sentence check must identify "Byzantine quorum".
+        let aliases = vec![
+            "majority quorum".to_string(),
+            "Byzantine quorum".to_string(),
+            "uniform quorum".to_string(),
+        ];
+        let hit = first_sentence_names_alias(
+            "Byzantine quorums are sized to tolerate f Byzantine failures; \
+             typically ⌈(n+f+1)/2⌉.",
+            "Quorum",
+            &aliases,
+        );
+        assert_eq!(hit, Some("Byzantine quorum"));
+
+        // A generic first sentence that doesn't name any alias passes.
+        let hit = first_sentence_names_alias(
+            "Quorum is a subset of nodes whose agreement is required for a \
+             distributed decision.",
+            "Quorum",
+            &aliases,
+        );
+        assert!(hit.is_none());
+
+        // Aliases that only appear after the first sentence don't count.
+        let hit = first_sentence_names_alias(
+            "Quorum is a subset of voting nodes. Byzantine quorums tolerate \
+             Byzantine failures.",
+            "Quorum",
+            &aliases,
+        );
+        assert!(hit.is_none());
+    }
+
+    #[test]
+    fn alias_in_first_sentence_flags_zab_leader_election_body() {
+        // Observed pass-10 failure: wiki/concepts/leader-election.md body
+        // described Zab's specific procedure. Canonical "Leader election" with
+        // an alias "Zab leader election" → the first-sentence-names-alias
+        // check catches it.
+        let aliases = vec![
+            "Raft leader election".to_string(),
+            "Zab leader election".to_string(),
+            "Bully algorithm".to_string(),
+        ];
+        let hit = first_sentence_names_alias(
+            "Zab leader election proceeds in phases using epochs and proposals \
+             in ZooKeeper Atomic Broadcast.",
+            "Leader election",
+            &aliases,
+        );
+        assert_eq!(hit, Some("Zab leader election"));
+
+        // Also flagged by canonical-prefix (subject is "Zab leader election",
+        // not "Leader election"), giving the bug two independent signals.
+        assert!(body_missing_canonical_prefix(
+            "Zab leader election proceeds in phases using epochs.",
+            "Leader election",
+        ));
+    }
+
+    #[test]
+    fn contains_word_respects_word_boundaries() {
+        // "paxos" should not match inside "multi-paxos" because the preceding
+        // '-' counts as a non-word byte — but the needle "basic paxos" should
+        // match "basic paxos" even when it's followed by punctuation.
+        assert!(contains_word("paxos is a family", "paxos"));
+        assert!(contains_word(
+            "variants include basic paxos, multi-paxos, and cheap paxos.",
+            "basic paxos",
+        ));
+        // Word-boundary: "paxos" must not match inside "paxosoid" (pretend).
+        assert!(!contains_word("paxosoid is not a word", "paxos"));
+        // Empty needle is never a match.
+        assert!(!contains_word("anything", ""));
+    }
+
+    #[test]
+    fn all_four_observed_failures_trigger_at_least_one_post_check() {
+        // Golden-corpus-style test: feed the four pass-10 failure bodies
+        // through the merge pipeline (via stubbed LLM) and assert the
+        // underlying post-check predicates fire for each one. This is the
+        // contract the warn! calls in render_concept_page rely on — if these
+        // predicates fire, tracing::warn! fires.
+
+        // Case 1: Raft page carrying a Leader-Completeness body.
+        let body_raft = "A Raft safety property stating that any entry committed \
+             in a term must appear in the logs of all leaders elected in \
+             later terms.";
+        assert!(
+            body_missing_canonical_prefix(body_raft, "Raft"),
+            "Raft body should fail canonical-prefix check"
+        );
+
+        // Case 2: Paxos page carrying a Basic-Paxos-only body. Aliases span
+        // multiple variants; body mentions only one alias and no family
+        // keyword.
+        let body_paxos = "Paxos is a two-phase consensus protocol where \
+             proposers and acceptors agree on a single value using the Basic \
+             Paxos exchange.";
+        let paxos_aliases = vec![
+            "Basic Paxos".to_string(),
+            "Multi-Paxos".to_string(),
+            "Cheap Paxos".to_string(),
+        ];
+        assert!(
+            body_missing_variant_scoping(body_paxos, &paxos_aliases),
+            "Paxos body should fail variant-scoping check"
+        );
+
+        // Case 3: Quorum page whose first sentence scopes to Byzantine quorum.
+        let body_quorum = "Byzantine quorums are sized to tolerate f Byzantine \
+             failures; typically ⌈(n+f+1)/2⌉.";
+        let quorum_aliases = vec![
+            "majority quorum".to_string(),
+            "Byzantine quorum".to_string(),
+            "uniform quorum".to_string(),
+        ];
+        assert!(
+            first_sentence_names_alias(body_quorum, "Quorum", &quorum_aliases).is_some(),
+            "Quorum body should fail first-sentence-names-alias check"
+        );
+        assert!(
+            body_missing_canonical_prefix(body_quorum, "Quorum"),
+            "Quorum body should also fail canonical-prefix check"
+        );
+
+        // Case 4: Leader-election page describing Zab's procedure.
+        let body_leader = "Zab leader election proceeds in phases using epochs \
+             and proposals in ZooKeeper Atomic Broadcast.";
+        let leader_aliases = vec![
+            "Raft leader election".to_string(),
+            "Zab leader election".to_string(),
+            "Bully algorithm".to_string(),
+        ];
+        assert!(
+            first_sentence_names_alias(body_leader, "Leader election", &leader_aliases)
+                .is_some(),
+            "Leader-election body should fail first-sentence-names-alias check"
+        );
+        assert!(
+            body_missing_canonical_prefix(body_leader, "Leader election"),
+            "Leader-election body should also fail canonical-prefix check"
+        );
+    }
+
+    fn bad_group(canonical: &str, aliases: Vec<String>, body: &str) -> MergeGroup {
+        MergeGroup {
+            canonical_name: canonical.to_string(),
+            aliases: aliases.clone(),
+            members: vec![ConceptCandidate {
+                name: canonical.to_string(),
+                aliases,
+                definition_hint: Some(body.to_string()),
+                source_anchors: vec![],
+            }],
+            confident: true,
+            rationale: None,
+        }
+    }
+
+    #[test]
+    fn golden_corpus_bad_bodies_flow_through_merge_without_blocking() {
+        // Stub the LLM adapter to return the four observed bad bodies and
+        // assert: (a) the write still happens (warn-only contract), and
+        // (b) the underlying predicates that gate the warn! calls fire.
+        // tracing-capture infra isn't wired into this crate's test deps, so
+        // we assert the gating predicates directly alongside the contract
+        // that the concept pages are still emitted.
+        let dir = tempdir().expect("tempdir");
+
+        let groups = vec![
+            bad_group(
+                "Raft",
+                vec!["Leader Completeness".to_string()],
+                "A Raft safety property stating that any entry committed in a \
+                 term must appear in the logs of all leaders elected in later \
+                 terms.",
+            ),
+            bad_group(
+                "Paxos",
+                vec![
+                    "Basic Paxos".to_string(),
+                    "Multi-Paxos".to_string(),
+                    "Cheap Paxos".to_string(),
+                ],
+                "Paxos is a two-phase consensus protocol where proposers and \
+                 acceptors agree on a single value using the Basic Paxos \
+                 exchange.",
+            ),
+            bad_group(
+                "Quorum",
+                vec![
+                    "majority quorum".to_string(),
+                    "Byzantine quorum".to_string(),
+                    "uniform quorum".to_string(),
+                ],
+                "Byzantine quorums are sized to tolerate f Byzantine failures; \
+                 typically ⌈(n+f+1)/2⌉.",
+            ),
+            bad_group(
+                "Leader election",
+                vec![
+                    "Raft leader election".to_string(),
+                    "Zab leader election".to_string(),
+                    "Bully algorithm".to_string(),
+                ],
+                "Zab leader election proceeds in phases using epochs and \
+                 proposals in ZooKeeper Atomic Broadcast.",
+            ),
+        ];
+
+        let adapter = FakeAdapter {
+            response: MergeConceptCandidatesResponse {
+                groups: groups.clone(),
+            },
+            provenance: provenance(),
+        };
+
+        // The merge pass must still produce one concept page per group — the
+        // warn checks are warn-only and never block the write.
+        let candidates: Vec<ConceptCandidate> = groups
+            .iter()
+            .flat_map(|g| g.members.clone())
+            .collect();
+        let artifact = run_concept_merge_pass(&adapter, candidates, dir.path())
+            .expect("merge pass runs despite bad bodies");
+        assert_eq!(
+            artifact.concept_pages.len(),
+            groups.len(),
+            "every confident group, even with a bad body, must still emit a page"
+        );
+
+        // And the gating predicates must fire for each group — this is what
+        // the warn! calls key off of, so if these fire, the warn! fires.
+        for group in &groups {
+            let body = group.members[0]
+                .definition_hint
+                .as_deref()
+                .expect("fixture body present");
+            let canonical_prefix = body_missing_canonical_prefix(body, &group.canonical_name);
+            let variant_scoping = body_missing_variant_scoping(body, &group.aliases);
+            let alias_first = first_sentence_names_alias(
+                body,
+                &group.canonical_name,
+                &group.aliases,
+            )
+            .is_some();
+            let narrow_variant =
+                narrow_variant_body_match(body, &group.canonical_name, &group.aliases).is_some();
+            assert!(
+                canonical_prefix || variant_scoping || alias_first || narrow_variant,
+                "group {} had no post-check fire for body: {body}",
+                group.canonical_name
+            );
+        }
     }
 
     #[test]
