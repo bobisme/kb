@@ -339,6 +339,31 @@ pub fn read_lock_metadata(root: &Path) -> Result<LockMetadata> {
     load_lock_metadata(&root_lock_metadata_path(root))
 }
 
+/// Non-acquiring look at the root lock.
+///
+/// Returns `Some(metadata)` when the root lock appears to be actively held by
+/// a live process (the sidecar metadata file exists, parses, and names a pid
+/// that responds to `kill -0`). Returns `None` when no metadata is present,
+/// when it can't be parsed, or when the recorded pid is dead (stale).
+///
+/// This intentionally does NOT contest or acquire the advisory file lock — it
+/// is a read-only probe used by read-only commands (like `kb lint`) to detect
+/// that another mutating command (like `kb compile`) is in flight so they can
+/// warn that their view of the tree may be mid-rewrite.
+///
+/// Callers must not treat a `Some` return as exclusive access; it is purely
+/// informational. Two peeks racing with a real acquire can disagree, which is
+/// fine — the warning is advisory.
+pub fn peek_root_lock(root: &Path) -> Option<LockMetadata> {
+    let metadata_path = root_lock_metadata_path(root);
+    let metadata = load_lock_metadata(&metadata_path).ok()?;
+    if is_pid_alive(metadata.pid) {
+        Some(metadata)
+    } else {
+        None
+    }
+}
+
 pub fn check_stale_jobs(root: &Path) -> Result<()> {
     let jobs_root = jobs_dir(root);
     if !jobs_root.exists() {

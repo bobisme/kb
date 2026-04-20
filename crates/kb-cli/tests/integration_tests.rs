@@ -3240,3 +3240,147 @@ fn review_show_mentions_auto_apply_for_concept_merge() {
         "show output must mention that files are deleted/absorbed: {stdout}"
     );
 }
+
+/// Seed an in-flight compile lock so `kb lint` can observe it via the
+/// sidecar-metadata peek. We write the JSON file directly (mirroring the
+/// shape `KbLock::acquire` writes) and use the current test pid, which is
+/// guaranteed to be alive, so the peek treats the holder as live.
+///
+/// The `root.lock` file itself is also touched so the on-disk layout matches
+/// a real holder; we do not flock it because the peek does not contest the
+/// advisory lock — it only reads the sidecar JSON.
+fn seed_fake_compile_lock(kb_root: &Path, command: &str) -> u32 {
+    let locks_dir = kb_root.join("state").join("locks");
+    fs::create_dir_all(&locks_dir).expect("create locks dir");
+    fs::write(locks_dir.join("root.lock"), b"").expect("touch root.lock");
+    let pid = std::process::id();
+    let metadata = serde_json::json!({
+        "command": command,
+        "pid": pid,
+        "started_at_millis": 1,
+    });
+    fs::write(
+        locks_dir.join("root.lock.json"),
+        serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+    )
+    .expect("write root.lock.json");
+    pid
+}
+
+/// When a compile is in flight, `kb lint` (default mode) must warn on stderr
+/// that the tree is mid-rewrite but continue to run normally and return its
+/// usual exit code. The warning names the holder pid + command so an operator
+/// can correlate.
+#[test]
+fn lint_warns_on_stderr_when_compile_in_flight() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let holder_pid = seed_fake_compile_lock(&kb_root, "compile");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint").arg("--check").arg("broken-links");
+    let output = cmd.output().expect("run kb lint");
+
+    // A clean tree with no broken links must still pass (exit 0). The in-flight
+    // compile must not fail default lint; it only adds a stderr preamble.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("kb compile is in flight"),
+        "stderr must warn about in-flight compile: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("pid {holder_pid}")),
+        "stderr warning must name the holder pid: {stderr}"
+    );
+}
+
+/// `--strict` must refuse to run while a compile holds the lock: stale
+/// warnings in --strict mode would fail CI for reasons that disappear on
+/// retry, and that's exactly what --strict is meant to prevent.
+#[test]
+fn lint_strict_refuses_while_compile_in_flight() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let holder_pid = seed_fake_compile_lock(&kb_root, "compile");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint")
+        .arg("--check")
+        .arg("broken-links")
+        .arg("--strict");
+    let output = cmd.output().expect("run kb lint --strict");
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to run --strict"),
+        "stderr must explain the refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("pid {holder_pid}")),
+        "stderr must name holder pid: {stderr}"
+    );
+    assert!(
+        stderr.contains("compile"),
+        "stderr must name the holder command: {stderr}"
+    );
+}
+
+/// Stale sidecar metadata (a sidecar that points at a dead pid) must not
+/// trigger the warning — the compile that wrote it is long gone and the
+/// tree is no longer mid-rewrite. Without the pid-alive check we would
+/// false-positive on every sidecar left behind by a SIGKILL'd compile.
+#[test]
+fn lint_ignores_stale_compile_metadata_from_dead_pid() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let locks_dir = kb_root.join("state").join("locks");
+    fs::create_dir_all(&locks_dir).expect("create locks dir");
+    fs::write(locks_dir.join("root.lock"), b"").expect("touch root.lock");
+    // u32::MAX / 2 is virtually guaranteed to not correspond to a running pid.
+    let dead_pid: u32 = u32::MAX / 2;
+    let metadata = serde_json::json!({
+        "command": "compile",
+        "pid": dead_pid,
+        "started_at_millis": 1,
+    });
+    fs::write(
+        locks_dir.join("root.lock.json"),
+        serde_json::to_vec_pretty(&metadata).expect("serialize metadata"),
+    )
+    .expect("write root.lock.json");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint").arg("--check").arg("broken-links");
+    let output = cmd.output().expect("run kb lint");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("kb compile is in flight"),
+        "stale metadata from a dead pid must not trigger the warning: {stderr}"
+    );
+}

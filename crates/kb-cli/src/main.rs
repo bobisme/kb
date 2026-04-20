@@ -2367,6 +2367,40 @@ fn render_inspect_report(report: &InspectReport) -> String {
 }
 
 fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Result<()> {
+    // Peek at the root lock before we walk the tree. If another process is
+    // mid-compile the on-disk state is a moving target (half-written source
+    // pages, not-yet-rendered concept pages), and running lint against that
+    // snapshot produces scary false positives (missing citations, orphans,
+    // broken links) that resolve themselves silently once compile finishes.
+    //
+    // Default mode: warn on stderr and keep going — lint is still useful
+    // advice and the operator may want to see it anyway.
+    //
+    // --strict mode: refuse to run. A strict run that fires off stale
+    // warnings defeats the point of --strict (it's used in CI to gate merges
+    // on a clean tree).
+    //
+    // The peek deliberately does not acquire the lock; lint is read-only and
+    // must remain runnable concurrently when no one is writing.
+    if let Some(holder) = jobs::peek_root_lock(root) {
+        if holder.command.contains("compile") {
+            if strict {
+                return Err(ExitCodeError {
+                    exit_code: 1,
+                    message: format!(
+                        "refusing to run --strict while kb compile is in flight (pid {}, command=`{}`); re-run after compile completes",
+                        holder.pid, holder.command
+                    ),
+                }
+                .into());
+            }
+            eprintln!(
+                "warning: kb compile is in flight (pid {}, command=`{}`); lint output may be stale",
+                holder.pid, holder.command
+            );
+        }
+    }
+
     let cfg = Config::load_from_root(root, None)?;
     let check = kb_lint::LintRule::parse(check)?;
     let missing_citations_level = match cfg.lint.missing_citations_level.as_str() {
