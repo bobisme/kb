@@ -353,74 +353,92 @@ const MENTION_STOPWORDS: &[&str] = &[
 ///
 /// This is additive on top of the source_document_ids-gated primary path, and
 /// is deduped via the `concept_backlinks` `BTreeSet`.
+/// Per-concept mention matcher: union regex over concept name + alias tokens
+/// (plus plural/singular inflections) and the set of wiki-link slug targets
+/// that count as a mention of this concept.
+struct ConceptMatcher {
+    concept_id: String,
+    word_regex: Option<Regex>,
+    /// Wiki-link target slugs (full `wiki/concepts/<slug>`) that should
+    /// count as a mention of this concept.
+    slug_targets: BTreeSet<String>,
+}
+
+/// Build a `ConceptMatcher` for a single concept page by parsing its
+/// frontmatter name/aliases, expanding tokens with simple plural/singular
+/// inflections, and compiling the union word-boundary regex.
+fn build_concept_matcher(concept_id: &str, path: &Path) -> Result<ConceptMatcher> {
+    let markdown = std::fs::read_to_string(path)
+        .with_context(|| format!("read concept page {}", path.display()))?;
+    let (name_opt, alias_tokens, alias_slugs) = match split_frontmatter(&markdown) {
+        Some((fm, _body)) => parse_concept_name_and_aliases(&fm),
+        None => (None, Vec::new(), Vec::new()),
+    };
+
+    // Build the set of word tokens to match: concept name + aliases, each
+    // filtered by length and stopwords. Names/aliases map to tokens via
+    // `normalize_mention_token`, then expanded to cover simple plural and
+    // singular inflections so a source that says "quorums" still credits
+    // an alias "quorum".
+    let mut tokens: BTreeSet<String> = BTreeSet::new();
+    if let Some(name) = name_opt.as_ref() {
+        if let Some(t) = normalize_mention_token(name) {
+            for form in inflect_mention_forms(&t) {
+                tokens.insert(form);
+            }
+        }
+    }
+    for alias in &alias_tokens {
+        if let Some(t) = normalize_mention_token(alias) {
+            for form in inflect_mention_forms(&t) {
+                tokens.insert(form);
+            }
+        }
+    }
+
+    // Build wiki-link slug targets: the concept's own page id, plus any
+    // slug-normalized aliases under wiki/concepts/. This lets an alias
+    // written as `[[aliases-slug]]` route to its concept.
+    let mut slug_targets: BTreeSet<String> = BTreeSet::new();
+    slug_targets.insert(concept_id.to_string());
+    for slug in alias_slugs {
+        if !slug.is_empty() {
+            slug_targets.insert(format!("wiki/concepts/{slug}"));
+        }
+    }
+
+    let word_regex = if tokens.is_empty() {
+        None
+    } else {
+        // Case-insensitive, Unicode-aware word boundaries. `regex::Regex`
+        // uses Unicode word boundaries by default.
+        let pattern = tokens
+            .iter()
+            .map(|t| regex::escape(t))
+            .collect::<Vec<_>>()
+            .join("|");
+        let full = format!(r"(?i)\b(?:{pattern})\b");
+        Some(
+            Regex::new(&full)
+                .with_context(|| format!("compile mention regex for {concept_id}"))?,
+        )
+    };
+
+    Ok(ConceptMatcher {
+        concept_id: concept_id.to_string(),
+        word_regex,
+        slug_targets,
+    })
+}
+
 fn collect_mention_backlinks(
     concept_pages: &BTreeMap<String, PathBuf>,
     source_pages: &BTreeMap<String, PathBuf>,
     concept_backlinks: &mut BTreeMap<String, BTreeSet<String>>,
 ) -> Result<()> {
-    // Per-concept tokens + slug matchers, precomputed once.
-    struct ConceptMatcher {
-        concept_id: String,
-        word_regex: Option<Regex>,
-        /// Wiki-link target slugs (full `wiki/concepts/<slug>`) that should
-        /// count as a mention of this concept.
-        slug_targets: BTreeSet<String>,
-    }
-
     let mut matchers: Vec<ConceptMatcher> = Vec::with_capacity(concept_pages.len());
     for (concept_id, path) in concept_pages {
-        let markdown = std::fs::read_to_string(path)
-            .with_context(|| format!("read concept page {}", path.display()))?;
-        let (name_opt, alias_tokens, alias_slugs) = match split_frontmatter(&markdown) {
-            Some((fm, _body)) => parse_concept_name_and_aliases(&fm),
-            None => (None, Vec::new(), Vec::new()),
-        };
-
-        // Build the set of word tokens to match: concept name + aliases, each
-        // filtered by length and stopwords. Names/aliases map to tokens via
-        // `normalize_mention_token`.
-        let mut tokens: BTreeSet<String> = BTreeSet::new();
-        if let Some(name) = name_opt.as_ref() {
-            if let Some(t) = normalize_mention_token(name) {
-                tokens.insert(t);
-            }
-        }
-        for alias in &alias_tokens {
-            if let Some(t) = normalize_mention_token(alias) {
-                tokens.insert(t);
-            }
-        }
-
-        // Build wiki-link slug targets: the concept's own page id, plus any
-        // slug-normalized aliases under wiki/concepts/. This lets an alias
-        // written as `[[aliases-slug]]` route to its concept.
-        let mut slug_targets: BTreeSet<String> = BTreeSet::new();
-        slug_targets.insert(concept_id.clone());
-        for slug in alias_slugs {
-            if !slug.is_empty() {
-                slug_targets.insert(format!("wiki/concepts/{slug}"));
-            }
-        }
-
-        let word_regex = if tokens.is_empty() {
-            None
-        } else {
-            // Case-insensitive, Unicode-aware word boundaries. `regex::Regex`
-            // uses Unicode word boundaries by default.
-            let pattern = tokens
-                .iter()
-                .map(|t| regex::escape(t))
-                .collect::<Vec<_>>()
-                .join("|");
-            let full = format!(r"(?i)\b(?:{pattern})\b");
-            Some(Regex::new(&full).with_context(|| format!("compile mention regex for {concept_id}"))?)
-        };
-
-        matchers.push(ConceptMatcher {
-            concept_id: concept_id.clone(),
-            word_regex,
-            slug_targets,
-        });
+        matchers.push(build_concept_matcher(concept_id, path)?);
     }
 
     let wiki_link_re = Regex::new(r"\[\[([^\]\r\n]+)\]\]").context("compile wikilink regex")?;
@@ -537,6 +555,74 @@ fn normalize_mention_token(raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// Minimum token length for pluralizing / singularizing. Below this threshold
+/// (e.g. "SQL", "BFT") morphological tweaks almost always produce false
+/// positives, so we keep the token literal.
+const MIN_INFLECTION_LEN: usize = 4;
+
+/// Expand an alias/name token into the set of word-boundary forms the
+/// mention-scanner should match. Always includes the original. For single-word
+/// tokens of sufficient length we additionally emit basic English plural and
+/// singular inflections:
+///
+/// * `<tok>` + "s"  (quorum → quorums) when the token ends in a consonant.
+/// * `<tok>` + "es" (box → boxes)      when the token ends in s/sh/ch/x/z.
+/// * singular by stripping a trailing "s" (requirements → requirement) when
+///   the token has length >= 5.
+///
+/// The rules intentionally stay small — no Porter stemmer — and only apply to
+/// single-word tokens so we don't mangle multi-word aliases like "Byzantine
+/// fault tolerance" (which get matched as-is).
+fn inflect_mention_forms(token: &str) -> Vec<String> {
+    let mut forms: Vec<String> = Vec::new();
+    forms.push(token.to_string());
+
+    let is_single_word = !token.chars().any(char::is_whitespace);
+    if !is_single_word {
+        return forms;
+    }
+
+    let char_count = token.chars().count();
+    if char_count < MIN_INFLECTION_LEN {
+        return forms;
+    }
+
+    let lower = token.to_lowercase();
+    let last_char = lower.chars().last();
+    let ends_with_vowel = matches!(last_char, Some('a' | 'e' | 'i' | 'o' | 'u'));
+
+    // -es plural for sibilant endings (box → boxes, dish → dishes).
+    let es_plural = lower.ends_with('s')
+        || lower.ends_with("sh")
+        || lower.ends_with("ch")
+        || lower.ends_with('x')
+        || lower.ends_with('z');
+
+    if es_plural {
+        forms.push(format!("{token}es"));
+    } else if !ends_with_vowel {
+        // Simple -s plural, but only when the token ends in a consonant to
+        // avoid nonsense like "data" → "datas".
+        forms.push(format!("{token}s"));
+    }
+
+    // Singularize: "requirements" → "requirement". Keep >= 5 total chars so
+    // stripping yields a token still >= MIN_MENTION_TOKEN_LEN long.
+    if char_count >= 5 && lower.ends_with('s') && !lower.ends_with("ss") {
+        // Drop the trailing ASCII 's'. All mention tokens are lowercase-normalized
+        // at match time via `(?i)`, so stripping a trailing byte is safe for
+        // ASCII-ending tokens; for non-ASCII tails we leave the token alone.
+        if token.is_char_boundary(token.len() - 1) && token.ends_with('s') {
+            let singular = &token[..token.len() - 1];
+            if singular.chars().count() >= MIN_MENTION_TOKEN_LEN {
+                forms.push(singular.to_string());
+            }
+        }
+    }
+
+    forms
 }
 
 /// Slugify an alias for wiki-link target matching: lowercase, ASCII, spaces
@@ -1201,6 +1287,194 @@ mod tests {
         assert!(
             !concept.updated_markdown.contains("- [[wiki/sources/src-a]]"),
             "short alias 'AI' and stopword 'the' must not trigger a mention backlink:\n{}",
+            concept.updated_markdown
+        );
+    }
+
+    #[test]
+    fn inflect_mention_forms_adds_plural_for_consonant_ending() {
+        let forms = inflect_mention_forms("Quorum");
+        assert!(forms.iter().any(|f| f == "Quorum"));
+        assert!(
+            forms.iter().any(|f| f == "Quorums"),
+            "expected plural 'Quorums', got {forms:?}"
+        );
+    }
+
+    #[test]
+    fn inflect_mention_forms_adds_es_plural_for_sibilant_ending() {
+        // "index" -> "indexes" (ends in x, length 5 >= MIN_INFLECTION_LEN).
+        let forms = inflect_mention_forms("index");
+        assert!(
+            forms.iter().any(|f| f == "indexes"),
+            "expected -es plural 'indexes', got {forms:?}"
+        );
+
+        // "class" -> "classes" (ends in s). Also tests we don't singularize
+        // past an -ss ending (should NOT emit "clas").
+        let forms_class = inflect_mention_forms("class");
+        assert!(
+            forms_class.iter().any(|f| f == "classes"),
+            "expected -es plural 'classes', got {forms_class:?}"
+        );
+        assert!(
+            !forms_class.iter().any(|f| f == "clas"),
+            "must not strip 's' from '-ss' ending: {forms_class:?}"
+        );
+    }
+
+    #[test]
+    fn inflect_mention_forms_singularizes_trailing_s() {
+        let forms = inflect_mention_forms("requirements");
+        assert!(
+            forms.iter().any(|f| f == "requirement"),
+            "expected singular 'requirement', got {forms:?}"
+        );
+    }
+
+    #[test]
+    fn inflect_mention_forms_skips_short_tokens() {
+        let forms = inflect_mention_forms("SQL");
+        // Only the literal; no pluralization / singularization on 3-char tokens.
+        assert_eq!(forms, vec!["SQL".to_string()]);
+    }
+
+    #[test]
+    fn inflect_mention_forms_skips_multi_word_tokens() {
+        let forms = inflect_mention_forms("Byzantine fault tolerance");
+        // Multi-word tokens are matched as-is; we don't pluralize them.
+        assert_eq!(forms, vec!["Byzantine fault tolerance".to_string()]);
+    }
+
+    #[test]
+    fn inflect_mention_forms_does_not_double_pluralize_ss() {
+        // "business" ends in "ss" — singularizing would drop to "busines" which
+        // is nonsense. The -es rule DOES still apply and yields "businesses".
+        let forms = inflect_mention_forms("business");
+        assert!(forms.iter().any(|f| f == "business"));
+        assert!(
+            !forms.iter().any(|f| f == "busines"),
+            "must not strip 's' from '-ss' ending: {forms:?}"
+        );
+        assert!(
+            forms.iter().any(|f| f == "businesses"),
+            "expected -es plural 'businesses', got {forms:?}"
+        );
+    }
+
+    #[test]
+    fn mention_backlinks_match_plural_forms_of_alias() {
+        let root = tempdir().expect("tempdir");
+
+        // Source page whose body mentions only the plural "quorums".
+        write(
+            &root.path().join("wiki/sources/src-plural.md"),
+            "---\nid: wiki-source-src-plural\ntype: source\ntitle: Plural form\nsource_document_id: src-plural\nsource_revision_id: rev-1\n---\n# Plural\n\nMajority quorums are required to commit.\n",
+        );
+        // Source that uses a compound mention; since we try the alias as-is and
+        // plural, "majority quorum" as a two-word phrase still matches the plain
+        // "quorum" token via word-boundary.
+        write(
+            &root.path().join("wiki/sources/src-compound.md"),
+            "---\nid: wiki-source-src-compound\ntype: source\ntitle: Compound\nsource_document_id: src-compound\nsource_revision_id: rev-2\n---\n# Compound\n\nA majority quorum is the usual protocol requirement.\n",
+        );
+        // Source that should NOT be credited — "craft" must not match "quorum"
+        // substring tricks nor should the word "requires" trigger "requirement".
+        write(
+            &root.path().join("wiki/sources/src-nomatch.md"),
+            "---\nid: wiki-source-src-nomatch\ntype: source\ntitle: Nope\nsource_document_id: src-nomatch\nsource_revision_id: rev-3\n---\n# Nope\n\nThis page is about aircraft and draft notes only.\n",
+        );
+
+        // Concept with alias "quorum" (triggers plural expansion) and
+        // "requirement" (tests -s plural matching "requirements" in body).
+        write(
+            &root.path().join("wiki/concepts/quorum.md"),
+            "---\nid: concept:quorum\nname: Quorum\naliases:\n- quorum\n- requirement\n---\n\n# Quorum\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/quorum.md"))
+            .expect("concept artifact");
+
+        assert!(
+            concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-plural]]"),
+            "plural 'quorums' should match alias 'quorum':\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-compound]]"),
+            "compound 'majority quorum' should match alias 'quorum' by word boundary:\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            !concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-nomatch]]"),
+            "aircraft/draft must NOT match quorum or requirement aliases:\n{}",
+            concept.updated_markdown
+        );
+    }
+
+    #[test]
+    fn mention_backlinks_singularize_source_uses_alias() {
+        let root = tempdir().expect("tempdir");
+
+        // Source body says "requirements" (plural); concept has alias "requirement".
+        write(
+            &root.path().join("wiki/sources/src-r.md"),
+            "---\nid: wiki-source-src-r\ntype: source\ntitle: Reqs\nsource_document_id: src-r\nsource_revision_id: rev-r\n---\n# Reqs\n\nFunctional requirements and non-functional requirements both matter.\n",
+        );
+
+        write(
+            &root.path().join("wiki/concepts/requirement.md"),
+            "---\nid: concept:requirement\nname: Requirement\naliases:\n- requirement\n---\n\n# Requirement\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/requirement.md"))
+            .expect("concept artifact");
+
+        assert!(
+            concept.updated_markdown.contains("- [[wiki/sources/src-r]]"),
+            "concept alias 'requirement' should match plural 'requirements':\n{}",
+            concept.updated_markdown
+        );
+    }
+
+    #[test]
+    fn mention_backlinks_short_alias_is_not_pluralized() {
+        let root = tempdir().expect("tempdir");
+
+        // "SQLs" appears in body but no standalone "SQL" word. The alias "SQL"
+        // has 3 chars, which is below MIN_INFLECTION_LEN (4) — so we do NOT
+        // emit "SQLs" as a pluralized form. The literal `\bSQL\b` also doesn't
+        // match inside "SQLs" due to the trailing 's'. Net effect: no backlink.
+        write(
+            &root.path().join("wiki/sources/src-sql.md"),
+            "---\nid: wiki-source-src-sql\ntype: source\ntitle: Databases\nsource_document_id: src-sql\nsource_revision_id: rev-sql\n---\n# Databases\n\nSome SQLs are bad, and SQLite is fine.\n",
+        );
+
+        write(
+            &root.path().join("wiki/concepts/sql.md"),
+            "---\nid: concept:sql\nname: SQL\naliases:\n- SQL\n---\n\n# Structured Query Language\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/sql.md"))
+            .expect("concept artifact");
+        assert!(
+            !concept.updated_markdown.contains("- [[wiki/sources/src-sql]]"),
+            "short alias 'SQL' (< MIN_MENTION_TOKEN_LEN) must not produce mention backlinks:\n{}",
             concept.updated_markdown
         );
     }
