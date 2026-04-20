@@ -120,6 +120,31 @@ pub struct MergeConceptCandidatesResponse {
     pub groups: Vec<MergeGroup>,
 }
 
+/// Request to generate a general-scope body for a canonical concept.
+///
+/// bn-1w5: body synthesis used to happen inside the single merge call, which
+/// is where the "LLM latches onto the most-quoted variant" regression lives.
+/// Splitting it out lets the prompt be minimal + strict ("describe what the
+/// aliases have in COMMON"), which the merge prompt can't enforce because it
+/// has to carry all the clustering rules too.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateConceptBodyRequest {
+    /// Canonical concept name picked by the merge step.
+    pub canonical_name: String,
+    /// Folded aliases under the canonical name.
+    pub aliases: Vec<String>,
+    /// Candidate source quotes to show the model as context only
+    /// (the prompt instructs the model NOT to copy them).
+    pub candidate_quotes: Vec<String>,
+}
+
+/// Response containing a plain-text concept body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateConceptBodyResponse {
+    /// 1-3 sentence general body — already stripped of code fences / markdown.
+    pub body: String,
+}
+
 /// Request to answer a user question.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerQuestionRequest {
@@ -288,6 +313,33 @@ pub trait LlmAdapter: Send + Sync {
         &self,
         request: MergeConceptCandidatesRequest,
     ) -> Result<(MergeConceptCandidatesResponse, ProvenanceRecord), LlmAdapterError>;
+
+    /// Generate a 1-3 sentence general-scope body for a canonical concept.
+    ///
+    /// This is the bn-1w5 two-step body synthesis call: after
+    /// [`merge_concept_candidates`](Self::merge_concept_candidates) picks the
+    /// canonical name and aliases, the merge pipeline calls this on each
+    /// confident group so the body is generated in isolation with a minimal,
+    /// strict prompt that forces the "what do the aliases have in common?"
+    /// framing.
+    ///
+    /// The default implementation returns [`LlmAdapterError::Other`] so that
+    /// adapters without runner support (e.g. test doubles that only stub
+    /// `merge_concept_candidates`) cause the caller to fall back to the
+    /// merge-step `definition_hint` instead of hard-failing the pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmAdapterError` if the backend cannot be reached, times out,
+    /// fails to parse the response, or the adapter does not implement this call.
+    fn generate_concept_body(
+        &self,
+        _request: GenerateConceptBodyRequest,
+    ) -> Result<(GenerateConceptBodyResponse, ProvenanceRecord), LlmAdapterError> {
+        Err(LlmAdapterError::Other(
+            "generate_concept_body is not implemented by this adapter".to_string(),
+        ))
+    }
 
     /// Answer a user question using context documents.
     ///

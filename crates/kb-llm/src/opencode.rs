@@ -8,10 +8,11 @@ use tempfile::TempDir;
 
 use crate::adapter::{
     AnswerQuestionRequest, AnswerQuestionResponse, ExtractConceptsRequest, ExtractConceptsResponse,
-    GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
-    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
-    RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
-    parse_extract_concepts_json, parse_merge_concept_candidates_json,
+    GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateSlidesRequest,
+    GenerateSlidesResponse, LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest,
+    MergeConceptCandidatesResponse, RunHealthCheckRequest, RunHealthCheckResponse,
+    SummarizeDocumentRequest, SummarizeDocumentResponse, parse_extract_concepts_json,
+    parse_merge_concept_candidates_json,
 };
 use crate::provenance::ProvenanceRecord;
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -323,6 +324,57 @@ impl LlmAdapter for OpencodeAdapter {
         Ok((response, provenance))
     }
 
+    fn generate_concept_body(
+        &self,
+        request: GenerateConceptBodyRequest,
+    ) -> Result<(GenerateConceptBodyResponse, ProvenanceRecord), LlmAdapterError> {
+        let template = Template::load("concept_body.md", self.config.project_root.as_deref())
+            .map_err(|err| {
+                LlmAdapterError::Other(format!("load concept_body template: {err}"))
+            })?;
+
+        let mut context = HashMap::new();
+        context.insert("canonical".to_string(), request.canonical_name.clone());
+        context.insert(
+            "aliases".to_string(),
+            format_aliases_for_prompt(&request.aliases),
+        );
+        context.insert(
+            "quotes".to_string(),
+            format_quotes_for_prompt(&request.candidate_quotes),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render concept_body template: {err}"))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        let raw = self.run_prompt(&rendered.content)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((
+            GenerateConceptBodyResponse {
+                body: strip_plain_text_wrappers(&raw),
+            },
+            provenance,
+        ))
+    }
+
     fn answer_question(
         &self,
         request: AnswerQuestionRequest,
@@ -481,6 +533,46 @@ fn strip_ansi_header(text: &str) -> String {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+/// Format an alias list for the `concept_body.md` prompt.
+/// Empty list renders as "(none)" so the template line "Aliases: " stays grammatical.
+fn format_aliases_for_prompt(aliases: &[String]) -> String {
+    if aliases.is_empty() {
+        "(none)".to_string()
+    } else {
+        aliases.join(", ")
+    }
+}
+
+/// Format candidate quotes as bullet lines for the `concept_body.md` prompt.
+/// Empty list renders as a single "(no quotes available)" line so the prompt
+/// still parses cleanly without dangling whitespace.
+fn format_quotes_for_prompt(quotes: &[String]) -> String {
+    if quotes.is_empty() {
+        "- (no quotes available)".to_string()
+    } else {
+        quotes
+            .iter()
+            .map(|q| format!("- {}", q.trim()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Strip wrapping code fences from a plain-text LLM response. Defensive —
+/// the prompt tells the model to return plain text, but models occasionally
+/// wrap short bodies in triple backticks anyway.
+fn strip_plain_text_wrappers(text: &str) -> String {
+    let trimmed = text.trim();
+    let without_fence = trimmed.strip_prefix("```").map_or(trimmed, |rest| {
+        let after_header = rest.split_once('\n').map_or(rest, |(_, body)| body);
+        after_header
+            .rsplit_once("```")
+            .map_or(after_header, |(body, _)| body)
+            .trim()
+    });
+    without_fence.to_string()
 }
 
 /// Clamp the configured runner timeout into `[30s, 60s]` for health checks.

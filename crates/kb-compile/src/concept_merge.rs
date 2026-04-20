@@ -12,8 +12,9 @@ use kb_core::{
     save_review_item, slug_from_title,
 };
 use kb_llm::{
-    ConceptCandidate, LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest,
-    MergeConceptCandidatesResponse, MergeGroup, ProvenanceRecord, SourceAnchor,
+    ConceptCandidate, GenerateConceptBodyRequest, LlmAdapter, LlmAdapterError,
+    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, MergeGroup, ProvenanceRecord,
+    SourceAnchor,
 };
 use regex::Regex;
 use serde_yaml::{Mapping, Value};
@@ -143,7 +144,7 @@ where
     };
     let (response, provenance) = adapter.merge_concept_candidates(request)?;
 
-    let concept_pages = build_concept_pages(&response, root, candidate_origins)?;
+    let concept_pages = build_concept_pages(adapter, &response, root, candidate_origins)?;
     let review_records =
         build_review_records(&response, root, &provenance).map_err(ConceptMergeError::Serialize)?;
     let build_record = build_record_for_merge(
@@ -161,17 +162,104 @@ where
     })
 }
 
-fn build_concept_pages<S: std::hash::BuildHasher>(
+fn build_concept_pages<A, S>(
+    adapter: &A,
     response: &MergeConceptCandidatesResponse,
     root: &Path,
     candidate_origins: &HashMap<String, Vec<String>, S>,
-) -> Result<Vec<ConceptPage>, ConceptMergeError> {
+) -> Result<Vec<ConceptPage>, ConceptMergeError>
+where
+    A: LlmAdapter + ?Sized,
+    S: std::hash::BuildHasher,
+{
     response
         .groups
         .iter()
         .filter(|g| g.confident)
-        .map(|group| render_concept_page(group, root, candidate_origins))
+        .map(|group| render_concept_page(adapter, group, root, candidate_origins))
         .collect()
+}
+
+/// Synthesize the general-scope body for a canonical concept via a dedicated
+/// LLM call. bn-1w5: running body generation as a separate, strictly-scoped
+/// call is what breaks the "LLM latches onto the most-quoted variant"
+/// pattern. On any failure of the secondary call (missing adapter support,
+/// transport error, empty response, the post-checks detect it's still narrow)
+/// we fall back to the merge-step `definition_hint` so the pass stays
+/// resilient.
+///
+/// Returns the chosen body string alongside the source tag that produced it
+/// (`"llm"` for the new two-step call, `"hint"` for the fallback). Callers
+/// only use the tag for log/debug breadcrumbs.
+fn synthesize_concept_body<A: LlmAdapter + ?Sized>(
+    adapter: &A,
+    group: &MergeGroup,
+    definition_hint: Option<&str>,
+) -> (Option<String>, &'static str) {
+    // Fold the candidate-source quotes so the two-step prompt has grounding.
+    // We also include each member's own `definition_hint` as a candidate
+    // quote because those are the richest single-sentence descriptions we
+    // have in the merge pipeline.
+    let mut quotes: Vec<String> = Vec::new();
+    for member in &group.members {
+        if let Some(hint) = &member.definition_hint {
+            let trimmed = hint.trim();
+            if !trimmed.is_empty() {
+                quotes.push(trimmed.to_string());
+            }
+        }
+        for anchor in &member.source_anchors {
+            if let Some(q) = &anchor.quote {
+                let trimmed = q.trim();
+                if !trimmed.is_empty() {
+                    quotes.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    // Deterministic de-dup: keep first occurrence, drop duplicates.
+    let mut seen = BTreeSet::new();
+    quotes.retain(|q| seen.insert(q.clone()));
+
+    let request = GenerateConceptBodyRequest {
+        canonical_name: group.canonical_name.clone(),
+        aliases: group.aliases.clone(),
+        candidate_quotes: quotes,
+    };
+
+    match adapter.generate_concept_body(request) {
+        Ok((response, _provenance)) => {
+            let body = response.body.trim().to_string();
+            if body.is_empty() {
+                tracing::warn!(
+                    concept = %group.canonical_name,
+                    "generate_concept_body returned empty body; falling back to merge-step \
+                     definition_hint"
+                );
+                (
+                    definition_hint.map(|h| h.trim().to_string()),
+                    "hint",
+                )
+            } else {
+                (Some(body), "llm")
+            }
+        }
+        Err(err) => {
+            // Not a hard failure — adapters without runner support (test
+            // doubles, incomplete backends) return
+            // `LlmAdapterError::Other("… not implemented …")`, and transient
+            // runner errors shouldn't block the whole merge pass.
+            tracing::warn!(
+                concept = %group.canonical_name,
+                error = %err,
+                "generate_concept_body failed; falling back to merge-step definition_hint"
+            );
+            (
+                definition_hint.map(|h| h.trim().to_string()),
+                "hint",
+            )
+        }
+    }
 }
 
 fn build_review_records(
@@ -530,11 +618,16 @@ fn next_token_looks_like_verb(after: &str) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-fn render_concept_page<S: std::hash::BuildHasher>(
+fn render_concept_page<A, S>(
+    adapter: &A,
     group: &MergeGroup,
     root: &Path,
     candidate_origins: &HashMap<String, Vec<String>, S>,
-) -> Result<ConceptPage, ConceptMergeError> {
+) -> Result<ConceptPage, ConceptMergeError>
+where
+    A: LlmAdapter + ?Sized,
+    S: std::hash::BuildHasher,
+{
     use serde_yaml::{Mapping, Value};
 
     let slug = slug_from_title(&group.canonical_name);
@@ -564,10 +657,17 @@ fn render_concept_page<S: std::hash::BuildHasher>(
         .into_iter()
         .collect();
 
-    let definition_hint: Option<&str> = group
+    let merge_step_hint: Option<&str> = group
         .members
         .iter()
         .find_map(|m| m.definition_hint.as_deref());
+
+    // bn-1w5: run the dedicated body-generation call. On failure we fall back
+    // to the merge-step hint so the pass remains resilient.
+    let (synthesized_body, _body_source) =
+        synthesize_concept_body(adapter, group, merge_step_hint);
+    // Alias kept to keep downstream post-check code below unchanged.
+    let definition_hint: Option<&str> = synthesized_body.as_deref();
 
     // Post-checks: if the merged body looks like it copied a narrow variant's
     // definition (e.g. "A Paxos variant ...") instead of synthesizing across
@@ -2114,5 +2214,273 @@ mod tests {
         assert_eq!(response.groups.len(), 1);
         assert_eq!(response.groups[0].canonical_name, "Borrow checker");
         assert!(response.groups[0].confident);
+    }
+
+    /// `FakeAdapter` variant that also returns a canned body from the two-step
+    /// `generate_concept_body` call. Lets tests exercise the bn-1w5 split:
+    /// canonical selection from `merge_concept_candidates`, body from the
+    /// second dedicated call. The `body_request_log` captures the requests
+    /// the merge pipeline sent so tests can assert on the prompt inputs
+    /// (canonical, aliases, quotes passed through).
+    #[derive(Debug)]
+    struct BodyFakeAdapter {
+        merge_response: MergeConceptCandidatesResponse,
+        body_by_canonical: std::collections::HashMap<String, String>,
+        body_request_log: std::sync::Mutex<Vec<kb_llm::GenerateConceptBodyRequest>>,
+        provenance: ProvenanceRecord,
+    }
+
+    impl LlmAdapter for BodyFakeAdapter {
+        fn summarize_document(
+            &self,
+            _request: SummarizeDocumentRequest,
+        ) -> Result<(SummarizeDocumentResponse, ProvenanceRecord), LlmAdapterError> {
+            unreachable!("unused in concept merge test")
+        }
+
+        fn extract_concepts(
+            &self,
+            _request: ExtractConceptsRequest,
+        ) -> Result<(ExtractConceptsResponse, ProvenanceRecord), LlmAdapterError> {
+            unreachable!("unused in concept merge test")
+        }
+
+        fn merge_concept_candidates(
+            &self,
+            _request: MergeConceptCandidatesRequest,
+        ) -> Result<(MergeConceptCandidatesResponse, ProvenanceRecord), LlmAdapterError> {
+            Ok((self.merge_response.clone(), self.provenance.clone()))
+        }
+
+        fn generate_concept_body(
+            &self,
+            request: kb_llm::GenerateConceptBodyRequest,
+        ) -> Result<(kb_llm::GenerateConceptBodyResponse, ProvenanceRecord), LlmAdapterError>
+        {
+            self.body_request_log
+                .lock()
+                .expect("mutex poisoned")
+                .push(request.clone());
+            match self.body_by_canonical.get(&request.canonical_name) {
+                Some(body) => Ok((
+                    kb_llm::GenerateConceptBodyResponse {
+                        body: body.clone(),
+                    },
+                    self.provenance.clone(),
+                )),
+                None => Err(LlmAdapterError::Other(format!(
+                    "no canned body for {}",
+                    request.canonical_name
+                ))),
+            }
+        }
+
+        fn answer_question(
+            &self,
+            _request: AnswerQuestionRequest,
+        ) -> Result<(AnswerQuestionResponse, ProvenanceRecord), LlmAdapterError> {
+            unreachable!("unused in concept merge test")
+        }
+
+        fn generate_slides(
+            &self,
+            _request: GenerateSlidesRequest,
+        ) -> Result<(GenerateSlidesResponse, ProvenanceRecord), LlmAdapterError> {
+            unreachable!("unused in concept merge test")
+        }
+
+        fn run_health_check(
+            &self,
+            _request: RunHealthCheckRequest,
+        ) -> Result<(RunHealthCheckResponse, ProvenanceRecord), LlmAdapterError> {
+            unreachable!("unused in concept merge test")
+        }
+    }
+
+    fn cache_candidate(name: &str, hint: &str) -> ConceptCandidate {
+        ConceptCandidate {
+            name: name.to_string(),
+            aliases: vec![],
+            definition_hint: Some(hint.to_string()),
+            source_anchors: vec![SourceAnchor {
+                heading_anchor: None,
+                quote: Some(format!("{name}: {hint}")),
+            }],
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn two_step_body_synthesis_emits_general_cache_eviction_body() {
+        // bn-1w5 golden-corpus test. Four cache-variant candidates fold into
+        // `cache-eviction-policy`. The merge step's `definition_hint` on the
+        // canonical member is deliberately 2Q-specific (the regression we
+        // keep seeing in practice). The two-step body call returns a general
+        // umbrella definition — that's the body the rendered page must carry,
+        // NOT the 2Q-specific hint.
+        let dir = tempdir().expect("tempdir");
+
+        let lru = cache_candidate(
+            "LRU",
+            "Least Recently Used: evict the entry whose last access is oldest.",
+        );
+        let lfu = cache_candidate(
+            "LFU",
+            "Least Frequently Used: evict the entry with the smallest hit count.",
+        );
+        let arc = cache_candidate(
+            "ARC",
+            "Adaptive Replacement Cache: balances recency and frequency via two LRU lists.",
+        );
+        let twoq = cache_candidate(
+            "2Q",
+            "A two-queue admission scheme that keeps a short FIFO probationary queue \
+             and a longer LRU main queue.",
+        );
+
+        // The canonical member's hint is narrow — 2Q-specific — exactly what
+        // bn-1w5 is designed to stop bleeding into the body.
+        let narrow_canonical = ConceptCandidate {
+            name: "Cache eviction policy".to_string(),
+            aliases: vec![
+                "LRU".to_string(),
+                "LFU".to_string(),
+                "ARC".to_string(),
+                "2Q".to_string(),
+            ],
+            definition_hint: Some(
+                "A two-queue admission scheme that keeps a short FIFO probationary \
+                 queue and a longer LRU main queue."
+                    .to_string(),
+            ),
+            source_anchors: vec![],
+        };
+
+        let mut body_by_canonical = std::collections::HashMap::new();
+        body_by_canonical.insert(
+            "Cache eviction policy".to_string(),
+            "Cache eviction policy is a family of strategies for choosing which \
+             entry to remove when a cache is full. Variants include LRU, LFU, ARC, \
+             and 2Q, each trading off recency, frequency, and adaptivity."
+                .to_string(),
+        );
+
+        let adapter = BodyFakeAdapter {
+            merge_response: MergeConceptCandidatesResponse {
+                groups: vec![MergeGroup {
+                    canonical_name: "Cache eviction policy".to_string(),
+                    aliases: vec![
+                        "LRU".to_string(),
+                        "LFU".to_string(),
+                        "ARC".to_string(),
+                        "2Q".to_string(),
+                    ],
+                    members: vec![
+                        narrow_canonical,
+                        lru.clone(),
+                        lfu.clone(),
+                        arc.clone(),
+                        twoq.clone(),
+                    ],
+                    confident: true,
+                    rationale: None,
+                }],
+            },
+            body_by_canonical,
+            body_request_log: std::sync::Mutex::new(Vec::new()),
+            provenance: provenance(),
+        };
+
+        let candidates = vec![lru, lfu, arc, twoq];
+        let artifact =
+            run_concept_merge_pass(&adapter, candidates, dir.path()).expect("run merge pass");
+
+        assert_eq!(artifact.concept_pages.len(), 1);
+        let page = &artifact.concept_pages[0];
+
+        let body_after_heading = page
+            .content
+            .split_once("# Cache eviction policy\n")
+            .map(|(_, rest)| rest.trim_start())
+            .expect("rendered page has heading");
+
+        // Acceptance: the body must start with the canonical + linking verb.
+        assert!(
+            body_after_heading.starts_with("Cache eviction policy is"),
+            "body missing canonical-prefix opener:\n{body_after_heading}"
+        );
+        // Acceptance: umbrella scope must be explicit.
+        assert!(
+            body_after_heading.contains("variants include")
+                || body_after_heading.contains("family"),
+            "body missing umbrella-scope keyword:\n{body_after_heading}"
+        );
+        // Acceptance: the merge-step narrow-hint MUST NOT be what's rendered.
+        assert!(
+            !body_after_heading.contains("FIFO probationary"),
+            "body leaked 2Q-specific merge-step hint through:\n{body_after_heading}"
+        );
+
+        // Contract: the two-step body call actually fired, and it saw the
+        // merge-step canonical + aliases + candidate quotes. Snapshot the
+        // log into a local Vec so the guard drops promptly.
+        let requests: Vec<kb_llm::GenerateConceptBodyRequest> = adapter
+            .body_request_log
+            .lock()
+            .expect("mutex")
+            .clone();
+        assert_eq!(requests.len(), 1, "expected exactly one body call");
+        assert_eq!(requests[0].canonical_name, "Cache eviction policy");
+        assert_eq!(
+            requests[0].aliases,
+            vec![
+                "LRU".to_string(),
+                "LFU".to_string(),
+                "ARC".to_string(),
+                "2Q".to_string(),
+            ]
+        );
+        assert!(
+            requests[0].candidate_quotes.len() >= 4,
+            "body call should receive all the variant hints as grounding: {:?}",
+            requests[0].candidate_quotes
+        );
+    }
+
+    #[test]
+    fn two_step_body_falls_back_to_hint_when_call_fails() {
+        // Resilience: when the dedicated body call errors (e.g. adapter
+        // doesn't implement it, or a transient runner error), the pipeline
+        // falls back to the merge-step `definition_hint` so the pass still
+        // produces a page. The legacy FakeAdapter is exactly this case —
+        // it inherits the default trait impl, which returns Err.
+        let dir = tempdir().expect("tempdir");
+
+        let adapter = FakeAdapter {
+            response: MergeConceptCandidatesResponse {
+                groups: vec![MergeGroup {
+                    canonical_name: "Borrow checker".to_string(),
+                    aliases: vec!["borrowck".to_string()],
+                    members: vec![borrow_checker_candidate(), borrowck_candidate()],
+                    confident: true,
+                    rationale: None,
+                }],
+            },
+            provenance: provenance(),
+        };
+
+        let candidates = vec![borrow_checker_candidate(), borrowck_candidate()];
+        let artifact =
+            run_concept_merge_pass(&adapter, candidates, dir.path()).expect("run merge pass");
+
+        assert_eq!(artifact.concept_pages.len(), 1);
+        let page = &artifact.concept_pages[0];
+        // Fallback: the hint from the canonical member is what's rendered.
+        assert!(
+            page.content
+                .contains("Validates references at compile time."),
+            "expected fallback to merge-step hint when body call errors, got:\n{}",
+            page.content
+        );
     }
 }

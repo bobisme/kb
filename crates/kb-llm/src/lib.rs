@@ -10,8 +10,9 @@ mod templates;
 
 pub use adapter::{
     AnswerQuestionRequest, AnswerQuestionResponse, ConceptCandidate, ExtractConceptsRequest,
-    ExtractConceptsResponse, GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter,
-    LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, MergeGroup,
+    ExtractConceptsResponse, GenerateConceptBodyRequest, GenerateConceptBodyResponse,
+    GenerateSlidesRequest, GenerateSlidesResponse, LlmAdapter, LlmAdapterError,
+    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, MergeGroup,
     RunHealthCheckRequest, RunHealthCheckResponse, SourceAnchor, SummarizeDocumentRequest,
     SummarizeDocumentResponse, parse_merge_concept_candidates_json,
 };
