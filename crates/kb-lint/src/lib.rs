@@ -971,6 +971,17 @@ fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<Lin
     let mut issues = Vec::new();
 
     for page in markdown_files_under(&root.join(WIKI_DIR))? {
+        // Skip auto-generated index pages (e.g. wiki/concepts/index.md,
+        // wiki/sources/index.md). These are navigational listings, not source
+        // material; requiring citations on them is a category error. Other
+        // lint checks (broken-links, etc.) still evaluate index pages.
+        if page
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("index.md"))
+        {
+            continue;
+        }
         let raw = fs::read_to_string(&page)
             .with_context(|| format!("read wiki page {}", page.display()))?;
         let (frontmatter, body) = match read_frontmatter(&page) {
@@ -1594,6 +1605,51 @@ mod tests {
                 .iter()
                 .any(|issue| issue.kind == IssueKind::MissingCitations),
             "expected MissingCitations issue, got: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn missing_citations_skips_wiki_index_pages() {
+        // Regression: bn-308. Auto-generated index pages (wiki/concepts/index.md,
+        // wiki/sources/index.md) are navigational listings, not source material.
+        // They should never trigger missing-citations warnings, even when their
+        // body contains synthetic managed regions without citations.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+
+        // Index page shaped like a source page (would normally warn) — must be skipped.
+        fs::write(
+            root.join("wiki/concepts/index.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Concepts\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write concepts index");
+        fs::write(
+            root.join("wiki/sources/index.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Sources\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write sources index");
+
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert!(
+            report.is_clean(),
+            "index pages must not trigger missing-citations: {report:?}"
+        );
+
+        // Sanity: a non-index page with the same shape still warns.
+        fs::write(
+            root.join("wiki/sources/doc.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Source\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write non-index source page");
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert_eq!(report.issue_count, 1);
+        assert_eq!(report.issues[0].kind, IssueKind::MissingCitations);
+        assert!(
+            report.issues[0].referring_page.ends_with("doc.md"),
+            "non-index page should still warn: {:?}",
             report.issues
         );
     }
