@@ -26,14 +26,24 @@ const MIN_ENTRY_TOKEN_ESTIMATE: u32 = 32;
 /// Common English stopwords stripped from query tokens before scoring.
 ///
 /// Kept small and hand-picked: we only want to drop terms that add noise to
-/// lexical scoring ("is", "the", ...) without dropping short technical terms
-/// ("raft", "sgd"). Indexed text is NOT filtered — stopwords remain in the
-/// index; we simply refuse to score them on the query side.
+/// lexical scoring ("is", "the", "how", ...) without dropping short technical
+/// terms ("raft", "sgd") or content words ("work", "thing"). Indexed text is
+/// NOT filtered — stopwords remain in the index; we simply refuse to score
+/// them on the query side.
+///
+/// The list is intentionally bounded (~70 words) and focuses on:
+/// - articles and copulas: "a", "the", "is", "are", ...
+/// - question stems: "how", "why", "when", "where", "which", ...
+/// - auxiliary verbs and modals: "do", "does", "can", "would", ...
+/// - mild quantifiers and conjunctions: "some", "any", "also", "then", ...
+/// - common prepositions: "about", "into", "between", ...
 pub const STOPWORDS: &[&str] = &[
     "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
     "of", "in", "on", "at", "by", "for", "with", "to", "from", "and", "or", "but", "not", "it",
     "its", "this", "that", "these", "those", "as", "if", "so", "such", "do", "does", "did", "can",
-    "will", "would", "should", "could",
+    "will", "would", "should", "could", "how", "why", "when", "where", "which", "whose", "whom",
+    "also", "then", "than", "some", "any", "most", "many", "about", "across", "around", "between",
+    "during", "into", "onto", "over", "under", "while",
 ];
 
 /// A single page's indexed data for lexical search.
@@ -1366,5 +1376,87 @@ mod tests {
         let index = build_lexical_index(root).unwrap();
         assert!(index.search("is", 10).is_empty());
         assert!(index.search("the and or", 10).is_empty());
+    }
+
+    #[test]
+    fn tokenize_query_strips_question_stem_words() {
+        // Interrogatives and auxiliary question verbs must be filtered so that
+        // queries like "How does X work?" score only the content words.
+        let tokens = tokenize_query("How does X work when Y?");
+        assert!(!tokens.contains(&"how".to_string()));
+        assert!(!tokens.contains(&"does".to_string()));
+        assert!(!tokens.contains(&"when".to_string()));
+        // Content words must be preserved.
+        assert!(tokens.contains(&"work".to_string()));
+    }
+
+    #[test]
+    fn tokenize_query_strips_why_where_which_whom() {
+        let tokens = tokenize_query("Why where which whose whom raft");
+        assert_eq!(tokens, vec!["raft".to_string()]);
+    }
+
+    #[test]
+    fn tokenize_query_strips_mild_quantifiers_and_conjunctions() {
+        let tokens = tokenize_query("also then than some any most many raft");
+        assert_eq!(tokens, vec!["raft".to_string()]);
+    }
+
+    #[test]
+    fn tokenize_query_strips_common_prepositions() {
+        let tokens =
+            tokenize_query("about across around between during into onto over under while raft");
+        assert_eq!(tokens, vec!["raft".to_string()]);
+    }
+
+    #[test]
+    fn tokenize_query_keeps_content_words_like_work() {
+        // "work", "thing", and similar content words must NOT be filtered.
+        // They're legitimate scoring signals in queries like "how does X work".
+        let tokens = tokenize_query("how does X work");
+        assert!(tokens.contains(&"work".to_string()));
+        let tokens = tokenize_query("what is the main thing");
+        assert!(tokens.contains(&"main".to_string()));
+        assert!(tokens.contains(&"thing".to_string()));
+    }
+
+    #[test]
+    fn plan_retrieval_reasons_exclude_question_stems() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(
+            &sources,
+            "scheduling",
+            "Process Scheduling",
+            "How the scheduler decides when to run which process.",
+        );
+
+        let index = build_lexical_index(root).unwrap();
+        let plan = index.plan_retrieval("How does scheduling differ from Y?", 1_000);
+        assert_eq!(plan.candidates.len(), 1);
+        for reason in &plan.candidates[0].reasons {
+            assert!(
+                !reason.contains("'how'")
+                    && !reason.contains("'does'")
+                    && !reason.contains("'when'")
+                    && !reason.contains("'which'")
+                    && !reason.contains("'from'"),
+                "question-stem stopword leaked into retrieval plan: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn stopwords_list_stays_bounded() {
+        // Guard against unbounded growth; we explicitly do NOT want to become
+        // a generic English stopword filter. Cap roughly matches the design
+        // target in bn-1jl (~70 words).
+        assert!(
+            STOPWORDS.len() <= 70,
+            "STOPWORDS grew past the design cap of 70 (now {}): review additions for scope creep",
+            STOPWORDS.len()
+        );
     }
 }
