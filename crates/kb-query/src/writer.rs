@@ -312,7 +312,15 @@ fn collect_source_document_ids_for_path(
         out.insert(id.clone());
     }
 
-    // Some pages (including prior answer artifacts) carry a list.
+    // Some pages (including concept pages and prior answer artifacts) carry a
+    // list of source_document_ids. This is the *authoritative* provenance list
+    // written by `concept-merge` (for concepts) or by `write_artifact` itself
+    // (for answer artifacts). When present, it is the ground truth — we prefer
+    // it over walking the `backlinks` managed region, because backlinks also
+    // include "mentioned-by" sources that did not actually contribute to the
+    // page. Using backlinks indiscriminately over-broadens the answer's
+    // `source_document_ids` to the point of matching `retrieval_candidates`.
+    let mut found_list_entry = false;
     if let Some(Value::Sequence(seq)) =
         frontmatter.get(Value::String("source_document_ids".into()))
     {
@@ -322,15 +330,17 @@ fn collect_source_document_ids_for_path(
                 // Paths would just re-introduce the bug this function is fixing.
                 if !s.starts_with("wiki/") {
                     out.insert(s.clone());
+                    found_list_entry = true;
                 }
             }
         }
     }
 
-    // Concept pages don't carry source_document_id directly — walk their
-    // backlinks region to the source pages they were extracted from, and
-    // recursively resolve those.
-    if rel_path.starts_with("wiki/concepts/") {
+    // Concept pages don't always carry `source_document_ids` in frontmatter —
+    // older or hand-authored concepts may only have a `backlinks` managed
+    // region. Fall back to walking backlinks *only* when the frontmatter list
+    // was absent or empty, so the authoritative list wins when available.
+    if !found_list_entry && rel_path.starts_with("wiki/concepts/") {
         for linked in source_links_in_backlinks(&body) {
             collect_source_document_ids_for_path(root, &linked, out, depth + 1);
         }
@@ -1068,5 +1078,185 @@ mod tests {
             .filter_map(Value::as_str)
             .collect();
         assert_eq!(rcs, vec!["src-alpha", "src-beta", "src-delta", "src-gamma"]);
+    }
+
+    /// Regression for bn-2om: cited concept pages must not over-aggregate
+    /// `source_document_ids` through their `backlinks` region when the concept
+    /// already carries an authoritative `source_document_ids` frontmatter list.
+    ///
+    /// Before the fix, resolving a cited concept page merged:
+    ///   1. the concept's frontmatter `source_document_ids` list (authoritative
+    ///      provenance from `concept-merge`), AND
+    ///   2. every source reachable via the concept's `backlinks` managed region
+    ///      (which includes "mentioned by" sources, not just contributors).
+    ///
+    /// (2) pulled in every non-cited source that happened to mention the concept,
+    /// which collapsed `source_document_ids` into `retrieval_candidates`. The
+    /// fix prefers (1) when present.
+    #[test]
+    fn cited_concept_frontmatter_list_wins_over_backlinks_aggregation() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Authoritative contributor — named in the concept's frontmatter.
+        seed_source_page(root, "hdfs-source", "src-hdfs-auth");
+        // Noise source — only mentions the concept, reachable via backlinks.
+        seed_source_page(root, "unrelated-a", "src-noise-a");
+        seed_source_page(root, "unrelated-b", "src-noise-b");
+
+        // Concept whose frontmatter authoritatively lists ONE contributor
+        // (src-hdfs-auth). Its backlinks region, however, lists all three
+        // sources because each mentions the concept somewhere.
+        let concept_path = root.join("wiki/concepts/hdfs.md");
+        std::fs::create_dir_all(concept_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &concept_path,
+            "---\n\
+             id: concept:hdfs\n\
+             name: HDFS\n\
+             source_document_ids:\n\
+             - src-hdfs-auth\n\
+             ---\n\
+             \n\
+             # HDFS\n\
+             \n\
+             <!-- kb:begin id=backlinks -->\n\
+             - [[wiki/sources/hdfs-source]]\n\
+             - [[wiki/sources/unrelated-a]]\n\
+             - [[wiki/sources/unrelated-b]]\n\
+             <!-- kb:end id=backlinks -->\n",
+        )
+        .unwrap();
+
+        let question = sample_question("q-agg");
+        let artifact = sample_artifact("q-agg");
+        let plan = RetrievalPlan {
+            query: "hdfs".into(),
+            token_budget: 4096,
+            estimated_tokens: 400,
+            candidates: vec![crate::RetrievalCandidate {
+                id: "wiki/concepts/hdfs.md".into(),
+                title: "HDFS".into(),
+                score: 10,
+                estimated_tokens: 100,
+                reasons: vec![],
+            }],
+        };
+
+        let cited = vec!["wiki/concepts/hdfs.md".to_string()];
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &question,
+            artifact: &artifact,
+            retrieval_plan: &plan,
+            artifact_result: None,
+            provenance: None,
+            artifact_body: "Body.",
+            cited_source_paths: &cited,
+            build_record_id: None,
+        })
+        .unwrap();
+
+        let sidecar_str = std::fs::read_to_string(root.join(&output.metadata_path)).unwrap();
+        let sidecar: ArtifactSidecar = serde_json::from_str(&sidecar_str).unwrap();
+
+        // Only the authoritative contributor — the backlinks noise is ignored
+        // because the frontmatter list is present and wins.
+        assert_eq!(
+            sidecar.source_document_ids,
+            vec!["src-hdfs-auth".to_string()],
+            "cited concept must narrow to its frontmatter list, got: {:?}",
+            sidecar.source_document_ids,
+        );
+    }
+
+    /// Regression for bn-2om: mirrors the bone's acceptance integration test.
+    /// Seed a retrieval plan with 4 candidates, pretend `valid_citations = [1, 3]`
+    /// by passing the corresponding two wiki paths as `cited_source_paths`.
+    /// `source_document_ids` must contain exactly those two src-ids, while
+    /// `retrieval_candidates` keeps all four.
+    #[test]
+    fn valid_citations_1_and_3_narrow_source_document_ids_to_two_entries() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        seed_source_page(root, "one", "src-one");
+        seed_source_page(root, "two", "src-two");
+        seed_source_page(root, "three", "src-three");
+        seed_source_page(root, "four", "src-four");
+
+        let plan = RetrievalPlan {
+            query: "anything".into(),
+            token_budget: 4096,
+            estimated_tokens: 400,
+            candidates: vec![
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/one.md".into(),
+                    title: "One".into(),
+                    score: 10,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/two.md".into(),
+                    title: "Two".into(),
+                    score: 9,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/three.md".into(),
+                    title: "Three".into(),
+                    score: 8,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/four.md".into(),
+                    title: "Four".into(),
+                    score: 7,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+            ],
+        };
+
+        // Citations [1, 3] map to candidates at index 0 and 2 — i.e. "one"
+        // and "three". Pass those as cited paths.
+        let cited = vec![
+            "wiki/sources/one.md".to_string(),
+            "wiki/sources/three.md".to_string(),
+        ];
+
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &sample_question("q-cit-1-3"),
+            artifact: &sample_artifact("q-cit-1-3"),
+            retrieval_plan: &plan,
+            artifact_result: None,
+            provenance: None,
+            artifact_body: "Body.",
+            cited_source_paths: &cited,
+            build_record_id: None,
+        })
+        .unwrap();
+
+        let sidecar: ArtifactSidecar =
+            serde_json::from_str(&std::fs::read_to_string(root.join(&output.metadata_path)).unwrap())
+                .unwrap();
+        assert_eq!(
+            sidecar.source_document_ids,
+            vec!["src-one".to_string(), "src-three".to_string()],
+        );
+        assert_eq!(
+            sidecar.retrieval_candidates,
+            vec![
+                "src-four".to_string(),
+                "src-one".to_string(),
+                "src-three".to_string(),
+                "src-two".to_string(),
+            ],
+        );
+        assert_ne!(sidecar.source_document_ids, sidecar.retrieval_candidates);
     }
 }
