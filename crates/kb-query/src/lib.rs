@@ -11,7 +11,7 @@ pub use artifact::{
 };
 pub use lexical::{
     AssembledContext, ContextChunkKind, ContextManifestEntry, LexicalEntry, LexicalIndex,
-    RetrievalCandidate, RetrievalPlan, SearchResult, assemble_context, build_lexical_index,
-    lexical_index_path,
+    RetrievalCandidate, RetrievalPlan, STOPWORDS, SearchResult, assemble_context,
+    build_lexical_index, lexical_index_path, query_reduced_to_stopwords, tokenize_query,
 };
 pub use writer::{ArtifactSidecar, WriteArtifactInput, WriteArtifactOutput, write_artifact};

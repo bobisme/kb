@@ -440,6 +440,23 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             let index = kb_query::LexicalIndex::load(search_root)?;
             let limit = limit.unwrap_or(10);
+
+            // Detect the "query reduced entirely to stopwords" case before
+            // scoring so we can surface a helpful message instead of a silent
+            // empty result set. Exit 0 — this is a user-facing hint, not an
+            // error.
+            if kb_query::query_reduced_to_stopwords(&query) {
+                if cli.json {
+                    let empty: Vec<kb_query::SearchResult> = Vec::new();
+                    emit_json("search", &empty)?;
+                } else {
+                    println!(
+                        "No results for '{query}': query reduced to stopwords; try more specific terms."
+                    );
+                }
+                return Ok(());
+            }
+
             let results = index.search(&query, limit);
             if cli.json {
                 emit_json("search", &results)?;

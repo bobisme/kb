@@ -23,6 +23,19 @@ const DEFAULT_RETRIEVAL_TOP_K: usize = 25;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MIN_ENTRY_TOKEN_ESTIMATE: u32 = 32;
 
+/// Common English stopwords stripped from query tokens before scoring.
+///
+/// Kept small and hand-picked: we only want to drop terms that add noise to
+/// lexical scoring ("is", "the", ...) without dropping short technical terms
+/// ("raft", "sgd"). Indexed text is NOT filtered — stopwords remain in the
+/// index; we simply refuse to score them on the query side.
+pub const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+    "of", "in", "on", "at", "by", "for", "with", "to", "from", "and", "or", "but", "not", "it",
+    "its", "this", "that", "these", "those", "as", "if", "so", "such", "do", "does", "did", "can",
+    "will", "would", "should", "could",
+];
+
 /// A single page's indexed data for lexical search.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LexicalEntry {
@@ -142,9 +155,15 @@ impl LexicalIndex {
     ///
     /// Returns up to `top_k` results ranked by score descending.
     /// Field weights: title (4) > alias (3) > heading (2) > summary (1).
+    ///
+    /// Stopwords ("is", "the", "for", ...) are stripped from the query before
+    /// scoring — they would otherwise dominate ranking with noisy matches.
+    /// A query that contains nothing but stopwords returns an empty result
+    /// set; callers that want to distinguish "no matches" from "reduced to
+    /// stopwords" should call [`tokenize_query`] themselves.
     #[must_use]
     pub fn search(&self, query: &str, top_k: usize) -> Vec<SearchResult> {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_query(query);
         if query_tokens.is_empty() || top_k == 0 {
             return Vec::new();
         }
@@ -177,9 +196,13 @@ impl LexicalIndex {
     }
 
     /// Build a deterministic, budgeted retrieval plan for a question.
+    ///
+    /// Stopwords are filtered out of the query tokens before scoring so that
+    /// common words ("is", "the", "what", ...) don't dominate the plan's
+    /// ranking reasons. If the filter removes every token, the plan is empty.
     #[must_use]
     pub fn plan_retrieval(&self, query: &str, token_budget: u32) -> RetrievalPlan {
-        let query_tokens = tokenize(query);
+        let query_tokens = tokenize_query(query);
         if query_tokens.is_empty() || token_budget == 0 {
             return RetrievalPlan {
                 query: query.to_string(),
@@ -252,7 +275,7 @@ pub fn assemble_context(root: &Path, plan: &RetrievalPlan) -> Result<AssembledCo
         });
     }
 
-    let query_tokens = tokenize(&plan.query);
+    let query_tokens = tokenize_query(&plan.query);
     let mut text = String::new();
     let mut manifest = Vec::new();
     let mut estimated_tokens = 0_u32;
@@ -498,6 +521,37 @@ fn tokenize(text: &str) -> Vec<String> {
         .map(|s| s.to_lowercase())
         .filter(|s| s.len() > 1)
         .collect()
+}
+
+/// Tokenize a query string and drop common English stopwords.
+///
+/// Use this for query-side tokenization in search and retrieval. Indexed text
+/// should keep using [`tokenize`] so that stopwords stay in the index — we
+/// only want to avoid scoring them on the query side. Matching is
+/// case-insensitive because [`tokenize`] lowercases tokens before we compare.
+#[must_use]
+pub fn tokenize_query(text: &str) -> Vec<String> {
+    tokenize(text)
+        .into_iter()
+        .filter(|token| !is_stopword(token))
+        .collect()
+}
+
+/// Return `true` when `text` has at least one token but every token is a
+/// stopword.
+///
+/// Callers use this to decide whether an empty search result should be
+/// framed as "no matches" or as "your query is entirely stopwords". Queries
+/// with no tokens at all (blank, pure punctuation) return `false` so the
+/// caller can fall through to its usual empty-results handling.
+#[must_use]
+pub fn query_reduced_to_stopwords(text: &str) -> bool {
+    let raw = tokenize(text);
+    !raw.is_empty() && raw.iter().all(|token| is_stopword(token))
+}
+
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.iter().any(|sw| sw.eq_ignore_ascii_case(token))
 }
 
 /// Split a word on `CamelCase` boundaries, e.g. `SourceDocument` → `Source`, `Document`.
@@ -1175,5 +1229,142 @@ mod tests {
 
         assert!(!results.is_empty(), "should find Source Ingestion doc");
         assert_eq!(results[0].id, "wiki/sources/ingest.md");
+    }
+
+    #[test]
+    fn tokenize_query_strips_stopwords() {
+        assert_eq!(
+            tokenize_query("the Raft is fast"),
+            vec!["raft".to_string(), "fast".to_string()]
+        );
+    }
+
+    #[test]
+    fn tokenize_query_returns_empty_when_only_stopwords() {
+        let tokens = tokenize_query("a an the");
+        assert!(
+            tokens.is_empty(),
+            "stopword-only query should tokenize to empty, got {tokens:?}"
+        );
+    }
+
+    #[test]
+    fn tokenize_query_matches_stopwords_case_insensitively() {
+        assert!(tokenize_query("The IS Are").is_empty());
+    }
+
+    #[test]
+    fn tokenize_query_keeps_short_technical_terms() {
+        // Stopword list must not drop short technical terms like "raft" or
+        // "sgd" — they are shorter than many stopwords but not generic.
+        let tokens = tokenize_query("Raft SGD");
+        assert!(tokens.contains(&"raft".to_string()));
+        assert!(tokens.contains(&"sgd".to_string()));
+    }
+
+    #[test]
+    fn query_reduced_to_stopwords_detects_stopword_only_queries() {
+        assert!(query_reduced_to_stopwords("is"));
+        assert!(query_reduced_to_stopwords("the and or"));
+        assert!(!query_reduced_to_stopwords("Raft safety"));
+        assert!(!query_reduced_to_stopwords("the Raft"));
+        // Empty / whitespace / pure punctuation: no tokens at all — not a
+        // stopword-only query, just an empty one.
+        assert!(!query_reduced_to_stopwords(""));
+        assert!(!query_reduced_to_stopwords("   "));
+        assert!(!query_reduced_to_stopwords("!!!"));
+    }
+
+    #[test]
+    fn stopwords_do_not_contribute_to_scoring() {
+        // A body that mentions "is" 5 times and "raft" 1 time, scored
+        // against the query "Raft", must count only the 1 raft match —
+        // not be flooded by the 5 stopword hits.
+        let entry = LexicalEntry {
+            id: "wiki/sources/raft.md".to_string(),
+            title: "Raft".to_string(),
+            aliases: Vec::new(),
+            headings: Vec::new(),
+            summary: "is is is is is raft".to_string(),
+        };
+        let query_tokens = tokenize_query("Raft");
+        let analysis = analyze_entry(&entry, &query_tokens);
+        // Only raft matches should score: title (1 * WEIGHT_TITLE) +
+        // summary (1 * WEIGHT_SUMMARY). No "is" contributions.
+        assert_eq!(analysis.score, WEIGHT_TITLE + WEIGHT_SUMMARY);
+        assert!(
+            analysis
+                .reasons
+                .iter()
+                .all(|reason| !reason.contains("'is'")),
+            "scoring reasons must not reference stopword 'is': {:?}",
+            analysis.reasons
+        );
+    }
+
+    #[test]
+    fn search_with_stopword_prefix_scores_same_as_without() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(
+            &sources,
+            "raft",
+            "Raft Protocol",
+            "The Raft consensus protocol.",
+        );
+
+        let index = build_lexical_index(root).unwrap();
+        let with_stopword = index.search("the Raft protocol", 10);
+        let without_stopword = index.search("Raft protocol", 10);
+        assert_eq!(
+            with_stopword.len(),
+            without_stopword.len(),
+            "stopword prefix must not change result count"
+        );
+        assert_eq!(
+            with_stopword[0].score, without_stopword[0].score,
+            "stopword prefix must not change score"
+        );
+    }
+
+    #[test]
+    fn plan_retrieval_reasons_exclude_stopwords() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(
+            &sources,
+            "raft",
+            "Raft Safety",
+            "Raft is a consensus algorithm and it is safe.",
+        );
+
+        let index = build_lexical_index(root).unwrap();
+        let plan = index.plan_retrieval("What is Raft?", 1_000);
+        assert_eq!(plan.candidates.len(), 1);
+        for reason in &plan.candidates[0].reasons {
+            assert!(
+                !reason.contains("'is'")
+                    && !reason.contains("'what'")
+                    && !reason.contains("'a'"),
+                "stopword reason leaked into retrieval plan: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_returns_empty_for_stopword_only_query() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(&sources, "raft", "Raft", "Raft is a protocol.");
+
+        let index = build_lexical_index(root).unwrap();
+        assert!(index.search("is", 10).is_empty());
+        assert!(index.search("the and or", 10).is_empty());
     }
 }
