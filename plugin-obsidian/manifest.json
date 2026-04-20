@@ -5,6 +5,6 @@
   "minAppVersion": "1.0.0",
   "description": "Thin wrapper exposing kb ask, inspect, and compile as Obsidian commands",
   "author": "KB Project",
-  "authorUrl": "https://github.com/shiftsource/kb",
+  "authorUrl": "https://github.com/bobisme/kb",
   "isDesktopOnly": true
 }
