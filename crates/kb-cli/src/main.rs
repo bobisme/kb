@@ -3829,10 +3829,23 @@ fn print_lint_check_report(
 
 fn print_lint_issues(issues: &[&kb_lint::LintIssue]) {
     for issue in issues {
-        println!(
-            "- [{:?}] {}:{} {}",
-            issue.severity, issue.referring_page, issue.line, issue.message
-        );
+        // Some lint checks (e.g. concept-candidate) don't have a source
+        // location — they fire at the corpus level, not at a particular
+        // `file:line`. In that case skip the `:line` suffix entirely so
+        // the output doesn't render a stray `:0` that reads like a
+        // column number.
+        let location = if issue.referring_page.is_empty() && issue.line == 0 {
+            String::new()
+        } else if issue.line == 0 {
+            issue.referring_page.clone()
+        } else {
+            format!("{}:{}", issue.referring_page, issue.line)
+        };
+        if location.is_empty() {
+            println!("- [{:?}] {}", issue.severity, issue.message);
+        } else {
+            println!("- [{:?}] {} {}", issue.severity, location, issue.message);
+        }
         if let Some(suggested_fix) = &issue.suggested_fix {
             println!("  suggested fix: {suggested_fix}");
         }

@@ -702,7 +702,7 @@ mod tests {
         let id = format!("lint:concept-candidate:{slug}");
         let comment = format!(
             "Term '{name}' is mentioned in {} source(s) (10 total mention(s)) but has no concept page. \
-             Sources: {}. Approve to draft wiki/concepts/{slug}.md from the mentions.",
+             Sources: {}. Approve to generate wiki/concepts/{slug}.md from the mentions.",
             sources.len(),
             sources.join(", "),
         );

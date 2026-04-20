@@ -7083,7 +7083,7 @@ fn review_approve_applies_concept_candidate_with_stub_llm() {
         affected_pages: vec![dest],
         created_at_millis: 1_000,
         status: ReviewStatus::Pending,
-        comment: "Term 'FooBar System' is mentioned in 3 source(s) (6 total mention(s)) but has no concept page. Sources: doc-a, doc-b, doc-c. Approve to draft wiki/concepts/foobar-system.md from the mentions.".to_string(),
+        comment: "Term 'FooBar System' is mentioned in 3 source(s) (6 total mention(s)) but has no concept page. Sources: doc-a, doc-b, doc-c. Approve to generate wiki/concepts/foobar-system.md from the mentions.".to_string(),
     };
     save_review_item(&kb_root, &item).expect("save review item");
 

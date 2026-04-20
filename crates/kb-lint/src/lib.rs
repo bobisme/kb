@@ -2281,8 +2281,7 @@ fn build_concept_candidate_review_item(hit: &ConceptCandidateHit, now: u64) -> R
 
     let comment = format!(
         "Term '{}' is mentioned in {} source(s) ({} total mention(s)) but has no concept page. \
-         Sources: {}. Approve to draft wiki/concepts/{}.md from the mentions (LLM step \
-         currently stubbed — see bone bn-31lt).",
+         Sources: {}. Approve to generate wiki/concepts/{}.md from the mentions.",
         hit.name,
         hit.source_ids.len(),
         hit.mention_count,

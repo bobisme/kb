@@ -181,10 +181,8 @@ fn print_pending_kind_narrative(kind: ReviewKind) {
         }
         ReviewKind::ConceptCandidate => {
             println!(
-                "On approve: the decision is recorded; creating the concept \
-                 page from mentions via LLM is not yet implemented (see \
-                 bone spec 'Approve workflow'). Work around by creating \
-                 wiki/concepts/<slug>.md manually, then run 'kb compile'."
+                "On approve: an LLM drafts wiki/concepts/<slug>.md from \
+                 the source mentions and refreshes backlinks + indexes."
             );
         }
         ReviewKind::Contradiction => {
