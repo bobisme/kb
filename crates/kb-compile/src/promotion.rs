@@ -18,12 +18,15 @@ pub struct PromotionInput<'a> {
     pub review_item: &'a ReviewItem,
     pub artifact_body: &'a str,
     pub promoted_at: u64,
-    /// Source document IDs grounding the promoted page.
-    ///
-    /// These are the wiki/sources paths (or equivalent normalized document IDs)
-    /// drawn from the original retrieval plan. They populate the
-    /// `source_document_ids` frontmatter field so `kb lint` orphan checks pass.
+    /// Source document IDs grounding the promoted page — narrowed to the
+    /// sources the answer actually cited, as recorded in the source artifact's
+    /// `source_document_ids` frontmatter. A reader of the promoted wiki page
+    /// interprets this as "what grounds this answer".
     pub source_document_ids: &'a [String],
+    /// All source-document IDs the original retrieval considered, even those
+    /// the answer did not cite. Mirrored from the artifact's
+    /// `retrieval_candidates` frontmatter for audit/debugging.
+    pub retrieval_candidates: &'a [String],
     /// Question ID that produced the answer, mirrored into `derived_from`
     /// frontmatter so the promotion chain is traceable without polluting
     /// `source_document_ids` with non-source IDs.
@@ -74,6 +77,7 @@ pub fn render_promotion(
         &build_record_id,
         input.promoted_at,
         input.source_document_ids,
+        input.retrieval_candidates,
         input.derived_from_question_id,
         input.derived_from_artifact_id,
     );
@@ -140,6 +144,7 @@ pub fn execute_promotion(
     let ArtifactLoad {
         body: artifact_body,
         source_document_ids,
+        retrieval_candidates,
     } = load_artifact(root, review_item)
         .with_context(|| format!("read artifact for review {}", review_item.metadata.id))?;
 
@@ -162,6 +167,7 @@ pub fn execute_promotion(
         artifact_body: &artifact_body,
         promoted_at,
         source_document_ids: &source_document_ids,
+        retrieval_candidates: &retrieval_candidates,
         derived_from_question_id: question_id.as_deref(),
         derived_from_artifact_id: artifact_id.as_deref(),
     };
@@ -186,6 +192,7 @@ pub fn execute_promotion(
 struct ArtifactLoad {
     body: String,
     source_document_ids: Vec<String>,
+    retrieval_candidates: Vec<String>,
 }
 
 fn load_artifact(root: &Path, item: &ReviewItem) -> Result<ArtifactLoad> {
@@ -219,14 +226,21 @@ fn load_artifact(root: &Path, item: &ReviewItem) -> Result<ArtifactLoad> {
 }
 
 fn parse_artifact(raw: &str) -> ArtifactLoad {
-    let source_document_ids = extract_source_document_ids(raw);
+    let source_document_ids = extract_frontmatter_string_list(raw, "source_document_ids");
+    let retrieval_candidates = extract_frontmatter_string_list(raw, "retrieval_candidates");
     ArtifactLoad {
         body: strip_frontmatter(raw),
         source_document_ids,
+        retrieval_candidates,
     }
 }
 
+#[cfg(test)]
 fn extract_source_document_ids(markdown: &str) -> Vec<String> {
+    extract_frontmatter_string_list(markdown, "source_document_ids")
+}
+
+fn extract_frontmatter_string_list(markdown: &str, key: &str) -> Vec<String> {
     let Some(yaml) = extract_frontmatter_yaml(markdown) else {
         return Vec::new();
     };
@@ -237,7 +251,7 @@ fn extract_source_document_ids(markdown: &str) -> Vec<String> {
         return Vec::new();
     };
     let Some(seq) = mapping
-        .get(Value::String("source_document_ids".into()))
+        .get(Value::String(key.into()))
         .and_then(Value::as_sequence)
     else {
         return Vec::new();
@@ -301,6 +315,7 @@ fn build_frontmatter(
     build_record_id: &str,
     promoted_at: u64,
     source_document_ids: &[String],
+    retrieval_candidates: &[String],
     derived_from_question_id: Option<&str>,
     derived_from_artifact_id: Option<&str>,
 ) -> Mapping {
@@ -338,9 +353,10 @@ fn build_frontmatter(
         );
     }
 
-    // `source_document_ids` must list *real* sources (retrieval plan candidates)
-    // so `kb lint`'s orphan check can resolve them against `normalized/<id>/`.
-    // The question/artifact IDs are linkage, not sources, and go in `derived_from`.
+    // `source_document_ids` must list *real* sources (the ones the answer
+    // actually cited) so `kb lint`'s orphan check can resolve them against
+    // `normalized/<id>/`. The question/artifact IDs are linkage, not sources,
+    // and go in `derived_from`.
     if !source_document_ids.is_empty() {
         let source_ids: Vec<Value> = source_document_ids
             .iter()
@@ -349,6 +365,20 @@ fn build_frontmatter(
         fm.insert(
             Value::String("source_document_ids".into()),
             Value::Sequence(source_ids),
+        );
+    }
+
+    // `retrieval_candidates` preserves the full set of sources the original
+    // retrieval considered (load-bearing debugging info from the answer
+    // artifact). Mirrored through so promoted pages stay introspectable.
+    if !retrieval_candidates.is_empty() {
+        let candidates: Vec<Value> = retrieval_candidates
+            .iter()
+            .map(|d| Value::String(d.clone()))
+            .collect();
+        fm.insert(
+            Value::String("retrieval_candidates".into()),
+            Value::Sequence(candidates),
         );
     }
 
@@ -488,6 +518,7 @@ mod tests {
             artifact_body,
             promoted_at,
             source_document_ids: &[],
+            retrieval_candidates: &[],
             derived_from_question_id: None,
             derived_from_artifact_id: None,
         }
@@ -714,6 +745,57 @@ mod tests {
         assert_eq!(
             derived.get(Value::String("artifact_id".into())).and_then(Value::as_str),
             Some("artifact-q1")
+        );
+    }
+
+    #[test]
+    fn execute_promotion_mirrors_retrieval_candidates_from_artifact() {
+        // The promoted page's `source_document_ids` narrows to actually-cited
+        // sources (mirrored from the artifact), and `retrieval_candidates`
+        // carries the full retrieval scope for auditability.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+
+        std::fs::create_dir_all(root.join("outputs/questions/q1")).expect("create artifact dir");
+        std::fs::write(
+            root.join("outputs/questions/q1/answer.md"),
+            "---\nid: artifact-q1\ntype: question_answer\n\
+             source_document_ids:\n- src-cited-a\n- src-cited-b\n\
+             retrieval_candidates:\n- src-cited-a\n- src-cited-b\n- src-scope-c\n- src-scope-d\n\
+             ---\n\nBody.\n",
+        )
+        .expect("write artifact");
+
+        let item = test_review_item("review-mirror-rc");
+        let _ = execute_promotion(root, &item, 11_000).expect("execute");
+
+        let page_path = root.join("wiki/questions/example.md");
+        let page = std::fs::read_to_string(&page_path).expect("read page");
+        let fm = page
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n").map(|(fm, _)| fm))
+            .expect("frontmatter block");
+        let doc: Value = serde_yaml::from_str(fm).expect("parse frontmatter");
+
+        let cited: Vec<&str> = doc
+            .get("source_document_ids")
+            .and_then(Value::as_sequence)
+            .expect("source_document_ids present")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(cited, vec!["src-cited-a", "src-cited-b"]);
+
+        let candidates: Vec<&str> = doc
+            .get("retrieval_candidates")
+            .and_then(Value::as_sequence)
+            .expect("retrieval_candidates present on promoted page")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            candidates,
+            vec!["src-cited-a", "src-cited-b", "src-scope-c", "src-scope-d"]
         );
     }
 

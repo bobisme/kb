@@ -1308,6 +1308,23 @@ fn run_ask(
         None
     };
 
+    // Derive the wiki-page paths actually referenced by valid [N] citations in
+    // the answer body. These feed `source_document_ids` so the frontmatter
+    // only lists sources that ground the answer — not the whole retrieval scope.
+    let cited_source_paths: Vec<String> = llm_info
+        .as_ref()
+        .map(|(result, _)| {
+            let mut seen: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            for key in &result.valid_citations {
+                if let Some(entry) = citation_manifest.entries.get(key) {
+                    seen.insert(entry.source_id.clone());
+                }
+            }
+            seen.into_iter().collect()
+        })
+        .unwrap_or_default();
+
     let write_output = kb_query::write_artifact(&kb_query::WriteArtifactInput {
         root,
         question: &question,
@@ -1316,6 +1333,7 @@ fn run_ask(
         artifact_result: llm_info.as_ref().map(|(r, _)| r),
         provenance: llm_info.as_ref().map(|(_, p)| p),
         artifact_body: &artifact_body,
+        cited_source_paths: &cited_source_paths,
         build_record_id: build_record_id.as_deref(),
     })?;
 

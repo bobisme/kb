@@ -19,7 +19,16 @@ pub struct ArtifactSidecar {
     pub artifact_id: String,
     pub retrieval_plan_path: String,
     pub provenance: Option<ProvenanceRecord>,
+    /// Source-document IDs that actually ground the answer — the union of
+    /// `source_document_id`(s) reachable from pages referenced by valid
+    /// citations. Readers of the promoted wiki page should see this as
+    /// "what supports this answer".
     pub source_document_ids: Vec<String>,
+    /// All source-document IDs that were considered during retrieval, even
+    /// those the model did not end up citing. Kept for debugging/audit — the
+    /// "what was in scope" view that used to live in `source_document_ids`.
+    #[serde(default)]
+    pub retrieval_candidates: Vec<String>,
     pub valid_citations: Vec<u32>,
     pub invalid_citations: Vec<u32>,
     pub has_uncertainty_banner: bool,
@@ -37,6 +46,13 @@ pub struct WriteArtifactInput<'a> {
     pub artifact_result: Option<&'a ArtifactResult>,
     pub provenance: Option<&'a ProvenanceRecord>,
     pub artifact_body: &'a str,
+    /// Wiki page paths (`wiki/sources/*.md` or `wiki/concepts/*.md`) that the
+    /// model actually cited in the answer body. Used to narrow
+    /// `source_document_ids` to sources that really ground the answer.
+    ///
+    /// When empty (e.g. placeholder artifact with no LLM run, or an answer
+    /// that cited nothing), `source_document_ids` ends up empty too.
+    pub cited_source_paths: &'a [String],
     /// [`kb_core::BuildRecord`] identifier for this generation, when one was
     /// emitted. The writer mirrors it into the answer frontmatter so `kb inspect`
     /// can walk the provenance chain from the artifact back to its record.
@@ -75,7 +91,11 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
         serde_json::to_string_pretty(input.question).map_err(json_io_err)?;
     atomic_write(input.root.join(&question_rel), question_json.as_bytes())?;
 
-    let source_doc_ids = resolve_source_document_ids(input.root, &input.retrieval_plan.candidates);
+    let source_doc_ids = resolve_source_document_ids(input.root, input.cited_source_paths);
+    let retrieval_candidate_ids = resolve_source_document_ids(
+        input.root,
+        &candidate_paths(&input.retrieval_plan.candidates),
+    );
 
     let (valid_citations, invalid_citations, has_uncertainty_banner) =
         input.artifact_result.map_or_else(
@@ -104,6 +124,7 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
         retrieval_plan_path: plan_rel.to_string_lossy().into_owned(),
         provenance: input.provenance.cloned(),
         source_document_ids: source_doc_ids,
+        retrieval_candidates: retrieval_candidate_ids,
         valid_citations,
         invalid_citations,
         has_uncertainty_banner,
@@ -237,31 +258,37 @@ fn render_answer_json(
     serde_json::to_string_pretty(&serde_json::Value::Object(obj))
 }
 
-/// Resolves retrieval candidate paths to the underlying `source_document_id`
+/// Resolves a list of wiki page paths to the underlying `source_document_id`
 /// values recorded in each page's frontmatter.
 ///
-/// The retrieval plan identifies candidates by their wiki page path (e.g.
-/// `wiki/sources/foo.md` or `wiki/concepts/bar.md`). Downstream consumers —
-/// particularly `kb lint orphans` — expect `source_document_ids` to contain
-/// real source-document identifiers that map to `normalized/<id>/`.
+/// The inputs are wiki page paths (e.g. `wiki/sources/foo.md` or
+/// `wiki/concepts/bar.md`). Downstream consumers — particularly
+/// `kb lint orphans` — expect `source_document_ids` to contain real
+/// source-document identifiers that map to `normalized/<id>/`.
 ///
-/// For each candidate this function:
-/// - Reads the candidate's frontmatter.
+/// For each path this function:
+/// - Reads the page's frontmatter.
 /// - If the page is a source wiki (`source_document_id` present as string or
-///   `source_document_ids` as list), returns those IDs.
-/// - If the page is a concept wiki, walks its `backlinks` managed region,
-///   parses each `[[wiki/sources/<slug>]]` link, and recursively extracts the
-///   referenced source page's `source_document_id`.
+///   `source_document_ids` as list), collects those IDs.
+/// - If the page is a concept wiki, reads `source_document_ids` from its
+///   frontmatter when present (that is the authoritative provenance list
+///   written by the concept-merge pass). Otherwise, walks its `backlinks`
+///   managed region, parses each `[[wiki/sources/<slug>]]` link, and
+///   recursively extracts the referenced source page's `source_document_id`.
 ///
 /// Unreadable or unresolvable candidates are silently skipped — this mirrors
 /// existing lint behaviour, which already reports missing sources.
 /// Results are deduplicated and sorted for stable output.
-fn resolve_source_document_ids(root: &Path, candidates: &[RetrievalCandidate]) -> Vec<String> {
+fn resolve_source_document_ids(root: &Path, paths: &[String]) -> Vec<String> {
     let mut resolved: BTreeSet<String> = BTreeSet::new();
-    for candidate in candidates {
-        collect_source_document_ids_for_path(root, &candidate.id, &mut resolved, 0);
+    for path in paths {
+        collect_source_document_ids_for_path(root, path, &mut resolved, 0);
     }
     resolved.into_iter().collect()
+}
+
+fn candidate_paths(candidates: &[RetrievalCandidate]) -> Vec<String> {
+    candidates.iter().map(|c| c.id.clone()).collect()
 }
 
 const MAX_RESOLVE_DEPTH: usize = 2;
@@ -381,13 +408,28 @@ fn render_answer_frontmatter(input: &WriteArtifactInput<'_>) -> Result<String, s
     }
 
     let source_ids: Vec<Value> =
-        resolve_source_document_ids(input.root, &input.retrieval_plan.candidates)
+        resolve_source_document_ids(input.root, input.cited_source_paths)
             .into_iter()
             .map(Value::String)
             .collect();
     fm.insert(
         Value::String("source_document_ids".into()),
         Value::Sequence(source_ids),
+    );
+
+    // `retrieval_candidates` preserves the full set of sources the retrieval
+    // plan considered — load-bearing debugging info that used to live in
+    // `source_document_ids` before that field was narrowed to cited sources.
+    let retrieval_candidate_ids: Vec<Value> = resolve_source_document_ids(
+        input.root,
+        &candidate_paths(&input.retrieval_plan.candidates),
+    )
+    .into_iter()
+    .map(Value::String)
+    .collect();
+    fm.insert(
+        Value::String("retrieval_candidates".into()),
+        Value::Sequence(retrieval_candidate_ids),
     );
 
     let source_hashes: Vec<Value> = input
@@ -530,6 +572,7 @@ mod tests {
             artifact_result: Some(&result),
             provenance: None,
             artifact_body: &result.body,
+            cited_source_paths: &[],
             build_record_id: None,
         })
         .unwrap();
@@ -557,6 +600,7 @@ mod tests {
             artifact_result: None,
             provenance: None,
             artifact_body: body,
+            cited_source_paths: &[],
             build_record_id: None,
         })
         .unwrap();
@@ -567,6 +611,7 @@ mod tests {
         assert!(content.contains("question_id: q2"));
         assert!(content.contains("generated_at:"));
         assert!(content.contains("source_document_ids:"));
+        assert!(content.contains("retrieval_candidates:"));
         assert!(content.contains("Answer text here."));
     }
 
@@ -602,6 +647,7 @@ mod tests {
             has_uncertainty_banner: false,
         };
 
+        let cited = vec!["wiki/sources/rust-overview.md".to_string()];
         let output = write_artifact(&WriteArtifactInput {
             root,
             question: &question,
@@ -610,6 +656,7 @@ mod tests {
             artifact_result: Some(&result),
             provenance: Some(&prov),
             artifact_body: &result.body,
+            cited_source_paths: &cited,
             build_record_id: None,
         })
         .unwrap();
@@ -621,6 +668,9 @@ mod tests {
         assert_eq!(sidecar.valid_citations, vec![1]);
         assert_eq!(sidecar.invalid_citations, vec![99]);
         assert_eq!(sidecar.source_document_ids, vec!["src-rust-overview"]);
+        // retrieval_candidates mirrors the full retrieval scope (same single
+        // candidate here, so equal to source_document_ids).
+        assert_eq!(sidecar.retrieval_candidates, vec!["src-rust-overview"]);
     }
 
     #[test]
@@ -639,6 +689,7 @@ mod tests {
             artifact_result: None,
             provenance: None,
             artifact_body: "body",
+            cited_source_paths: &[],
             build_record_id: None,
         })
         .unwrap();
@@ -689,6 +740,7 @@ mod tests {
             artifact_result: None,
             provenance: Some(&prov),
             artifact_body: "body",
+            cited_source_paths: &[],
             build_record_id: None,
         })
         .unwrap();
@@ -713,6 +765,7 @@ mod tests {
             artifact_result: None,
             provenance: None,
             artifact_body: "body",
+            cited_source_paths: &[],
             build_record_id: Some("build:ask:q6"),
         })
         .unwrap();
@@ -762,6 +815,7 @@ mod tests {
             provenance: None,
             artifact_body: &result.body,
             build_record_id: Some("build:ask:q-json"),
+            cited_source_paths: &["wiki/sources/rust-overview.md".to_string()],
         })
         .unwrap();
 
@@ -800,6 +854,10 @@ mod tests {
     /// artifact's `source_document_ids` must contain the real `src-*` IDs
     /// pulled from each candidate's frontmatter — not the paths themselves —
     /// so `kb lint orphans` can resolve them against `normalized/<id>/`.
+    /// Regression: the `source_document_ids` field must list only sources
+    /// whose pages were *actually cited*. When both cited paths are passed
+    /// (one source page, one concept page whose backlinks reach another source),
+    /// the resolver must produce real `src-*` IDs — not the wiki paths themselves.
     #[test]
     fn source_document_ids_resolve_to_frontmatter_ids_not_paths() {
         let tmp = TempDir::new().unwrap();
@@ -847,6 +905,13 @@ mod tests {
             ],
         };
 
+        // Both pages are cited (simulated — in real use this comes from valid
+        // citation indices resolved against the context manifest).
+        let cited = vec![
+            "wiki/sources/ownership-guide.md".to_string(),
+            "wiki/concepts/ownership.md".to_string(),
+        ];
+
         let output = write_artifact(&WriteArtifactInput {
             root,
             question: &question,
@@ -855,6 +920,7 @@ mod tests {
             artifact_result: None,
             provenance: None,
             artifact_body: "Body.",
+            cited_source_paths: &cited,
             build_record_id: None,
         })
         .unwrap();
@@ -874,6 +940,11 @@ mod tests {
                 "source_document_ids must not contain wiki paths: {entry}"
             );
         }
+        // retrieval_candidates mirrors the full retrieval scope (same here).
+        assert_eq!(
+            sidecar.retrieval_candidates,
+            vec!["src-aaaa1111".to_string(), "src-bbbb2222".to_string()],
+        );
 
         // Frontmatter of the answer must agree with the sidecar.
         let answer_md = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
@@ -881,5 +952,121 @@ mod tests {
         assert!(answer_md.contains("- src-bbbb2222"));
         assert!(!answer_md.contains("wiki/sources/ownership-guide.md"));
         assert!(!answer_md.contains("wiki/concepts/ownership.md"));
+    }
+
+    /// Core behaviour of this bone: `source_document_ids` must narrow to the
+    /// sources the model actually cited, not the entire retrieval scope. The
+    /// full scope remains available under `retrieval_candidates` for audit.
+    #[test]
+    fn source_document_ids_narrows_to_cited_sources_only() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Four source pages; only two will be "cited".
+        seed_source_page(root, "alpha", "src-alpha");
+        seed_source_page(root, "beta", "src-beta");
+        seed_source_page(root, "gamma", "src-gamma");
+        seed_source_page(root, "delta", "src-delta");
+
+        let question = sample_question("q-narrow");
+        let artifact = sample_artifact("q-narrow");
+        let plan = RetrievalPlan {
+            query: "anything".into(),
+            token_budget: 4096,
+            estimated_tokens: 400,
+            candidates: vec![
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/alpha.md".into(),
+                    title: "Alpha".into(),
+                    score: 10,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/beta.md".into(),
+                    title: "Beta".into(),
+                    score: 9,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/gamma.md".into(),
+                    title: "Gamma".into(),
+                    score: 8,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+                crate::RetrievalCandidate {
+                    id: "wiki/sources/delta.md".into(),
+                    title: "Delta".into(),
+                    score: 7,
+                    estimated_tokens: 100,
+                    reasons: vec![],
+                },
+            ],
+        };
+
+        // Only alpha and gamma were cited by the answer.
+        let cited = vec![
+            "wiki/sources/alpha.md".to_string(),
+            "wiki/sources/gamma.md".to_string(),
+        ];
+
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &question,
+            artifact: &artifact,
+            retrieval_plan: &plan,
+            artifact_result: None,
+            provenance: None,
+            artifact_body: "Body.",
+            cited_source_paths: &cited,
+            build_record_id: None,
+        })
+        .unwrap();
+
+        let sidecar_str = std::fs::read_to_string(root.join(&output.metadata_path)).unwrap();
+        let sidecar: ArtifactSidecar = serde_json::from_str(&sidecar_str).unwrap();
+
+        // Narrow: only alpha + gamma (what was cited).
+        assert_eq!(
+            sidecar.source_document_ids,
+            vec!["src-alpha".to_string(), "src-gamma".to_string()],
+        );
+        // Wide: all four retrieval candidates.
+        assert_eq!(
+            sidecar.retrieval_candidates,
+            vec![
+                "src-alpha".to_string(),
+                "src-beta".to_string(),
+                "src-delta".to_string(),
+                "src-gamma".to_string(),
+            ],
+        );
+
+        // Answer frontmatter reflects the same narrowing.
+        let answer_md = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
+        // Extract the frontmatter only.
+        let fm = answer_md
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n").map(|(fm, _)| fm))
+            .unwrap();
+        let parsed: Value = serde_yaml::from_str(fm).unwrap();
+        let sdids: Vec<&str> = parsed
+            .get("source_document_ids")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(sdids, vec!["src-alpha", "src-gamma"]);
+        let rcs: Vec<&str> = parsed
+            .get("retrieval_candidates")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(rcs, vec!["src-alpha", "src-beta", "src-delta", "src-gamma"]);
     }
 }
