@@ -20,6 +20,7 @@ The following citation keys map to specific source locations. Use these keys whe
 4. If the sources do not contain enough information to answer fully, state what the sources do cover, answer what you can, then explicitly note what is missing or uncertain. Do not speculate or fill gaps with outside knowledge.
 5. Do **not** invent or hallucinate citations — only use keys from the manifest above. If a claim has no supporting source, remove the claim or flag it as unsupported.
 6. If the sources contradict each other, note the contradiction and cite both sides.
+7. Some sources include embedded images (diagrams, figures, screenshots) attached alongside this prompt. When an image is relevant to the answer, describe what you see and cite the source the image belongs to — don't invent image content when nothing is attached.
 
 ## Format
 

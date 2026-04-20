@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -174,6 +176,16 @@ pub struct AnswerQuestionRequest {
     /// landed where kb expects it.
     #[serde(default)]
     pub output_path: Option<String>,
+    /// Absolute paths to image assets referenced by the retrieval context.
+    ///
+    /// Adapters are expected to attach these to the LLM invocation so the
+    /// model can see the images instead of just their markdown references
+    /// (bn-3dkw — multimodal retrieval). The caller caps the list (typically
+    /// at 5) and is responsible for only passing files that actually exist.
+    /// Empty vec means "no images" — adapters must treat that as a cheap
+    /// no-op and not pay any attachment cost.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_paths: Vec<PathBuf>,
 }
 
 /// Response containing the answer to a question.

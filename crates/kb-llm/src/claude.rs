@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -389,10 +390,18 @@ impl LlmAdapter for ClaudeCliAdapter {
             .render(&context)
             .map_err(|err| LlmAdapterError::Other(format!("render ask template: {err}")))?;
 
+        // bn-3dkw: `claude` CLI doesn't expose a local-image attachment flag
+        // (`--file` expects an Anthropic-uploaded `file_id`, and `--add-dir`
+        // is a tool-access flag, not an attachment). Fall back to embedding
+        // each image as a base64 data URI inline in the prompt — Claude 4.X
+        // is multimodal and accepts data-URI images in user turns.
+        let content_with_images =
+            append_image_attachments_as_data_uris(&rendered.content, &request.image_paths)?;
+
         let prompt = RenderedPrompt {
             template_name: template.name,
             template_hash: template.template_hash,
-            content: rendered.content,
+            content: content_with_images,
             render_hash: rendered.render_hash,
         };
 
@@ -810,6 +819,115 @@ fn unix_time_ms() -> Result<u64, LlmAdapterError> {
         .map_err(|err| LlmAdapterError::Other(format!("timestamp overflow: {err}")))
 }
 
+/// Append a trailing "Attachments" section to `prompt` containing each image
+/// from `image_paths` as a markdown data-URI image.
+///
+/// bn-3dkw: the `claude` CLI does not accept local image paths directly — its
+/// `--file` flag wants a pre-uploaded Anthropic `file_id`, not a path on disk.
+/// Base64 data URIs in the prompt text are the cheapest portable fallback and
+/// Claude 4.X reads them as real image inputs.
+///
+/// A missing file is surfaced as a transport-style error so the caller can
+/// degrade gracefully rather than silently drop the attachment.
+fn append_image_attachments_as_data_uris(
+    prompt: &str,
+    image_paths: &[PathBuf],
+) -> Result<String, LlmAdapterError> {
+    if image_paths.is_empty() {
+        return Ok(prompt.to_string());
+    }
+
+    let mut out = String::with_capacity(prompt.len());
+    out.push_str(prompt);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("\n## Attachments\n\n");
+    out.push_str(
+        "The following images are referenced by the sources above. \
+         Inspect them when answering if they're relevant.\n\n",
+    );
+
+    for path in image_paths {
+        let bytes = std::fs::read(path).map_err(|err| {
+            LlmAdapterError::Other(format!(
+                "read image attachment {}: {err}",
+                path.display()
+            ))
+        })?;
+        let mime = guess_image_mime(path);
+        let encoded = base64_encode(&bytes);
+        let label = path
+            .file_name()
+            .map_or_else(|| "image".to_string(), |n| n.to_string_lossy().into_owned());
+        // writeln! into a String never fails; ignore the fmt::Result.
+        let _ = writeln!(out, "![{label}](data:{mime};base64,{encoded})");
+    }
+
+    Ok(out)
+}
+
+/// Minimal RFC 4648 base64 encoder (standard alphabet, with `=` padding).
+///
+/// bn-3dkw: the `base64` crate isn't in the workspace, and adding it for one
+/// call site is overkill. Output matches `data:`-URI encoding expectations.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    let mut iter = input.chunks_exact(3);
+    for chunk in iter.by_ref() {
+        let b0 = chunk[0];
+        let b1 = chunk[1];
+        let b2 = chunk[2];
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(ALPHABET[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(ALPHABET[(b2 & 0b11_1111) as usize] as char);
+    }
+    let rem = iter.remainder();
+    match rem.len() {
+        0 => {}
+        1 => {
+            let b0 = rem[0];
+            out.push(ALPHABET[(b0 >> 2) as usize] as char);
+            out.push(ALPHABET[((b0 & 0b11) << 4) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let b0 = rem[0];
+            let b1 = rem[1];
+            out.push(ALPHABET[(b0 >> 2) as usize] as char);
+            out.push(ALPHABET[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+            out.push(ALPHABET[((b1 & 0b1111) << 2) as usize] as char);
+            out.push('=');
+        }
+        _ => unreachable!("chunks_exact(3) remainder is 0, 1, or 2"),
+    }
+    out
+}
+
+/// Map a file extension to a MIME type for data URI embedding. Defaults to
+/// `application/octet-stream` so unknown extensions still produce a valid
+/// data URI (the model will just ignore them) rather than failing the call.
+fn guess_image_mime(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("bmp") => "image/bmp",
+        _ => "application/octet-stream",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1030,6 +1148,99 @@ mod tests {
 
         assert_eq!(response.status, "degraded");
         assert_eq!(response.details, Some("Error".to_string()));
+    }
+
+    #[test]
+    fn base64_encode_matches_known_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn append_image_attachments_embeds_data_uris_when_paths_present() {
+        // bn-3dkw: claude CLI has no local-image attach flag, so we append
+        // the images as base64 data URIs in the prompt. Verify the prompt
+        // grows with a markdown image reference per path.
+        let tmp = TempDir::new().expect("tmp");
+        let img = tmp.path().join("fig.png");
+        fs::write(&img, b"\x89PNG\r\n\x1a\n").expect("png");
+
+        let out = append_image_attachments_as_data_uris("prompt body", std::slice::from_ref(&img))
+            .expect("embed image");
+        assert!(out.starts_with("prompt body"));
+        assert!(out.contains("## Attachments"));
+        assert!(out.contains("data:image/png;base64,"));
+        assert!(out.contains("fig.png"));
+    }
+
+    #[test]
+    fn append_image_attachments_is_noop_when_empty() {
+        let out = append_image_attachments_as_data_uris("prompt body", &[]).expect("noop");
+        assert_eq!(out, "prompt body");
+    }
+
+    #[test]
+    fn answer_question_forwards_image_data_uris_to_claude_prompt() {
+        // bn-3dkw: the argv captured by the fake-claude harness must include
+        // the data-URI-embedded prompt so an actual Claude invocation would
+        // see the image bytes.
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-claude.sh");
+        let args_path = tmp.path().join("args.txt");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"result\":\"ok\"}}'\n",
+                args_path.display(),
+            ),
+        )
+        .expect("write fake claude script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let img = tmp.path().join("diagram.png");
+        fs::write(&img, b"\x89PNGfake").expect("png");
+
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+            command: script_path.display().to_string(),
+            model: None,
+            permission_mode: Some("default".to_string()),
+            timeout: Duration::from_secs(5),
+            project_root: None,
+        });
+
+        let (response, _prov) = adapter
+            .answer_question(AnswerQuestionRequest {
+                question: "describe the diagram".to_string(),
+                context: vec!["source".to_string()],
+                format: Some(String::new()),
+                template_name: None,
+                output_path: None,
+                image_paths: vec![img],
+            })
+            .expect("answer");
+        assert_eq!(response.answer, "ok");
+
+        let args = fs::read_to_string(&args_path).expect("captured args");
+        assert!(
+            args.contains("data:image/png;base64,"),
+            "claude argv must include data URI: {args}"
+        );
+        assert!(
+            args.contains("diagram.png"),
+            "claude argv must include image label: {args}"
+        );
     }
 
     #[test]

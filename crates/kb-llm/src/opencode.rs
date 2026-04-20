@@ -115,6 +115,20 @@ impl OpencodeAdapter {
 
     /// Build the shell command string for `opencode run`.
     fn build_command(&self, config_path: &Path, prompt: &str) -> String {
+        self.build_command_with_attachments(config_path, prompt, &[])
+    }
+
+    /// Build the shell command string for `opencode run`, appending one `-f`
+    /// flag per image attachment. `opencode run -f <path>` is repeatable
+    /// (declared as `[array]` in `opencode run --help`), and opencode is
+    /// routed to openai/gpt-5.4 which accepts multimodal inputs natively —
+    /// so each image path flows through as an attachment the model can see.
+    fn build_command_with_attachments(
+        &self,
+        config_path: &Path,
+        prompt: &str,
+        image_paths: &[PathBuf],
+    ) -> String {
         // OPENCODE_CONFIG env var is set inline before the command (sh -c handles this)
         let mut parts = vec![
             format!(
@@ -135,6 +149,11 @@ impl OpencodeAdapter {
         if let Some(ref session_id) = self.config.session_id {
             parts.push("--session".to_string());
             parts.push(shell_quote(session_id));
+        }
+
+        for image in image_paths {
+            parts.push("-f".to_string());
+            parts.push(shell_quote(&image.display().to_string()));
         }
 
         parts.push(shell_quote(prompt));
@@ -179,11 +198,20 @@ impl OpencodeAdapter {
 
     /// Generate config, invoke opencode, and return the stripped response text.
     fn run_prompt(&self, prompt: &str) -> Result<String, LlmAdapterError> {
+        self.run_prompt_with_attachments(prompt, &[])
+    }
+
+    /// Like [`run_prompt`](Self::run_prompt) but forwards `image_paths` as
+    /// `-f <path>` flags on the `opencode run` invocation.
+    fn run_prompt_with_attachments(
+        &self,
+        prompt: &str,
+        image_paths: &[PathBuf],
+    ) -> Result<String, LlmAdapterError> {
         // `_temp_dir` is held for the duration of the subprocess; its Drop removes
         // the config directory even if we panic or unwind here.
         let (_temp_dir, config_path) = self.write_config()?;
-        let command = self.build_command(&config_path, prompt);
-
+        let command = self.build_command_with_attachments(&config_path, prompt, image_paths);
         let result = run_shell_command(&command, self.config.timeout);
 
         let output = result.map_err(|e| match e {
@@ -401,7 +429,10 @@ impl LlmAdapter for OpencodeAdapter {
             .map_err(|err| LlmAdapterError::Other(format!("render ask template: {err}")))?;
 
         let started_at = unix_time_ms()?;
-        let answer = self.run_prompt(&rendered.content)?;
+        // bn-3dkw: forward image attachments as `-f <path>` flags so the
+        // multimodal model (gpt-5.4) can actually see them instead of just the
+        // markdown reference in the prompt text.
+        let answer = self.run_prompt_with_attachments(&rendered.content, &request.image_paths)?;
         let ended_at = unix_time_ms()?;
 
         let provenance = ProvenanceRecord {
@@ -835,6 +866,151 @@ mod tests {
         assert!(cmd.contains("fast"), "missing variant value: {cmd}");
         assert!(cmd.contains("--session"), "missing --session: {cmd}");
         assert!(cmd.contains("sess-123"), "missing session value: {cmd}");
+    }
+
+    #[test]
+    fn build_command_with_attachments_emits_f_flag_per_image() {
+        // bn-3dkw: each image must appear as its own `-f <path>` pair so
+        // opencode's yargs parser picks them up as an array.
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: "opencode".to_string(),
+            agent_name: "kb".to_string(),
+            ..Default::default()
+        });
+
+        let config_path = PathBuf::from("/tmp/opencode.json");
+        let images = [
+            PathBuf::from("/abs/a.png"),
+            PathBuf::from("/abs/b.jpg"),
+        ];
+        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &images);
+
+        let f_flag_count = cmd.matches("-f ").count();
+        assert_eq!(f_flag_count, 2, "expected two -f flags in: {cmd}");
+        assert!(cmd.contains("/abs/a.png"), "missing a.png in: {cmd}");
+        assert!(cmd.contains("/abs/b.jpg"), "missing b.jpg in: {cmd}");
+    }
+
+    #[test]
+    fn build_command_omits_f_flag_when_no_attachments() {
+        let adapter = OpencodeAdapter::new(OpencodeConfig::default());
+        let config_path = PathBuf::from("/tmp/opencode.json");
+        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &[]);
+        assert!(
+            !cmd.contains(" -f "),
+            "no -f flag expected when image_paths empty: {cmd}"
+        );
+    }
+
+    #[test]
+    fn answer_question_forwards_image_paths_to_opencode_cli() {
+        // bn-3dkw integration: the image paths on AnswerQuestionRequest reach
+        // the opencode subprocess invocation as `-f <path>` args. Uses a
+        // fake-opencode script that captures argv to disk.
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-opencode.sh");
+        let args_path = tmp.path().join("args.txt");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'answer from opencode'\n",
+                args_path.display(),
+            ),
+        )
+        .expect("write fake opencode script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let image_one = tmp.path().join("pic1.png");
+        let image_two = tmp.path().join("pic2.png");
+        fs::write(&image_one, b"\x89PNG1").expect("pic1");
+        fs::write(&image_two, b"\x89PNG2").expect("pic2");
+
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: script_path.display().to_string(),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+
+        let (response, _provenance) = adapter
+            .answer_question(AnswerQuestionRequest {
+                question: "what does the diagram show?".to_string(),
+                context: vec!["source body with ![d](pic.png)".to_string()],
+                format: Some(String::new()),
+                template_name: None,
+                output_path: None,
+                image_paths: vec![image_one.clone(), image_two.clone()],
+            })
+            .expect("answer");
+
+        assert_eq!(response.answer, "answer from opencode");
+
+        let args = fs::read_to_string(&args_path).expect("captured args");
+        // Each line is one positional argument. Count the `-f` flags and
+        // verify both image paths appear in argv.
+        let f_lines = args.lines().filter(|line| line == &"-f").count();
+        assert_eq!(f_lines, 2, "expected two -f flags in captured args: {args}");
+        assert!(
+            args.contains(image_one.to_str().expect("utf8")),
+            "missing first image in args: {args}"
+        );
+        assert!(
+            args.contains(image_two.to_str().expect("utf8")),
+            "missing second image in args: {args}"
+        );
+    }
+
+    #[test]
+    fn answer_question_with_no_images_omits_f_flag() {
+        // bn-3dkw zero-cost fast path: image_paths empty => no `-f` in argv.
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-opencode.sh");
+        let args_path = tmp.path().join("args.txt");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'answer without images'\n",
+                args_path.display(),
+            ),
+        )
+        .expect("write fake opencode");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: script_path.display().to_string(),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+
+        let _ = adapter
+            .answer_question(AnswerQuestionRequest {
+                question: "text-only?".to_string(),
+                context: vec!["plain source text".to_string()],
+                format: Some(String::new()),
+                template_name: None,
+                output_path: None,
+                image_paths: Vec::new(),
+            })
+            .expect("answer");
+
+        let args = fs::read_to_string(&args_path).expect("captured args");
+        assert!(
+            !args.lines().any(|l| l == "-f"),
+            "no -f flag expected for empty image_paths: {args}"
+        );
     }
 
     #[test]

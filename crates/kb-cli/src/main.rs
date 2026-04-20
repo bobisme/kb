@@ -1676,6 +1676,18 @@ fn run_ask(
     let citation_manifest = kb_query::build_citation_manifest(&assembled);
     let manifest_text = kb_query::render_manifest_for_prompt(&citation_manifest);
 
+    // bn-3dkw: multimodal retrieval. For each candidate, pull out any local
+    // image refs in its body and hand the absolute paths to the adapter so
+    // the LLM actually sees the images. Capped at MAX_IMAGES_PER_QUERY to
+    // stop context from blowing up on image-heavy corpora, and gated by a
+    // cheap "does any candidate mention an image?" check so the common
+    // text-only path pays nothing.
+    let image_paths = if kb_query::plan_mentions_images(root, &retrieval_plan) {
+        kb_query::resolve_candidate_image_paths(root, &retrieval_plan)
+    } else {
+        Vec::new()
+    };
+
     let (template_override, output_path_override) = if requested_format == "chart" {
         (
             Some("ask_chart.md"),
@@ -1695,6 +1707,7 @@ fn run_ask(
         &manifest_text,
         template_override,
         output_path_override.as_deref(),
+        &image_paths,
     );
 
     // Chart format rejects silent fallbacks. If the LLM call failed OR the
@@ -2000,6 +2013,10 @@ fn run_ask(
     Ok(())
 }
 
+// bn-3dkw: `image_paths` brings the arity to 8. The helper only has one caller
+// (`run_ask`) and each param is a distinct concern, so bundling them into a
+// struct is more ceremony than the site is worth.
+#[allow(clippy::too_many_arguments)]
 fn try_generate_answer(
     cfg: &Config,
     root: &Path,
@@ -2008,6 +2025,7 @@ fn try_generate_answer(
     manifest_text: &str,
     template_name: Option<&str>,
     output_path: Option<&str>,
+    image_paths: &[PathBuf],
 ) -> Result<(kb_query::ArtifactResult, kb_llm::ProvenanceRecord)> {
     let adapter = create_ask_adapter(cfg, root)?;
 
@@ -2017,6 +2035,7 @@ fn try_generate_answer(
         format: Some(manifest_text.to_string()),
         template_name: template_name.map(str::to_string),
         output_path: output_path.map(str::to_string),
+        image_paths: image_paths.to_vec(),
     };
 
     let (llm_response, provenance) = adapter
