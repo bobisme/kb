@@ -84,6 +84,7 @@ pub fn run_backlinks_pass(root: &Path) -> Result<Vec<BacklinksArtifact>> {
         &mut concept_backlinks,
         &mut source_referenced_by,
     )?;
+    collect_mention_backlinks(&concept_pages, &source_pages, &mut concept_backlinks)?;
 
     let mut artifacts = Vec::with_capacity(concept_pages.len() + source_pages.len());
 
@@ -328,6 +329,270 @@ fn collect_frontmatter_source_backlinks(
     }
 
     Ok(())
+}
+
+/// Minimum token length for mention-based backlinks. Tokens shorter than this
+/// (e.g. "a", "of", "it") would cause extreme false-positive rates, so they're
+/// skipped entirely when derived from concept names or aliases.
+const MIN_MENTION_TOKEN_LEN: usize = 3;
+
+/// Aliases equal to one of these (case-insensitive, after normalization) are
+/// skipped when building mention tokens. These are generic English words that
+/// concepts occasionally list as aliases but would flood every source page.
+const MENTION_STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "are", "was", "has",
+    "have", "not", "but", "all", "any", "can", "its", "one", "two", "new",
+    "use", "via",
+];
+
+/// For each concept page, collect its `name` + `aliases` as mention tokens and
+/// scan every source page's body. A source page that mentions a concept token
+/// as a standalone word (case-insensitive, Unicode word boundaries) OR that
+/// contains a `[[<slug>]]`-style wiki-link whose normalized target matches the
+/// concept's slug or an alias slug is added to the concept's backlinks set.
+///
+/// This is additive on top of the source_document_ids-gated primary path, and
+/// is deduped via the `concept_backlinks` `BTreeSet`.
+fn collect_mention_backlinks(
+    concept_pages: &BTreeMap<String, PathBuf>,
+    source_pages: &BTreeMap<String, PathBuf>,
+    concept_backlinks: &mut BTreeMap<String, BTreeSet<String>>,
+) -> Result<()> {
+    // Per-concept tokens + slug matchers, precomputed once.
+    struct ConceptMatcher {
+        concept_id: String,
+        word_regex: Option<Regex>,
+        /// Wiki-link target slugs (full `wiki/concepts/<slug>`) that should
+        /// count as a mention of this concept.
+        slug_targets: BTreeSet<String>,
+    }
+
+    let mut matchers: Vec<ConceptMatcher> = Vec::with_capacity(concept_pages.len());
+    for (concept_id, path) in concept_pages {
+        let markdown = std::fs::read_to_string(path)
+            .with_context(|| format!("read concept page {}", path.display()))?;
+        let (name_opt, alias_tokens, alias_slugs) = match split_frontmatter(&markdown) {
+            Some((fm, _body)) => parse_concept_name_and_aliases(&fm),
+            None => (None, Vec::new(), Vec::new()),
+        };
+
+        // Build the set of word tokens to match: concept name + aliases, each
+        // filtered by length and stopwords. Names/aliases map to tokens via
+        // `normalize_mention_token`.
+        let mut tokens: BTreeSet<String> = BTreeSet::new();
+        if let Some(name) = name_opt.as_ref() {
+            if let Some(t) = normalize_mention_token(name) {
+                tokens.insert(t);
+            }
+        }
+        for alias in &alias_tokens {
+            if let Some(t) = normalize_mention_token(alias) {
+                tokens.insert(t);
+            }
+        }
+
+        // Build wiki-link slug targets: the concept's own page id, plus any
+        // slug-normalized aliases under wiki/concepts/. This lets an alias
+        // written as `[[aliases-slug]]` route to its concept.
+        let mut slug_targets: BTreeSet<String> = BTreeSet::new();
+        slug_targets.insert(concept_id.clone());
+        for slug in alias_slugs {
+            if !slug.is_empty() {
+                slug_targets.insert(format!("wiki/concepts/{slug}"));
+            }
+        }
+
+        let word_regex = if tokens.is_empty() {
+            None
+        } else {
+            // Case-insensitive, Unicode-aware word boundaries. `regex::Regex`
+            // uses Unicode word boundaries by default.
+            let pattern = tokens
+                .iter()
+                .map(|t| regex::escape(t))
+                .collect::<Vec<_>>()
+                .join("|");
+            let full = format!(r"(?i)\b(?:{pattern})\b");
+            Some(Regex::new(&full).with_context(|| format!("compile mention regex for {concept_id}"))?)
+        };
+
+        matchers.push(ConceptMatcher {
+            concept_id: concept_id.clone(),
+            word_regex,
+            slug_targets,
+        });
+    }
+
+    let wiki_link_re = Regex::new(r"\[\[([^\]\r\n]+)\]\]").context("compile wikilink regex")?;
+
+    // Scan each source page body once and test every concept matcher against it.
+    for (source_id, path) in source_pages {
+        let markdown = std::fs::read_to_string(path)
+            .with_context(|| format!("read source page {}", path.display()))?;
+        let body = match split_frontmatter(&markdown) {
+            Some((_fm, body)) => body,
+            None => markdown.clone(),
+        };
+
+        // Precollect the normalized wiki-link targets present in this body.
+        let mut wiki_targets: BTreeSet<String> = BTreeSet::new();
+        // Also collect raw bare forms (e.g. `[[raft]]` -> "raft") so we can
+        // match alias-slug style links that don't carry a `wiki/concepts/` prefix.
+        let mut bare_targets: BTreeSet<String> = BTreeSet::new();
+        for capture in wiki_link_re.captures_iter(&body) {
+            let Some(raw) = capture.get(1).map(|c| c.as_str()) else {
+                continue;
+            };
+            if let Some(target) = normalize_wiki_link(raw) {
+                wiki_targets.insert(target);
+            }
+            // Bare form: strip alias/anchor but don't require `wiki/concepts/` prefix.
+            if let Some(bare) = bare_wiki_link_slug(raw) {
+                bare_targets.insert(bare);
+            }
+        }
+
+        for matcher in &matchers {
+            let mut hit = false;
+
+            // 1) wiki-link match against any known slug target for this concept.
+            for target in &matcher.slug_targets {
+                if wiki_targets.contains(target) {
+                    hit = true;
+                    break;
+                }
+                // Bare-form match: compare the final path segment.
+                if let Some(slug) = target.rsplit('/').next() {
+                    if bare_targets.contains(slug) {
+                        hit = true;
+                        break;
+                    }
+                }
+            }
+
+            // 2) word-boundary match on concept name/aliases.
+            if !hit {
+                if let Some(re) = matcher.word_regex.as_ref() {
+                    if re.is_match(&body) {
+                        hit = true;
+                    }
+                }
+            }
+
+            if hit {
+                if let Some(referers) = concept_backlinks.get_mut(&matcher.concept_id) {
+                    referers.insert(source_id.clone());
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Extract the `name` string and `aliases` sequence from a concept's YAML
+/// frontmatter. Returns `(name, alias_strings, alias_slugs)`. Alias slugs are
+/// the slug-form aliases useful for `[[<slug>]]`-style wiki-link matching
+/// (dashed, lowercase), distinct from the raw alias strings which are used as
+/// word-boundary tokens.
+fn parse_concept_name_and_aliases(fm: &str) -> (Option<String>, Vec<String>, Vec<String>) {
+    let Ok(parsed) = serde_yaml::from_str::<Value>(fm) else {
+        return (None, Vec::new(), Vec::new());
+    };
+    let name = parsed
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let mut aliases: Vec<String> = Vec::new();
+    let mut alias_slugs: Vec<String> = Vec::new();
+    if let Some(seq) = parsed.get("aliases").and_then(|v| v.as_sequence()) {
+        for entry in seq {
+            if let Some(s) = entry.as_str() {
+                aliases.push(s.to_string());
+                alias_slugs.push(slugify_for_wiki_link(s));
+            }
+        }
+    }
+    (name, aliases, alias_slugs)
+}
+
+/// Normalize an alias/name string into a word-boundary-matched mention token,
+/// or return `None` if the alias should be skipped (too short, stopword, or
+/// contains no word characters).
+fn normalize_mention_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Require the token to contain at least one alphanumeric character.
+    if !trimmed.chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    if trimmed.chars().count() < MIN_MENTION_TOKEN_LEN {
+        return None;
+    }
+    let lower = trimmed.to_lowercase();
+    if MENTION_STOPWORDS.contains(&lower.as_str()) {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Slugify an alias for wiki-link target matching: lowercase, ASCII, spaces
+/// become dashes. This is a lightweight slug that aligns with how concept
+/// page ids are produced.
+fn slugify_for_wiki_link(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.trim().chars() {
+        if ch.is_alphanumeric() {
+            for c in ch.to_lowercase() {
+                out.push(c);
+            }
+        } else if (ch.is_whitespace() || ch == '-' || ch == '_')
+            && !out.ends_with('-')
+        {
+            out.push('-');
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Strip alias, anchor, leading paths, and `.md` suffix from a raw wiki-link
+/// target, returning just the final path segment (bare slug). Unlike
+/// `normalize_wiki_link`, this does not require a `wiki/concepts/` prefix.
+fn bare_wiki_link_slug(raw: &str) -> Option<String> {
+    let without_alias = raw.split('|').next()?.trim();
+    if without_alias.is_empty() {
+        return None;
+    }
+    let without_anchor = without_alias
+        .split('#')
+        .next()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())?;
+    if without_anchor.starts_with("http://")
+        || without_anchor.starts_with("https://")
+        || without_anchor.starts_with("mailto:")
+        || without_anchor.starts_with('#')
+    {
+        return None;
+    }
+    let mut target = without_anchor.trim_start_matches("./");
+    target = target.trim_start_matches('/');
+    if std::path::Path::new(target)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        target = target.trim_end_matches(".md");
+    }
+    target = target.trim_end_matches('/');
+    let last = target.rsplit('/').next().unwrap_or(target).trim();
+    if last.is_empty() {
+        None
+    } else {
+        Some(last.to_string())
+    }
 }
 
 /// Split YAML frontmatter from a markdown document. Returns `(frontmatter_yaml, body)`.
@@ -834,6 +1099,151 @@ mod tests {
             src_a.updated_markdown.contains("- [[wiki/concepts/topic]]"),
             "src-a should list topic under Referenced by concepts:\n{}",
             src_a.updated_markdown
+        );
+    }
+
+    #[test]
+    fn mention_backlinks_credit_sources_that_mention_concept_name_or_aliases() {
+        let root = tempdir().expect("tempdir");
+
+        // Authoritative source for the Raft concept.
+        write(
+            &root.path().join("wiki/sources/src-a.md"),
+            "---\nid: wiki-source-src-a\ntype: source\ntitle: Raft overview\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Raft overview\n\nRaft is a consensus algorithm.\n",
+        );
+        // Source that only mentions the concept's name as a standalone word.
+        // Also contains the word "aircraft" to exercise word-boundary correctness.
+        write(
+            &root.path().join("wiki/sources/src-b.md"),
+            "---\nid: wiki-source-src-b\ntype: source\ntitle: Read paths\nsource_document_id: src-b\nsource_revision_id: rev-b\n---\n# Read paths\n\nThe Raft leader serves linearizable reads. An aircraft reference should NOT match.\n",
+        );
+        // Source that references the concept via an alias-only mention.
+        write(
+            &root.path().join("wiki/sources/src-c.md"),
+            "---\nid: wiki-source-src-c\ntype: source\ntitle: Alias mentions\nsource_document_id: src-c\nsource_revision_id: rev-c\n---\n# Alias\n\nSome systems use Raft-Consensus heavily in the design.\n",
+        );
+        // Unrelated source that should NOT be credited.
+        write(
+            &root.path().join("wiki/sources/src-d.md"),
+            "---\nid: wiki-source-src-d\ntype: source\ntitle: Unrelated\nsource_document_id: src-d\nsource_revision_id: rev-d\n---\n# Unrelated\n\nThe word craft appears here and also aircraft, but no consensus algorithm.\n",
+        );
+
+        // Concept page sourced only from src-a; name "Raft", one alias.
+        write(
+            &root.path().join("wiki/concepts/raft.md"),
+            "---\nid: concept:raft\nname: Raft\naliases:\n- Raft-Consensus\nsource_document_ids:\n- src-a\n---\n\n# Raft\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/raft.md"))
+            .expect("concept artifact");
+
+        // Authoritative (source_document_ids) path must still work.
+        assert!(
+            concept.updated_markdown.contains("- [[wiki/sources/src-a]]"),
+            "concept should backlink to authoritative src-a:\n{}",
+            concept.updated_markdown
+        );
+        // Mention scan picks up the standalone "Raft" word in src-b.
+        assert!(
+            concept.updated_markdown.contains("- [[wiki/sources/src-b]]"),
+            "concept should backlink to src-b via name mention:\n{}",
+            concept.updated_markdown
+        );
+        // Mention scan picks up the alias "Raft-Consensus" in src-c.
+        assert!(
+            concept.updated_markdown.contains("- [[wiki/sources/src-c]]"),
+            "concept should backlink to src-c via alias mention:\n{}",
+            concept.updated_markdown
+        );
+        // Word-boundary correctness: "aircraft" / "craft" must NOT credit src-d.
+        assert!(
+            !concept.updated_markdown.contains("- [[wiki/sources/src-d]]"),
+            "concept must NOT backlink to src-d (substring-only match):\n{}",
+            concept.updated_markdown
+        );
+
+        // Dedup: src-a should appear only once despite being listed both as an
+        // authoritative source and (trivially) matching its own mention regex.
+        let a_count = concept
+            .updated_markdown
+            .matches("- [[wiki/sources/src-a]]")
+            .count();
+        assert_eq!(a_count, 1, "src-a should appear exactly once");
+    }
+
+    #[test]
+    fn mention_backlinks_skip_short_aliases_and_stopwords() {
+        let root = tempdir().expect("tempdir");
+
+        write(
+            &root.path().join("wiki/sources/src-a.md"),
+            "---\nid: wiki-source-src-a\ntype: source\ntitle: Generic\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Source\n\nThe quick brown fox jumps and AI rules the day.\n",
+        );
+
+        // Concept with name "ArtificialIntelligence" but aliases "AI" (too short)
+        // and "the" (stopword). Only the long name should produce a token.
+        write(
+            &root.path().join("wiki/concepts/ai.md"),
+            "---\nid: concept:ai\nname: ArtificialIntelligence\naliases:\n- AI\n- the\n---\n\n# AI\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/ai.md"))
+            .expect("concept artifact");
+
+        // "AI" and "the" appear in src-a but must NOT credit it (short/stopword).
+        // The long name "ArtificialIntelligence" does not appear in src-a.
+        assert!(
+            !concept.updated_markdown.contains("- [[wiki/sources/src-a]]"),
+            "short alias 'AI' and stopword 'the' must not trigger a mention backlink:\n{}",
+            concept.updated_markdown
+        );
+    }
+
+    #[test]
+    fn mention_backlinks_word_boundary_does_not_match_substring() {
+        let root = tempdir().expect("tempdir");
+
+        // Source body mentions "TSGD" and "SGDM" (should not match "SGD") and
+        // "SGD" as a standalone word (should match).
+        write(
+            &root.path().join("wiki/sources/src-with-sgd.md"),
+            "---\nid: wiki-source-src-with-sgd\ntype: source\ntitle: Optimizers\nsource_document_id: src-x\nsource_revision_id: rev-x\n---\n# Optimizers\n\nSGD is classic. TSGD and SGDM are variants.\n",
+        );
+        write(
+            &root.path().join("wiki/sources/src-substring-only.md"),
+            "---\nid: wiki-source-src-substring-only\ntype: source\ntitle: Substrings only\nsource_document_id: src-y\nsource_revision_id: rev-y\n---\n# Substrings\n\nOnly TSGD and SGDM appear here, never the standalone form.\n",
+        );
+
+        write(
+            &root.path().join("wiki/concepts/sgd.md"),
+            "---\nid: concept:sgd\nname: SGD\n---\n\n# SGD\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/sgd.md"))
+            .expect("concept artifact");
+
+        assert!(
+            concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-with-sgd]]"),
+            "concept should backlink to source with standalone SGD:\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            !concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-substring-only]]"),
+            "concept must NOT backlink via substring-only matches (TSGD, SGDM):\n{}",
+            concept.updated_markdown
         );
     }
 }
