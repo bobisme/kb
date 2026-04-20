@@ -1164,7 +1164,11 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
         && !flags.json
         && !forget::confirm_on_stderr(&plan)?
     {
-        bail!("forget aborted by user");
+        // Declining the confirmation is the "user changed their mind" happy
+        // path — return Ok so exit code is 0 and the job manifest records
+        // Succeeded (nothing was done, nothing failed).
+        println!("forget cancelled");
+        return Ok(());
     }
 
     let backlinks_refreshed = forget::execute(root, &plan)?;

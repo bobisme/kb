@@ -4497,6 +4497,91 @@ fn status_surfaces_sources_with_missing_origin() {
     );
 }
 
+/// bn-32t: declining the `[y/N]` confirmation prompt is the happy path
+/// ("user changed their mind"), not an error. `kb forget src-X` with `n`
+/// must exit 0, leave the source on disk, and NOT surface as a failed job
+/// in `kb status`.
+#[test]
+fn forget_declined_prompt_exits_zero_and_is_noop() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("keep.md");
+    fs::write(&source, "# hi\n\ncontent\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let normalized_dir = kb_root.join("normalized").join(&src_id);
+    let raw_dir = kb_root.join("raw/inbox").join(&src_id);
+    let wiki_page = kb_root.join("wiki/sources").join(format!("{src_id}.md"));
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("forget").arg(&src_id).write_stdin("n\n");
+    let output = cmd.output().expect("run kb forget with declined prompt");
+
+    assert!(
+        output.status.success(),
+        "kb forget should exit 0 when user declines the prompt; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("forget cancelled"),
+        "expected 'forget cancelled' in stdout, got: {stdout}"
+    );
+
+    // Source must still be on disk — declining is a no-op.
+    assert!(normalized_dir.exists(), "normalized dir must remain");
+    assert!(raw_dir.exists(), "raw/inbox dir must remain");
+    assert!(wiki_page.exists(), "wiki source page must remain");
+
+    // Declined forget must not surface as a failed job in `kb status`.
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let status_output = status_cmd.output().expect("run kb status");
+    assert!(status_output.status.success());
+    let envelope: Value =
+        serde_json::from_slice(&status_output.stdout).expect("parse status json");
+    let recent = envelope["data"]["recent_jobs"]
+        .as_array()
+        .expect("recent_jobs");
+    let failed_forgets: Vec<&Value> = recent
+        .iter()
+        .filter(|j| j["command"] == "forget" && j["status"] == "failed")
+        .collect();
+    assert!(
+        failed_forgets.is_empty(),
+        "declined forget should not appear as a failed job: {failed_forgets:?}"
+    );
+}
+
+/// bn-32t: pressing Enter at the `[y/N]` prompt (empty input) also declines
+/// and exits 0. Mirrors the `n`/`N` behavior.
+#[test]
+fn forget_empty_prompt_response_declines_and_exits_zero() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("keep2.md");
+    fs::write(&source, "# hi\n\ncontent\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let normalized_dir = kb_root.join("normalized").join(&src_id);
+
+    let mut cmd = kb_cmd(&kb_root);
+    // Empty line: just press Enter.
+    cmd.arg("forget").arg(&src_id).write_stdin("\n");
+    let output = cmd.output().expect("run kb forget with empty prompt");
+
+    assert!(
+        output.status.success(),
+        "kb forget should exit 0 on empty (default-No) input; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(normalized_dir.exists(), "normalized dir must remain");
+}
+
 /// F1/F2: after `kb forget`, `kb status` must no longer list the removed
 /// source — both `normalized_source_count` and `sources_with_missing_origin`
 /// should be empty with respect to it.
