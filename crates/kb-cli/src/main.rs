@@ -3,6 +3,7 @@
 mod config;
 mod init;
 mod jobs;
+mod jobs_cmd;
 mod publish;
 mod review;
 mod root;
@@ -37,7 +38,7 @@ struct JsonEnvelope {
     errors: Vec<String>,
 }
 
-fn emit_json<T: Serialize>(command: &str, data: T) -> Result<()> {
+pub(crate) fn emit_json<T: Serialize>(command: &str, data: T) -> Result<()> {
     let envelope = JsonEnvelope {
         schema_version: 1,
         command: command.to_string(),
@@ -159,6 +160,51 @@ enum Command {
     Review {
         #[command(subcommand)]
         action: ReviewAction,
+    },
+    /// Inspect and prune job-run manifests under `state/jobs/`
+    Jobs {
+        #[command(subcommand)]
+        action: Option<JobsAction>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum JobsAction {
+    /// List job runs filtered by status, with log paths.
+    List {
+        /// Show interrupted job runs.
+        #[arg(long)]
+        interrupted: bool,
+        /// Show failed job runs.
+        #[arg(long)]
+        failed: bool,
+        /// Page size (default: 50).
+        #[arg(long, default_value_t = 50)]
+        page_size: usize,
+        /// 1-based page index (default: 1).
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+    },
+    /// Move old job-run manifests (and their logs) into `trash/jobs-<ts>/`.
+    ///
+    /// The prune is explicit, non-recursive, and requires at least one of
+    /// `--interrupted`, `--failed`, or `--all`. A root lock is held for the
+    /// duration — status/doctor readers stay consistent.
+    Prune {
+        /// Prune interrupted job runs.
+        #[arg(long)]
+        interrupted: bool,
+        /// Prune failed job runs.
+        #[arg(long)]
+        failed: bool,
+        /// Prune both interrupted AND failed job runs.
+        #[arg(long)]
+        all: bool,
+        /// Only prune manifests whose `started_at` is older than this many
+        /// days. Default: 7. Pass `0` to prune everything matching the
+        /// selected status (useful for tests / one-off cleanup).
+        #[arg(long, default_value_t = 7)]
+        older_than: u64,
     },
 }
 
@@ -430,6 +476,44 @@ fn run(cli: Cli) -> Result<()> {
                 ReviewAction::Reject { id, reason } => {
                     execute_mutating_command(Some(review_root), "review.reject", move || {
                         review::run_review_reject(review_root, &id, reason.as_deref(), json, &json_emitter)
+                    })
+                }
+            }
+        }
+        Some(Command::Jobs { action }) => {
+            let jobs_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            let json = cli.json;
+            match action {
+                None => {
+                    // No default action: print help text and bail out. Echoes
+                    // clap's convention for subcommand groups without a
+                    // sensible "top-level verb" (cf. `kb review` with no
+                    // action also prints help).
+                    println!("kb jobs: inspect and prune job-run manifests");
+                    println!();
+                    println!("USAGE:");
+                    println!("  kb jobs list --interrupted|--failed [--page N --page-size N]");
+                    println!("  kb jobs prune --interrupted|--failed|--all [--older-than DAYS]");
+                    println!();
+                    println!("Run 'kb jobs --help' for details.");
+                    Ok(())
+                }
+                Some(JobsAction::List {
+                    interrupted,
+                    failed,
+                    page_size,
+                    page,
+                }) => jobs_cmd::run_list(jobs_root, interrupted, failed, page, page_size, json),
+                Some(JobsAction::Prune {
+                    interrupted,
+                    failed,
+                    all,
+                    older_than,
+                }) => {
+                    execute_mutating_command(Some(jobs_root), "jobs.prune", move || {
+                        jobs_cmd::run_prune(jobs_root, interrupted, failed, all, older_than, json)
                     })
                 }
             }
@@ -2649,7 +2733,10 @@ struct StatusPayload {
     failed_jobs: Vec<JobRun>,
     /// Total count of failed jobs, including those truncated from `failed_jobs`.
     failed_jobs_total: usize,
+    /// Interrupted job runs, capped at `INTERRUPTED_JOBS_DISPLAY_LIMIT` most recent.
     interrupted_jobs: Vec<JobRun>,
+    /// Total count of interrupted jobs, including those truncated from `interrupted_jobs`.
+    interrupted_jobs_total: usize,
     /// Normalized source directories whose contents haven't been compiled yet,
     /// each annotated (when available) with the original filename/URL the
     /// source was ingested from so users can grep by filename — not just the
@@ -2684,6 +2771,15 @@ struct ChangedInput {
 /// typo/bad-path failures accrue indefinitely and would otherwise drown the
 /// signal in every `kb status` invocation.
 const FAILED_JOBS_DISPLAY_LIMIT: usize = 10;
+
+/// Maximum number of interrupted jobs shown in text `kb status` output.
+/// Kept smaller than the failed-jobs cap (10) because interrupted runs
+/// are ALSO flagged with a per-run "→ Inspect the logs and rerun" footer
+/// that would otherwise turn `kb status` into a wall of remediation text
+/// on any machine that's been SIGINT'd a few times. Cap 5 keeps the
+/// status page compact; the `... and N more` hint points at `kb jobs
+/// prune --interrupted` for cleanup.
+const INTERRUPTED_JOBS_DISPLAY_LIMIT: usize = 5;
 
 fn gather_status(root: &Path) -> Result<StatusPayload> {
     let graph = Graph::load_from(root)?;
@@ -2728,10 +2824,19 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         }
     }
 
+    // Interrupted jobs: mirror the failed-jobs treatment below. Every
+    // SIGINT/SIGPIPE/OS-crash leaves a manifest behind, so this list grows
+    // without bound. Cap the rendered slice at
+    // `INTERRUPTED_JOBS_DISPLAY_LIMIT` and keep the honest total on
+    // `interrupted_jobs_total` for the header and JSON consumers.
+    let interrupted_jobs_total = all_jobs
+        .iter()
+        .filter(|j| j.status == JobRunStatus::Interrupted)
+        .count();
     let interrupted_jobs: Vec<_> = all_jobs
         .iter()
         .filter(|j| j.status == JobRunStatus::Interrupted)
-        .take(20)
+        .take(INTERRUPTED_JOBS_DISPLAY_LIMIT)
         .cloned()
         .collect();
 
@@ -2769,6 +2874,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         failed_jobs,
         failed_jobs_total,
         interrupted_jobs,
+        interrupted_jobs_total,
         changed_inputs_not_compiled,
     })
 }
@@ -3120,7 +3226,11 @@ fn print_status(status: &StatusPayload) {
     }
 
     if !status.interrupted_jobs.is_empty() {
-        println!("⚠ interrupted job runs ({}):", status.interrupted_jobs.len());
+        // Header reflects the TRUE total so users see the real backlog;
+        // the detail list is capped to keep status output compact (see
+        // `INTERRUPTED_JOBS_DISPLAY_LIMIT`). A "... and N more" hint
+        // points users at `kb jobs prune --interrupted` to clean up.
+        println!("⚠ interrupted job runs ({}):", status.interrupted_jobs_total);
         for job in &status.interrupted_jobs {
             let duration = job
                 .ended_at_millis
@@ -3133,6 +3243,12 @@ fn print_status(status: &StatusPayload) {
                 format!("{:?}", job.status),
                 job.command,
                 duration_str
+            );
+        }
+        if status.interrupted_jobs_total > status.interrupted_jobs.len() {
+            let hidden = status.interrupted_jobs_total - status.interrupted_jobs.len();
+            println!(
+                "  ... and {hidden} more (run 'kb jobs prune --interrupted' to clean up)"
             );
         }
         println!("  → Inspect the logs and rerun: kb {}",

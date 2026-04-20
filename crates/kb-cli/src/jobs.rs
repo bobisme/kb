@@ -69,7 +69,7 @@ pub struct LockMetadata {
     pub started_at_millis: u64,
 }
 
-fn jobs_dir(root: &Path) -> PathBuf {
+pub fn jobs_dir(root: &Path) -> PathBuf {
     root.join("state").join("jobs")
 }
 

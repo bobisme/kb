@@ -3241,6 +3241,343 @@ fn status_caps_failed_jobs_at_ten_with_more_hint() {
     );
 }
 
+/// Seed an interrupted `JobRun` manifest for cap + prune tests. Mirrors
+/// `seed_failed_job` but with `"interrupted"` status and a default
+/// command of `"compile"` (the most realistic source — user hits ^C
+/// during a long compile, leaves a manifest behind).
+fn seed_interrupted_job(root: &Path, id: &str, started_at_millis: u64) {
+    let jobs_dir = root.join("state/jobs");
+    fs::create_dir_all(&jobs_dir).expect("create state/jobs");
+    let manifest = serde_json::json!({
+        "metadata": {
+            "id": id,
+            "created_at_millis": started_at_millis,
+            "updated_at_millis": started_at_millis,
+            "source_hashes": [],
+            "model_version": null,
+            "tool_version": "kb-cli/0.1.0",
+            "prompt_template_hash": null,
+            "dependencies": [],
+            "output_paths": [],
+            "status": "fresh"
+        },
+        "command": "compile",
+        "root_path": root,
+        "started_at_millis": started_at_millis,
+        "ended_at_millis": started_at_millis + 42,
+        "status": "interrupted",
+        "log_path": null,
+        "affected_outputs": [],
+        "pid": 99_999,
+        "exit_code": 130
+    });
+    fs::write(
+        jobs_dir.join(format!("{id}.json")),
+        manifest.to_string(),
+    )
+    .expect("write interrupted job manifest");
+}
+
+/// bn-3qn part 1: `kb status` must cap interrupted-job detail lines at
+/// 5 (mirrors bn-2cr's 10-cap for failed jobs, but tighter — each
+/// interrupted entry also gets a per-section "Inspect the logs" footer
+/// so 20+ entries turn status into a wall of remediation text).
+#[test]
+fn status_caps_interrupted_jobs_at_five_with_more_hint() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed 20 interrupted jobs with strictly-increasing timestamps so
+    // sort order is deterministic.
+    for i in 0u32..20 {
+        seed_interrupted_job(&kb_root, &format!("intr-{i:02}"), 1_000 + u64::from(i));
+    }
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(
+        output.status.success(),
+        "kb status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Header reflects the true total.
+    assert!(
+        stdout.contains("interrupted job runs (20):"),
+        "header should report true total of 20; got: {stdout}"
+    );
+
+    // Body is capped at 5 detail lines (ids like `intr-NN`).
+    let detail_lines = stdout
+        .lines()
+        .filter(|line| line.starts_with("  intr-"))
+        .count();
+    assert_eq!(
+        detail_lines, 5,
+        "exactly 5 interrupted detail lines should render; got {detail_lines}\nfull: {stdout}"
+    );
+
+    // "... and 15 more (run 'kb jobs prune --interrupted' ...)" hint.
+    assert!(
+        stdout.contains("... and 15 more"),
+        "expected '... and 15 more' hint; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("kb jobs prune --interrupted"),
+        "hint should point at `kb jobs prune --interrupted`; got: {stdout}"
+    );
+
+    // JSON payload: `interrupted_jobs_total` = 20 (honest), while
+    // `interrupted_jobs` array is capped at 5 for consumers.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("status");
+    let output = cmd.output().expect("run kb --json status");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    assert_eq!(envelope["data"]["interrupted_jobs_total"], 20);
+    assert_eq!(
+        envelope["data"]["interrupted_jobs"]
+            .as_array()
+            .expect("interrupted_jobs array")
+            .len(),
+        5
+    );
+}
+
+/// Negative: with fewer than 5 interrupted jobs the "more" hint must
+/// not appear — no dangling "... and 0 more" line.
+#[test]
+fn status_below_interrupted_cap_has_no_more_hint() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    for i in 0u32..3 {
+        seed_interrupted_job(&kb_root, &format!("intr-{i}"), 1_000 + u64::from(i));
+    }
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(stdout.contains("interrupted job runs (3):"));
+    assert!(
+        !stdout.contains("... and"),
+        "no more-hint expected below the cap; got: {stdout}"
+    );
+}
+
+/// bn-3qn part 2: `kb jobs prune --interrupted --older-than 0` moves
+/// all interrupted manifests into `trash/jobs-<ts>/` and a subsequent
+/// `kb status` reports zero interrupted runs. `--older-than 0` is the
+/// test-friendly "prune everything" escape hatch.
+#[test]
+fn jobs_prune_interrupted_moves_to_trash_and_clears_status() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed 20 interrupted manifests + a `.log` sidecar for one to prove
+    // the log is also moved (forensic preservation).
+    for i in 0u32..20 {
+        seed_interrupted_job(&kb_root, &format!("intr-{i:02}"), 1_000 + u64::from(i));
+    }
+    fs::write(
+        kb_root.join("state/jobs/intr-00.log"),
+        "some log content\n",
+    )
+    .expect("write log sidecar");
+
+    // Prune.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("jobs")
+        .arg("prune")
+        .arg("--interrupted")
+        .arg("--older-than")
+        .arg("0");
+    let output = cmd.output().expect("run kb jobs prune --interrupted");
+    assert!(
+        output.status.success(),
+        "kb jobs prune failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Pruned 20 job run(s)"),
+        "expected prune confirmation, got: {stdout}"
+    );
+
+    // Trash directory exists and contains all 20 manifests + the log.
+    let trash_root = kb_root.join("trash");
+    let trash_dirs: Vec<PathBuf> = fs::read_dir(&trash_root)
+        .expect("read trash")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("jobs-"))
+        })
+        .collect();
+    assert_eq!(trash_dirs.len(), 1, "exactly one jobs-<ts>/ bucket expected");
+    let trash = &trash_dirs[0];
+    let trashed: Vec<String> = fs::read_dir(trash)
+        .expect("read trash bucket")
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    assert_eq!(
+        trashed
+            .iter()
+            .filter(|n| Path::new(n)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json")))
+            .count(),
+        20,
+        "all 20 manifests should be in trash: {trashed:?}"
+    );
+    assert!(
+        trashed.iter().any(|n| n == "intr-00.log"),
+        "log sidecar for intr-00 must be preserved in trash, got: {trashed:?}"
+    );
+
+    // `state/jobs/` is now clean — no stray manifests.
+    let remaining: Vec<String> = fs::read_dir(kb_root.join("state/jobs"))
+        .expect("read jobs dir")
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| {
+            Path::new(n)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+        })
+        .filter(|n| n.starts_with("intr-"))
+        .collect();
+    assert!(
+        remaining.is_empty(),
+        "no interrupted manifests should remain; got: {remaining:?}"
+    );
+
+    // Subsequent `kb status --json`: zero interrupted jobs.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("status");
+    let output = cmd.output().expect("run kb status");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    assert_eq!(
+        envelope["data"]["interrupted_jobs_total"], 0,
+        "status should show zero interrupted jobs after prune"
+    );
+}
+
+/// `kb jobs prune --interrupted` with the default `--older-than 7`
+/// must KEEP recently-created manifests — we don't want a stray prune
+/// to wipe out a still-investigatable failure. The stamp needs to be
+/// within the 7-day window for this test; seeding with `now - 1s`
+/// ensures that.
+#[test]
+fn jobs_prune_respects_older_than_window() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let now_ms = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_millis(),
+    )
+    .expect("now-millis fits in u64");
+    // Brand-new interrupted job (< 7d old) — must NOT be pruned.
+    seed_interrupted_job(&kb_root, "fresh-intr", now_ms - 1_000);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("jobs").arg("prune").arg("--interrupted"); // default --older-than 7
+    let output = cmd.output().expect("run kb jobs prune --interrupted");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("No job runs older than 7 day(s)"),
+        "fresh manifests should be kept by default; got: {stdout}"
+    );
+
+    // Manifest still on disk.
+    assert!(
+        kb_root.join("state/jobs/fresh-intr.json").exists(),
+        "fresh manifest should still be on disk under default window"
+    );
+}
+
+/// Missing status selectors is a user error — "prune nothing" deserves
+/// a non-zero exit, not silent success.
+#[test]
+fn jobs_prune_without_selector_errors() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("jobs").arg("prune");
+    let output = cmd.output().expect("run kb jobs prune");
+    assert!(
+        !output.status.success(),
+        "kb jobs prune without a status selector should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--interrupted") && stderr.contains("--failed"),
+        "error message should mention the missing selectors; got stderr: {stderr}"
+    );
+}
+
+/// `kb jobs list --interrupted` surfaces manifests with their log
+/// paths. JSON round-trips through the `jobs.list` envelope so
+/// downstream tooling can page through.
+#[test]
+fn jobs_list_interrupted_reports_ids_and_log_paths() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    for i in 0u32..3 {
+        seed_interrupted_job(&kb_root, &format!("intr-{i}"), 1_000 + u64::from(i));
+    }
+    // Log sidecar for one; list must surface it for forensic jump-to.
+    fs::write(kb_root.join("state/jobs/intr-1.log"), "trace\n")
+        .expect("write log sidecar");
+
+    // Text listing.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("jobs").arg("list").arg("--interrupted");
+    let output = cmd.output().expect("run kb jobs list --interrupted");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("intr-0"));
+    assert!(stdout.contains("intr-1"));
+    assert!(stdout.contains("intr-2"));
+    assert!(
+        stdout.contains("intr-1.log"),
+        "log path should appear for the manifest with a sidecar; got: {stdout}"
+    );
+
+    // JSON listing: 3 entries, total 3, interrupted status.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("jobs")
+        .arg("list")
+        .arg("--interrupted");
+    let output = cmd.output().expect("run kb --json jobs list");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["data"]["total"], 3);
+    let arr = envelope["data"]["jobs"]
+        .as_array()
+        .expect("jobs array");
+    assert_eq!(arr.len(), 3);
+    for entry in arr {
+        assert_eq!(entry["status"], "interrupted");
+    }
+}
+
 /// ST3 negative: with fewer than 10 failures the "more" hint must not
 /// appear — we don't want a dangling "... and 0 more" line.
 #[test]
