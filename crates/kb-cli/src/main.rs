@@ -164,6 +164,13 @@ enum Command {
         /// `raw/inbox/<src>/source_document.json::stable_location`.
         #[arg(required = true)]
         target: String,
+        /// Opt out of the cascade. Preserves the pre-bn-did behavior: only
+        /// the source's own normalized/, raw/inbox/, and wiki/sources/
+        /// entries are touched. Orphaned concept pages, cited question
+        /// pages, and stale build records are left in place — `kb lint`
+        /// will surface them afterwards.
+        #[arg(long)]
+        no_cascade: bool,
     },
     /// Inspect and manage review queue
     Review {
@@ -462,7 +469,7 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             run_inspect(root, &target, cli.json, trace)
         }
-        Some(Command::Forget { target }) => {
+        Some(Command::Forget { target, no_cascade }) => {
             let forget_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands")
@@ -472,6 +479,7 @@ fn run(cli: Cli) -> Result<()> {
                 json: cli.json,
                 force: cli.force,
                 quiet: cli.quiet,
+                no_cascade,
             };
 
             // Dry-run is a pure read: no lock, no job manifest, no writes.
@@ -1095,12 +1103,11 @@ struct IngestSummary {
 
 /// Flags extracted from `Cli` that `run_forget` cares about.
 ///
-/// Packed into a struct (instead of passed as four separate `bool`s) to
-/// keep the handler signature under clippy's `fn_params_excessive_bools`
-/// threshold. All four flags come from global top-level CLI flags:
-/// `--dry-run`, `--json`, `--force`, `--quiet`. The top-level `Cli` struct
-/// already carries the same four bools and is allow-listed for the same
-/// reason; mirroring that here is a deliberate choice, not an oversight.
+/// Packed into a struct (instead of passed as separate `bool`s) to keep the
+/// handler signature under clippy's `fn_params_excessive_bools` threshold.
+/// The first four flags come from global top-level CLI flags (`--dry-run`,
+/// `--json`, `--force`, `--quiet`). `no_cascade` is forget-specific (see
+/// the `Forget` subcommand definition).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy)]
 struct ForgetFlags {
@@ -1108,6 +1115,7 @@ struct ForgetFlags {
     json: bool,
     force: bool,
     quiet: bool,
+    no_cascade: bool,
 }
 
 /// Implement `kb forget <target>`. See `forget.rs` for the helpers.
@@ -1119,7 +1127,7 @@ struct ForgetFlags {
 /// them).
 fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
     let (src_id, origin) = forget::resolve_target(root, target)?;
-    let plan = forget::plan(root, &src_id, origin)?;
+    let plan = forget::plan(root, &src_id, origin, !flags.no_cascade)?;
 
     // Dry-run and JSON paths emit the plan and return without touching disk.
     if flags.dry_run {
@@ -1138,7 +1146,7 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
         return Ok(());
     }
 
-    if plan.moves.is_empty() {
+    if plan.moves.is_empty() && plan.cascade.is_empty() {
         // Nothing to remove. Report so users don't wonder whether the op
         // silently failed. No job manifest needed — we already opened one
         // around this handler, and "nothing to do" is a legitimate success.

@@ -4622,3 +4622,331 @@ fn status_after_forget_does_not_list_source() {
         "forgotten source should not linger in sources_with_missing_origin: {missing:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `kb forget` cascade — bn-did F3a/F3b/F3c
+// ---------------------------------------------------------------------------
+
+/// Drop a minimal `wiki/concepts/<slug>.md` with a `source_document_ids` list.
+fn stub_concept_page(kb_root: &Path, slug: &str, source_ids: &[&str]) -> PathBuf {
+    let dir = kb_root.join("wiki/concepts");
+    fs::create_dir_all(&dir).expect("mkdir wiki/concepts");
+    let ids = source_ids
+        .iter()
+        .map(|id| format!("  - {id}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "---\nid: concept-{slug}\nname: {slug}\nsource_document_ids:\n{ids}\n---\n\n# {slug}\n",
+    );
+    let path = dir.join(format!("{slug}.md"));
+    fs::write(&path, body).expect("write concept page");
+    path
+}
+
+/// Drop a minimal `wiki/questions/<slug>.md` with a `source_document_ids` list.
+fn stub_question_page(kb_root: &Path, slug: &str, source_ids: &[&str]) -> PathBuf {
+    let dir = kb_root.join("wiki/questions");
+    fs::create_dir_all(&dir).expect("mkdir wiki/questions");
+    let ids = source_ids
+        .iter()
+        .map(|id| format!("  - {id}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = format!(
+        "---\nid: q-{slug}\ntitle: {slug}\nsource_document_ids:\n{ids}\n---\n\n# {slug}\n",
+    );
+    let path = dir.join(format!("{slug}.md"));
+    fs::write(&path, body).expect("write question page");
+    path
+}
+
+/// Write a `state/build_records/<id>.json` whose `metadata.output_paths`
+/// points at `normalized/<src>/...`, simulating the `build:source-summary:<src>`
+/// record observed in pass-9.
+fn stub_source_build_record(kb_root: &Path, src_id: &str) -> PathBuf {
+    let record_id = format!("build:source-summary:{src_id}");
+    let mut metadata = test_metadata(&record_id);
+    metadata
+        .output_paths
+        .push(PathBuf::from(format!("normalized/{src_id}/summary.md")));
+    save_build_record(
+        kb_root,
+        &BuildRecord {
+            metadata,
+            pass_name: "source_summary".to_string(),
+            input_ids: vec![src_id.to_string()],
+            output_ids: vec![record_id.clone()],
+            manifest_hash: "m1".to_string(),
+        },
+    )
+    .expect("save build record");
+    kb_root
+        .join("state/build_records")
+        .join(format!("{record_id}.json"))
+}
+
+/// bn-did F3b: concepts solely sourced from the forgotten src get trashed,
+/// concepts grounded by additional sources survive, and the trash bundle
+/// receives the orphans alongside the source.
+#[test]
+fn forget_cascade_trashes_orphaned_concept_pages() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("note.md");
+    fs::write(&source, "# hi\n\ncontent\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let orphan_a = stub_concept_page(&kb_root, "zab", &[&src_id]);
+    let orphan_b = stub_concept_page(&kb_root, "zookeeper", &[&src_id]);
+    let survivor =
+        stub_concept_page(&kb_root, "shared", &[&src_id, "src-deadbeef"]);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!orphan_a.exists(), "orphaned concept zab should be trashed");
+    assert!(
+        !orphan_b.exists(),
+        "orphaned concept zookeeper should be trashed"
+    );
+    assert!(
+        survivor.exists(),
+        "multi-sourced concept must NOT be trashed: {survivor:?}"
+    );
+
+    // Orphans land under `trash/<src>-*/wiki/concepts/`.
+    let trash_root = kb_root.join("trash");
+    let bundle = fs::read_dir(&trash_root)
+        .expect("read trash")
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{src_id}-"))
+        })
+        .expect("trash bundle for src")
+        .path();
+    assert!(bundle.join("wiki/concepts/zab.md").exists());
+    assert!(bundle.join("wiki/concepts/zookeeper.md").exists());
+}
+
+/// bn-did F3b: promoted question pages citing the forgotten source are
+/// flagged with `orphaned_sources:` in frontmatter (not rewritten, not
+/// removed).
+#[test]
+fn forget_cascade_flags_promoted_question_pages() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let question = stub_question_page(&kb_root, "how-does-x", &[&src_id]);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Page survives.
+    assert!(question.exists(), "question page must not be trashed");
+    let body = fs::read_to_string(&question).expect("read question");
+    assert!(
+        body.contains("orphaned_sources:"),
+        "question frontmatter must carry orphaned_sources marker:\n{body}"
+    );
+    assert!(
+        body.contains(&src_id),
+        "marker must list the forgotten src_id"
+    );
+}
+
+/// bn-did F3b: build records whose `metadata.output_paths` reference
+/// `normalized/<src>/...` or `wiki/sources/<src>.md` are moved to trash.
+#[test]
+fn forget_cascade_trashes_stale_build_records() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+    let record_path = stub_source_build_record(&kb_root, &src_id);
+    assert!(record_path.exists(), "sanity: build record written");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!record_path.exists(), "stale build record must be trashed");
+    let bundle = fs::read_dir(kb_root.join("trash"))
+        .expect("read trash")
+        .filter_map(Result::ok)
+        .find(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{src_id}-"))
+        })
+        .expect("trash bundle")
+        .path();
+    let trashed_record = bundle
+        .join("state/build_records")
+        .join(format!("build:source-summary:{src_id}.json"));
+    assert!(
+        trashed_record.exists(),
+        "build record preserved under trash: expected {trashed_record:?}"
+    );
+}
+
+/// bn-did F3c: `--no-cascade` preserves bn-1fq behavior: orphaned concepts,
+/// cited questions, and stale build records stay put.
+#[test]
+fn forget_no_cascade_preserves_legacy_behavior() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let orphan = stub_concept_page(&kb_root, "zab", &[&src_id]);
+    let question = stub_question_page(&kb_root, "how", &[&src_id]);
+    let record_path = stub_source_build_record(&kb_root, &src_id);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force")
+        .arg("forget")
+        .arg("--no-cascade")
+        .arg(&src_id);
+    let output = cmd.output().expect("run kb forget --no-cascade");
+    assert!(
+        output.status.success(),
+        "kb forget --no-cascade failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Source itself was forgotten.
+    assert!(!kb_root.join("normalized").join(&src_id).exists());
+    // Cascade targets were NOT touched.
+    assert!(orphan.exists(), "concept should survive --no-cascade");
+    let q_body = fs::read_to_string(&question).expect("read question");
+    assert!(
+        !q_body.contains("orphaned_sources:"),
+        "question must NOT be flagged under --no-cascade:\n{q_body}"
+    );
+    assert!(record_path.exists(), "build record must survive --no-cascade");
+}
+
+/// bn-did F3a: `--dry-run` includes the cascade plan in JSON output and
+/// moves no files.
+#[test]
+fn forget_dry_run_reports_cascade_items() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let orphan = stub_concept_page(&kb_root, "zab", &[&src_id]);
+    let question = stub_question_page(&kb_root, "how", &[&src_id]);
+    let record_path = stub_source_build_record(&kb_root, &src_id);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run")
+        .arg("--json")
+        .arg("forget")
+        .arg(&src_id);
+    let output = cmd.output().expect("run kb forget --dry-run --json");
+    assert!(
+        output.status.success(),
+        "dry-run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse json");
+    assert_eq!(envelope["data"]["dry_run"], true);
+    let cascade = &envelope["data"]["plan"]["cascade"];
+    let concepts = cascade["orphaned_concept_pages"]
+        .as_array()
+        .expect("orphaned_concept_pages array");
+    assert_eq!(
+        concepts.len(),
+        1,
+        "one orphaned concept expected, got {concepts:?}"
+    );
+    let questions = cascade["flagged_question_pages"]
+        .as_array()
+        .expect("flagged_question_pages array");
+    assert_eq!(questions.len(), 1);
+    let records = cascade["stale_build_records"]
+        .as_array()
+        .expect("stale_build_records array");
+    assert_eq!(records.len(), 1);
+
+    // Nothing touched on disk.
+    assert!(orphan.exists(), "dry-run must not move concepts");
+    let q_body = fs::read_to_string(&question).expect("read question");
+    assert!(
+        !q_body.contains("orphaned_sources:"),
+        "dry-run must not flag questions"
+    );
+    assert!(record_path.exists(), "dry-run must not move build records");
+}
+
+/// bn-did acceptance: after a cascade forget, `kb lint` reports 0 orphan
+/// errors — the orphan-lint rule that triggered the bone is silenced.
+#[test]
+fn lint_after_cascade_forget_has_no_orphan_errors() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+    stub_concept_page(&kb_root, "zab", &[&src_id]);
+    stub_concept_page(&kb_root, "zookeeper", &[&src_id]);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(output.status.success());
+
+    let mut lint_cmd = kb_cmd(&kb_root);
+    lint_cmd.arg("--json").arg("lint");
+    let lint_output = lint_cmd.output().expect("run kb lint");
+    // Lint may still exit non-zero for other issues, but the `orphans`
+    // check for our forgotten src should report zero issues.
+    let stdout = String::from_utf8_lossy(&lint_output.stdout);
+    // Cheap guard: the orphan messages would name src_id; after cascade,
+    // no concept page still points at it.
+    assert!(
+        !stdout.contains(&format!("refers to source_document_id {src_id}")),
+        "lint still flags orphaned concepts after cascade forget:\n{stdout}"
+    );
+}

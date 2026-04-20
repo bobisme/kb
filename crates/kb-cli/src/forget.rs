@@ -13,9 +13,17 @@
 //!   a GC hook (e.g. `kb doctor --clean-trash-older-than 30d`).
 //!
 //! - **Best-effort backlinks.** After removing the wiki source page we run
-//!   `run_backlinks_pass` so concept pages stop linking to a dead URL. We
-//!   don't cascade-delete orphaned concept pages (bn-1fq F3 scope); `kb
-//!   lint` already surfaces unreferenced concepts.
+//!   `run_backlinks_pass` so concept pages stop linking to a dead URL.
+//!
+//! - **Cascade (bn-did).** Concept pages whose `source_document_ids` becomes
+//!   empty after forgetting `<src>` are orphans by definition; the forget
+//!   command enumerates them in the pre-flight plan and moves them into the
+//!   same trash bundle on approval. Promoted question pages citing the
+//!   forgotten src are flagged via an `orphaned_sources:` frontmatter field
+//!   but are left in place (full rewriting is a future pass). Stale build
+//!   records whose `metadata.output_paths` names files under the forgotten
+//!   source are also trashed. `--no-cascade` opts out and restores the pre-
+//!   bn-did behavior (source-only).
 //!
 //! - **Hash-state cleanup.** `state/hashes.json` is rewritten without the
 //!   forgotten `normalized/<id>` key so `kb status` doesn't flag its now-
@@ -28,7 +36,39 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use kb_compile::{HashState, backlinks};
+use kb_core::{BuildRecord, build_records_dir, frontmatter::read_frontmatter, frontmatter::write_frontmatter};
 use serde::Serialize;
+use serde_yaml::{Mapping, Value};
+
+/// Cascade effects discovered by the pre-flight analysis for a given src.
+///
+/// Empty lists are valid and mean "no cascade effects of that kind" — the
+/// caller still emits the header but skips the sub-section.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CascadePlan {
+    /// Concept pages (absolute paths) whose `source_document_ids`
+    /// becomes empty after removing this src; they'll be moved to trash.
+    pub orphaned_concept_pages: Vec<PathBuf>,
+    /// Promoted question pages (absolute paths) whose `source_document_ids`
+    /// lists this src; we add an `orphaned_sources:` marker to the
+    /// frontmatter instead of removing/rewriting the page.
+    pub flagged_question_pages: Vec<PathBuf>,
+    /// Build records (absolute paths to the JSON files) whose
+    /// `metadata.output_paths` names files under the forgotten source
+    /// (normalized/<src>/... or wiki/sources/<src>.md); they'll be moved to
+    /// trash.
+    pub stale_build_records: Vec<PathBuf>,
+}
+
+impl CascadePlan {
+    /// `true` when this cascade does not move or flag any file.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.orphaned_concept_pages.is_empty()
+            && self.flagged_question_pages.is_empty()
+            && self.stale_build_records.is_empty()
+    }
+}
 
 /// What a single `kb forget` call would move (or moved) to trash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -45,6 +85,11 @@ pub struct ForgetPlan {
     /// Entries missing on disk at plan time are omitted so the plan reflects
     /// only real work.
     pub moves: Vec<PathBuf>,
+    /// Cascade effects discovered by the pre-flight analysis. Empty when
+    /// `--no-cascade` was passed; non-empty otherwise (but individual fields
+    /// may still be empty).
+    #[serde(default, skip_serializing_if = "CascadePlan::is_empty")]
+    pub cascade: CascadePlan,
 }
 
 /// Result of a `kb forget` invocation, suitable for `--json` output.
@@ -135,11 +180,26 @@ pub fn resolve_target(root: &Path, target: &str) -> Result<(String, Option<Strin
 
 /// Build a `ForgetPlan` for `src_id` without touching disk.
 ///
+/// When `cascade` is `true` (default; `--no-cascade` passes `false`), walks
+/// `wiki/concepts/*.md`, `wiki/questions/*.md`, and `state/build_records/*.json`
+/// and populates `plan.cascade` with the derived effects. A concept page is
+/// marked orphaned iff its `source_document_ids` list contains `src_id` and
+/// has length 1 (so removing `src_id` empties it); a concept with two or more
+/// sources survives because removing this one leaves at least one grounding
+/// source. Question pages are flagged (not rewritten) whenever the list
+/// merely *contains* `src_id`, regardless of the other sources present.
+///
 /// # Errors
 ///
 /// Returns an error when the system clock is before `UNIX_EPOCH`
-/// (unreachable on sane hosts; used only to derive the trash timestamp).
-pub fn plan(root: &Path, src_id: &str, origin: Option<String>) -> Result<ForgetPlan> {
+/// (unreachable on sane hosts; used only to derive the trash timestamp), or
+/// when the cascade walk encounters an unreadable directory.
+pub fn plan(
+    root: &Path,
+    src_id: &str,
+    origin: Option<String>,
+    cascade: bool,
+) -> Result<ForgetPlan> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock before UNIX_EPOCH")?
@@ -158,22 +218,163 @@ pub fn plan(root: &Path, src_id: &str, origin: Option<String>) -> Result<ForgetP
         .filter(|p| p.exists())
         .collect();
 
+    let cascade_plan = if cascade {
+        analyze_cascade(root, src_id)?
+    } else {
+        CascadePlan::default()
+    };
+
     Ok(ForgetPlan {
         src_id: src_id.to_string(),
         origin,
         trash_dir,
         moves,
+        cascade: cascade_plan,
     })
+}
+
+/// Walk the KB and enumerate concept pages, promoted question pages, and
+/// build records affected by forgetting `src_id`.
+///
+/// See `plan` for the precise definition of "orphaned" vs "flagged".
+///
+/// # Errors
+///
+/// Returns an error only when a directory listing itself fails. Unreadable
+/// or malformed individual files (bad YAML frontmatter, unreadable JSON)
+/// are silently skipped — they would be stale regardless of this cascade
+/// and `kb lint` will surface them on the next run.
+fn analyze_cascade(root: &Path, src_id: &str) -> Result<CascadePlan> {
+    let orphaned_concept_pages =
+        scan_frontmatter_matches(&root.join("wiki/concepts"), src_id, /*orphan_only=*/ true)?;
+    let flagged_question_pages =
+        scan_frontmatter_matches(&root.join("wiki/questions"), src_id, /*orphan_only=*/ false)?;
+    let stale_build_records = scan_stale_build_records(root, src_id)?;
+    Ok(CascadePlan {
+        orphaned_concept_pages,
+        flagged_question_pages,
+        stale_build_records,
+    })
+}
+
+/// Walk `dir` (a `wiki/*` subdirectory) and return `.md` files whose
+/// frontmatter `source_document_ids` references `src_id`.
+///
+/// `orphan_only=true`: only return files where the list *equals* `[src_id]`
+/// (the 1-element case). After forgetting `src_id`, the list becomes empty
+/// and the page is orphaned.
+///
+/// `orphan_only=false`: return files where the list merely *contains*
+/// `src_id`. Used for promoted questions, which we flag but don't remove
+/// even when they'd otherwise be orphaned.
+fn scan_frontmatter_matches(
+    dir: &Path,
+    src_id: &str,
+    orphan_only: bool,
+) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("read dir {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        // Malformed frontmatter (lint will flag it) — skip silently.
+        let Ok((frontmatter, _body)) = read_frontmatter(&path) else {
+            continue;
+        };
+        let ids = frontmatter_source_ids(&frontmatter);
+        let contains = ids.iter().any(|id| id == src_id);
+        if !contains {
+            continue;
+        }
+        if orphan_only {
+            // Orphan: list is exactly [src_id] after the forget.
+            if ids.len() == 1 {
+                matches.push(path);
+            }
+        } else {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
+/// Extract the `source_document_ids` list from a frontmatter mapping.
+/// Returns an empty vec when the field is missing, non-sequence, or contains
+/// non-string entries (mixed entries are taken at their string parts).
+fn frontmatter_source_ids(frontmatter: &Mapping) -> Vec<String> {
+    let Some(value) = frontmatter.get(Value::String("source_document_ids".into())) else {
+        return Vec::new();
+    };
+    match value {
+        Value::Sequence(seq) => seq
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Walk `state/build_records/*.json` and return those whose
+/// `metadata.output_paths` includes a file under `normalized/<src>/...` or
+/// `wiki/sources/<src>.md` (the two directly-forgotten bucket prefixes).
+fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
+    let dir = build_records_dir(root);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let normalized_prefix = PathBuf::from("normalized").join(src_id);
+    let wiki_source_path = kb_compile::source_page::source_page_path_for_id(src_id);
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("read build_records dir {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<BuildRecord>(&bytes) else {
+            continue;
+        };
+        let references_src = record.metadata.output_paths.iter().any(|out| {
+            out.starts_with(&normalized_prefix) || out == &wiki_source_path
+        });
+        if references_src {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    Ok(matches)
 }
 
 /// Execute a previously-built `ForgetPlan`, moving real bytes on disk.
 ///
 /// Each entry in `plan.moves` is moved into `plan.trash_dir` under its
-/// original basename (e.g. `normalized/src-XXXX` → `trash/src-XXXX-T/normalized/`,
+/// original relative path (e.g. `normalized/src-XXXX` → `trash/src-XXXX-T/normalized/`,
 /// `wiki/sources/src-XXXX.md` → `trash/src-XXXX-T/wiki/sources/src-XXXX.md`).
 /// Layout preserves the original parent directory name so the trash dir is
 /// self-describing — a user poking at `trash/src-XXXX-1700000000/` can tell
 /// which bucket each file came from.
+///
+/// Cascade effects execute after the core moves:
+///   - `plan.cascade.orphaned_concept_pages` — each page is moved under
+///     `trash/<bundle>/wiki/concepts/`.
+///   - `plan.cascade.flagged_question_pages` — each page gets (or appends)
+///     `orphaned_sources: [<src_id>]` to its frontmatter. The body is not
+///     rewritten; a future pass can handle full rewrites.
+///   - `plan.cascade.stale_build_records` — each JSON file is moved under
+///     `trash/<bundle>/state/build_records/`.
 ///
 /// After moves succeed, the `normalized/<id>` key is dropped from
 /// `state/hashes.json` (if present) and `run_backlinks_pass` is invoked so
@@ -181,11 +382,6 @@ pub fn plan(root: &Path, src_id: &str, origin: Option<String>) -> Result<ForgetP
 /// best-effort: a failure emits a warning and returns success, because the
 /// user has already agreed to the destructive operation and rerunning `kb
 /// compile` will correct any lingering staleness.
-///
-/// F3 note: cascade-deleting concept pages whose only source was the
-/// forgotten one is explicitly out of scope. `kb lint` already surfaces
-/// unreferenced concepts; future work can promote that into an automatic
-/// cascade when user feedback warrants it.
 ///
 /// # Errors
 ///
@@ -196,22 +392,30 @@ pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<bool> {
     fs::create_dir_all(&plan.trash_dir)
         .with_context(|| format!("create trash dir {}", plan.trash_dir.display()))?;
 
+    // Core moves first (normalized/, raw/inbox/, wiki/sources/).
     for src in &plan.moves {
-        let relative = src
-            .strip_prefix(root)
-            .unwrap_or(src)
-            .to_path_buf();
-        let dest = plan.trash_dir.join(&relative);
-        if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create trash subdir {}", parent.display()))?;
+        move_into_trash(root, src, &plan.trash_dir)?;
+    }
+
+    // Cascade: orphaned concept pages → trash.
+    for concept in &plan.cascade.orphaned_concept_pages {
+        if concept.exists() {
+            move_into_trash(root, concept, &plan.trash_dir)?;
         }
-        // `fs::rename` works across the same filesystem and is atomic; the
-        // KB root and its trash/ subdir are always on the same mount so
-        // we don't need fallback-copy semantics here.
-        fs::rename(src, &dest).with_context(|| {
-            format!("move {} → {}", src.display(), dest.display())
-        })?;
+    }
+
+    // Cascade: flag (not rewrite) promoted question pages.
+    for question in &plan.cascade.flagged_question_pages {
+        if question.exists() {
+            flag_orphaned_source(question, &plan.src_id)?;
+        }
+    }
+
+    // Cascade: stale build records → trash.
+    for record in &plan.cascade.stale_build_records {
+        if record.exists() {
+            move_into_trash(root, record, &plan.trash_dir)?;
+        }
     }
 
     // Drop the forgotten source from the hash state so `kb status` doesn't
@@ -246,6 +450,48 @@ pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<bool> {
     };
 
     Ok(backlinks_refreshed)
+}
+
+/// Move `src` (absolute) into `trash_dir`, preserving its path relative to
+/// `root`. Parent directories under `trash_dir` are created as needed.
+fn move_into_trash(root: &Path, src: &Path, trash_dir: &Path) -> Result<()> {
+    let relative = src.strip_prefix(root).unwrap_or(src).to_path_buf();
+    let dest = trash_dir.join(&relative);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create trash subdir {}", parent.display()))?;
+    }
+    // `fs::rename` works across the same filesystem and is atomic; the
+    // KB root and its trash/ subdir are always on the same mount so
+    // we don't need fallback-copy semantics here.
+    fs::rename(src, &dest)
+        .with_context(|| format!("move {} → {}", src.display(), dest.display()))?;
+    Ok(())
+}
+
+/// Append `src_id` to the `orphaned_sources:` frontmatter field on `page`,
+/// creating the field as a single-element list when it is absent. Idempotent
+/// — a second forget of the same src does not duplicate the entry. The body
+/// of the page is left untouched; v1 of the cascade treats this as a marker
+/// for later sweeps (full rewriting is tracked as future work).
+fn flag_orphaned_source(page: &Path, src_id: &str) -> Result<()> {
+    let (mut frontmatter, body) = read_frontmatter(page)
+        .with_context(|| format!("read frontmatter for {}", page.display()))?;
+    let key = Value::String("orphaned_sources".into());
+    let entry = Value::String(src_id.to_string());
+    match frontmatter.get_mut(&key) {
+        Some(Value::Sequence(seq)) => {
+            if !seq.iter().any(|v| v.as_str() == Some(src_id)) {
+                seq.push(entry);
+            }
+        }
+        _ => {
+            frontmatter.insert(key, Value::Sequence(vec![entry]));
+        }
+    }
+    write_frontmatter(page, &frontmatter, body)
+        .with_context(|| format!("write frontmatter for {}", page.display()))?;
+    Ok(())
 }
 
 /// Render the prompt shown in the default (interactive) flow.
@@ -288,11 +534,15 @@ pub fn confirm_on_stderr(plan: &ForgetPlan) -> Result<bool> {
 
 /// Readable string for `kb forget` text output.
 ///
-/// # Errors
+/// The cascade section mirrors the bone spec's sample:
 ///
-/// Returns an error only if writing to the in-memory `String` buffer fails,
-/// which is not expected in practice. Surfaced as `Result` so callers can
-/// decide whether to `?` or panic.
+///   forget src-aa540111 would also affect:
+///     concept pages orphaned by this forget (will be moved to trash):
+///       - wiki/concepts/zab.md
+///     promoted questions that cite this source (will be flagged but not rewritten):
+///       - wiki/questions/how-does-zookeeper-x.md
+///     stale build records (will be removed):
+///       - state/build_records/build:source-summary:src-aa540111.json
 pub fn render_plan(plan: &ForgetPlan, dry_run: bool) -> String {
     use std::fmt::Write as _;
     let verb = if dry_run { "would move" } else { "moved" };
@@ -303,7 +553,7 @@ pub fn render_plan(plan: &ForgetPlan, dry_run: bool) -> String {
     } else {
         let _ = writeln!(out, "forget {}", plan.src_id);
     }
-    if plan.moves.is_empty() {
+    if plan.moves.is_empty() && plan.cascade.is_empty() {
         out.push_str(
             "  nothing to move — no normalized/, raw/inbox/, or wiki/sources/ entry found\n",
         );
@@ -312,7 +562,36 @@ pub fn render_plan(plan: &ForgetPlan, dry_run: bool) -> String {
     for src in &plan.moves {
         let _ = writeln!(out, "  {verb}: {}", src.display());
     }
-    let _ = writeln!(out, "  trash:    {}", plan.trash_dir.display());
+    if !plan.cascade.is_empty() {
+        out.push_str("  cascade:\n");
+        if !plan.cascade.orphaned_concept_pages.is_empty() {
+            out.push_str(
+                "    concept pages orphaned by this forget (will be moved to trash):\n",
+            );
+            for page in &plan.cascade.orphaned_concept_pages {
+                let _ = writeln!(out, "      - {}", page.display());
+            }
+        }
+        if !plan.cascade.flagged_question_pages.is_empty() {
+            out.push_str(
+                "    promoted questions that cite this source (will be flagged but not rewritten):\n",
+            );
+            for page in &plan.cascade.flagged_question_pages {
+                let _ = writeln!(out, "      - {}", page.display());
+            }
+        }
+        if !plan.cascade.stale_build_records.is_empty() {
+            out.push_str("    stale build records (will be removed):\n");
+            for rec in &plan.cascade.stale_build_records {
+                let _ = writeln!(out, "      - {}", rec.display());
+            }
+        }
+    }
+    if !plan.moves.is_empty() || !plan.cascade.orphaned_concept_pages.is_empty()
+        || !plan.cascade.stale_build_records.is_empty()
+    {
+        let _ = writeln!(out, "  trash:    {}", plan.trash_dir.display());
+    }
     out
 }
 
@@ -388,6 +667,23 @@ mod tests {
             .expect("write source_document.json");
     }
 
+    /// Write a minimal concept page with `source_document_ids:` frontmatter.
+    fn write_concept_page(root: &Path, slug: &str, source_ids: &[&str]) -> PathBuf {
+        let dir = root.join("wiki/concepts");
+        fs::create_dir_all(&dir).expect("mkdir wiki/concepts");
+        let ids_yaml = source_ids
+            .iter()
+            .map(|id| format!("  - {id}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body = format!(
+            "---\nid: concept-{slug}\nname: {slug}\nsource_document_ids:\n{ids_yaml}\n---\n\n# {slug}\n",
+        );
+        let path = dir.join(format!("{slug}.md"));
+        fs::write(&path, body).expect("write concept page");
+        path
+    }
+
     #[test]
     fn resolve_target_by_src_id_returns_origin() {
         let dir = tempdir().expect("tempdir");
@@ -418,10 +714,100 @@ mod tests {
         let src = "src-cafef00d";
         fs::create_dir_all(root.join("normalized").join(src)).expect("create normalized");
         // No wiki page, no raw/inbox entry yet.
-        let plan = plan(root, src, None).expect("plan");
+        let plan = plan(root, src, None, true).expect("plan");
         assert_eq!(plan.src_id, src);
         assert_eq!(plan.moves.len(), 1);
         assert!(plan.moves[0].ends_with(format!("normalized/{src}")));
+    }
+
+    #[test]
+    fn cascade_detects_orphaned_concept_and_skips_multi_sourced_one() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-abc00001";
+        let other = "src-abc00002";
+        fs::create_dir_all(root.join("normalized").join(src)).expect("create normalized");
+        let orphan = write_concept_page(root, "zab", &[src]);
+        let multi = write_concept_page(root, "shared", &[src, other]);
+
+        let plan = plan(root, src, None, true).expect("plan with cascade");
+        assert_eq!(
+            plan.cascade.orphaned_concept_pages,
+            vec![orphan],
+            "only solely-sourced concepts should orphan; got {:?}",
+            plan.cascade.orphaned_concept_pages
+        );
+        assert!(
+            !plan.cascade.orphaned_concept_pages.contains(&multi),
+            "multi-sourced concept must NOT be flagged as orphaned"
+        );
+    }
+
+    #[test]
+    fn cascade_disabled_yields_empty_cascade_plan() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-abc00003";
+        fs::create_dir_all(root.join("normalized").join(src)).expect("create normalized");
+        write_concept_page(root, "zab", &[src]);
+
+        let plan = plan(root, src, None, false).expect("plan without cascade");
+        assert!(
+            plan.cascade.is_empty(),
+            "no-cascade plan must not enumerate cascade effects: {:?}",
+            plan.cascade
+        );
+    }
+
+    #[test]
+    fn flag_orphaned_source_adds_new_field() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-q00001";
+        let question_dir = root.join("wiki/questions");
+        fs::create_dir_all(&question_dir).expect("mkdir");
+        let page = question_dir.join("q.md");
+        fs::write(
+            &page,
+            format!(
+                "---\nid: q-1\ntitle: How\nsource_document_ids:\n  - {src}\n---\n\n# q\n"
+            ),
+        )
+        .expect("write q");
+
+        flag_orphaned_source(&page, src).expect("flag");
+        let (fm, _body) = read_frontmatter(&page).expect("re-read");
+        let value = fm
+            .get(Value::String("orphaned_sources".into()))
+            .expect("orphaned_sources added");
+        let seq = value.as_sequence().expect("sequence");
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0].as_str(), Some(src));
+    }
+
+    #[test]
+    fn flag_orphaned_source_is_idempotent() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-q00002";
+        let page = root.join("wiki/questions/q.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("mkdir");
+        fs::write(
+            &page,
+            format!(
+                "---\nid: q-2\ntitle: How\nsource_document_ids:\n  - {src}\norphaned_sources:\n  - {src}\n---\n\n# q\n"
+            ),
+        )
+        .expect("write q");
+
+        flag_orphaned_source(&page, src).expect("flag again");
+        let (fm, _body) = read_frontmatter(&page).expect("re-read");
+        let seq = fm
+            .get(Value::String("orphaned_sources".into()))
+            .expect("present")
+            .as_sequence()
+            .expect("seq");
+        assert_eq!(seq.len(), 1, "duplicate flags must collapse");
     }
 
     #[test]
@@ -449,7 +835,7 @@ mod tests {
             .insert(format!("normalized/{src}"), "fp".to_string());
         state.save_to_root(root).expect("save hash state");
 
-        let plan = plan(root, src, None).expect("plan");
+        let plan = plan(root, src, None, true).expect("plan");
         assert_eq!(plan.moves.len(), 3);
         execute(root, &plan).expect("execute forget");
 
