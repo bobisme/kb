@@ -5941,3 +5941,227 @@ fn forget_exact_full_src_id_still_works_after_bn_1525() {
         "plan must mention full id; got:\n{stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// bn-1dar: `kb ask --editor` / `-e`
+//
+// The flag opens $VISUAL/$EDITOR (falling back to `vi`) on a tempfile and
+// uses the resulting content as the question. Lines starting with `#` are
+// stripped like `git commit`. Empty content after stripping is a
+// ValidationError — it must NOT leave a failed-job manifest behind.
+// ---------------------------------------------------------------------------
+
+/// Write a fake editor script that overwrites the tempfile passed as its
+/// first argument with `body`. Returns the script path.
+fn write_fake_editor(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let script = dir.join(name);
+    // Quote `body` using a shell-friendly heredoc so newlines round-trip.
+    let contents = format!(
+        "#!/bin/sh\ncat > \"$1\" <<'FAKE_EDITOR_EOF'\n{body}\nFAKE_EDITOR_EOF\n"
+    );
+    write_executable(&script, &contents);
+    script
+}
+
+#[test]
+fn ask_editor_flag_reads_question_from_editor() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let script = write_fake_editor(&kb_root, "fake-editor.sh", "my test question");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--editor")
+        .env("EDITOR", &script)
+        .env_remove("VISUAL");
+    let output = cmd.output().expect("run kb ask --editor");
+    assert!(
+        output.status.success(),
+        "kb ask --editor failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    assert_eq!(envelope["command"], "ask");
+    let question_path = kb_root.join(
+        envelope["data"]["question_path"]
+            .as_str()
+            .expect("question_path string"),
+    );
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(&question_path).expect("read question record"),
+    )
+    .expect("parse question record");
+    assert_eq!(
+        record["raw_query"], "my test question",
+        "editor content must become the raw_query; record: {record}"
+    );
+}
+
+#[test]
+fn ask_editor_short_flag_equivalent() {
+    // `-e` is the short form of `--editor` and behaves identically.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let script = write_fake_editor(&kb_root, "fake-editor.sh", "short-flag question");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask")
+        .arg("-e")
+        .env("EDITOR", &script)
+        .env_remove("VISUAL");
+    let output = cmd.output().expect("run kb ask -e");
+    assert!(
+        output.status.success(),
+        "kb ask -e failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn ask_editor_visual_takes_precedence_over_editor() {
+    // $VISUAL wins when both are set — standard Unix convention.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let visual_script =
+        write_fake_editor(&kb_root, "visual-editor.sh", "from VISUAL wins");
+    // The EDITOR script writes a DIFFERENT body AND would fail the test
+    // (nonzero exit). If $VISUAL isn't preferred, we'd run this one and
+    // either get the wrong body or a launch error.
+    let editor_script = kb_root.join("editor-fail.sh");
+    write_executable(
+        &editor_script,
+        "#!/bin/sh\necho 'EDITOR was used, but VISUAL should have won' >&2\nexit 17\n",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--editor")
+        .env("VISUAL", &visual_script)
+        .env("EDITOR", &editor_script);
+    let output = cmd.output().expect("run kb ask --editor with VISUAL set");
+    assert!(
+        output.status.success(),
+        "kb ask --editor with $VISUAL set failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let question_path = kb_root.join(
+        envelope["data"]["question_path"]
+            .as_str()
+            .expect("question_path string"),
+    );
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(&question_path).expect("read question record"),
+    )
+    .expect("parse question record");
+    assert_eq!(
+        record["raw_query"], "from VISUAL wins",
+        "VISUAL content must win; record: {record}"
+    );
+}
+
+#[test]
+fn ask_editor_strips_comment_lines() {
+    // git-style: lines starting with `#` are dropped before validation.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let script = write_fake_editor(
+        &kb_root,
+        "fake-editor.sh",
+        "# This is a comment\n   # indented comment\nreal question line\n# trailing comment",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--editor")
+        .env("EDITOR", &script)
+        .env_remove("VISUAL");
+    let output = cmd.output().expect("run kb ask --editor with comments");
+    assert!(
+        output.status.success(),
+        "kb ask --editor with comments failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let question_path = kb_root.join(
+        envelope["data"]["question_path"]
+            .as_str()
+            .expect("question_path string"),
+    );
+    let record: Value = serde_json::from_str(
+        &fs::read_to_string(&question_path).expect("read question record"),
+    )
+    .expect("parse question record");
+    let raw_query = record["raw_query"]
+        .as_str()
+        .expect("raw_query should be string");
+    assert_eq!(
+        raw_query, "real question line",
+        "comment lines must be stripped; got: {raw_query}"
+    );
+}
+
+#[test]
+fn ask_editor_empty_content_is_validation_error_no_failed_job() {
+    // bn-1jx acceptance: empty editor content is a pure validation
+    // rejection — exit 1, but NO failed-job manifest.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Editor writes only comments → after stripping, body is empty.
+    let script = write_fake_editor(
+        &kb_root,
+        "empty-editor.sh",
+        "# only comments here\n# nothing of substance",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask")
+        .arg("--editor")
+        .env("EDITOR", &script)
+        .env_remove("VISUAL");
+    let output = cmd.output().expect("run kb ask --editor with only-comments");
+    assert!(
+        !output.status.success(),
+        "empty editor content must cause kb ask to fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("empty"),
+        "expected stderr to mention 'empty', got: {stderr}"
+    );
+
+    assert_eq!(
+        count_job_manifests(&kb_root),
+        0,
+        "validation rejection must not write a job manifest"
+    );
+
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let status_output = status_cmd.output().expect("run kb --json status");
+    assert!(status_output.status.success(), "kb status failed");
+    let envelope: Value =
+        serde_json::from_slice(&status_output.stdout).expect("parse status json");
+    assert_eq!(
+        envelope["data"]["failed_jobs_total"], 0,
+        "empty --editor content must not count as a failed job"
+    );
+    assert!(
+        envelope["data"]["failed_jobs"]
+            .as_array()
+            .expect("failed_jobs array")
+            .is_empty(),
+        "failed_jobs list must be empty after validation rejection"
+    );
+}

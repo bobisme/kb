@@ -121,6 +121,12 @@ enum Command {
         /// Propose promoting the answer into the wiki
         #[arg(long)]
         promote: bool,
+
+        /// Open $VISUAL/$EDITOR (falling back to `vi`) to compose the
+        /// question on a tempfile. Lines starting with `#` are ignored
+        /// (like `git commit`); empty content cancels the ask.
+        #[arg(short = 'e', long = "editor")]
+        editor: bool,
     },
     /// Lint knowledge base for issues
     Lint {
@@ -399,11 +405,11 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             run_doctor_command(root, cli.json, cli.model.as_deref())
         }
-        Some(Command::Ask { query, format, promote }) => {
+        Some(Command::Ask { query, format, promote, editor }) => {
             let ask_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            let query = resolve_query(query)?;
+            let query = resolve_query(query, editor)?;
             let model = cli.model.clone();
             let dry_run = cli.dry_run;
             let json = cli.json;
@@ -1962,7 +1968,14 @@ fn create_ask_adapter(
     }
 }
 
-fn resolve_query(query: Option<String>) -> Result<String> {
+fn resolve_query(query: Option<String>, editor: bool) -> Result<String> {
+    // bn-1dar: `--editor`/`-e` always opens $VISUAL/$EDITOR/vi on a tempfile,
+    // regardless of whether a query arg, stdin, or TTY is present. This is
+    // the dedicated multi-line authoring path; the rustyline quick-path
+    // (bn-3iq4) stays the default when `--editor` is not set.
+    if editor {
+        return read_from_editor();
+    }
     // bn-3iq4: when invoked with no query arg on a TTY, open an interactive
     // multi-line readline editor. Piped stdin and explicit `-` keep the
     // original read-to-EOF behavior.
@@ -1981,6 +1994,64 @@ fn resolve_query(query: Option<String>) -> Result<String> {
             }
         }
     }
+}
+
+/// bn-1dar: compose the question in `$VISUAL`/`$EDITOR` (falling back to
+/// `vi`) on a tempfile. Lines starting with `#` are stripped (git-commit
+/// style). Empty content — both at the "user saved blank" and "user wrote
+/// only comments" levels — is a `ValidationError` so it does not leave a
+/// failed-job manifest behind (bn-1jx).
+fn read_from_editor() -> Result<String> {
+    // $VISUAL wins over $EDITOR, per longstanding Unix convention.
+    let editor = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|s| !s.trim().is_empty()))
+        .unwrap_or_else(|| "vi".to_string());
+
+    let tmp = tempfile::Builder::new()
+        .prefix("kb-ask-")
+        .suffix(".md")
+        .tempfile()
+        .context("create editor tempfile")?;
+
+    let header = "\
+# Write your question below. Lines starting with # are ignored.
+# Save and close to submit; close with empty content to cancel.
+
+";
+    fs::write(tmp.path(), header).context("seed editor tempfile")?;
+
+    // Split on whitespace so `EDITOR=\"vim -u NONE\"` and similar work.
+    let mut parts = editor.split_whitespace();
+    let program = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty $EDITOR/$VISUAL value"))?;
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(tmp.path())
+        .status()
+        .with_context(|| format!("launch editor: {editor}"))?;
+    if !status.success() {
+        bail!("editor exited with non-zero status: {status}");
+    }
+
+    let raw = fs::read_to_string(tmp.path()).context("read editor tempfile")?;
+    // Strip git-style comment lines, then trim. `#` only counts as a comment
+    // at the start of a line (after optional whitespace).
+    let body = raw
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim().to_string();
+
+    if body.is_empty() {
+        return Err(ValidationError::new("ask: question cannot be empty").into());
+    }
+
+    // RAII drops `tmp` here, unlinking the tempfile on success.
+    Ok(body)
 }
 
 fn read_stdin_to_end() -> Result<String> {
