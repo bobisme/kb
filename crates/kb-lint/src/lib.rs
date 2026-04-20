@@ -22,6 +22,7 @@ const MD_EXT: &str = "md";
 pub enum LintRule {
     BrokenLinks,
     Orphans,
+    StaleRevision,
     StaleArtifacts,
     MissingCitations,
     All,
@@ -37,6 +38,9 @@ impl LintRule {
             None => Ok(Self::All),
             Some("broken-links" | "broken_links" | "brokenlinks") => Ok(Self::BrokenLinks),
             Some("orphans" | "orphan" | "orphan-pages" | "orphan_pages") => Ok(Self::Orphans),
+            Some(
+                "stale-revision" | "stale_revision" | "stale-revisions" | "stale_revisions",
+            ) => Ok(Self::StaleRevision),
             Some("stale" | "stale-artifacts" | "stale_artifacts") => Ok(Self::StaleArtifacts),
             Some("missing-citations" | "missing_citations" | "missingcitations") => {
                 Ok(Self::MissingCitations)
@@ -50,6 +54,7 @@ impl LintRule {
         match self {
             Self::BrokenLinks => "broken-links",
             Self::Orphans => "orphans",
+            Self::StaleRevision => "stale-revision",
             Self::StaleArtifacts => "stale",
             Self::MissingCitations => "missing-citations",
             Self::All => "all",
@@ -168,6 +173,9 @@ pub fn run_lint_with_options(
     }
     if matches!(rule, LintRule::Orphans | LintRule::All) {
         issues.extend(detect_orphan_pages(root)?);
+    }
+    if matches!(rule, LintRule::StaleRevision | LintRule::All) {
+        issues.extend(detect_stale_revisions(root)?);
     }
     if matches!(rule, LintRule::StaleArtifacts | LintRule::All) {
         issues.extend(detect_stale_artifacts(root)?);
@@ -718,6 +726,15 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
             });
         }
 
+        // Revision-level orphan: page references revision(s), but NO live
+        // revision is available for any of the page's source documents (i.e.
+        // the underlying normalized/<doc>/ dirs are all gone). This is the
+        // "truly orphaned" case — the source is no longer in the KB.
+        //
+        // The related-but-distinct case — live revisions exist but none of
+        // them match the page's recorded revision ids — is a *stale revision*
+        // (source re-ingested, page not yet recompiled) and lives in its own
+        // `stale_revision` lint class. See `detect_stale_revisions`.
         if !rev_ids.is_empty() {
             let live_revision_ids: BTreeSet<_> = existing_docs
                 .iter()
@@ -743,23 +760,93 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
                         suggested_fix: None,
                     });
                 }
-            } else if rev_ids
-                .iter()
-                .all(|revision_id| !live_revision_ids.contains(revision_id))
-            {
+            }
+        }
+    }
+    Ok(issues)
+}
+
+// ---------------------------------------------------------------------------
+// Stale revision detection
+// ---------------------------------------------------------------------------
+//
+// A page has "stale revisions" when:
+//   - its source document(s) still exist (normalized/<doc>/metadata.json is
+//     present), AND
+//   - the page's recorded `source_revision_id(s)` do not match the current
+//     normalized revision for any of those documents.
+//
+// This is a "please recompile" signal, not an "orphaned page" signal: the
+// source is still in the KB, just at a newer revision. Keeping it as its own
+// lint class (rather than folding it into `orphans`) gives users a precise
+// `--check stale_revision` filter and avoids the misleading "orphans" label
+// on pages whose sources are very much present.
+
+fn detect_stale_revisions(root: &Path) -> Result<Vec<LintIssue>> {
+    let mut issues = Vec::new();
+    for page in markdown_files_under(&root.join("wiki"))? {
+        let (frontmatter, _) = match read_frontmatter(&page) {
+            Ok(v) => v,
+            Err(err) => {
                 issues.push(LintIssue {
+                    kind: IssueKind::InvalidFrontmatter,
                     severity: IssueSeverity::Error,
-                    kind: IssueKind::SourceRevisionStale,
-                    referring_page: rel_page_str,
+                    referring_page: relative_to_root(root, &page)
+                        .to_string_lossy()
+                        .into_owned(),
                     line: 0,
-                    target: rev_ids.join(", "),
-                    message: format!(
-                        "page references stale source revision(s): {}",
-                        rev_ids.join(", ")
-                    ),
+                    target: String::new(),
+                    message: format!("invalid YAML frontmatter: {err}"),
                     suggested_fix: None,
                 });
+                continue;
             }
+        };
+
+        let doc_ids =
+            frontmatter_string_list(&frontmatter, "source_document_id", "source_document_ids");
+        let rev_ids =
+            frontmatter_string_list(&frontmatter, "source_revision_id", "source_revision_ids");
+
+        if rev_ids.is_empty() {
+            continue;
+        }
+
+        let rel_page = relative_to_root(root, &page);
+        let rel_page_str = rel_page.to_string_lossy().into_owned();
+
+        let live_revision_ids: BTreeSet<_> = doc_ids
+            .iter()
+            .filter_map(|doc_id| {
+                normalized_metadata_for_doc(root, doc_id)
+                    .ok()
+                    .flatten()
+                    .map(|metadata| metadata.source_revision_id)
+            })
+            .collect();
+
+        // No live revisions — this is an *orphan* concern, handled by
+        // `detect_orphan_pages`. Avoid double-reporting here.
+        if live_revision_ids.is_empty() {
+            continue;
+        }
+
+        if rev_ids
+            .iter()
+            .all(|revision_id| !live_revision_ids.contains(revision_id))
+        {
+            issues.push(LintIssue {
+                severity: IssueSeverity::Error,
+                kind: IssueKind::SourceRevisionStale,
+                referring_page: rel_page_str,
+                line: 0,
+                target: rev_ids.join(", "),
+                message: format!(
+                    "page references stale source revision(s): {}",
+                    rev_ids.join(", ")
+                ),
+                suggested_fix: None,
+            });
         }
     }
     Ok(issues)
@@ -1331,6 +1418,16 @@ mod tests {
         );
     }
 
+    fn write_normalized_metadata(root: &Path, doc_id: &str, revision_id: &str) {
+        let dir = root.join("normalized").join(doc_id);
+        fs::create_dir_all(&dir).expect("create normalized dir");
+        fs::write(
+            dir.join("metadata.json"),
+            format!("{{\"source_revision_id\":\"{revision_id}\"}}"),
+        )
+        .expect("write normalized metadata");
+    }
+
     #[test]
     fn orphan_pages_are_reported_when_source_document_is_missing() {
         let dir = tempdir().expect("tempdir");
@@ -1356,6 +1453,125 @@ mod tests {
                 .issues
                 .iter()
                 .any(|issue| issue.kind == IssueKind::SourceRevisionMissing)
+        );
+        // Orphans must NOT report SourceRevisionStale — that belongs to
+        // `stale_revision` as of bn-2tq.
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|issue| issue.kind != IssueKind::SourceRevisionStale),
+            "orphans should not report stale-revision issues: {report:?}"
+        );
+    }
+
+    #[test]
+    fn orphans_does_not_fire_on_stale_revision_when_source_is_present() {
+        // Regression: bn-2tq. Page references rev-old, but the source was
+        // re-ingested at rev-new and the page hasn't been recompiled. The
+        // source is present, just at a newer revision — that's a
+        // `stale_revision`, not an `orphan`.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/sources/src-a.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-old\n---\n# A\n",
+        )
+        .expect("write page");
+        write_normalized_metadata(root, "doc-1", "rev-new");
+
+        let report = run_lint(root, LintRule::Orphans).expect("lint report");
+        assert!(
+            report.is_clean(),
+            "orphans must not fire when source is present: {report:?}"
+        );
+    }
+
+    #[test]
+    fn stale_revision_fires_when_revision_differs_from_live() {
+        // bn-2tq: page revision differs from the normalized document's
+        // current revision. `stale_revision` should fire.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/sources/src-a.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-old\n---\n# A\n",
+        )
+        .expect("write page");
+        write_normalized_metadata(root, "doc-1", "rev-new");
+
+        let report = run_lint(root, LintRule::StaleRevision).expect("lint report");
+        assert_eq!(report.issue_count, 1, "{report:?}");
+        assert_eq!(report.issues[0].kind, IssueKind::SourceRevisionStale);
+        assert_eq!(report.issues[0].severity, IssueSeverity::Error);
+        assert!(report.has_errors());
+    }
+
+    #[test]
+    fn stale_revision_does_not_fire_when_revision_matches() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/sources/src-a.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# A\n",
+        )
+        .expect("write page");
+        write_normalized_metadata(root, "doc-1", "rev-1");
+
+        let report = run_lint(root, LintRule::StaleRevision).expect("lint report");
+        assert!(
+            report.is_clean(),
+            "stale_revision must not fire on fresh pages: {report:?}"
+        );
+    }
+
+    #[test]
+    fn stale_revision_does_not_fire_when_source_is_orphaned() {
+        // When the source document is entirely gone, that's an `orphans`
+        // concern (SourceRevisionMissing). `stale_revision` should stay
+        // quiet so we don't double-report.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/sources/src-a.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# A\n",
+        )
+        .expect("write page");
+        // No normalized/doc-1/ — document is orphaned.
+
+        let stale = run_lint(root, LintRule::StaleRevision).expect("lint report");
+        assert!(
+            stale.is_clean(),
+            "stale_revision must not fire on orphans: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn lint_rule_parse_accepts_stale_revision_aliases() {
+        assert_eq!(
+            LintRule::parse(Some("stale-revision")).expect("parse"),
+            LintRule::StaleRevision,
+        );
+        assert_eq!(
+            LintRule::parse(Some("stale_revision")).expect("parse"),
+            LintRule::StaleRevision,
+        );
+        assert_eq!(
+            LintRule::parse(Some("stale-revisions")).expect("parse"),
+            LintRule::StaleRevision,
+        );
+        // `stale` is still stale-artifacts, not stale-revision.
+        assert_eq!(
+            LintRule::parse(Some("stale")).expect("parse"),
+            LintRule::StaleArtifacts,
         );
     }
 
@@ -1498,7 +1714,7 @@ mod tests {
         let report = run_lint(root, LintRule::All).expect("lint should not bail");
 
         // InvalidFrontmatter reported (once per frontmatter-consuming pass; today
-        // that's orphans, stale-artifacts, and missing-citations).
+        // that's orphans, stale-revision, stale-artifacts, and missing-citations).
         let invalid: Vec<_> = report
             .issues
             .iter()

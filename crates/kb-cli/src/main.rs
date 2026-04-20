@@ -2891,6 +2891,7 @@ fn lint_rules_for_root(require_citations: bool) -> Vec<kb_lint::LintRule> {
     let mut rules = vec![
         kb_lint::LintRule::BrokenLinks,
         kb_lint::LintRule::Orphans,
+        kb_lint::LintRule::StaleRevision,
         kb_lint::LintRule::StaleArtifacts,
     ];
     if require_citations {
