@@ -4934,6 +4934,169 @@ fn forget_cascade_trashes_stale_build_records() {
     );
 }
 
+/// bn-3f6: both `build:source-summary:<src>` AND
+/// `build:extract-concepts:<src>` records are scooped up by the cascade.
+/// Before bn-3f6, only source-summary matched (via `output_paths` under
+/// `wiki/sources/<src>.md`); extract-concepts was missed because its
+/// `output_paths` points at `state/concept_candidates/<src>.json`.
+#[test]
+fn forget_cascade_trashes_both_source_summary_and_extract_concepts_records() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    // Stub both record types. source-summary → wiki/sources/<src>.md.
+    let summary_record = stub_source_build_record(&kb_root, &src_id);
+    // extract-concepts → state/concept_candidates/<src>.json.
+    let extract_record_id = format!("build:extract-concepts:{src_id}");
+    let mut extract_meta = test_metadata(&extract_record_id);
+    extract_meta
+        .output_paths
+        .push(PathBuf::from(format!(
+            "state/concept_candidates/{src_id}.json"
+        )));
+    save_build_record(
+        &kb_root,
+        &BuildRecord {
+            metadata: extract_meta,
+            pass_name: "extract_concepts".to_string(),
+            input_ids: vec![src_id.clone()],
+            output_ids: vec![extract_record_id.clone()],
+            manifest_hash: "m2".to_string(),
+        },
+    )
+    .expect("save extract-concepts build record");
+    let extract_record = kb_root
+        .join("state/build_records")
+        .join(format!("{extract_record_id}.json"));
+    assert!(summary_record.exists(), "sanity: summary record written");
+    assert!(extract_record.exists(), "sanity: extract record written");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !summary_record.exists(),
+        "source-summary build record must be trashed"
+    );
+    assert!(
+        !extract_record.exists(),
+        "extract-concepts build record must be trashed (bn-3f6 regression guard)"
+    );
+
+    // Acceptance: grep -rl <src> under state/ returns nothing.
+    for entry in walkdir_files(&kb_root.join("state")) {
+        let contents = fs::read_to_string(&entry).unwrap_or_default();
+        assert!(
+            !contents.contains(&src_id),
+            "state/{} still references forgotten src {src_id}",
+            entry
+                .strip_prefix(&kb_root)
+                .unwrap_or(&entry)
+                .display()
+        );
+    }
+
+    // Cascade plan (stdout) lists BOTH records.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("build:source-summary:{src_id}")),
+        "cascade plan should name source-summary record:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("build:extract-concepts:{src_id}")),
+        "cascade plan should name extract-concepts record:\n{stdout}"
+    );
+}
+
+/// bn-3f6: `state/graph.json` is surgically pruned of nodes referencing the
+/// forgotten src, without a full compile rebuild.
+#[test]
+fn forget_prunes_graph_json_nodes_for_src() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    // Pre-seed graph.json with nodes referencing this src plus an unrelated
+    // keepalive lane.
+    let mut graph = Graph::default();
+    graph.record(
+        [format!("source-document-{src_id}")],
+        [format!("wiki-page-{src_id}")],
+    );
+    graph.record(
+        ["source-document-src-keepalive"],
+        ["wiki-page-src-keepalive"],
+    );
+    graph.persist_to(&kb_root).expect("persist pre-forget graph");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Acceptance: graph.json exists and references no forgotten src ids.
+    let graph_json = fs::read_to_string(Graph::graph_path(&kb_root))
+        .expect("read graph.json after forget");
+    assert!(
+        !graph_json.contains(&src_id),
+        "graph.json still references forgotten src {src_id}:\n{graph_json}"
+    );
+
+    // Surgical: unrelated lane survives.
+    let reloaded = Graph::load_from(&kb_root).expect("reload graph");
+    assert!(
+        reloaded.nodes.contains_key("source-document-src-keepalive"),
+        "surgical prune must not touch unrelated src: {:?}",
+        reloaded.nodes.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        reloaded.nodes.contains_key("wiki-page-src-keepalive"),
+        "surgical prune must keep unrelated wiki-page node"
+    );
+}
+
+/// Walk `dir` recursively and collect every file path into `out`. Tiny
+/// helper to avoid pulling in `walkdir` just for the one bn-3f6 acceptance
+/// test. Symlinks are followed implicitly by `file_type`.
+fn walkdir_visit(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => walkdir_visit(&path, out),
+            Ok(ft) if ft.is_file() => out.push(path),
+            _ => {}
+        }
+    }
+}
+
+fn walkdir_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walkdir_visit(dir, &mut out);
+    out
+}
+
 /// bn-did F3c: `--no-cascade` preserves bn-1fq behavior: orphaned concepts,
 /// cited questions, and stale build records stay put.
 #[test]

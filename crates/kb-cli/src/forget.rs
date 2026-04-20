@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use kb_compile::{HashState, backlinks, index_page};
+use kb_compile::{Graph, HashState, backlinks, index_page};
 use kb_core::{BuildRecord, build_records_dir, frontmatter::read_frontmatter, frontmatter::write_frontmatter};
 use serde::Serialize;
 use serde_yaml::{Mapping, Value};
@@ -126,6 +126,11 @@ pub struct CascadeRefresh {
     /// `true` when `state/indexes/lexical.json` was rebuilt from the current
     /// on-disk wiki pages.
     pub lexical_index_refreshed: bool,
+    /// Number of dependency-graph nodes surgically removed from
+    /// `state/graph.json` (bn-3f6). Zero when `state/graph.json` was absent
+    /// or carried no nodes referencing the forgotten src.
+    #[serde(default)]
+    pub graph_nodes_pruned: usize,
 }
 
 impl CascadeRefresh {
@@ -136,6 +141,7 @@ impl CascadeRefresh {
         !self.index_pages_refreshed
             && self.frontmatter_scrubbed == 0
             && !self.lexical_index_refreshed
+            && self.graph_nodes_pruned == 0
     }
 }
 
@@ -395,9 +401,24 @@ fn frontmatter_source_ids(frontmatter: &Mapping) -> Vec<String> {
     }
 }
 
-/// Walk `state/build_records/*.json` and return those whose
-/// `metadata.output_paths` includes a file under `normalized/<src>/...` or
-/// `wiki/sources/<src>.md` (the two directly-forgotten bucket prefixes).
+/// Walk `state/build_records/*.json` and return those attributable to
+/// `src_id` by any of the following criteria (bn-3f6 expansion):
+///
+/// 1. `metadata.output_paths` includes a path under `normalized/<src>/...`
+///    (covers passes that emit into the normalized bucket, e.g. hypothetical
+///    `source_summary` variants).
+/// 2. `metadata.output_paths` equals `wiki/sources/<src>.md` (the canonical
+///    source-summary destination).
+/// 3. `metadata.output_paths` includes a path under `state/concept_candidates/<src>.*`
+///    (covers `extract_concepts`, which pass-11 found was being missed).
+/// 4. `metadata.id` contains `:<src>` as a suffix component (covers every
+///    pass whose record id follows the `build:<pass>:<src_id>` convention,
+///    including future passes that haven't been written yet).
+///
+/// Together these guarantee that every build record scoped to a single
+/// forgotten source is trashed — the pass-11 audit found that before this
+/// change only `build:source-summary:<src>` was removed, leaving
+/// `build:extract-concepts:<src>` on disk.
 fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
     let dir = build_records_dir(root);
     if !dir.exists() {
@@ -405,6 +426,12 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
     }
     let normalized_prefix = PathBuf::from("normalized").join(src_id);
     let wiki_source_path = kb_compile::source_page::source_page_path_for_id(src_id);
+    let concept_candidates_prefix =
+        PathBuf::from("state/concept_candidates").join(src_id);
+    // `build:<pass>:<src-id>` → the id ends with `:<src-id>`. A suffix check
+    // is narrow enough to avoid collisions with records for unrelated srcs
+    // whose id happens to embed this src-id as a substring.
+    let id_suffix = format!(":{src_id}");
     let mut matches = Vec::new();
     for entry in fs::read_dir(&dir)
         .with_context(|| format!("read build_records dir {}", dir.display()))?
@@ -420,10 +447,18 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
         let Ok(record) = serde_json::from_slice::<BuildRecord>(&bytes) else {
             continue;
         };
-        let references_src = record.metadata.output_paths.iter().any(|out| {
-            out.starts_with(&normalized_prefix) || out == &wiki_source_path
+        let references_src_via_paths = record.metadata.output_paths.iter().any(|out| {
+            out.starts_with(&normalized_prefix)
+                || out == &wiki_source_path
+                // `starts_with` on `state/concept_candidates/<src>` catches both
+                // `<src>.json` (exact file) and any future subpath.
+                || out.starts_with(&concept_candidates_prefix)
+                || out.to_string_lossy().starts_with(
+                    &format!("state/concept_candidates/{src_id}."),
+                )
         });
-        if references_src {
+        let references_src_via_id = record.metadata.id.ends_with(&id_suffix);
+        if references_src_via_paths || references_src_via_id {
             matches.push(path);
         }
     }
@@ -471,9 +506,14 @@ pub struct ExecuteOutcome {
 ///      link lists no longer point into `trash/` (bn-i5r step 1),
 ///   5. **rebuild** the lexical search index at `state/indexes/lexical.json`
 ///      from surviving wiki pages so `kb ask` doesn't crash trying to read a
-///      trashed candidate (bn-i5r step 3).
+///      trashed candidate (bn-i5r step 3),
+///   6. **prune** `state/graph.json` — surgically remove every node that
+///      references the forgotten src (`source-document-<src>`,
+///      `wiki-page-<src>`, and path-style nodes containing `/<src>/`) along
+///      with their edges so `kb inspect` / `kb status` don't surface dangling
+///      references until the next full compile (bn-3f6).
 ///
-/// Steps 2–5 are all best-effort: a failure emits a warning and marks the
+/// Steps 2–6 are all best-effort: a failure emits a warning and marks the
 /// corresponding field in [`ExecuteOutcome`] as `false`/`0` but the forget as
 /// a whole still succeeds — rerunning `kb compile` will correct any lingering
 /// staleness.
@@ -483,6 +523,7 @@ pub struct ExecuteOutcome {
 /// Returns an error when a move fails or the hash-state file cannot be
 /// updated. Partial moves are NOT rolled back — callers should treat a
 /// failure as "inspect manually and finish by hand".
+#[allow(clippy::too_many_lines)]
 pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<ExecuteOutcome> {
     fs::create_dir_all(&plan.trash_dir)
         .with_context(|| format!("create trash dir {}", plan.trash_dir.display()))?;
@@ -598,14 +639,54 @@ pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<ExecuteOutcome> {
         }
     };
 
+    // bn-3f6 step 4: surgically prune `state/graph.json` so stale
+    // `source-document-<src>` / `wiki-page-<src>` nodes don't linger until
+    // the next full compile. Missing graph.json is fine (`load_from` returns
+    // an empty Graph).
+    let graph_nodes_pruned = match prune_graph_for_src(root, &plan.src_id) {
+        Ok(n) => n,
+        Err(err) => {
+            eprintln!(
+                "warning: graph.json prune failed after forget: {err:#}"
+            );
+            0
+        }
+    };
+
     Ok(ExecuteOutcome {
         backlinks_refreshed,
         cascade_refresh: CascadeRefresh {
             index_pages_refreshed,
             frontmatter_scrubbed,
             lexical_index_refreshed,
+            graph_nodes_pruned,
         },
     })
+}
+
+/// Load `state/graph.json`, remove every node referencing `src_id`, and
+/// persist back atomically. Returns the number of nodes pruned (0 when the
+/// file is absent or carries no matching nodes).
+///
+/// # Errors
+///
+/// Returns an error when the graph fails to load or persist (including the
+/// post-prune `validate()` round-trip).
+fn prune_graph_for_src(root: &Path, src_id: &str) -> Result<usize> {
+    let graph_path = Graph::graph_path(root);
+    if !graph_path.exists() {
+        return Ok(0);
+    }
+    let mut graph = Graph::load_from(root)
+        .with_context(|| format!("load {}", graph_path.display()))?;
+    let removed = graph.prune_for_src(src_id);
+    if removed == 0 {
+        return Ok(0);
+    }
+    graph
+        .persist_to(root)
+        .with_context(|| format!("persist {} after prune", graph_path.display()))?;
+    Ok(removed)
 }
 
 /// Walk `wiki/concepts/*.md` and remove `src_id` from each page's
@@ -834,8 +915,8 @@ pub fn render_refresh_footer(plan: &ForgetPlan, refresh: &CascadeRefresh, dry_ru
     if dry_run {
         let _ = writeln!(
             out,
-            "  will also refresh: wiki/index.md, wiki/sources/index.md, wiki/concepts/index.md, wiki/questions/index.md, state/indexes/lexical.json, frontmatter scrub on {} page(s)",
-            refresh.frontmatter_scrubbed
+            "  will also refresh: wiki/index.md, wiki/sources/index.md, wiki/concepts/index.md, wiki/questions/index.md, state/indexes/lexical.json, frontmatter scrub on {} page(s), graph.json prune of {} node(s)",
+            refresh.frontmatter_scrubbed, refresh.graph_nodes_pruned,
         );
         // Moves / cascade bookkeeping already printed above; nothing else.
         let _ = &plan;
@@ -857,6 +938,13 @@ pub fn render_refresh_footer(plan: &ForgetPlan, refresh: &CascadeRefresh, dry_ru
             refresh.frontmatter_scrubbed
         );
     }
+    if refresh.graph_nodes_pruned > 0 {
+        let _ = writeln!(
+            out,
+            "  pruned {} graph.json node(s)",
+            refresh.graph_nodes_pruned
+        );
+    }
     out
 }
 
@@ -875,11 +963,26 @@ pub fn render_refresh_footer(plan: &ForgetPlan, refresh: &CascadeRefresh, dry_ru
 /// directories are tolerated; see [`concept_pages_needing_scrub`]).
 pub fn preview_refresh(root: &Path, src_id: &str) -> Result<CascadeRefresh> {
     let frontmatter_scrubbed = concept_pages_needing_scrub(root, src_id)?.len();
+    let graph_nodes_pruned = preview_graph_prune(root, src_id).unwrap_or(0);
     Ok(CascadeRefresh {
         index_pages_refreshed: true,
         frontmatter_scrubbed,
         lexical_index_refreshed: true,
+        graph_nodes_pruned,
     })
+}
+
+/// Count how many `state/graph.json` nodes a live execute would prune without
+/// modifying the file. Returns `Ok(0)` when the graph file is missing. Shared
+/// between `preview_refresh` and any future diagnostic command.
+fn preview_graph_prune(root: &Path, src_id: &str) -> Result<usize> {
+    let graph_path = Graph::graph_path(root);
+    if !graph_path.exists() {
+        return Ok(0);
+    }
+    // Clone-and-prune so the on-disk file is untouched.
+    let mut graph = Graph::load_from(root)?;
+    Ok(graph.prune_for_src(src_id))
 }
 
 fn is_src_id(token: &str) -> bool {
@@ -1281,5 +1384,188 @@ mod tests {
         assert!(preview.index_pages_refreshed);
         assert!(preview.lexical_index_refreshed);
         assert_eq!(preview.frontmatter_scrubbed, 1);
+    }
+
+    // -- bn-3f6: expanded build-record matching ----------------------------
+
+    /// Write a build record under `state/build_records/<id>.json` with the
+    /// given id and output paths. Leaves every other metadata field at
+    /// defaults, which is enough for [`scan_stale_build_records`] since it
+    /// only inspects `id` and `output_paths`.
+    fn write_build_record(root: &Path, id: &str, output_paths: &[&str]) -> PathBuf {
+        let dir = build_records_dir(root);
+        fs::create_dir_all(&dir).expect("mkdir build_records");
+        let record = serde_json::json!({
+            "metadata": {
+                "id": id,
+                "created_at_millis": 0u64,
+                "updated_at_millis": 0u64,
+                "source_hashes": [],
+                "dependencies": [],
+                "output_paths": output_paths,
+                "status": "fresh",
+            },
+            "pass_name": "test",
+            "input_ids": [],
+            "output_ids": [],
+            "manifest_hash": "m",
+        });
+        let path = dir.join(format!("{id}.json"));
+        fs::write(&path, record.to_string()).expect("write build record");
+        path
+    }
+
+    #[test]
+    fn scan_stale_build_records_matches_source_summary_and_extract_concepts() {
+        // bn-3f6: pass-11 found that `build:extract-concepts:<src>` was NOT
+        // scooped up by the cascade because its `output_paths` points at
+        // `state/concept_candidates/<src>.json`, not `normalized/<src>/` nor
+        // `wiki/sources/<src>.md`. Both must be trashed after the fix.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-3f600001";
+        let other = "src-3f600002";
+
+        // Source-summary record — caught today via `output_paths`.
+        let summary = write_build_record(
+            root,
+            &format!("build:source-summary:{src}"),
+            &[&format!("wiki/sources/{src}.md")],
+        );
+        // Extract-concepts record — caught ONLY after bn-3f6 (id suffix
+        // match OR state/concept_candidates path match).
+        let extract = write_build_record(
+            root,
+            &format!("build:extract-concepts:{src}"),
+            &[&format!("state/concept_candidates/{src}.json")],
+        );
+        // Unrelated src — must NOT match.
+        let unrelated = write_build_record(
+            root,
+            &format!("build:source-summary:{other}"),
+            &[&format!("wiki/sources/{other}.md")],
+        );
+
+        let found = scan_stale_build_records(root, src).expect("scan");
+        assert!(
+            found.contains(&summary),
+            "source-summary record must match; got {found:?}"
+        );
+        assert!(
+            found.contains(&extract),
+            "extract-concepts record must match; got {found:?}"
+        );
+        assert!(
+            !found.contains(&unrelated),
+            "unrelated src must NOT match: {found:?}"
+        );
+        assert_eq!(found.len(), 2, "only the two src-owned records match");
+    }
+
+    #[test]
+    fn scan_stale_build_records_matches_future_pass_by_id_suffix() {
+        // Future passes that emit `build:<pass>:<src>` with output paths
+        // outside normalized/, wiki/sources/, and state/concept_candidates/
+        // are still caught by the id-suffix rule — the whole point of the
+        // bn-3f6 expansion is to be forward-compatible.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-3f600010";
+        let hypothetical = write_build_record(
+            root,
+            &format!("build:future-pass:{src}"),
+            &["state/somewhere-else/blob.json"],
+        );
+
+        let found = scan_stale_build_records(root, src).expect("scan");
+        assert_eq!(found, vec![hypothetical]);
+    }
+
+    // -- bn-3f6: graph.json surgical prune ---------------------------------
+
+    #[test]
+    fn execute_prunes_graph_json_nodes_referencing_src() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-3f60a001";
+
+        // Minimal on-disk layout so the forget plan has something to move.
+        fs::create_dir_all(root.join("normalized").join(src))
+            .expect("mkdir normalized");
+        let wiki_page = root.join(kb_compile::source_page::source_page_path_for_id(src));
+        fs::create_dir_all(wiki_page.parent().expect("parent"))
+            .expect("mkdir wiki/sources");
+        fs::write(&wiki_page, "---\nid: x\n---\n").expect("write wiki page");
+
+        // Persist a graph that references this src plus an unrelated doc.
+        let mut graph = kb_compile::Graph::default();
+        graph.record(
+            [format!("source-document-{src}")],
+            [format!("wiki-page-{src}")],
+        );
+        graph.record(
+            ["source-document-src-keepalive"],
+            ["wiki-page-src-keepalive"],
+        );
+        graph.persist_to(root).expect("persist graph");
+
+        let plan = plan(root, src, None, true).expect("plan");
+        let outcome = execute(root, &plan).expect("execute");
+
+        // Both src-owned nodes went away in a single prune.
+        assert_eq!(
+            outcome.cascade_refresh.graph_nodes_pruned, 2,
+            "source-document + wiki-page nodes must be pruned"
+        );
+
+        let reloaded = kb_compile::Graph::load_from(root).expect("reload graph");
+        assert!(
+            !reloaded.nodes.contains_key(&format!("source-document-{src}")),
+            "source-document-{src} must be gone"
+        );
+        assert!(
+            !reloaded.nodes.contains_key(&format!("wiki-page-{src}")),
+            "wiki-page-{src} must be gone"
+        );
+        // Unrelated src survives — surgical, not a rebuild.
+        assert!(reloaded.nodes.contains_key("source-document-src-keepalive"));
+        assert!(reloaded.nodes.contains_key("wiki-page-src-keepalive"));
+    }
+
+    #[test]
+    fn execute_tolerates_missing_graph_json() {
+        // No graph.json on disk → prune reports 0 and forget still succeeds.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-3f60a010";
+        fs::create_dir_all(root.join("normalized").join(src))
+            .expect("mkdir normalized");
+
+        let plan = plan(root, src, None, true).expect("plan");
+        let outcome = execute(root, &plan).expect("execute");
+
+        assert_eq!(outcome.cascade_refresh.graph_nodes_pruned, 0);
+        assert!(!kb_compile::Graph::graph_path(root).exists());
+    }
+
+    #[test]
+    fn preview_refresh_counts_graph_nodes() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-3f60b001";
+
+        let mut graph = kb_compile::Graph::default();
+        graph.record(
+            [format!("source-document-{src}")],
+            [format!("wiki-page-{src}")],
+        );
+        graph.persist_to(root).expect("persist graph");
+
+        let preview = preview_refresh(root, src).expect("preview");
+        assert_eq!(preview.graph_nodes_pruned, 2);
+        // Preview must NOT mutate the on-disk graph.
+        let reloaded = kb_compile::Graph::load_from(root).expect("reload graph");
+        assert!(reloaded.nodes.contains_key(&format!("source-document-{src}")));
+        assert!(reloaded.nodes.contains_key(&format!("wiki-page-{src}")));
     }
 }

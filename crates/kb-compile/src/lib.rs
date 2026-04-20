@@ -102,6 +102,56 @@ impl Graph {
         self.nodes.entry(id.into()).or_default();
     }
 
+    /// Remove `id` from the graph along with every edge that touches it.
+    ///
+    /// Returns `true` when the node was present.
+    pub fn remove_node(&mut self, id: &str) -> bool {
+        if self.nodes.remove(id).is_none() {
+            return false;
+        }
+        for node in self.nodes.values_mut() {
+            node.inputs.retain(|other| other != id);
+            node.outputs.retain(|other| other != id);
+        }
+        true
+    }
+
+    /// Surgically remove every node whose id references the forgotten
+    /// `src_id`, along with all edges that touch those nodes.
+    ///
+    /// Matches `source-document-<src>`, `wiki-page-<src>` (source pages use
+    /// the raw src-id as their slug via `source_page_path_for_id`), and any
+    /// node whose id contains `/<src>/` or ends with `/<src>.md` — the last
+    /// two catch filesystem-path nodes that older build records may have
+    /// emitted verbatim before the `graph_node_for_id` normalization existed.
+    ///
+    /// Returns the number of nodes removed so callers can surface the count
+    /// in logs / test assertions. `bn-3f6` uses this on the `kb forget` path
+    /// to avoid a full compile rebuild when only a single src went away.
+    pub fn prune_for_src(&mut self, src_id: &str) -> usize {
+        let src_doc_node = format!("source-document-{src_id}");
+        let wiki_page_node = format!("wiki-page-{src_id}");
+        let path_segment = format!("/{src_id}/");
+        let md_suffix = format!("/{src_id}.md");
+
+        let to_remove: Vec<NodeId> = self
+            .nodes
+            .keys()
+            .filter(|id| {
+                id.as_str() == src_doc_node
+                    || id.as_str() == wiki_page_node
+                    || id.contains(&path_segment)
+                    || id.ends_with(&md_suffix)
+            })
+            .cloned()
+            .collect();
+        let removed = to_remove.len();
+        for id in to_remove {
+            self.remove_node(&id);
+        }
+        removed
+    }
+
     pub fn add_edge(&mut self, input: impl Into<NodeId>, output: impl Into<NodeId>) {
         let input = input.into();
         let output = output.into();
@@ -655,6 +705,77 @@ mod tests {
 
         let suffix = graph.inspect("sources/doc.md").expect("suffix match");
         assert_eq!(suffix.id, "wiki/sources/doc.md");
+    }
+
+    #[test]
+    fn prune_for_src_removes_prefixed_nodes_and_their_edges() {
+        // bn-3f6: surgical removal of every node that references a forgotten
+        // src, leaving unrelated graph topology intact.
+        let mut graph = Graph::default();
+        let src = "src-3f60001f";
+        // Prefixed node forms emitted by `build_graph_from_state`.
+        graph.record(
+            [format!("source-document-{src}")],
+            [format!("wiki-page-{src}")],
+        );
+        // Downstream concept should lose its incoming edge from the pruned
+        // wiki-page node but otherwise remain.
+        graph.add_edge(format!("wiki-page-{src}"), "concept-shared".to_string());
+        // Unrelated src must survive.
+        graph.record(["source-document-src-keepme"], ["wiki-page-src-keepme"]);
+
+        let removed = graph.prune_for_src(src);
+        assert_eq!(removed, 2, "source-document + wiki-page nodes pruned");
+        assert!(!graph.nodes.contains_key(&format!("source-document-{src}")));
+        assert!(!graph.nodes.contains_key(&format!("wiki-page-{src}")));
+        assert!(graph.nodes.contains_key("concept-shared"));
+        let concept = graph.node("concept-shared").expect("concept survives");
+        assert!(
+            concept.inputs.is_empty(),
+            "concept must lose the dangling input edge; got {:?}",
+            concept.inputs
+        );
+        // Unrelated src lane untouched.
+        assert!(graph.nodes.contains_key("source-document-src-keepme"));
+        assert!(graph.nodes.contains_key("wiki-page-src-keepme"));
+        // Post-prune graph is still valid.
+        graph.validate().expect("pruned graph validates");
+    }
+
+    #[test]
+    fn prune_for_src_matches_filesystem_path_nodes() {
+        // Older graph entries sometimes store raw filesystem paths as node
+        // ids; those must also match when they carry `/<src>/` or end with
+        // `/<src>.md`.
+        let mut graph = Graph::default();
+        let src = "src-3f600029";
+        graph.add_edge(
+            format!("raw/inbox/{src}/source_document.json"),
+            format!("normalized/{src}/doc.json"),
+        );
+        graph.add_edge(
+            format!("normalized/{src}/doc.json"),
+            format!("wiki/sources/{src}.md"),
+        );
+        // Unrelated node.
+        graph.add_edge("raw/inbox/other/source.json", "normalized/other/doc.json");
+
+        let removed = graph.prune_for_src(src);
+        assert_eq!(removed, 3);
+        assert!(!graph.nodes.contains_key(&format!("raw/inbox/{src}/source_document.json")));
+        assert!(!graph.nodes.contains_key(&format!("normalized/{src}/doc.json")));
+        assert!(!graph.nodes.contains_key(&format!("wiki/sources/{src}.md")));
+        assert!(graph.nodes.contains_key("raw/inbox/other/source.json"));
+        assert!(graph.nodes.contains_key("normalized/other/doc.json"));
+    }
+
+    #[test]
+    fn prune_for_src_is_noop_when_absent() {
+        let mut graph = Graph::default();
+        graph.record(["source-document-src-aaaa"], ["wiki-page-src-aaaa"]);
+        let removed = graph.prune_for_src("src-notpresent");
+        assert_eq!(removed, 0);
+        assert!(graph.nodes.contains_key("source-document-src-aaaa"));
     }
 
     // --- Stale detection tests ---
