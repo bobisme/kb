@@ -1238,6 +1238,130 @@ fn inspect_citations_do_not_double_bullet() {
     );
 }
 
+// L1: `kb inspect wiki/sources/<id>` (no `.md`) should resolve to the
+// on-disk `.md` file — users follow the Obsidian/wiki convention of
+// omitting the extension.
+#[test]
+fn inspect_accepts_wiki_sources_path_without_md_extension() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    fs::write(
+        sources_dir.join("src-0e2e3f8b.md"),
+        "---\nid: wiki-source-src-0e2e3f8b\nsource_document_id: src-0e2e3f8b\nsource_revision_id: rev-1\n---\n\n# Src\n",
+    )
+    .expect("write source page");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("wiki/sources/src-0e2e3f8b");
+    let output = cmd
+        .output()
+        .expect("run kb inspect wiki/sources/src-0e2e3f8b");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("resolved_id: wiki/sources/src-0e2e3f8b.md"),
+        "expected resolved_id to include .md suffix, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("kind: wiki_page"),
+        "expected kind: wiki_page, got:\n{stdout}"
+    );
+}
+
+// L1: concept pages should resolve the same way.
+#[test]
+fn inspect_accepts_wiki_concepts_path_without_md_extension() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let concepts_dir = kb_root.join("wiki/concepts");
+    fs::create_dir_all(&concepts_dir).expect("create wiki/concepts");
+    fs::write(concepts_dir.join("tokio.md"), "# Tokio\n").expect("write concept");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("wiki/concepts/tokio");
+    let output = cmd.output().expect("run kb inspect wiki/concepts/tokio");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("resolved_id: wiki/concepts/tokio.md"),
+        "expected resolved_id to include .md suffix, got:\n{stdout}"
+    );
+}
+
+// L2: inspecting a directory (e.g. `raw/inbox`) should classify the kind as
+// `directory` rather than inheriting the `source_revision` prefix heuristic.
+#[test]
+fn inspect_directory_reports_directory_kind() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // `kb init` creates `raw/inbox/` as a directory.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect").arg("raw/inbox");
+    let output = cmd.output().expect("run kb inspect raw/inbox");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("kind: directory"),
+        "expected kind: directory for raw/inbox, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("kind: source_revision"),
+        "raw/inbox should not be classified source_revision, got:\n{stdout}"
+    );
+}
+
+// L2 (regression): an actual revision file under raw/inbox should still be
+// classified `source_revision`.
+#[test]
+fn inspect_source_revision_file_still_reports_source_revision_kind() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let rev_dir = kb_root.join("raw/inbox/src-abc12345/rev-1");
+    fs::create_dir_all(&rev_dir).expect("create revision dir");
+    fs::write(rev_dir.join("document.md"), "# doc\n").expect("write revision file");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("inspect")
+        .arg("raw/inbox/src-abc12345/rev-1/document.md");
+    let output = cmd.output().expect("run kb inspect revision file");
+
+    assert!(
+        output.status.success(),
+        "kb inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("kind: source_revision"),
+        "expected kind: source_revision for revision file, got:\n{stdout}"
+    );
+}
+
 #[test]
 fn ingest_mixed_file_directory_and_url_reports_summary() {
     let (_temp_dir, kb_root) = make_temp_kb();

@@ -1664,11 +1664,16 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
         build_job_report(target, job)
     } else {
         let candidate = root.join(target);
-        if candidate.exists() {
+        let resolved = if candidate.exists() {
+            Some(candidate)
+        } else {
+            resolve_wiki_missing_md(root, target)
+        };
+        if let Some(path) = resolved {
             build_file_report(
                 root,
                 target,
-                &candidate,
+                &path,
                 &jobs,
                 &graph,
                 &changed_inputs,
@@ -1752,7 +1757,7 @@ fn build_graph_inspect_report(
     Ok(InspectReport {
         target: target.to_string(),
         resolved_id: id.to_string(),
-        kind: inspect_kind(id),
+        kind: inspect_kind_for_path(id, path.exists().then_some(path.as_path())),
         metadata,
         freshness,
         graph: Some(InspectGraph {
@@ -1880,7 +1885,7 @@ fn build_file_report(
     Ok(InspectReport {
         target: target.to_string(),
         resolved_id: rel.clone(),
-        kind: inspect_kind(&rel),
+        kind: inspect_kind_for_path(&rel, Some(path)),
         metadata: file_metadata(root, Some(path))?,
         freshness,
         graph: None,
@@ -1989,6 +1994,18 @@ fn path_outside_root(root: &Path, target: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// L1: accept wiki page paths without the `.md` suffix, matching the
+/// Obsidian/wiki convention (`wiki/sources/src-0e2e3f8b` ->
+/// `wiki/sources/src-0e2e3f8b.md`). Returns the on-disk file path when the
+/// `.md` form exists and the bare form does not resolve to a file.
+fn resolve_wiki_missing_md(root: &Path, target: &str) -> Option<PathBuf> {
+    if !target.starts_with("wiki/") {
+        return None;
+    }
+    let with_md = root.join(format!("{target}.md"));
+    if with_md.is_file() { Some(with_md) } else { None }
 }
 
 /// I1: resolve a bare `src-<hex>` identifier to the wiki/sources page (if any)
@@ -2159,6 +2176,21 @@ fn inspect_kind(id: &str) -> String {
     } else {
         "entity".to_string()
     }
+}
+
+/// L2: classify the resolved entity using filesystem metadata when available.
+///
+/// `inspect_kind` does pure prefix classification, which mislabels
+/// intermediate directories (e.g. `raw/inbox`) as `source_revision`. When the
+/// resolved path is a directory, override to `directory`; otherwise fall
+/// through to the id-based heuristic.
+fn inspect_kind_for_path(id: &str, path: Option<&Path>) -> String {
+    if let Some(p) = path {
+        if p.is_dir() {
+            return "directory".to_string();
+        }
+    }
+    inspect_kind(id)
 }
 
 fn summarize_build_record(record: kb_core::BuildRecord) -> InspectBuildRecord {
