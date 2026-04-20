@@ -203,6 +203,35 @@ pub fn is_semantically_empty(content: &[u8]) -> bool {
     body.chars().all(char::is_whitespace)
 }
 
+/// Bundled options threaded through local-file ingest.
+///
+/// Grouping these avoids an ever-growing cascade of `fn(root, sources, bool,
+/// bool, …)` variants as the ingest pipeline picks up new behaviors
+/// (preprocessing, in future: format detection knobs, skip filters, …).
+#[derive(Debug, Clone, Default)]
+pub struct IngestOptions {
+    /// If true, compute outcomes and report paths without writing files.
+    pub dry_run: bool,
+    /// If true, ingest files whose body is semantically empty (e.g. a
+    /// frontmatter-only markdown file). Default is to skip with a warning.
+    pub allow_empty: bool,
+    /// Settings for the markitdown preprocessing step. Default = disabled so
+    /// callers that don't care about PDFs keep the v1 behavior.
+    pub markitdown: preprocess::MarkitdownOptions,
+}
+
+impl IngestOptions {
+    /// Convenience: preprocessing off, both flags default.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            dry_run: false,
+            allow_empty: false,
+            markitdown: preprocess::MarkitdownOptions::disabled(),
+        }
+    }
+}
+
 /// # Errors
 /// Returns an error if any source path cannot be read, walked, or ingested.
 pub fn ingest_paths(root: &Path, sources: &[PathBuf]) -> Result<Vec<IngestedSource>> {
@@ -233,6 +262,27 @@ pub fn ingest_paths_with_flags(
     dry_run: bool,
     allow_empty: bool,
 ) -> Result<Vec<LocalIngestReport>> {
+    ingest_paths_with_config(
+        root,
+        sources,
+        &IngestOptions {
+            dry_run,
+            allow_empty,
+            markitdown: preprocess::MarkitdownOptions::disabled(),
+        },
+    )
+}
+
+/// Full-configured entry point. All other public wrappers eventually funnel
+/// here so the markitdown preprocessing hook lives in exactly one place.
+///
+/// # Errors
+/// Returns an error if any source path cannot be read, walked, or ingested.
+pub fn ingest_paths_with_config(
+    root: &Path,
+    sources: &[PathBuf],
+    options: &IngestOptions,
+) -> Result<Vec<LocalIngestReport>> {
     let mut files: Vec<(PathBuf, FileOrigin)> = Vec::new();
     for source in sources {
         collect_files(source, &mut files)?;
@@ -241,7 +291,7 @@ pub fn ingest_paths_with_flags(
 
     let mut ingested = Vec::with_capacity(files.len());
     for (file, origin) in files {
-        match ingest_file(root, &file, dry_run, origin, allow_empty) {
+        match ingest_file(root, &file, origin, options) {
             Ok(Some(report)) => ingested.push(report),
             Ok(None) => {}
             Err(err) => return Err(err),
@@ -311,27 +361,41 @@ fn check_text_or_skip(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn ingest_file(
     root: &Path,
     source_path: &Path,
-    dry_run: bool,
     origin: FileOrigin,
-    allow_empty: bool,
+    options: &IngestOptions,
 ) -> Result<Option<LocalIngestReport>> {
     let canonical_source = fs::canonicalize(source_path)
         .with_context(|| format!("failed to canonicalize {}", source_path.display()))?;
     let stable_location = normalize_file_stable_location(&canonical_source)
         .with_context(|| format!("failed to normalize {}", source_path.display()))?;
-    let content = fs::read(&canonical_source)
+    let original_bytes = fs::read(&canonical_source)
         .with_context(|| format!("failed to read {}", canonical_source.display()))?;
     let fs_metadata = fs::metadata(&canonical_source)
         .with_context(|| format!("failed to read metadata for {}", canonical_source.display()))?;
 
-    if !check_text_or_skip(&canonical_source, &content, origin)? {
+    // Preprocess FIRST so PDFs / .docx / etc. can be routed through markitdown
+    // before the binary-detection gate rejects them. On a successful
+    // conversion, `normalized_bytes` is the markdown captured from
+    // markitdown's stdout and `original_bytes` is still the raw file we
+    // archive under `raw/inbox/<src>/<rev>/original.<ext>`. On an applicable
+    // but failed conversion (SkipFile) we drop the file entirely so we
+    // don't re-feed an unsupported binary through the text/binary gate.
+    let (normalized_bytes, was_preprocessed): (Vec<u8>, bool) =
+        match preprocess::maybe_preprocess(&canonical_source, &options.markitdown)? {
+            preprocess::Preprocessed::Converted(c) => (c.markdown, true),
+            preprocess::Preprocessed::NotApplicable => (original_bytes.clone(), false),
+            preprocess::Preprocessed::SkipFile => return Ok(None),
+        };
+
+    if !check_text_or_skip(&canonical_source, &normalized_bytes, origin)? {
         return Ok(None);
     }
 
-    if !allow_empty && is_semantically_empty(&content) {
+    if !options.allow_empty && is_semantically_empty(&normalized_bytes) {
         eprintln!(
             "warning: skipping empty source {} (use --allow-empty to override)",
             canonical_source.display()
@@ -342,8 +406,12 @@ fn ingest_file(
     let imported_at_millis = now_millis()?;
     let modified_at_millis = fs_metadata.modified().ok().and_then(system_time_to_millis);
     let source_document_id = mint_file_source_id(root, &stable_location);
-    let source_revision_id = mint_source_revision_id(&content);
-    let content_hash = source_revision_content_hash(&content);
+    // Revision id + content hash are derived from the ORIGINAL bytes so that
+    // re-ingesting the same PDF (same bytes) round-trips to the same rev id
+    // regardless of whether markitdown's output is byte-identical across
+    // versions. The normalized markdown lives alongside as a derived view.
+    let source_revision_id = mint_source_revision_id(&original_bytes);
+    let content_hash = source_revision_content_hash(&original_bytes);
 
     let original_name = canonical_source
         .file_name()
@@ -351,9 +419,27 @@ fn ingest_file(
 
     let relative_document_dir = PathBuf::from("raw").join("inbox").join(&source_document_id);
     let relative_revision_dir = relative_document_dir.join(&source_revision_id);
-    let relative_copied_path = relative_revision_dir.join(original_name);
+    // When we preprocessed, archive under `original.<ext>` and place the
+    // converted markdown at `source.md`. Otherwise keep the v1 layout where
+    // the file lives under its real name — no migration needed for existing
+    // KBs and non-PDF ingest works exactly as before.
+    let (relative_copied_path, relative_converted_path) = if was_preprocessed {
+        let ext = canonical_source
+            .extension()
+            .and_then(|e| e.to_str())
+            .map_or_else(|| "bin".to_string(), str::to_ascii_lowercase);
+        (
+            relative_revision_dir.join(format!("original.{ext}")),
+            Some(relative_revision_dir.join("source.md")),
+        )
+    } else {
+        (relative_revision_dir.join(original_name), None)
+    };
+    let sidecar_basename = relative_copied_path
+        .file_name()
+        .map_or_else(|| "source".to_string(), |n| n.to_string_lossy().into_owned());
     let relative_metadata_sidecar_path =
-        relative_revision_dir.join(format!("{}.metadata.json", original_name.to_string_lossy()));
+        relative_revision_dir.join(format!("{sidecar_basename}.metadata.json"));
     let relative_document_record_path = relative_document_dir.join(SOURCE_DOCUMENT_RECORD);
     let relative_revision_record_path = relative_revision_dir.join(SOURCE_REVISION_RECORD);
 
@@ -392,7 +478,7 @@ fn ingest_file(
         )
     };
 
-    if !dry_run {
+    if !options.dry_run {
         if !document_exists {
             write_json(&document_record_path, &document)?;
         }
@@ -400,21 +486,50 @@ fn ingest_file(
             write_new_revision(
                 &canonical_source,
                 &copied_path,
-                &content,
+                &original_bytes,
                 &fs_metadata,
                 &metadata_sidecar_path,
                 &revision_record_path,
                 modified_at_millis,
                 &revision,
             )?;
+            // When preprocessing fired, also persist the converted markdown
+            // at `raw/inbox/<src>/<rev>/source.md` so inspectors can see
+            // exactly what entered the normalize pipeline without re-running
+            // markitdown.
+            if let Some(rel_converted) = &relative_converted_path {
+                let converted_path = root.join(rel_converted);
+                fs::write(&converted_path, &normalized_bytes).with_context(|| {
+                    format!(
+                        "failed to write converted markdown {}",
+                        converted_path.display()
+                    )
+                })?;
+            }
         }
 
         // Also produce the canonical NormalizedDocument so downstream passes
         // (compile, query) can consume the ingested source. The raw/ tree
         // remains the immutable source archive; normalized/ is the derived
         // view keyed by source-document id.
-        let md_dir = canonical_source.parent().unwrap_or_else(|| Path::new(""));
-        write_normalized_for_file(root, &document, &revision, &content, md_dir)?;
+        //
+        // For preprocessed sources the markdown has no companion asset
+        // directory — markitdown is the only source of image refs, and they
+        // come out as URLs or inline data, not local paths we can resolve —
+        // so we stage against a temp dir. `scan_and_stage` tolerates dirs
+        // without local matches.
+        let md_dir = if was_preprocessed {
+            // Use the revision dir as the "markdown dir" so any accidentally
+            // relative refs in markitdown output are resolved against the
+            // archive location rather than the user's source tree.
+            root.join(&relative_revision_dir)
+        } else {
+            canonical_source
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_path_buf()
+        };
+        write_normalized_for_file(root, &document, &revision, &normalized_bytes, &md_dir)?;
     }
 
     let outcome = if !document_exists {
@@ -1354,15 +1469,291 @@ mod tests {
                 .is_none()
         );
     }
+
+    // ------------------------------------------------------------------
+    // bn-23am: markitdown preprocessing acceptance tests
+    // ------------------------------------------------------------------
+    //
+    // These tests drive the ingest pipeline with a shell-script shim named
+    // `markitdown` so we don't depend on the real Microsoft tool being
+    // installed in CI. Unix-only because the shim is `#!/bin/sh`; the
+    // Windows preprocessing path is untested here but the code itself
+    // doesn't special-case the platform.
+
+    #[cfg(unix)]
+    mod markitdown_ingest {
+        use super::*;
+        use crate::MarkitdownOptions;
+
+        /// Writes a plain shell script file (no executable bit). Tests
+        /// invoke it via `sh <script>`, side-stepping Linux's ETXTBSY race
+        /// that hits parallel test workers when they exec a just-written
+        /// binary while another thread still holds its write handle open.
+        fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
+            let path = dir.join(name);
+            fs::write(&path, body).expect("write shim");
+            path
+        }
+
+        /// Builds a config that runs the shim via `sh`. Whitespace splitting
+        /// in `MarkitdownOptions.command` produces argv = [sh, shim, file].
+        fn pdf_options(shim: &Path) -> IngestOptions {
+            IngestOptions {
+                dry_run: false,
+                allow_empty: false,
+                markitdown: MarkitdownOptions {
+                    enabled: true,
+                    command: format!("sh {}", shim.display()),
+                    extensions: vec!["pdf".to_string()],
+                    optional_extensions: Vec::new(),
+                },
+            }
+        }
+
+        /// Sanity: a PDF today is rejected (binary-detection gate) unless
+        /// preprocessing is wired up. Guards the "runs BEFORE binary check"
+        /// requirement from the bone — if this ever passes without a shim,
+        /// somebody wired a native PDF parser and these tests need
+        /// rewriting.
+        #[test]
+        fn pdf_without_markitdown_still_errors() {
+            let kb_root = init_kb_root();
+            let source_root = TempDir::new().expect("mktemp");
+            let pdf = source_root.path().join("paper.pdf");
+            fs::write(&pdf, b"%PDF-1.4 \x00\x00 binary bytes\n").expect("write pdf");
+
+            let err = ingest_paths(kb_root.path(), &[pdf]).expect_err("should reject");
+            assert!(
+                format!("{err:#}").contains("does not appear to be text"),
+                "expected binary-content rejection"
+            );
+        }
+
+        /// Acceptance: when markitdown is wired up, a PDF is converted to
+        /// markdown, the original bytes land at `original.pdf`, and the
+        /// converted text lands at `source.md` inside the revision dir.
+        /// The normalized view uses the converted markdown as its canonical
+        /// text.
+        #[test]
+        fn pdf_preprocessed_through_shim() {
+            let kb_root = init_kb_root();
+            let source_root = TempDir::new().expect("mktemp");
+            let shim = write_shim(
+                source_root.path(),
+                "markitdown",
+                "#!/bin/sh\nprintf '# From PDF\\n\\nContent extracted.\\n'\n",
+            );
+
+            let pdf = source_root.path().join("paper.pdf");
+            fs::write(&pdf, b"%PDF-1.4 \x00\x00 binary bytes\n").expect("write pdf");
+
+            let options = pdf_options(&shim);
+            let reports =
+                ingest_paths_with_config(kb_root.path(), std::slice::from_ref(&pdf), &options)
+                    .expect("ingest succeeds");
+            assert_eq!(reports.len(), 1);
+            let report = &reports[0];
+
+            // original.pdf + source.md both exist under the revision dir.
+            let rev_dir = kb_root
+                .path()
+                .join("raw/inbox")
+                .join(&report.ingested.document.metadata.id)
+                .join(&report.ingested.revision.metadata.id);
+            let original = rev_dir.join("original.pdf");
+            let converted = rev_dir.join("source.md");
+            assert!(original.is_file(), "{} should exist", original.display());
+            assert!(converted.is_file(), "{} should exist", converted.display());
+            assert_eq!(
+                fs::read(&original).expect("read original"),
+                b"%PDF-1.4 \x00\x00 binary bytes\n",
+                "original bytes must be archived verbatim"
+            );
+            let converted_text =
+                fs::read_to_string(&converted).expect("read converted markdown");
+            assert!(converted_text.starts_with("# From PDF"));
+
+            // The normalized view must carry the converted markdown, not
+            // the raw PDF bytes.
+            let src_id = &report.ingested.document.metadata.id;
+            let normalized =
+                fs::read_to_string(kb_root.path().join("normalized").join(src_id).join("source.md"))
+                    .expect("read normalized");
+            assert!(normalized.contains("Content extracted"));
+        }
+
+        /// Re-ingest of the same PDF with unchanged bytes must round-trip
+        /// to the same src-id and rev-id. Mirrors the canonical idempotency
+        /// acceptance criterion from the bone.
+        #[test]
+        fn pdf_reingest_is_idempotent() {
+            let kb_root = init_kb_root();
+            let source_root = TempDir::new().expect("mktemp");
+            let shim = write_shim(
+                source_root.path(),
+                "markitdown",
+                "#!/bin/sh\nprintf '# same output every time\\n'\n",
+            );
+            let pdf = source_root.path().join("doc.pdf");
+            fs::write(&pdf, b"%PDF-1.4 identical bytes").expect("write pdf");
+
+            let options = pdf_options(&shim);
+            let first =
+                ingest_paths_with_config(kb_root.path(), std::slice::from_ref(&pdf), &options)
+                    .expect("first ingest");
+            let second = ingest_paths_with_config(kb_root.path(), &[pdf], &options)
+                .expect("second ingest");
+
+            assert_eq!(
+                first[0].ingested.document.metadata.id,
+                second[0].ingested.document.metadata.id
+            );
+            assert_eq!(
+                first[0].ingested.revision.metadata.id,
+                second[0].ingested.revision.metadata.id
+            );
+            assert_eq!(second[0].outcome, IngestOutcome::Skipped);
+        }
+
+        /// A directory containing both a markdown file and a PDF should
+        /// ingest both: the .md takes the normal path, the .pdf goes
+        /// through the shim.
+        #[test]
+        fn directory_ingest_mixed_md_and_pdf() {
+            let kb_root = init_kb_root();
+            let source_root = TempDir::new().expect("mktemp");
+            // Put the shim outside the source tree so it isn't itself
+            // ingested.
+            let shim_dir = TempDir::new().expect("mktemp shim dir");
+            let shim = write_shim(
+                shim_dir.path(),
+                "markitdown",
+                "#!/bin/sh\nprintf '# Converted PDF\\n'\n",
+            );
+
+            fs::write(source_root.path().join("notes.md"), "# Notes\n\nbody\n")
+                .expect("write md");
+            fs::write(source_root.path().join("paper.pdf"), b"%PDF-1.4 bin\n")
+                .expect("write pdf");
+
+            let options = pdf_options(&shim);
+            let reports = ingest_paths_with_config(
+                kb_root.path(),
+                &[source_root.path().to_path_buf()],
+                &options,
+            )
+            .expect("directory ingest");
+
+            assert_eq!(reports.len(), 2);
+            let names: Vec<String> = reports
+                .iter()
+                .map(|r| {
+                    r.source_path
+                        .file_name()
+                        .expect("ingested source path has a file name")
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            assert!(names.contains(&"notes.md".to_string()));
+            assert!(names.contains(&"paper.pdf".to_string()));
+        }
+
+        /// Missing markitdown binary: the PDF should fall through to the
+        /// normal binary-detection path, which (for an explicit file
+        /// argument) errors out. The warning-once message is observable
+        /// via stderr — tested indirectly by the fact that the error is
+        /// the binary-detection error, not a "command not found" one.
+        #[test]
+        fn missing_binary_falls_through_to_binary_check() {
+            let kb_root = init_kb_root();
+            let source_root = TempDir::new().expect("mktemp");
+            let pdf = source_root.path().join("doc.pdf");
+            fs::write(&pdf, b"%PDF-1.4 \x00 binary").expect("write pdf");
+
+            let options = IngestOptions {
+                dry_run: false,
+                allow_empty: false,
+                markitdown: MarkitdownOptions {
+                    enabled: true,
+                    command: "/no/such/markitdown-xyz".to_string(),
+                    extensions: vec!["pdf".to_string()],
+                    optional_extensions: Vec::new(),
+                },
+            };
+            let err = ingest_paths_with_config(kb_root.path(), &[pdf], &options)
+                .expect_err("binary file should still be rejected");
+            assert!(format!("{err:#}").contains("does not appear to be text"));
+        }
+
+        /// Empty markitdown output for an explicit file triggers a warning
+        /// and a skip — no error, no on-disk artifacts. Mirrors bn-40r's
+        /// empty-file handling.
+        #[test]
+        fn empty_markitdown_output_skips_cleanly() {
+            let kb_root = init_kb_root();
+            let source_root = TempDir::new().expect("mktemp");
+            let shim = write_shim(
+                source_root.path(),
+                "markitdown",
+                "#!/bin/sh\nprintf ''\n",
+            );
+            let pdf = source_root.path().join("blank.pdf");
+            fs::write(&pdf, b"%PDF-1.4 \x00\x00 binary").expect("write pdf");
+
+            let options = pdf_options(&shim);
+            let reports = ingest_paths_with_config(kb_root.path(), &[pdf], &options)
+                .expect("ingest succeeds (skip is not an error)");
+            assert!(reports.is_empty(), "empty conversion must be skipped");
+            assert!(
+                fs::read_dir(kb_root.path().join("raw/inbox"))
+                    .expect("read raw inbox")
+                    .next()
+                    .is_none(),
+                "no source dirs should be created for a skipped file"
+            );
+        }
+
+        /// Markitdown binary is missing: a PDF specified explicitly falls
+        /// through to the binary-detection gate and errors out. This lets
+        /// the user learn loudly that they need to either install
+        /// markitdown or disable preprocessing in `kb.toml`.
+        #[test]
+        fn nonzero_exit_skips_cleanly() {
+            let kb_root = init_kb_root();
+            let source_root = TempDir::new().expect("mktemp");
+            let shim = write_shim(
+                source_root.path(),
+                "markitdown",
+                "#!/bin/sh\necho boom >&2\nexit 2\n",
+            );
+            let pdf = source_root.path().join("broken.pdf");
+            fs::write(&pdf, b"%PDF-1.4 \x00\x00 binary").expect("write pdf");
+
+            let options = pdf_options(&shim);
+            let reports = ingest_paths_with_config(kb_root.path(), &[pdf], &options)
+                .expect("ingest succeeds (skip is not an error)");
+            assert!(
+                reports.is_empty(),
+                "failed conversion must be skipped, not errored"
+            );
+        }
+    }
 }
 
 mod headings;
 mod image_refs;
+mod preprocess;
 mod repo;
 mod url;
 
 pub use headings::extract_heading_ids;
 pub use image_refs::{CopiedImages, rewrite_asset_refs, scan_and_stage};
+pub use preprocess::{
+    Converted, MarkitdownOptions, Preprocessed,
+    default_extensions as markitdown_default_extensions,
+    default_optional_extensions as markitdown_default_optional_extensions, maybe_preprocess,
+};
 pub use repo::{
     RepoFileReport, RepoIngestOptions, RepoIngestReport, ingest_repo, is_git_url,
 };

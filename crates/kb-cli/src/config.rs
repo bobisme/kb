@@ -17,6 +17,7 @@ pub struct Config {
     pub lint: LintConfig,
     pub publish: PublishConfig,
     pub lock: LockConfig,
+    pub ingest: IngestConfig,
 }
 
 impl Config {
@@ -357,6 +358,75 @@ impl Default for LockConfig {
         // workloads without hanging forever on a truly stuck holder.
         Self {
             timeout_ms: 600_000,
+        }
+    }
+}
+
+/// `[ingest]` section of `kb.toml`. Currently only gates the optional
+/// markitdown preprocessing step; split out as its own struct so future
+/// ingest-wide knobs (e.g. per-source timeouts) get a home.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct IngestConfig {
+    pub markitdown: MarkitdownConfig,
+}
+
+/// `[ingest.markitdown]` section of `kb.toml`. Controls whether `kb ingest`
+/// routes non-markdown source files through Microsoft's `markitdown` CLI
+/// before feeding them into the normalize pipeline. See
+/// `kb_ingest::MarkitdownOptions` for the runtime counterpart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct MarkitdownConfig {
+    /// Master switch. When false, no file is ever routed through markitdown
+    /// regardless of its extension. Defaults on — the conversion is a no-op
+    /// if the binary isn't on PATH (we warn once and skip).
+    pub enabled: bool,
+    /// Executable name (or absolute path) invoked per file. Defaults to the
+    /// string `"markitdown"` which relies on `$PATH` lookup.
+    pub command: String,
+    /// Extensions (no leading dot) that should always go through markitdown
+    /// when `enabled == true`.
+    pub extensions: Vec<String>,
+    /// Extensions advertised as opt-in (slower or cloud-backed conversions
+    /// like OCR and audio transcription). Stored so users can uncomment
+    /// entries from a rendered config without having to remember the list;
+    /// ingest-time dispatch only consults `extensions`.
+    pub optional_extensions: Vec<String>,
+}
+
+impl Default for MarkitdownConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: "markitdown".to_string(),
+            extensions: kb_ingest::markitdown_default_extensions(),
+            optional_extensions: kb_ingest::markitdown_default_optional_extensions(),
+        }
+    }
+}
+
+impl MarkitdownConfig {
+    /// Convert the CLI-facing config into the runtime options the
+    /// `kb-ingest` crate consumes. The two types are kept separate so
+    /// `kb-ingest` doesn't depend on `toml` / `serde` config plumbing.
+    #[must_use]
+    pub fn to_options(&self) -> kb_ingest::MarkitdownOptions {
+        kb_ingest::MarkitdownOptions {
+            enabled: self.enabled,
+            command: self.command.clone(),
+            extensions: self
+                .extensions
+                .iter()
+                .map(|e| e.to_ascii_lowercase())
+                .collect(),
+            optional_extensions: self
+                .optional_extensions
+                .iter()
+                .map(|e| e.to_ascii_lowercase())
+                .collect(),
         }
     }
 }

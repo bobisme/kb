@@ -1427,9 +1427,21 @@ fn run_ingest(
         }
     }
 
+    // Load kb.toml so the ingest pipeline picks up `[ingest.markitdown]`
+    // settings. The config loader tolerates a missing section by falling
+    // back to defaults (markitdown on, default extension set), which means
+    // `kb ingest` keeps working on KBs that predate bn-23am without any
+    // config edits.
+    let cfg = Config::load_from_root(root, None).unwrap_or_default();
+    let ingest_options = kb_ingest::IngestOptions {
+        dry_run,
+        allow_empty,
+        markitdown: cfg.ingest.markitdown.to_options(),
+    };
+
     let mut results = Vec::new();
     for report in
-        kb_ingest::ingest_paths_with_flags(root, &local_paths, dry_run, allow_empty)?
+        kb_ingest::ingest_paths_with_config(root, &local_paths, &ingest_options)?
     {
         results.push(IngestResult {
             input: report.source_path.display().to_string(),
