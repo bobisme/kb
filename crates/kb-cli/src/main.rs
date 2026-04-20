@@ -1148,6 +1148,9 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
 
     // Dry-run and JSON paths emit the plan and return without touching disk.
     if flags.dry_run {
+        // Preview the bn-i5r post-trash refreshes so users see what live
+        // execution would do beyond the trash moves.
+        let preview = forget::preview_refresh(root, &plan.src_id).unwrap_or_default();
         if flags.json {
             emit_json(
                 "forget",
@@ -1155,10 +1158,12 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
                     plan,
                     dry_run: true,
                     backlinks_refreshed: false,
+                    cascade_refresh: preview,
                 },
             )?;
         } else {
             print!("{}", forget::render_plan(&plan, true));
+            print!("{}", forget::render_refresh_footer(&plan, &preview, true));
         }
         return Ok(());
     }
@@ -1174,6 +1179,7 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
                     plan,
                     dry_run: false,
                     backlinks_refreshed: false,
+                    cascade_refresh: forget::CascadeRefresh::default(),
                 },
             )?;
         } else {
@@ -1196,7 +1202,7 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
         return Ok(());
     }
 
-    let backlinks_refreshed = forget::execute(root, &plan)?;
+    let outcome = forget::execute(root, &plan)?;
 
     if flags.json {
         emit_json(
@@ -1204,14 +1210,19 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
             forget::ForgetOutcome {
                 plan,
                 dry_run: false,
-                backlinks_refreshed,
+                backlinks_refreshed: outcome.backlinks_refreshed,
+                cascade_refresh: outcome.cascade_refresh,
             },
         )?;
     } else {
         print!("{}", forget::render_plan(&plan, false));
-        if backlinks_refreshed {
+        if outcome.backlinks_refreshed {
             println!("  backlinks refreshed");
         }
+        print!(
+            "{}",
+            forget::render_refresh_footer(&plan, &outcome.cascade_refresh, false)
+        );
     }
     Ok(())
 }

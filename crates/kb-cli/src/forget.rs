@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use kb_compile::{HashState, backlinks};
+use kb_compile::{HashState, backlinks, index_page};
 use kb_core::{BuildRecord, build_records_dir, frontmatter::read_frontmatter, frontmatter::write_frontmatter};
 use serde::Serialize;
 use serde_yaml::{Mapping, Value};
@@ -100,6 +100,43 @@ pub struct ForgetOutcome {
     /// Whether we walked `wiki/concepts/*.md` to refresh backlinks after
     /// removing the source page. Dry-run skips this pass.
     pub backlinks_refreshed: bool,
+    /// Whether each of the three post-trash layout refreshes ran
+    /// successfully (bn-i5r: index pages, frontmatter scrub, lexical index).
+    /// Dry-run always reports `false` since nothing is executed.
+    #[serde(default, skip_serializing_if = "CascadeRefresh::is_noop")]
+    pub cascade_refresh: CascadeRefresh,
+}
+
+/// Accounting for the three structural refreshes that run after the trash
+/// moves complete — separate from the cascade *plan* because these operate on
+/// the whole wiki, not a fixed per-src list.
+///
+/// Each field is best-effort: a failure is logged as a warning and recorded
+/// here as `false`/`0` so callers (and humans reading `--json`) can tell what
+/// actually happened without interpreting the exit code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CascadeRefresh {
+    /// `true` when `wiki/index.md`, `wiki/sources/index.md`, and
+    /// `wiki/concepts/index.md` were regenerated from the current on-disk
+    /// layout.
+    pub index_pages_refreshed: bool,
+    /// Number of surviving concept pages whose frontmatter
+    /// `source_document_ids` was rewritten to drop the forgotten src-id.
+    pub frontmatter_scrubbed: usize,
+    /// `true` when `state/indexes/lexical.json` was rebuilt from the current
+    /// on-disk wiki pages.
+    pub lexical_index_refreshed: bool,
+}
+
+impl CascadeRefresh {
+    /// `true` when no refresh ran (useful for skipping the JSON field on
+    /// `--dry-run` / "nothing to remove" paths).
+    #[must_use]
+    pub const fn is_noop(&self) -> bool {
+        !self.index_pages_refreshed
+            && self.frontmatter_scrubbed == 0
+            && !self.lexical_index_refreshed
+    }
 }
 
 /// Resolve `<target>` to a concrete `src-<hex>` id.
@@ -257,6 +294,42 @@ fn analyze_cascade(root: &Path, src_id: &str) -> Result<CascadePlan> {
     })
 }
 
+/// Walk `wiki/concepts/*.md` and return pages whose frontmatter
+/// `source_document_ids` contains `src_id` with *other* ids alongside it.
+/// These are the pages that survive cascade (not trashed) but still need
+/// their frontmatter scrubbed so `kb lint orphans` stops flagging a dangling
+/// reference.
+///
+/// # Errors
+///
+/// Returns an error only when the directory listing itself fails.
+pub fn concept_pages_needing_scrub(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
+    let dir = root.join("wiki/concepts");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&dir)
+        .with_context(|| format!("read dir {}", dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("read entry in {}", dir.display()))?;
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Ok((frontmatter, _body)) = read_frontmatter(&path) else {
+            continue;
+        };
+        let ids = frontmatter_source_ids(&frontmatter);
+        // Survivor: contains the forgotten src and at least one other.
+        if ids.iter().any(|id| id == src_id) && ids.len() >= 2 {
+            matches.push(path);
+        }
+    }
+    matches.sort();
+    Ok(matches)
+}
+
 /// Walk `dir` (a `wiki/*` subdirectory) and return `.md` files whose
 /// frontmatter `source_document_ids` references `src_id`.
 ///
@@ -358,6 +431,16 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
     Ok(matches)
 }
 
+/// Aggregate result of running [`execute`] — tracks which post-trash passes
+/// ran successfully so the CLI (and `--json` consumers) can report them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExecuteOutcome {
+    /// Whether backlinks were regenerated (same semantics as pre-bn-i5r).
+    pub backlinks_refreshed: bool,
+    /// Post-trash structural refreshes added by bn-i5r.
+    pub cascade_refresh: CascadeRefresh,
+}
+
 /// Execute a previously-built `ForgetPlan`, moving real bytes on disk.
 ///
 /// Each entry in `plan.moves` is moved into `plan.trash_dir` under its
@@ -376,19 +459,31 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
 ///   - `plan.cascade.stale_build_records` — each JSON file is moved under
 ///     `trash/<bundle>/state/build_records/`.
 ///
-/// After moves succeed, the `normalized/<id>` key is dropped from
-/// `state/hashes.json` (if present) and `run_backlinks_pass` is invoked so
-/// concept pages no longer link into a deleted source. Backlink refresh is
-/// best-effort: a failure emits a warning and returns success, because the
-/// user has already agreed to the destructive operation and rerunning `kb
-/// compile` will correct any lingering staleness.
+/// After moves succeed we:
+///   1. drop the `normalized/<id>` key from `state/hashes.json` (if present),
+///   2. refresh backlinks (`run_backlinks_pass`) so concept pages no longer
+///      point at the deleted source,
+///   3. **scrub** surviving concept frontmatter — any multi-sourced concept
+///      still listing `src_id` in `source_document_ids` has that entry
+///      removed via an atomic frontmatter rewrite (bn-i5r step 2),
+///   4. **regenerate** `wiki/index.md`, `wiki/sources/index.md`, and
+///      `wiki/concepts/index.md` from the current on-disk layout so their
+///      link lists no longer point into `trash/` (bn-i5r step 1),
+///   5. **rebuild** the lexical search index at `state/indexes/lexical.json`
+///      from surviving wiki pages so `kb ask` doesn't crash trying to read a
+///      trashed candidate (bn-i5r step 3).
+///
+/// Steps 2–5 are all best-effort: a failure emits a warning and marks the
+/// corresponding field in [`ExecuteOutcome`] as `false`/`0` but the forget as
+/// a whole still succeeds — rerunning `kb compile` will correct any lingering
+/// staleness.
 ///
 /// # Errors
 ///
 /// Returns an error when a move fails or the hash-state file cannot be
 /// updated. Partial moves are NOT rolled back — callers should treat a
 /// failure as "inspect manually and finish by hand".
-pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<bool> {
+pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<ExecuteOutcome> {
     fs::create_dir_all(&plan.trash_dir)
         .with_context(|| format!("create trash dir {}", plan.trash_dir.display()))?;
 
@@ -449,7 +544,135 @@ pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<bool> {
         }
     };
 
-    Ok(backlinks_refreshed)
+    // bn-i5r step 2: scrub the forgotten src from surviving concept pages.
+    // Must run BEFORE the lexical index rebuild so the index sees the
+    // post-scrub state.
+    let frontmatter_scrubbed = match scrub_concept_frontmatter(root, &plan.src_id) {
+        Ok(n) => n,
+        Err(err) => {
+            eprintln!(
+                "warning: frontmatter scrub failed after forget: {err:#}"
+            );
+            0
+        }
+    };
+
+    // bn-i5r step 1: regenerate the three index pages from current on-disk
+    // state so `wiki/*/index.md` stops listing trashed entries.
+    let index_pages_refreshed = match index_page::generate_indexes(root) {
+        Ok(artifacts) => match index_page::persist_index_artifacts(&artifacts) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "warning: index-page refresh failed after forget: {err:#}"
+                );
+                false
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "warning: index-page refresh failed after forget: {err:#}"
+            );
+            false
+        }
+    };
+
+    // bn-i5r step 3: rebuild the lexical search index from surviving wiki
+    // pages so `kb ask` doesn't try to read a candidate that lives in
+    // `trash/`.
+    let lexical_index_refreshed = match kb_query::build_lexical_index(root) {
+        Ok(index) => match index.save(root) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "warning: lexical index rebuild failed after forget: {err:#}"
+                );
+                false
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "warning: lexical index rebuild failed after forget: {err:#}"
+            );
+            false
+        }
+    };
+
+    Ok(ExecuteOutcome {
+        backlinks_refreshed,
+        cascade_refresh: CascadeRefresh {
+            index_pages_refreshed,
+            frontmatter_scrubbed,
+            lexical_index_refreshed,
+        },
+    })
+}
+
+/// Walk `wiki/concepts/*.md` and remove `src_id` from each page's
+/// `source_document_ids` frontmatter list when it still appears alongside
+/// other ids. Returns the number of pages rewritten.
+///
+/// Pages where the list becomes empty (or is empty) are left alone — they
+/// should have been moved to trash already by the cascade's
+/// `orphaned_concept_pages` step. If we find one, we conservatively skip it
+/// and let `kb lint` surface the discrepancy on the next run.
+///
+/// The write uses `write_frontmatter`, which goes through `atomic_write`, so
+/// a crash mid-rewrite leaves the original file intact.
+///
+/// # Errors
+///
+/// Returns an error when the `wiki/concepts/` directory listing itself
+/// fails. Per-file read / parse / write failures are logged as warnings and
+/// the page is skipped.
+fn scrub_concept_frontmatter(root: &Path, src_id: &str) -> Result<usize> {
+    let pages = concept_pages_needing_scrub(root, src_id)?;
+    let mut scrubbed = 0;
+    for page in pages {
+        match scrub_single_concept(&page, src_id) {
+            Ok(true) => scrubbed += 1,
+            Ok(false) => {}
+            Err(err) => {
+                eprintln!(
+                    "warning: could not scrub {} : {err:#}",
+                    page.display()
+                );
+            }
+        }
+    }
+    Ok(scrubbed)
+}
+
+/// Rewrite a single concept page's `source_document_ids` to drop `src_id`.
+///
+/// Returns `Ok(true)` when the file was rewritten, `Ok(false)` when nothing
+/// needed to change (the id was not present, or the rewrite would produce an
+/// empty list — which means cascade should have trashed it already).
+fn scrub_single_concept(page: &Path, src_id: &str) -> Result<bool> {
+    let (mut frontmatter, body) = read_frontmatter(page)
+        .with_context(|| format!("read frontmatter for {}", page.display()))?;
+    let key = Value::String("source_document_ids".into());
+    let Some(value) = frontmatter.get_mut(&key) else {
+        return Ok(false);
+    };
+    let Value::Sequence(seq) = value else {
+        return Ok(false);
+    };
+    let before = seq.len();
+    seq.retain(|v| v.as_str() != Some(src_id));
+    let after = seq.len();
+    if before == after {
+        return Ok(false);
+    }
+    // Empty list means cascade should have trashed this page; leave it alone
+    // so the next `kb lint` run flags the discrepancy rather than us silently
+    // producing a page with no grounding.
+    if after == 0 {
+        return Ok(false);
+    }
+    write_frontmatter(page, &frontmatter, body)
+        .with_context(|| format!("write frontmatter for {}", page.display()))?;
+    Ok(true)
 }
 
 /// Move `src` (absolute) into `trash_dir`, preserving its path relative to
@@ -593,6 +816,70 @@ pub fn render_plan(plan: &ForgetPlan, dry_run: bool) -> String {
         let _ = writeln!(out, "  trash:    {}", plan.trash_dir.display());
     }
     out
+}
+
+/// Render the "post-trash refresh" footer used by `--dry-run` and live runs.
+///
+/// The dry-run variant previews each step so users know what live execution
+/// would do beyond the trash moves. The live variant reports what actually
+/// happened (and distinguishes "ran" vs. "failed, warned, kept going" via the
+/// fields in [`CascadeRefresh`]).
+///
+/// Returns an empty string when `refresh` is a no-op (e.g. `--dry-run` path
+/// that computed 0 scrub candidates, or `execute` before any refresh ran).
+#[must_use]
+pub fn render_refresh_footer(plan: &ForgetPlan, refresh: &CascadeRefresh, dry_run: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if dry_run {
+        let _ = writeln!(
+            out,
+            "  will also refresh: wiki/index.md, wiki/sources/index.md, wiki/concepts/index.md, state/indexes/lexical.json, frontmatter scrub on {} page(s)",
+            refresh.frontmatter_scrubbed
+        );
+        // Moves / cascade bookkeeping already printed above; nothing else.
+        let _ = &plan;
+        return out;
+    }
+    if refresh.is_noop() {
+        return out;
+    }
+    if refresh.index_pages_refreshed {
+        out.push_str("  index pages refreshed\n");
+    }
+    if refresh.lexical_index_refreshed {
+        out.push_str("  lexical index rebuilt\n");
+    }
+    if refresh.frontmatter_scrubbed > 0 {
+        let _ = writeln!(
+            out,
+            "  scrubbed {} concept frontmatter page(s)",
+            refresh.frontmatter_scrubbed
+        );
+    }
+    out
+}
+
+/// Build the `CascadeRefresh` preview shown by `--dry-run` — reports what
+/// live execution *would* do without touching disk. Used by the CLI to drive
+/// `render_refresh_footer(_, _, true)` and the `--json` payload.
+///
+/// `index_pages_refreshed` and `lexical_index_refreshed` are reported as
+/// `true` in the preview because both passes run unconditionally on live
+/// execute. `frontmatter_scrubbed` is the number of concept pages that would
+/// be rewritten (0 when the cascade removes all cites).
+///
+/// # Errors
+///
+/// Returns an error when the scrub-candidate walk fails (missing
+/// directories are tolerated; see [`concept_pages_needing_scrub`]).
+pub fn preview_refresh(root: &Path, src_id: &str) -> Result<CascadeRefresh> {
+    let frontmatter_scrubbed = concept_pages_needing_scrub(root, src_id)?.len();
+    Ok(CascadeRefresh {
+        index_pages_refreshed: true,
+        frontmatter_scrubbed,
+        lexical_index_refreshed: true,
+    })
 }
 
 fn is_src_id(token: &str) -> bool {
@@ -837,7 +1124,13 @@ mod tests {
 
         let plan = plan(root, src, None, true).expect("plan");
         assert_eq!(plan.moves.len(), 3);
-        execute(root, &plan).expect("execute forget");
+        let outcome = execute(root, &plan).expect("execute forget");
+        // bn-i5r: execute now reports the three post-trash refreshes. This
+        // test only writes a wiki source page (no concept pages), so the
+        // scrub counter stays at 0; the index/lexical rebuilds still run.
+        assert!(outcome.cascade_refresh.index_pages_refreshed);
+        assert!(outcome.cascade_refresh.lexical_index_refreshed);
+        assert_eq!(outcome.cascade_refresh.frontmatter_scrubbed, 0);
 
         assert!(!normalized.exists(), "normalized dir should be gone");
         assert!(!raw.exists(), "raw/inbox dir should be gone");
@@ -853,5 +1146,140 @@ mod tests {
             !reloaded.hashes.contains_key(&format!("normalized/{src}")),
             "hash state should no longer list the forgotten src"
         );
+    }
+
+    // -- bn-i5r: post-trash structural refreshes ---------------------------
+
+    #[test]
+    fn concept_pages_needing_scrub_returns_only_multi_sourced_survivors() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-i5r00001";
+        let other = "src-i5r00002";
+        // Orphan (single src) — should NOT appear; cascade will trash it.
+        write_concept_page(root, "alone", &[src]);
+        // Survivor (two srcs) — should appear.
+        let survivor = write_concept_page(root, "shared", &[src, other]);
+        // Unrelated (only other src) — should NOT appear.
+        write_concept_page(root, "other", &[other]);
+
+        let pages = concept_pages_needing_scrub(root, src).expect("scan");
+        assert_eq!(pages, vec![survivor], "only multi-sourced survivors should need scrub; got {pages:?}");
+    }
+
+    #[test]
+    fn scrub_single_concept_drops_forgotten_id_and_keeps_others() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-i5r00010";
+        let other = "src-i5r00011";
+        let page = write_concept_page(root, "shared", &[src, other]);
+
+        let rewrote = scrub_single_concept(&page, src).expect("scrub");
+        assert!(rewrote, "scrub must report that it rewrote the file");
+
+        let (fm, _body) = read_frontmatter(&page).expect("reread");
+        let ids = frontmatter_source_ids(&fm);
+        assert_eq!(ids, vec![other.to_string()]);
+    }
+
+    #[test]
+    fn scrub_single_concept_leaves_empty_list_alone() {
+        // Guard: cascade should have trashed the page; don't silently leave
+        // a concept page with zero grounding behind.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-i5r00020";
+        let page = write_concept_page(root, "alone", &[src]);
+
+        let rewrote = scrub_single_concept(&page, src).expect("scrub");
+        assert!(!rewrote, "scrub must skip pages where the list becomes empty");
+        // File content unchanged.
+        let (fm, _body) = read_frontmatter(&page).expect("reread");
+        let ids = frontmatter_source_ids(&fm);
+        assert_eq!(ids, vec![src.to_string()]);
+    }
+
+    #[test]
+    fn scrub_single_concept_is_noop_when_id_absent() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let kept = "src-i5r00030";
+        let page = write_concept_page(root, "nope", &[kept]);
+
+        let rewrote = scrub_single_concept(&page, "src-absent01").expect("scrub");
+        assert!(!rewrote);
+    }
+
+    #[test]
+    fn execute_refreshes_index_pages_and_lexical_index() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-i5ra0001";
+        let other = "src-i5ra0002";
+
+        // Ingest-like layout: normalized + wiki source page.
+        fs::create_dir_all(root.join("normalized").join(src))
+            .expect("mkdir normalized");
+        let wiki_page = root.join(kb_compile::source_page::source_page_path_for_id(src));
+        fs::create_dir_all(wiki_page.parent().expect("parent"))
+            .expect("mkdir wiki/sources");
+        fs::write(
+            &wiki_page,
+            format!("---\nid: x\ntitle: Forgotten\nsource_document_id: {src}\n---\n\n# Forgotten\n"),
+        )
+        .expect("write wiki source");
+
+        // One orphan concept (single src) and one survivor (multi-sourced).
+        let orphan = write_concept_page(root, "orphan", &[src]);
+        let survivor = write_concept_page(root, "survivor", &[src, other]);
+
+        let plan = plan(root, src, None, true).expect("plan");
+        let outcome = execute(root, &plan).expect("execute");
+
+        // The three bn-i5r refreshes ran.
+        assert!(outcome.cascade_refresh.index_pages_refreshed);
+        assert!(outcome.cascade_refresh.lexical_index_refreshed);
+        assert_eq!(outcome.cascade_refresh.frontmatter_scrubbed, 1);
+
+        // Orphan was trashed; survivor remains but no longer references src.
+        assert!(!orphan.exists());
+        assert!(survivor.exists());
+        let (fm, _body) = read_frontmatter(&survivor).expect("reread survivor");
+        let ids = frontmatter_source_ids(&fm);
+        assert_eq!(ids, vec![other.to_string()], "survivor frontmatter must not list forgotten src");
+
+        // Index pages exist and don't reference the trashed concept / source.
+        let global = fs::read_to_string(root.join("wiki/index.md")).expect("read global index");
+        assert!(!global.contains(&format!("sources/{src}.md")),
+            "global index still lists trashed source:\n{global}");
+        assert!(!global.contains("orphan.md"),
+            "global index still lists trashed orphan concept:\n{global}");
+
+        // Lexical index doesn't mention the trashed pages either.
+        let lexical_json = fs::read_to_string(root.join("state/indexes/lexical.json"))
+            .expect("read lexical index");
+        assert!(!lexical_json.contains(&format!("wiki/sources/{src}.md")),
+            "lexical index still points at trashed source page");
+        assert!(!lexical_json.contains("orphan.md"),
+            "lexical index still points at trashed orphan concept");
+        // Survivor remains indexed.
+        assert!(lexical_json.contains("wiki/concepts/survivor.md"),
+            "lexical index must retain survivor page");
+    }
+
+    #[test]
+    fn preview_refresh_counts_scrub_candidates() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let src = "src-i5rp0001";
+        let other = "src-i5rp0002";
+        write_concept_page(root, "alone", &[src]);
+        write_concept_page(root, "shared", &[src, other]);
+
+        let preview = preview_refresh(root, src).expect("preview");
+        assert!(preview.index_pages_refreshed);
+        assert!(preview.lexical_index_refreshed);
+        assert_eq!(preview.frontmatter_scrubbed, 1);
     }
 }

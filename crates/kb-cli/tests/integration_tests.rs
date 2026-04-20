@@ -4918,6 +4918,240 @@ fn forget_dry_run_reports_cascade_items() {
     assert!(record_path.exists(), "dry-run must not move build records");
 }
 
+/// bn-i5r F1/F2/F3: after `kb forget --force` on a cascade-heavy setup
+/// (3 orphan concepts + 1 survivor that loses one of its two srcs), the KB
+/// must be immediately query-able:
+///   - `wiki/*/index.md` no longer lists the trashed concepts or source,
+///   - the surviving concept's frontmatter no longer cites the forgotten src,
+///   - `state/indexes/lexical.json` only references surviving pages,
+///   - `kb lint` reports no orphan / broken-links errors for the forgotten src,
+///   - `kb ask` runs cleanly (the old "No such file or directory" crash).
+#[test]
+#[allow(clippy::too_many_lines)]
+fn forget_cascade_fully_refreshes_index_pages_frontmatter_and_lexical() {
+    use kb_query::LexicalIndex;
+
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    // Give forget a wiki source page to remove (avoids full kb compile).
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    // Populate wiki/concepts/ with real post-compile layout: 3 orphans, 1
+    // survivor with a second source, and one unrelated concept.
+    let orphan_a = stub_concept_page(&kb_root, "orphan-a", &[&src_id]);
+    let orphan_b = stub_concept_page(&kb_root, "orphan-b", &[&src_id]);
+    let orphan_c = stub_concept_page(&kb_root, "orphan-c", &[&src_id]);
+    let survivor = stub_concept_page(&kb_root, "survivor", &[&src_id, "src-deadbeef"]);
+    let unrelated = stub_concept_page(&kb_root, "unrelated", &["src-deadbeef"]);
+
+    // Seed a stale lexical index and stale index pages referencing everything
+    // — the state the KB is left in after `kb compile` but before `kb forget`.
+    let pre_index = kb_query::build_lexical_index(&kb_root).expect("pre-index");
+    pre_index.save(&kb_root).expect("save pre-index");
+    let pre_artifacts =
+        kb_compile::index_page::generate_indexes(&kb_root).expect("pre-index-pages");
+    kb_compile::index_page::persist_index_artifacts(&pre_artifacts)
+        .expect("persist pre-index-pages");
+    // Sanity: pre-state references everything we're about to forget.
+    let pre_lex = fs::read_to_string(kb_root.join("state/indexes/lexical.json"))
+        .expect("read pre-lex");
+    assert!(
+        pre_lex.contains(&format!("wiki/sources/{src_id}.md")),
+        "pre-state lexical index must reference the source page; got:\n{pre_lex}"
+    );
+    assert!(
+        pre_lex.contains("wiki/concepts/orphan-a.md"),
+        "pre-state lexical index must reference orphan concepts"
+    );
+
+    // Now forget the source — cascade + all three bn-i5r refreshes.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // 1. Source + orphans moved to trash, survivor + unrelated preserved.
+    assert!(!orphan_a.exists());
+    assert!(!orphan_b.exists());
+    assert!(!orphan_c.exists());
+    assert!(survivor.exists());
+    assert!(unrelated.exists());
+
+    // 2. Surviving concept's frontmatter no longer cites the forgotten src.
+    let survivor_body = fs::read_to_string(&survivor).expect("read survivor");
+    assert!(
+        !survivor_body.contains(&src_id),
+        "surviving concept frontmatter still lists forgotten src:\n{survivor_body}"
+    );
+    assert!(
+        survivor_body.contains("src-deadbeef"),
+        "surviving concept must still list its other src:\n{survivor_body}"
+    );
+
+    // 3. Index pages no longer list trashed pages.
+    let global_index = fs::read_to_string(kb_root.join("wiki/index.md"))
+        .expect("read wiki/index.md");
+    assert!(
+        !global_index.contains("orphan-a.md"),
+        "global index still lists trashed concept:\n{global_index}"
+    );
+    assert!(
+        !global_index.contains(&format!("sources/{src_id}.md")),
+        "global index still lists trashed source page:\n{global_index}"
+    );
+    let concepts_index = fs::read_to_string(kb_root.join("wiki/concepts/index.md"))
+        .expect("read wiki/concepts/index.md");
+    assert!(!concepts_index.contains("orphan-a.md"));
+    assert!(!concepts_index.contains("orphan-b.md"));
+    assert!(!concepts_index.contains("orphan-c.md"));
+    assert!(concepts_index.contains("survivor.md"));
+    assert!(concepts_index.contains("unrelated.md"));
+
+    // 4. Lexical index was rebuilt from on-disk state.
+    let post_index =
+        LexicalIndex::load(&kb_root).expect("reload lexical index after forget");
+    let ids: Vec<&str> = post_index.entries.iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        !ids.iter().any(|id| id.contains(&format!("sources/{src_id}.md"))),
+        "lexical index still points at trashed source page: {ids:?}"
+    );
+    assert!(
+        !ids.iter().any(|id| id.contains("orphan-")),
+        "lexical index still points at trashed concepts: {ids:?}"
+    );
+    assert!(
+        ids.contains(&"wiki/concepts/survivor.md"),
+        "lexical index must retain surviving concept: {ids:?}"
+    );
+
+    // 5. `kb lint --check orphans` no longer flags the forgotten src.
+    let mut lint_cmd = kb_cmd(&kb_root);
+    lint_cmd.arg("--json").arg("lint").arg("--check").arg("orphans");
+    let lint_output = lint_cmd.output().expect("run kb lint --check orphans");
+    let lint_stdout = String::from_utf8_lossy(&lint_output.stdout);
+    assert!(
+        !lint_stdout.contains(&format!("refers to source_document_id {src_id}")),
+        "orphan-lint still mentions forgotten src:\n{lint_stdout}"
+    );
+
+    // 6. `kb lint --check broken-links` reports no errors pointing into trash.
+    let mut broken_cmd = kb_cmd(&kb_root);
+    broken_cmd
+        .arg("--json")
+        .arg("lint")
+        .arg("--check")
+        .arg("broken-links");
+    let broken_output = broken_cmd
+        .output()
+        .expect("run kb lint --check broken-links");
+    let broken_stdout = String::from_utf8_lossy(&broken_output.stdout);
+    assert!(
+        !broken_stdout.contains("trash/"),
+        "broken-links lint still points into trash/:\n{broken_stdout}"
+    );
+
+    // 7. `kb ask` runs cleanly (no "No such file or directory" crash).
+    let mut ask_cmd = kb_cmd(&kb_root);
+    ask_cmd.arg("--json").arg("ask").arg("survivor concept");
+    let ask_output = ask_cmd.output().expect("run kb ask");
+    assert!(
+        ask_output.status.success(),
+        "kb ask crashed after forget — stale lexical index not refreshed:\nstderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&ask_output.stderr),
+        String::from_utf8_lossy(&ask_output.stdout)
+    );
+    let ask_stderr = String::from_utf8_lossy(&ask_output.stderr);
+    assert!(
+        !ask_stderr.contains("No such file or directory"),
+        "kb ask surfaced stale lexical candidates:\n{ask_stderr}"
+    );
+}
+
+/// bn-i5r F3/F4: `--dry-run` previews the three post-trash refresh steps
+/// (index pages, lexical index, frontmatter scrub count) without touching
+/// disk.
+#[test]
+fn forget_dry_run_mentions_post_trash_refresh_steps() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    // One orphan + one survivor → 1 scrub candidate in the preview.
+    stub_concept_page(&kb_root, "orphan", &[&src_id]);
+    stub_concept_page(&kb_root, "survivor", &[&src_id, "src-deadbeef"]);
+
+    let pre_index = kb_query::build_lexical_index(&kb_root).expect("pre-index");
+    pre_index.save(&kb_root).expect("save pre-index");
+
+    // Text dry-run: footer names each refresh target.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget --dry-run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("will also refresh"),
+        "dry-run must mention the refresh plan:\n{stdout}"
+    );
+    assert!(stdout.contains("wiki/index.md"), "names global index");
+    assert!(
+        stdout.contains("wiki/concepts/index.md"),
+        "names concepts index"
+    );
+    assert!(
+        stdout.contains("wiki/sources/index.md"),
+        "names sources index"
+    );
+    assert!(
+        stdout.contains("lexical.json"),
+        "names lexical index target"
+    );
+    assert!(
+        stdout.contains("scrub on 1 page"),
+        "names scrub count; got:\n{stdout}"
+    );
+
+    // JSON dry-run: `cascade_refresh` previews the three steps.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--dry-run")
+        .arg("--json")
+        .arg("forget")
+        .arg(&src_id);
+    let output = cmd
+        .output()
+        .expect("run kb forget --dry-run --json");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let refresh = &envelope["data"]["cascade_refresh"];
+    assert_eq!(refresh["index_pages_refreshed"], true);
+    assert_eq!(refresh["lexical_index_refreshed"], true);
+    assert_eq!(refresh["frontmatter_scrubbed"], 1);
+
+    // Nothing was actually moved or rewritten.
+    assert!(
+        kb_root.join("wiki/concepts/orphan.md").exists(),
+        "dry-run must not trash the orphan"
+    );
+    let survivor_body = fs::read_to_string(kb_root.join("wiki/concepts/survivor.md"))
+        .expect("read survivor");
+    assert!(
+        survivor_body.contains(&src_id),
+        "dry-run must not scrub the survivor frontmatter:\n{survivor_body}"
+    );
+}
+
 /// bn-did acceptance: after a cascade forget, `kb lint` reports 0 orphan
 /// errors — the orphan-lint rule that triggered the bone is silenced.
 #[test]
