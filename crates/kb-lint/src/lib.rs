@@ -982,6 +982,16 @@ fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<Lin
         {
             continue;
         }
+        // Skip promoted question pages (wiki/questions/<slug>.md). These
+        // pages encode citations via frontmatter `citations:` list plus
+        // `[N]` bracket references in the body — a different structural
+        // shape than the source-page model this check was built for.
+        // See bn-3gs. Other lint checks (broken-links, orphans, etc.)
+        // still evaluate question pages.
+        let rel_for_skip = relative_to_root(root, &page);
+        if rel_for_skip.starts_with("wiki/questions") {
+            continue;
+        }
         let raw = fs::read_to_string(&page)
             .with_context(|| format!("read wiki page {}", page.display()))?;
         let (frontmatter, body) = match read_frontmatter(&page) {
@@ -1650,6 +1660,48 @@ mod tests {
         assert!(
             report.issues[0].referring_page.ends_with("doc.md"),
             "non-index page should still warn: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn missing_citations_skips_wiki_question_pages() {
+        // Regression: bn-3gs. Promoted question pages under wiki/questions/
+        // encode citations via a frontmatter `citations:` list plus `[N]`
+        // bracket references in the body — a different structural shape than
+        // the source-page model this check was built for. They must not
+        // trigger missing-citations warnings, even when their body contains
+        // synthetic managed regions without inline wiki-links.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/questions")).expect("create questions dir");
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+
+        // Question page shaped like a source page (would normally warn) — must be skipped.
+        fs::write(
+            root.join("wiki/questions/what-is-x.md"),
+            "---\ntype: question_answer\nsource_document_id: doc-1\nsource_revision_id: rev-1\ncitations:\n  - id: 1\n    source: doc-1\n---\n# What is X?\n\n## Summary\n<!-- kb:begin id=summary -->\nAn answer referencing [1].\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write question page");
+
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert!(
+            report.is_clean(),
+            "question pages must not trigger missing-citations: {report:?}"
+        );
+
+        // Sanity: a non-question page with the same shape still warns.
+        fs::write(
+            root.join("wiki/sources/doc.md"),
+            "---\nsource_document_id: doc-1\nsource_revision_id: rev-1\n---\n# Source\n\n## Summary\n<!-- kb:begin id=summary -->\nSynthetic summary.\n<!-- kb:end id=summary -->\n",
+        )
+        .expect("write non-question source page");
+        let report = run_lint(root, LintRule::MissingCitations).expect("lint report");
+        assert_eq!(report.issue_count, 1);
+        assert_eq!(report.issues[0].kind, IssueKind::MissingCitations);
+        assert!(
+            report.issues[0].referring_page.ends_with("doc.md"),
+            "non-question source page should still warn: {:?}",
             report.issues
         );
     }
