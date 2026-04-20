@@ -6813,3 +6813,252 @@ fn ask_editor_empty_content_is_validation_error_no_failed_job() {
         "failed_jobs list must be empty after validation rejection"
     );
 }
+
+// ── concept_candidate auto-apply tests (bn-lw06) ─────────────────────────────
+
+/// Install a fake `opencode` script that returns a fixed
+/// `GenerateConceptFromCandidateResponse` JSON payload. Matches the
+/// bundled `generate_concept_from_candidate.md` prompt's output schema so
+/// the CLI's parser accepts it. We also stub `generate_concept_body` by
+/// returning a plain sentence whenever the prompt mentions "general
+/// definition" — the primary draft already looks healthy, so the two-step
+/// refinement should not trigger; but being ready means we don't fail
+/// spuriously if the heuristic flips.
+fn install_fake_concept_candidate_harness(root: &Path, canonical: &str, category: &str) -> PathBuf {
+    let bin_dir = root.join("fake-concept-candidate-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    // The prompt is the last positional arg. If it's the
+    // generate_concept_from_candidate prompt (which names the candidate term),
+    // return the canonical JSON. Otherwise fall through to a plain-text reply
+    // used by the concept_body two-step prompt.
+    let script = format!(
+        r#"#!/bin/sh
+set -e
+prompt=""
+for arg in "$@"; do
+    prompt="$arg"
+done
+case "$prompt" in
+  *"drafting a canonical concept entry"*)
+    printf '{{"canonical_name":"{canonical}","aliases":["FooBar"],"category":"{category}","definition":"{canonical} is a coordinated system described across multiple sources that covers its design, failure modes, and operational characteristics."}}'
+    ;;
+  *"general definition for a knowledge base concept"*)
+    printf '{canonical} is a coordinated system described across multiple sources that covers its design, failure modes, and operational characteristics.'
+    ;;
+  *)
+    printf '{{"canonical_name":"{canonical}","aliases":[],"category":null,"definition":"{canonical} is a coordinated system."}}'
+    ;;
+esac
+"#
+    );
+    write_executable(bin_dir.join("opencode").as_path(), &script);
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+    bin_dir
+}
+
+/// bn-lw06: `kb review approve concept-candidate:<slug>` drafts a concept
+/// page via the LLM, writes `wiki/concepts/<slug>.md` with proper
+/// frontmatter, refreshes backlinks + indexes inline, and flips the review
+/// item to approved.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn review_approve_applies_concept_candidate_with_stub_llm() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed three normalized source bodies that all mention "FooBar System"
+    // (matches the existing lint test pattern so the snippet extractor has
+    // real prose to work with, not just the candidate term in isolation).
+    let normalized_root = kb_root.join("normalized");
+    for (doc_id, body) in [
+        (
+            "doc-a",
+            "# A\n\nThe FooBar System is a distributed store. FooBar System partitions data.\n",
+        ),
+        (
+            "doc-b",
+            "# B\n\nFooBar System has unique consistency semantics. The FooBar System model.\n",
+        ),
+        (
+            "doc-c",
+            "# C\n\nAnother look at FooBar System for comparison purposes.\n",
+        ),
+    ] {
+        let dir = normalized_root.join(doc_id);
+        fs::create_dir_all(&dir).expect("create normalized doc dir");
+        fs::write(
+            dir.join("metadata.json"),
+            format!("{{\"source_revision_id\":\"rev-{doc_id}\"}}"),
+        )
+        .expect("write metadata");
+        fs::write(dir.join("source.md"), body).expect("write source body");
+    }
+
+    // Seed the concept_candidate review item directly (bypass the lint; the
+    // review-item format is stable contract from bn-31lt).
+    let slug = "foobar-system";
+    let id = format!("lint:concept-candidate:{slug}");
+    let dest = PathBuf::from(format!("wiki/concepts/{slug}.md"));
+    let item = ReviewItem {
+        metadata: EntityMetadata {
+            id: id.clone(),
+            created_at_millis: 1_000,
+            updated_at_millis: 1_000,
+            source_hashes: vec!["hash-foobar".to_string()],
+            model_version: None,
+            tool_version: Some("kb-test".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec![
+                "doc-a".to_string(),
+                "doc-b".to_string(),
+                "doc-c".to_string(),
+            ],
+            output_paths: vec![dest.clone()],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::ConceptCandidate,
+        target_entity_id: id.clone(),
+        proposed_destination: Some(dest.clone()),
+        citations: vec![
+            "doc-a".to_string(),
+            "doc-b".to_string(),
+            "doc-c".to_string(),
+        ],
+        affected_pages: vec![dest],
+        created_at_millis: 1_000,
+        status: ReviewStatus::Pending,
+        comment: "Term 'FooBar System' is mentioned in 3 source(s) (6 total mention(s)) but has no concept page. Sources: doc-a, doc-b, doc-c. Approve to draft wiki/concepts/foobar-system.md from the mentions.".to_string(),
+    };
+    save_review_item(&kb_root, &item).expect("save review item");
+
+    let fake_bin = install_fake_concept_candidate_harness(&kb_root, "FooBar System", "storage");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json").arg("review").arg("approve").arg(&id);
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        output.status.success(),
+        "kb review approve failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse approve json");
+    assert_eq!(envelope["command"], "review.approve");
+    let data = &envelope["data"];
+    assert_eq!(data["kind"], "concept_candidate");
+    assert_eq!(data["action"], "approved");
+    assert_eq!(data["canonical_name"], "FooBar System");
+    assert_eq!(data["category"], "storage");
+    assert_eq!(
+        data["concept_path"].as_str(),
+        Some("wiki/concepts/foobar-system.md")
+    );
+    assert_eq!(
+        data["source_document_ids"]
+            .as_array()
+            .expect("source_document_ids array")
+            .len(),
+        3
+    );
+
+    // Concept page exists with the expected frontmatter + body.
+    let page_path = kb_root.join("wiki/concepts/foobar-system.md");
+    assert!(
+        page_path.is_file(),
+        "wiki/concepts/foobar-system.md must be written"
+    );
+    let page = fs::read_to_string(&page_path).expect("read concept page");
+    assert!(page.contains("id: concept:foobar-system"), "page: {page}");
+    assert!(page.contains("name: FooBar System"), "page: {page}");
+    assert!(page.contains("category: storage"), "page: {page}");
+    assert!(page.contains("- doc-a"), "page: {page}");
+    assert!(page.contains("- doc-b"), "page: {page}");
+    assert!(page.contains("- doc-c"), "page: {page}");
+    assert!(
+        page.contains("FooBar System is a coordinated system"),
+        "page body from LLM stub: {page}"
+    );
+
+    // Review item flipped to approved on disk.
+    let review_path = kb_root
+        .join("reviews")
+        .join("concept_candidates")
+        .join(format!("{id}.json"));
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).expect("read review"))
+            .expect("parse review");
+    assert_eq!(saved["status"], "approved");
+
+    // Wiki index updated to include the new concept (bn-2zy inline refresh).
+    let concepts_index = kb_root.join("wiki/concepts/index.md");
+    assert!(
+        concepts_index.is_file(),
+        "wiki/concepts/index.md must be generated after approve"
+    );
+    let concepts_index_text = fs::read_to_string(&concepts_index).expect("read concepts index");
+    assert!(
+        concepts_index_text.contains("FooBar System")
+            || concepts_index_text.contains("foobar-system"),
+        "concepts index must list the new concept: {concepts_index_text}"
+    );
+
+    // Wiki global index exists and has been rebuilt.
+    assert!(
+        kb_root.join("wiki/index.md").is_file(),
+        "wiki/index.md must be generated"
+    );
+}
+
+/// Re-approving a `concept_candidate` that's already been approved must
+/// fail with a clear error (not silently overwrite the concept page).
+#[test]
+fn review_approve_concept_candidate_rejects_already_approved() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let slug = "already-done";
+    let id = format!("lint:concept-candidate:{slug}");
+    let dest = PathBuf::from(format!("wiki/concepts/{slug}.md"));
+    let item = ReviewItem {
+        metadata: EntityMetadata {
+            id: id.clone(),
+            created_at_millis: 1_000,
+            updated_at_millis: 1_000,
+            source_hashes: vec!["hash-done".to_string()],
+            model_version: None,
+            tool_version: Some("kb-test".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec!["doc-a".to_string()],
+            output_paths: vec![dest.clone()],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::ConceptCandidate,
+        target_entity_id: id.clone(),
+        proposed_destination: Some(dest.clone()),
+        citations: vec!["doc-a".to_string()],
+        affected_pages: vec![dest],
+        created_at_millis: 1_000,
+        status: ReviewStatus::Approved, // already approved
+        comment: "Term 'Already Done' is mentioned".to_string(),
+    };
+    save_review_item(&kb_root, &item).expect("save review item");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg(&id);
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        !output.status.success(),
+        "re-approving a concept_candidate must fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("approved") || stderr.contains("only pending"),
+        "error must mention status: {stderr}"
+    );
+}

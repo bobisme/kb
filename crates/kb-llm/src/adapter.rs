@@ -156,6 +156,93 @@ pub struct GenerateConceptBodyResponse {
     pub body: String,
 }
 
+/// Request to draft a canonical concept entry from a lint-flagged candidate.
+///
+/// bn-lw06: the `missing_concepts` lint queues `concept_candidate` review
+/// items with a surface term (e.g. `"FooBar System"`) and the source
+/// documents that mention it. On approve, the CLI hands a snippet of each
+/// source body to the LLM so it can propose the canonical shape: preferred
+/// name, aliases, category tag, and a general-scope 2-3 sentence
+/// definition. Mirrors the `bn-1w5` two-step pattern — callers may refine
+/// the body via a subsequent
+/// [`generate_concept_body`](LlmAdapter::generate_concept_body) call if the
+/// returned definition looks variant-narrowed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GenerateConceptFromCandidateRequest {
+    /// Surface term flagged by the lint (what the user sees in `kb review show`).
+    pub candidate_name: String,
+    /// Source-document ids with a short snippet each — one bullet per source.
+    /// The adapter renders these verbatim into the prompt so the LLM can see
+    /// how the term is used in context.
+    pub source_snippets: Vec<CandidateSourceSnippet>,
+    /// Pre-existing concept category tags in the knowledge base. The prompt
+    /// instructs the model to reuse one of these when a reasonable fit exists
+    /// rather than spawning a new tag per concept.
+    pub existing_categories: Vec<String>,
+}
+
+/// One source's contribution to a concept-candidate prompt.
+///
+/// The `snippet` is already trimmed/truncated by the caller before being
+/// handed to the adapter; the adapter treats it as opaque text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CandidateSourceSnippet {
+    /// The source document id (e.g. `repo/foo` or a hashed content id).
+    pub source_document_id: String,
+    /// A short excerpt from the source that mentions the candidate term.
+    pub snippet: String,
+}
+
+/// Response containing a drafted canonical concept entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerateConceptFromCandidateResponse {
+    /// Preferred canonical display name (may be identical to the candidate).
+    pub canonical_name: String,
+    /// Alternate labels observed in the sources (0-5).
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    /// Optional 1-3 word tag for the concepts index. `None` puts the
+    /// concept under "Uncategorized" (matches the merge-pass convention).
+    #[serde(default)]
+    pub category: Option<String>,
+    /// 2-3 sentence general definition. May be refined by a follow-up
+    /// `generate_concept_body` call; the prompt already asks for a general
+    /// scope, but the two-step pattern gives a safety net.
+    pub definition: String,
+}
+
+/// Parse a `GenerateConceptFromCandidateResponse` from LLM text output.
+///
+/// Accepts raw JSON or a fenced code block. Unknown fields are ignored so
+/// model drift (e.g. an extra `rationale`) doesn't break parsing.
+///
+/// # Errors
+///
+/// Returns [`LlmAdapterError::Parse`] when the text is empty, not valid JSON,
+/// or does not match the expected schema.
+pub fn parse_generate_concept_from_candidate_json(
+    text: &str,
+) -> Result<GenerateConceptFromCandidateResponse, LlmAdapterError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(LlmAdapterError::Parse(
+            "generate_concept_from_candidate response was empty".to_string(),
+        ));
+    }
+
+    let json_text = trimmed
+        .strip_prefix("```")
+        .and_then(|body| body.split_once('\n').map(|(_, rest)| rest))
+        .and_then(|body| body.rsplit_once("```").map(|(json, _)| json.trim()))
+        .unwrap_or(trimmed);
+
+    serde_json::from_str(json_text).map_err(|err| {
+        LlmAdapterError::Parse(format!(
+            "generate_concept_from_candidate response had invalid shape: {err}"
+        ))
+    })
+}
+
 /// Request to answer a user question.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AnswerQuestionRequest {
@@ -462,6 +549,31 @@ pub trait LlmAdapter: Send + Sync {
             "detect_contradictions is not implemented by this adapter".to_string(),
         ))
     }
+
+    /// Draft a canonical concept entry from a lint-flagged candidate.
+    ///
+    /// bn-lw06: called from `kb review approve concept-candidate:<name>`. The
+    /// CLI passes the surface term plus a short snippet from each source
+    /// document that mentions it; the model returns the canonical name,
+    /// aliases, category, and a general-scope 2-3 sentence definition.
+    ///
+    /// Default implementation returns [`LlmAdapterError::Other`] so that
+    /// adapters without runner support (test doubles) cause the caller to
+    /// surface a clear error rather than crashing.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmAdapterError` if the backend cannot be reached, times out,
+    /// fails to parse the response, or the adapter does not implement this call.
+    fn generate_concept_from_candidate(
+        &self,
+        _request: GenerateConceptFromCandidateRequest,
+    ) -> Result<(GenerateConceptFromCandidateResponse, ProvenanceRecord), LlmAdapterError> {
+        Err(LlmAdapterError::Other(
+            "generate_concept_from_candidate is not implemented by this adapter".to_string(),
+        ))
+    }
+
 
     /// Answer a user question using context documents.
     ///

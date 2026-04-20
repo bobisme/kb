@@ -680,7 +680,21 @@ fn run(cli: Cli) -> Result<()> {
                         .into());
                     }
                     execute_mutating_command(Some(review_root), "review.approve", move || {
-                        review::run_review_approve(review_root, &id, json, &json_emitter)
+                        // bn-lw06: lazy adapter factory — only constructed
+                        // when the approve path for the review's kind needs
+                        // an LLM (currently ConceptCandidate). Keeps
+                        // promotion/merge approvals from paying adapter
+                        // init cost.
+                        let adapter_factory = || -> Result<Box<dyn kb_llm::LlmAdapter>> {
+                            build_compile_adapter(review_root, None)
+                        };
+                        review::run_review_approve(
+                            review_root,
+                            &id,
+                            json,
+                            &json_emitter,
+                            &adapter_factory,
+                        )
                     })
                 }
                 ReviewAction::Reject { id, reason } => {

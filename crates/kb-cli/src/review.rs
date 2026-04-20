@@ -4,12 +4,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
+use kb_compile::backlinks;
+use kb_compile::concept_candidate::apply_concept_candidate;
 use kb_compile::concept_merge::{AppliedMerge, WIKI_CONCEPTS_DIR, apply_concept_merge};
 use kb_compile::index_page;
 use kb_compile::promotion::execute_promotion;
 use kb_core::{
     ReviewItem, ReviewKind, ReviewStatus, list_review_items, load_review_item, save_review_item,
 };
+use kb_llm::LlmAdapter;
 
 /// Prefix used by `kb-lint`'s duplicate-concepts check when it queues a
 /// `concept_merge` review item. These items encode both concept ids in the
@@ -256,7 +259,13 @@ pub fn run_review_show(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(&st
     Ok(())
 }
 
-pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(&str, serde_json::Value) -> Result<()>) -> Result<()> {
+pub fn run_review_approve(
+    root: &Path,
+    id: &str,
+    json: bool,
+    emit_json: &dyn Fn(&str, serde_json::Value) -> Result<()>,
+    adapter_factory: &dyn Fn() -> Result<Box<dyn LlmAdapter>>,
+) -> Result<()> {
     let item = load_review_item(root, id)?
         .with_context(|| format!("review item '{id}' not found"))?;
 
@@ -339,6 +348,17 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
 
             emit_concept_merge_applied(id, &applied, prior_status, json, emit_json)?;
         }
+        ReviewKind::ConceptCandidate => {
+            approve_concept_candidate(
+                root,
+                id,
+                item,
+                now,
+                json,
+                emit_json,
+                adapter_factory,
+            )?;
+        }
         other => {
             // alias_merge and canonicalization remain decision-only for now: we
             // flip status so the queue moves on but the reviewer must make the
@@ -371,6 +391,81 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
     Ok(())
 }
 
+/// Apply a `concept_candidate` approval: build the LLM adapter lazily,
+/// draft + write the concept page, flip the review item, and run the
+/// best-effort backlinks + index refreshes. Split out of
+/// `run_review_approve` so the match-body stays under clippy's line cap.
+fn approve_concept_candidate(
+    root: &Path,
+    id: &str,
+    item: kb_core::ReviewItem,
+    now: u64,
+    json: bool,
+    emit_json: &dyn Fn(&str, serde_json::Value) -> Result<()>,
+    adapter_factory: &dyn Fn() -> Result<Box<dyn LlmAdapter>>,
+) -> Result<()> {
+    // bn-lw06: draft a concept page via the LLM from the lint-flagged
+    // candidate + the normalized source mentions, then refresh backlinks
+    // + indexes inline (mirrors bn-i5r/bn-2zy pattern).
+    let adapter = adapter_factory()
+        .with_context(|| format!("build LLM adapter for review '{id}'"))?;
+    let applied = apply_concept_candidate(adapter.as_ref(), root, &item)
+        .with_context(|| format!("apply concept candidate for review '{id}'"))?;
+
+    // Flip review item → approved before the layout refresh so even if
+    // backlinks/index refresh hiccups, the queue moves on. The page is
+    // already written atomically by apply_concept_candidate.
+    let mut approved = item;
+    approved.status = ReviewStatus::Approved;
+    approved.metadata.updated_at_millis = now;
+    save_review_item(root, &approved)
+        .with_context(|| format!("save approved review item '{id}'"))?;
+
+    // Best-effort refreshes: any failure is logged but does not propagate
+    // — the concept page is already on disk and the review item is
+    // flipped. Users can run `kb compile` to fully rebuild if needed.
+    let backlinks_refreshed = refresh_backlinks(root);
+    let index_pages_refreshed = refresh_wiki_indexes(root);
+
+    if json {
+        emit_json(
+            "review.approve",
+            serde_json::json!({
+                "id": id,
+                "action": "approved",
+                "kind": "concept_candidate",
+                "concept_path": applied.concept_path.display().to_string(),
+                "canonical_name": applied.canonical_name,
+                "aliases": applied.aliases,
+                "category": applied.category,
+                "source_document_ids": applied.source_document_ids,
+                "backlinks_refreshed": backlinks_refreshed,
+                "index_pages_refreshed": index_pages_refreshed,
+            }),
+        )?;
+    } else {
+        println!("Approved: {id} (concept_candidate)");
+        println!("  Canonical: {}", applied.canonical_name);
+        if !applied.aliases.is_empty() {
+            println!("  Aliases: {}", applied.aliases.join(", "));
+        }
+        if let Some(cat) = &applied.category {
+            println!("  Category: {cat}");
+        }
+        println!("  Page: {}", applied.concept_path.display());
+        if !applied.source_document_ids.is_empty() {
+            println!("  Sources: {}", applied.source_document_ids.join(", "));
+        }
+        if backlinks_refreshed {
+            println!("  Backlinks refreshed.");
+        }
+        if index_pages_refreshed {
+            println!("  Wiki indexes refreshed.");
+        }
+    }
+    Ok(())
+}
+
 /// Regenerate the wiki's global + per-category index pages from current
 /// on-disk state. Returns `true` on success, `false` (with a warning printed)
 /// on any failure. Never propagates the error — index refresh is best-effort
@@ -389,6 +484,32 @@ fn refresh_wiki_indexes(root: &Path) -> bool {
         Err(err) => {
             eprintln!(
                 "warning: wiki index refresh failed after approve: {err:#}"
+            );
+            false
+        }
+    }
+}
+
+/// Rebuild the `backlinks` managed region on every concept page from
+/// current on-disk state. Returns `true` on success, `false` (with a
+/// warning printed) on any failure. Never propagates the error — a new
+/// concept page has already been written atomically, so a backlinks hiccup
+/// shouldn't make approve look failed. Users can run `kb compile` for a
+/// full rebuild.
+fn refresh_backlinks(root: &Path) -> bool {
+    match backlinks::run_backlinks_pass(root) {
+        Ok(artifacts) => match backlinks::persist_backlinks_artifacts(&artifacts) {
+            Ok(()) => true,
+            Err(err) => {
+                eprintln!(
+                    "warning: backlinks refresh failed after approve: {err:#}"
+                );
+                false
+            }
+        },
+        Err(err) => {
+            eprintln!(
+                "warning: backlinks refresh failed after approve: {err:#}"
             );
             false
         }

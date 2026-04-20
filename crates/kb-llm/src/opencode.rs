@@ -9,11 +9,12 @@ use tempfile::TempDir;
 use crate::adapter::{
     AnswerQuestionRequest, AnswerQuestionResponse, DetectContradictionsRequest,
     DetectContradictionsResponse, ExtractConceptsRequest, ExtractConceptsResponse,
-    GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateSlidesRequest,
-    GenerateSlidesResponse, LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest,
-    MergeConceptCandidatesResponse, RunHealthCheckRequest, RunHealthCheckResponse,
-    SummarizeDocumentRequest, SummarizeDocumentResponse, parse_detect_contradictions_json,
-    parse_extract_concepts_json, parse_merge_concept_candidates_json,
+    GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateConceptFromCandidateRequest,
+    GenerateConceptFromCandidateResponse, GenerateSlidesRequest, GenerateSlidesResponse,
+    LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse,
+    RunHealthCheckRequest, RunHealthCheckResponse, SummarizeDocumentRequest,
+    SummarizeDocumentResponse, parse_detect_contradictions_json, parse_extract_concepts_json,
+    parse_generate_concept_from_candidate_json, parse_merge_concept_candidates_json,
 };
 use crate::provenance::ProvenanceRecord;
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -404,6 +405,60 @@ impl LlmAdapter for OpencodeAdapter {
         ))
     }
 
+    fn generate_concept_from_candidate(
+        &self,
+        request: GenerateConceptFromCandidateRequest,
+    ) -> Result<(GenerateConceptFromCandidateResponse, ProvenanceRecord), LlmAdapterError> {
+        let template = Template::load(
+            "generate_concept_from_candidate.md",
+            self.config.project_root.as_deref(),
+        )
+        .map_err(|err| {
+            LlmAdapterError::Other(format!(
+                "load generate_concept_from_candidate template: {err}"
+            ))
+        })?;
+
+        let mut context = HashMap::new();
+        context.insert("candidate_name".to_string(), request.candidate_name.clone());
+        context.insert(
+            "source_snippets".to_string(),
+            format_candidate_snippets_for_prompt(&request.source_snippets),
+        );
+        context.insert(
+            "existing_categories".to_string(),
+            format_existing_categories_for_prompt(&request.existing_categories),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!(
+                "render generate_concept_from_candidate template: {err}"
+            ))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        let raw = self.run_prompt(&rendered.content)?;
+        let response = parse_generate_concept_from_candidate_json(&raw)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((response, provenance))
+    }
+
     fn answer_question(
         &self,
         request: AnswerQuestionRequest,
@@ -665,6 +720,38 @@ fn format_contradiction_quotes_for_prompt(
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Format candidate snippets as bullet lines for the
+/// `generate_concept_from_candidate.md` prompt. Empty list renders as
+/// a single "(no snippets available)" line so the prompt still parses cleanly.
+fn format_candidate_snippets_for_prompt(
+    snippets: &[crate::adapter::CandidateSourceSnippet],
+) -> String {
+    if snippets.is_empty() {
+        return "- (no snippets available)".to_string();
+    }
+    snippets
+        .iter()
+        .map(|s| format!("- [{}] {}", s.source_document_id, s.snippet.trim()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Format the list of existing category tags for the
+/// `generate_concept_from_candidate.md` prompt. Empty list renders as
+/// "(none)" so the prompt stays grammatical.
+fn format_existing_categories_for_prompt(categories: &[String]) -> String {
+    if categories.is_empty() {
+        "(none)".to_string()
+    } else {
+        categories
+            .iter()
+            .map(|c| format!("- {c}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
 
 /// Strip wrapping code fences from a plain-text LLM response. Defensive —
 /// the prompt tells the model to return plain text, but models occasionally
