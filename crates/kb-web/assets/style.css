@@ -1,0 +1,145 @@
+:root {
+  --fg: #1a1a1a;
+  --bg: #fafaf7;
+  --accent: #2a6b9c;
+  --muted: #6b6b6b;
+  --border: #d8d8d4;
+  --code-bg: #eceae3;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: #fff;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.brand {
+  font-weight: 700;
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 1.1rem;
+}
+
+.searchbar {
+  flex: 1;
+  display: flex;
+}
+
+.searchbar input {
+  flex: 1;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 0.95rem;
+}
+
+main {
+  max-width: 780px;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 4rem;
+}
+
+.ask {
+  margin-bottom: 2rem;
+  padding: 1rem;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.ask form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.ask input[type="text"] {
+  flex: 1;
+  padding: 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 1rem;
+}
+
+.ask button {
+  padding: 0.5rem 1rem;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+#ask-result {
+  margin-top: 1rem;
+  color: var(--muted);
+}
+
+#ask-result pre {
+  white-space: pre-wrap;
+  background: var(--code-bg);
+  padding: 0.75rem;
+  border-radius: 4px;
+  color: var(--fg);
+  font-size: 0.9rem;
+}
+
+article h1, article h2, article h3 {
+  line-height: 1.25;
+}
+
+article a {
+  color: var(--accent);
+}
+
+article code {
+  background: var(--code-bg);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
+article pre {
+  background: var(--code-bg);
+  padding: 0.8rem;
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+article pre code {
+  background: transparent;
+  padding: 0;
+}
+
+article table {
+  border-collapse: collapse;
+  margin: 1rem 0;
+}
+
+article th, article td {
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--border);
+}
+
+article blockquote {
+  border-left: 3px solid var(--accent);
+  padding-left: 1rem;
+  color: var(--muted);
+  margin: 1rem 0;
+}

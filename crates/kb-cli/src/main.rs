@@ -53,6 +53,19 @@ pub(crate) fn emit_json<T: Serialize>(command: &str, data: T) -> Result<()> {
     Ok(())
 }
 
+/// Return true when `host` resolves to loopback (IPv4 `127.0.0.0/8`, IPv6
+/// `::1`, or the string "localhost"). Used to gate `kb serve`'s network
+/// exposure.
+fn is_loopback_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
 #[derive(Parser)]
 #[command(name = "kb", version, about = "Personal knowledge base compiler")]
 #[allow(clippy::struct_excessive_bools)]
@@ -217,6 +230,19 @@ enum Command {
         /// LLM model to use (overrides kb.toml default)
         #[arg(long)]
         model: Option<String>,
+    },
+    /// Serve the KB as a local read-only web UI
+    ///
+    /// Starts a lightweight HTTP server that renders the `wiki/` tree as
+    /// HTML and exposes `/search` + `/ask` endpoints. Bound to 127.0.0.1
+    /// by default — there is no auth, so don't expose it publicly.
+    Serve {
+        /// Host interface to bind. Default: 127.0.0.1 (localhost-only).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// TCP port to listen on.
+        #[arg(long, default_value_t = 8484)]
+        port: u16,
     },
 }
 
@@ -761,6 +787,35 @@ fn run(cli: Cli) -> Result<()> {
             // threads through to the opencode agent config.
             let model_override = model.as_deref().or(cli.model.as_deref());
             chat::run_chat(chat_root, model_override)
+        }
+        Some(Command::Serve { host, port }) => {
+            let serve_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands")
+                .to_path_buf();
+            // Defense-in-depth against copy/paste mistakes: v1 is explicitly
+            // unauthenticated, so we refuse to bind non-loopback addresses
+            // unless the operator force-opts-in. If you really need remote
+            // access, set up a reverse proxy with auth — don't punch
+            // `--host 0.0.0.0` straight into a dev tool.
+            if !is_loopback_host(&host) && !cli.force {
+                return Err(ValidationError::new(format!(
+                    "refusing to bind {host}: kb serve has no authentication. \
+                     Bind 127.0.0.1 (default), put a reverse proxy in front, \
+                     or pass --force to override at your own risk."
+                ))
+                .into());
+            }
+            // Serve is read-only and long-running: no job manifest, no root
+            // lock. The request handlers read the lexical index and wiki
+            // tree directly; concurrent `kb compile` runs will not be
+            // reflected until restart.
+            let state = kb_web::WebState::new(serve_root)?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("build tokio runtime for kb serve")?;
+            rt.block_on(kb_web::serve(&host, port, state))
         }
         None => {
             println!("kb: a personal knowledge base compiler");

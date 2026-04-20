@@ -7,6 +7,7 @@ members = [
     "crates/kb-lint",
     "crates/kb-llm",
     "crates/kb-query",
+    "crates/kb-web",
 ]
 resolver = "2"
 
@@ -46,3 +47,4 @@ kb-ingest = { path = "crates/kb-ingest" }
 kb-compile = { path = "crates/kb-compile" }
 kb-query = { path = "crates/kb-query" }
 kb-lint = { path = "crates/kb-lint" }
+kb-web = { path = "crates/kb-web" }

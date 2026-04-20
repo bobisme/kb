@@ -25,6 +25,7 @@ kb-ingest.workspace = true
 kb-lint.workspace = true
 kb-llm.workspace = true
 kb-query.workspace = true
+kb-web.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
