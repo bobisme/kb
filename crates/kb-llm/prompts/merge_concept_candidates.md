@@ -57,6 +57,37 @@ actions") rather than leaving six separate children ungrouped.
 - `rationale` — for uncertain groupings, briefly explain the ambiguity (e.g. "X could be
   a member of Y or an independent concept").
 
+### 3. Definition synthesis across variants
+
+When multiple variants/aliases fold into a single canonical concept, the merged
+concept's body definition (carried in any `definition_hint` on the canonical member,
+or synthesized downstream) MUST describe the **most general reading** — the umbrella
+that covers every folded variant — NOT the definition of the last-seen or most-specific
+variant. Do not copy one variant's one-liner verbatim when that one-liner only
+describes that variant.
+
+Signals you have picked the wrong body:
+
+- The body starts with "A <variant-name> variant…" where `<variant-name>` is one of
+  the folded aliases rather than the canonical name.
+- The body starts with "A specialization of…" or "An instance of…" framing.
+- The body would be wrong if the reader only knew the canonical name and didn't know
+  which specific variant was meant.
+
+Worked example:
+
+- Input candidates:
+  - `{name: "Basic Paxos", definition_hint: "A two-phase consensus protocol for agreeing on a single value.", …}`
+  - `{name: "Multi-Paxos", definition_hint: "An optimization of Paxos that amortizes leader election across a log of values.", …}`
+  - `{name: "Cheap Paxos", definition_hint: "A Paxos variant that keeps auxiliary nodes out of the steady state and activates them only during failures.", …}`
+- Canonical: `"Paxos"`, aliases: `["Basic Paxos", "Multi-Paxos", "Cheap Paxos"]`.
+- ✓ correct canonical-member `definition_hint`: "A family of consensus algorithms
+  for replicated logs, with variants including Basic Paxos, Multi-Paxos, and Cheap
+  Paxos."
+- ❌ wrong canonical-member `definition_hint`: "A Paxos variant that keeps auxiliary
+  nodes out of the steady state and activates them only during failures." — that is
+  Cheap Paxos specifically, not Paxos in general.
+
 Return only valid JSON in this exact shape — no other text before or after:
 {
   "groups": [
