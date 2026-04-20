@@ -410,6 +410,7 @@ pub fn run_compile_with_llm(
                     "wiki/index.md".to_string(),
                     "wiki/sources/index.md".to_string(),
                     "wiki/concepts/index.md".to_string(),
+                    "wiki/questions/index.md".to_string(),
                 ],
             },
         ));

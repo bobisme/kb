@@ -1798,6 +1798,121 @@ fn compile_builds_lexical_index() {
     assert_eq!(entries.len(), 2, "should index 2 pages");
 }
 
+// bn-k79: promoted question pages must be surfaced in both the top-level
+// wiki/index.md (as a dedicated Questions section) and a per-category
+// wiki/questions/index.md, mirroring the existing sources/concepts layout.
+#[test]
+fn compile_lists_promoted_questions_in_indexes() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // A source so the regular index sections aren't empty — isolates the
+    // assertion to the new Questions behavior.
+    write_source_page(
+        &kb_root,
+        "rust-book",
+        "The Rust Programming Language",
+        "Memory safety.",
+    );
+
+    // Two promoted question pages. Test both `title:` and `question:`
+    // frontmatter keys since real promotion pipelines use either.
+    let questions_dir = kb_root.join("wiki/questions");
+    fs::create_dir_all(&questions_dir).expect("mkdir wiki/questions");
+    fs::write(
+        questions_dir.join("what-is-rust.md"),
+        "---\nid: q-what-is-rust\ntype: question_answer\ntitle: What is Rust?\n---\n\n## Answer\nRust is a systems language.\n",
+    )
+    .expect("write promoted question a");
+    fs::write(
+        questions_dir.join("why-borrow-checker.md"),
+        "---\nid: q-why-borrow-checker\ntype: question_answer\nquestion: Why a borrow checker?\n---\n\n## Answer\nMemory safety without GC.\n",
+    )
+    .expect("write promoted question b");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("compile");
+    let output = cmd.output().expect("run kb compile");
+    assert!(
+        output.status.success(),
+        "kb compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // wiki/questions/index.md exists and lists both questions with
+    // file-relative links (bare filenames from the category dir).
+    let questions_index =
+        fs::read_to_string(kb_root.join("wiki/questions/index.md")).expect("read questions index");
+    assert!(
+        questions_index.contains("# Questions"),
+        "questions index missing header: {questions_index}"
+    );
+    assert!(
+        questions_index.contains("[What is Rust?]")
+            && questions_index.contains("(what-is-rust.md)"),
+        "questions index missing first entry: {questions_index}"
+    );
+    assert!(
+        questions_index.contains("[Why a borrow checker?]")
+            && questions_index.contains("(why-borrow-checker.md)"),
+        "questions index missing second entry (question: fallback): {questions_index}"
+    );
+
+    // Global wiki/index.md gains a ## Questions section with links
+    // relative to wiki/ (i.e., questions/<slug>.md).
+    let global = fs::read_to_string(kb_root.join("wiki/index.md")).expect("read global index");
+    assert!(
+        global.contains("## Questions"),
+        "global index missing Questions section: {global}"
+    );
+    assert!(
+        global.contains("2 question(s)"),
+        "global index missing question count: {global}"
+    );
+    assert!(
+        global.contains("(questions/what-is-rust.md)"),
+        "global index missing file-relative link to first question: {global}"
+    );
+    assert!(
+        global.contains("(questions/why-borrow-checker.md)"),
+        "global index missing file-relative link to second question: {global}"
+    );
+}
+
+// bn-k79: with zero promoted questions, keep the output tidy — no
+// Questions section in wiki/index.md, no wiki/questions/index.md file.
+#[test]
+fn compile_without_questions_omits_questions_index() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_source_page(
+        &kb_root,
+        "rust-book",
+        "The Rust Programming Language",
+        "Memory safety.",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("compile");
+    let output = cmd.output().expect("run kb compile");
+    assert!(
+        output.status.success(),
+        "kb compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        !kb_root.join("wiki/questions/index.md").exists(),
+        "wiki/questions/index.md must not be emitted when there are no promoted questions"
+    );
+    let global = fs::read_to_string(kb_root.join("wiki/index.md")).expect("read global index");
+    assert!(
+        !global.contains("## Questions"),
+        "global index must not contain Questions section when there are no questions: {global}"
+    );
+}
+
 #[test]
 fn search_returns_ranked_results_after_compile() {
     let (_temp_dir, kb_root) = make_temp_kb();

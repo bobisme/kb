@@ -834,7 +834,7 @@ pub fn render_refresh_footer(plan: &ForgetPlan, refresh: &CascadeRefresh, dry_ru
     if dry_run {
         let _ = writeln!(
             out,
-            "  will also refresh: wiki/index.md, wiki/sources/index.md, wiki/concepts/index.md, state/indexes/lexical.json, frontmatter scrub on {} page(s)",
+            "  will also refresh: wiki/index.md, wiki/sources/index.md, wiki/concepts/index.md, wiki/questions/index.md, state/indexes/lexical.json, frontmatter scrub on {} page(s)",
             refresh.frontmatter_scrubbed
         );
         // Moves / cascade bookkeeping already printed above; nothing else.

@@ -8,6 +8,7 @@ use serde::Deserialize;
 
 const SOURCES_DIR: &str = "wiki/sources";
 const CONCEPTS_DIR: &str = "wiki/concepts";
+const QUESTIONS_DIR: &str = "wiki/questions";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
@@ -25,14 +26,19 @@ pub struct IndexArtifact {
 struct PageFrontmatter {
     title: Option<String>,
     name: Option<String>,
+    question: Option<String>,
 }
 
 /// Generate global and per-category index pages from the wiki directory.
 ///
-/// Produces up to three index files:
-/// - `wiki/index.md` — global index linking sources and concepts
+/// Produces up to four index files:
+/// - `wiki/index.md` — global index linking sources, concepts, and (when any
+///   promoted question pages exist) questions
 /// - `wiki/sources/index.md` — all source pages
 /// - `wiki/concepts/index.md` — all concept pages
+/// - `wiki/questions/index.md` — all promoted question pages (only emitted
+///   when `wiki/questions/` holds at least one non-index markdown file, so
+///   KBs without promoted questions stay tidy)
 ///
 /// # Errors
 ///
@@ -40,8 +46,9 @@ struct PageFrontmatter {
 pub fn generate_indexes(root: &Path) -> Result<Vec<IndexArtifact>> {
     let sources = discover_entries(root, SOURCES_DIR)?;
     let concepts = discover_entries(root, CONCEPTS_DIR)?;
+    let questions = discover_entries(root, QUESTIONS_DIR)?;
 
-    let mut artifacts = Vec::with_capacity(3);
+    let mut artifacts = Vec::with_capacity(4);
 
     let global_path = root.join("wiki/index.md");
     let global_parent = global_path
@@ -49,7 +56,7 @@ pub fn generate_indexes(root: &Path) -> Result<Vec<IndexArtifact>> {
         .context("wiki/index.md has no parent")?
         .to_path_buf();
     artifacts.push(IndexArtifact {
-        content: render_global_index(&sources, &concepts, root, &global_parent),
+        content: render_global_index(&sources, &concepts, &questions, root, &global_parent),
         path: global_path,
     });
 
@@ -73,6 +80,18 @@ pub fn generate_indexes(root: &Path) -> Result<Vec<IndexArtifact>> {
             .to_path_buf();
         artifacts.push(IndexArtifact {
             content: render_category_index("Concepts", &concepts, root, &parent),
+            path,
+        });
+    }
+
+    if !questions.is_empty() {
+        let path = root.join("wiki/questions/index.md");
+        let parent = path
+            .parent()
+            .context("wiki/questions/index.md has no parent")?
+            .to_path_buf();
+        artifacts.push(IndexArtifact {
+            content: render_category_index("Questions", &questions, root, &parent),
             path,
         });
     }
@@ -190,7 +209,10 @@ fn extract_title(path: &Path) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     let yaml = extract_frontmatter_yaml(&raw)?;
     let fm: PageFrontmatter = serde_yaml::from_str(&yaml).ok()?;
-    fm.title.or(fm.name).filter(|t| !t.is_empty())
+    fm.title
+        .or(fm.question)
+        .or(fm.name)
+        .filter(|t| !t.is_empty())
 }
 
 fn extract_frontmatter_yaml(markdown: &str) -> Option<String> {
@@ -219,6 +241,7 @@ fn title_from_filename(path: &Path) -> String {
 fn render_global_index(
     sources: &[IndexEntry],
     concepts: &[IndexEntry],
+    questions: &[IndexEntry],
     root: &Path,
     index_parent: &Path,
 ) -> String {
@@ -246,6 +269,22 @@ fn render_global_index(
     } else {
         write!(out, "{} concept(s) indexed.\n\n", concepts.len()).expect("infallible");
         for entry in concepts {
+            writeln!(
+                out,
+                "- [{}]({})",
+                entry.title,
+                link_target(entry, root, index_parent)
+            )
+            .expect("infallible");
+        }
+    }
+
+    // Questions section is suppressed entirely when no promoted question
+    // pages exist, to keep freshly-initialized KBs uncluttered.
+    if !questions.is_empty() {
+        out.push_str("\n## Questions\n\n");
+        write!(out, "{} question(s) indexed.\n\n", questions.len()).expect("infallible");
+        for entry in questions {
             writeln!(
                 out,
                 "- [{}]({})",
@@ -320,6 +359,8 @@ mod tests {
         assert!(global.content.contains("[Rust]"));
         assert!(global.content.contains("2 source(s)"));
         assert!(global.content.contains("1 concept(s)"));
+        // No promoted questions → no Questions section.
+        assert!(!global.content.contains("## Questions"));
 
         let sources = &artifacts[1];
         assert!(sources.path.ends_with("wiki/sources/index.md"));
@@ -342,6 +383,7 @@ mod tests {
         let global = &artifacts[0];
         assert!(global.content.contains("_No sources yet"));
         assert!(global.content.contains("_No concepts yet"));
+        assert!(!global.content.contains("## Questions"));
     }
 
     #[test]
@@ -475,6 +517,12 @@ mod tests {
                 &format!("---\nname: {name}\n---\n"),
             );
         }
+        for name in ["q-one", "q-two"] {
+            write_file(
+                &root.path().join(format!("wiki/questions/{name}.md")),
+                &format!("---\ntitle: {name}\n---\n"),
+            );
+        }
 
         let artifacts = generate_indexes(root.path()).expect("generate");
         persist_index_artifacts(&artifacts).expect("persist");
@@ -532,5 +580,96 @@ mod tests {
         let apple_pos = global.content.find("[Apple]").expect("Apple found");
         let zebra_pos = global.content.find("[Zebra]").expect("Zebra found");
         assert!(apple_pos < zebra_pos, "Apple should appear before Zebra");
+    }
+
+    #[test]
+    fn generate_indexes_emits_questions_section_and_index_page() {
+        let root = tempdir().expect("tempdir");
+        write_file(
+            &root.path().join("wiki/sources/doc.md"),
+            "---\ntitle: Doc\n---\n",
+        );
+        write_file(
+            &root.path().join("wiki/questions/what-is-rust.md"),
+            "---\ntitle: What is Rust?\n---\n",
+        );
+        write_file(
+            &root.path().join("wiki/questions/why-async.md"),
+            "---\nquestion: Why async?\n---\n",
+        );
+
+        let artifacts = generate_indexes(root.path()).expect("generate");
+
+        // Global index must list both questions with paths relative to wiki/.
+        let global = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/index.md"))
+            .expect("global index");
+        assert!(
+            global.content.contains("## Questions"),
+            "expected Questions section; got:\n{}",
+            global.content
+        );
+        assert!(global.content.contains("2 question(s)"));
+        assert!(global.content.contains("[What is Rust?]"));
+        assert!(global.content.contains("[Why async?]"));
+        assert!(global.content.contains("(questions/what-is-rust.md)"));
+        assert!(global.content.contains("(questions/why-async.md)"));
+
+        // Per-category index must exist with file-relative links.
+        let questions = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/questions/index.md"))
+            .expect("questions index");
+        assert!(questions.content.contains("# Questions"));
+        assert!(questions.content.contains("[What is Rust?]"));
+        assert!(questions.content.contains("(what-is-rust.md)"));
+        assert!(!questions.content.contains("(wiki/"));
+        assert!(!questions.content.contains("(questions/"));
+    }
+
+    #[test]
+    fn generate_indexes_omits_questions_when_none_exist() {
+        let root = tempdir().expect("tempdir");
+        write_file(
+            &root.path().join("wiki/sources/doc.md"),
+            "---\ntitle: Doc\n---\n",
+        );
+
+        let artifacts = generate_indexes(root.path()).expect("generate");
+        // No wiki/questions/index.md artifact when there are zero questions.
+        assert!(
+            !artifacts
+                .iter()
+                .any(|a| a.path.ends_with("wiki/questions/index.md")),
+            "should not emit questions index when no promoted questions exist"
+        );
+
+        let global = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/index.md"))
+            .expect("global index");
+        assert!(
+            !global.content.contains("## Questions"),
+            "global index must not contain Questions section when empty"
+        );
+    }
+
+    #[test]
+    fn question_title_falls_back_to_question_field() {
+        // Promoted question pages sometimes use `question:` instead of
+        // `title:` — the index must surface whichever is present.
+        let root = tempdir().expect("tempdir");
+        write_file(
+            &root.path().join("wiki/questions/slug.md"),
+            "---\nquestion: How does caching work?\n---\n",
+        );
+
+        let artifacts = generate_indexes(root.path()).expect("generate");
+        let global = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/index.md"))
+            .expect("global index");
+        assert!(global.content.contains("[How does caching work?]"));
     }
 }
