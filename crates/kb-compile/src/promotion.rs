@@ -197,10 +197,14 @@ struct ArtifactLoad {
 
 fn load_artifact(root: &Path, item: &ReviewItem) -> Result<ArtifactLoad> {
     for dep in &item.metadata.dependencies {
-        if dep.starts_with("artifact-") {
+        if dep.starts_with("art-") {
+            // Artifact id `art-<suffix>` maps to the question directory
+            // `outputs/questions/q-<suffix>/answer.md` (artifacts share the
+            // short suffix of their question).
+            let suffix = dep.strip_prefix("art-").unwrap_or(dep);
             let answer_path = root
                 .join("outputs/questions")
-                .join(dep.strip_prefix("artifact-").unwrap_or(dep))
+                .join(format!("q-{suffix}"))
                 .join("answer.md");
             if answer_path.exists() {
                 let raw = std::fs::read_to_string(&answer_path)
@@ -282,11 +286,11 @@ fn split_derived_ids(deps: &[String]) -> (Option<String>, Option<String>) {
     let mut question_id = None;
     let mut artifact_id = None;
     for dep in deps {
-        if dep.starts_with("artifact-") && artifact_id.is_none() {
+        if dep.starts_with("art-") && artifact_id.is_none() {
             artifact_id = Some(dep.clone());
-        } else if dep.starts_with("question-") && question_id.is_none() {
+        } else if dep.starts_with("q-") && question_id.is_none() {
             question_id = Some(dep.clone());
-        } else if question_id.is_none() && !dep.starts_with("artifact-") {
+        } else if question_id.is_none() && !dep.starts_with("art-") {
             // Fallback: older pipelines stored the bare question id without a prefix.
             question_id = Some(dep.clone());
         }
@@ -564,15 +568,15 @@ mod tests {
                 model_version: None,
                 tool_version: Some("kb/0.1.0".to_string()),
                 prompt_template_hash: None,
-                dependencies: vec!["question-1".to_string(), "artifact-q1".to_string()],
+                dependencies: vec!["q-1".to_string(), "art-1".to_string()],
                 output_paths: vec![
-                    PathBuf::from("outputs/questions/q1/answer.md"),
+                    PathBuf::from("outputs/questions/q-1/answer.md"),
                     PathBuf::from("wiki/questions/example.md"),
                 ],
                 status: Status::NeedsReview,
             },
             kind: ReviewKind::Promotion,
-            target_entity_id: "artifact-q1".to_string(),
+            target_entity_id: "art-1".to_string(),
             proposed_destination: Some(PathBuf::from("wiki/questions/example.md")),
             citations: vec!["source-a#intro".to_string(), "source-b#details".to_string()],
             affected_pages: vec![PathBuf::from("wiki/questions/example.md")],
@@ -644,7 +648,7 @@ mod tests {
         assert_eq!(result.build_record.metadata.created_at_millis, 5000);
         assert_eq!(
             result.build_record.input_ids,
-            vec!["question-1".to_string(), "artifact-q1".to_string()]
+            vec!["q-1".to_string(), "art-1".to_string()]
         );
         assert_eq!(
             result.build_record.output_ids,
@@ -688,10 +692,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
 
-        std::fs::create_dir_all(root.join("outputs/questions/q1")).expect("create artifact dir");
+        std::fs::create_dir_all(root.join("outputs/questions/q-1")).expect("create artifact dir");
         std::fs::write(
-            root.join("outputs/questions/q1/answer.md"),
-            "---\nid: artifact-q1\ntype: question_answer\nsource_document_ids:\n- wiki/sources/rust.md\n- wiki/sources/cargo.md\n---\n\nRust is great.\n",
+            root.join("outputs/questions/q-1/answer.md"),
+            "---\nid: art-1\ntype: question_answer\nsource_document_ids:\n- wiki/sources/rust.md\n- wiki/sources/cargo.md\n---\n\nRust is great.\n",
         )
         .expect("write artifact");
 
@@ -718,10 +722,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
 
-        std::fs::create_dir_all(root.join("outputs/questions/q1")).expect("create artifact dir");
+        std::fs::create_dir_all(root.join("outputs/questions/q-1")).expect("create artifact dir");
         std::fs::write(
-            root.join("outputs/questions/q1/answer.md"),
-            "---\nid: artifact-q1\ntype: question_answer\nsource_document_ids:\n- wiki/sources/rust.md\n- wiki/sources/cargo.md\n---\n\nBody.\n",
+            root.join("outputs/questions/q-1/answer.md"),
+            "---\nid: art-1\ntype: question_answer\nsource_document_ids:\n- wiki/sources/rust.md\n- wiki/sources/cargo.md\n---\n\nBody.\n",
         )
         .expect("write artifact");
 
@@ -758,7 +762,7 @@ mod tests {
         assert_eq!(source_strs, vec!["wiki/sources/rust.md", "wiki/sources/cargo.md"]);
         for s in &source_strs {
             assert!(
-                !s.starts_with("question-") && !s.starts_with("artifact-"),
+                !s.starts_with("q-") && !s.starts_with("art-"),
                 "source_document_ids must not contain question/artifact IDs: {s}"
             );
         }
@@ -770,11 +774,11 @@ mod tests {
             .expect("derived_from mapping");
         assert_eq!(
             derived.get(Value::String("question_id".into())).and_then(Value::as_str),
-            Some("question-1")
+            Some("q-1")
         );
         assert_eq!(
             derived.get(Value::String("artifact_id".into())).and_then(Value::as_str),
-            Some("artifact-q1")
+            Some("art-1")
         );
     }
 
@@ -786,10 +790,10 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
 
-        std::fs::create_dir_all(root.join("outputs/questions/q1")).expect("create artifact dir");
+        std::fs::create_dir_all(root.join("outputs/questions/q-1")).expect("create artifact dir");
         std::fs::write(
-            root.join("outputs/questions/q1/answer.md"),
-            "---\nid: artifact-q1\ntype: question_answer\n\
+            root.join("outputs/questions/q-1/answer.md"),
+            "---\nid: art-1\ntype: question_answer\n\
              source_document_ids:\n- src-cited-a\n- src-cited-b\n\
              retrieval_candidates:\n- src-cited-a\n- src-cited-b\n- src-scope-c\n- src-scope-d\n\
              ---\n\nBody.\n",
@@ -831,26 +835,26 @@ mod tests {
 
     #[test]
     fn extract_source_document_ids_from_answer_frontmatter() {
-        let md = "---\nid: artifact-q1\nsource_document_ids:\n- wiki/sources/a.md\n- wiki/sources/b.md\n---\n\nBody\n";
+        let md = "---\nid: art-1\nsource_document_ids:\n- wiki/sources/a.md\n- wiki/sources/b.md\n---\n\nBody\n";
         let ids = extract_source_document_ids(md);
         assert_eq!(ids, vec!["wiki/sources/a.md", "wiki/sources/b.md"]);
     }
 
     #[test]
     fn extract_source_document_ids_missing_returns_empty() {
-        let md = "---\nid: artifact-q1\n---\n\nBody\n";
+        let md = "---\nid: art-1\n---\n\nBody\n";
         assert!(extract_source_document_ids(md).is_empty());
     }
 
     #[test]
     fn split_derived_ids_picks_out_question_and_artifact() {
         let deps = vec![
-            "question-abcd".to_string(),
-            "artifact-q1".to_string(),
+            "q-abcd".to_string(),
+            "art-q1".to_string(),
         ];
         let (q, a) = split_derived_ids(&deps);
-        assert_eq!(q.as_deref(), Some("question-abcd"));
-        assert_eq!(a.as_deref(), Some("artifact-q1"));
+        assert_eq!(q.as_deref(), Some("q-abcd"));
+        assert_eq!(a.as_deref(), Some("art-q1"));
     }
 
     #[test]

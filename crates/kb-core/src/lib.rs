@@ -338,7 +338,7 @@ mod tests {
         });
 
         round_trip(&Question {
-            metadata: metadata("question-1"),
+            metadata: metadata("q-1"),
             raw_query: "How does this work?".to_string(),
             requested_format: "markdown".to_string(),
             requesting_context: QuestionContext::ProjectKb,
@@ -347,8 +347,8 @@ mod tests {
         });
 
         round_trip(&Artifact {
-            metadata: metadata("artifact-1"),
-            question_id: "question-1".to_string(),
+            metadata: metadata("art-1"),
+            question_id: "q-1".to_string(),
             artifact_kind: ArtifactKind::Report,
             format: "md".to_string(),
             output_path: PathBuf::from("outputs/artifact.md"),
@@ -395,7 +395,7 @@ mod tests {
         round_trip(&ReviewItem {
             metadata: metadata("review-item-1"),
             kind: ReviewKind::Promotion,
-            target_entity_id: "artifact-1".to_string(),
+            target_entity_id: "art-1".to_string(),
             proposed_destination: Some(PathBuf::from("wiki/reports/testing.md")),
             citations: vec!["citation-1".to_string()],
             affected_pages: vec![PathBuf::from("wiki/index.md")],

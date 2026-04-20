@@ -1500,7 +1500,7 @@ fn run_ask(
     }
 
     let timestamp = now_millis()?;
-    let question_id = format!("question-{}", unique_question_suffix(timestamp, query));
+    let question_id = generate_question_id(root, timestamp, query);
 
     // Filename tracks the requested format. JSON gets `.json`; everything
     // else (md/marp) stays as `.md`. Keep in sync with `kb_query::write_artifact`.
@@ -1573,7 +1573,10 @@ fn run_ask(
 
     let artifact = Artifact {
         metadata: EntityMetadata {
-            id: format!("artifact-{question_id}"),
+            id: format!(
+                "art-{}",
+                question_id.strip_prefix("q-").unwrap_or(&question_id)
+            ),
             created_at_millis: timestamp,
             updated_at_millis: now_millis()?,
             source_hashes: Vec::new(),
@@ -1964,9 +1967,36 @@ fn now_millis() -> Result<u64> {
     Ok(u64::try_from(millis)?)
 }
 
-fn unique_question_suffix(timestamp: u64, query: &str) -> String {
-    let hash = blake3::hash(query.as_bytes()).to_hex();
-    format!("{timestamp}-{}", &hash[..10])
+/// Generate a terse, collision-free id for a new question under `outputs/questions/`.
+///
+/// Uses `terseid` with prefix `"q"`. The seed is derived from
+/// `{timestamp_ns}|{query}` so repeated asks of the same query at different
+/// times produce distinct seeds (and therefore different ids). The exists
+/// closure walks `outputs/questions/` so we never collide with an existing
+/// question directory.
+fn generate_question_id(root: &Path, timestamp_ms: u64, query: &str) -> String {
+    let questions_dir = root.join("outputs/questions");
+    let item_count = if questions_dir.exists() {
+        fs::read_dir(&questions_dir)
+            .map(|rd| rd.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    // Combine the timestamp (in ns for extra entropy across sub-ms asks) with
+    // the raw query text to build the seed.
+    let ts_nanos = u128::from(timestamp_ms).saturating_mul(1_000_000);
+    let seed_base = format!("{ts_nanos}|{query}");
+    let generator = terseid::IdGenerator::new(terseid::IdConfig::new("q"));
+    generator.generate(
+        |nonce| {
+            let mut bytes = seed_base.as_bytes().to_vec();
+            bytes.extend_from_slice(&nonce.to_le_bytes());
+            bytes
+        },
+        item_count,
+        |candidate| questions_dir.join(candidate).exists(),
+    )
 }
 
 
@@ -2227,7 +2257,7 @@ fn build_job_report(target: &str, job: &JobRun) -> InspectReport {
 /// field matches `target`. Returns absolute paths of all matches.
 ///
 /// Used as a fallback resolver in `run_inspect` so users can inspect entities
-/// by their frontmatter id (e.g. `wiki-source-manual`, `artifact-question-abcd`)
+/// by their frontmatter id (e.g. `wiki-source-manual`, `art-a7x`)
 /// without having to hunt for the file path.
 fn find_by_frontmatter_id(root: &Path, target: &str) -> Vec<PathBuf> {
     let mut matches = Vec::new();
@@ -2572,9 +2602,9 @@ fn inspect_kind(id: &str) -> String {
         "source_revision".to_string()
     } else if id.starts_with("outputs/questions/") {
         "artifact".to_string()
-    } else if id.starts_with("question-") {
+    } else if id.starts_with("q-") {
         "question".to_string()
-    } else if id.starts_with("artifact-") {
+    } else if id.starts_with("art-") {
         "artifact".to_string()
     } else {
         "entity".to_string()

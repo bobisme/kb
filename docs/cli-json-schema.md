@@ -76,7 +76,7 @@ Normal run:
 
 ```json
 {
-  "question_id": "question-<timestamp>-<hash>",
+  "question_id": "q-<short-suffix>",
   "question_path": "outputs/questions/<id>/question.json",
   "artifact_path": "outputs/questions/<id>/answer.md",
   "requested_format": "md"

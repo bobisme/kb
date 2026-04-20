@@ -912,7 +912,7 @@ fn ask_format_png_refuses_cleanly() {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("question-")
+                    .starts_with("q-")
             })
             .count();
         assert_eq!(
@@ -2476,7 +2476,7 @@ fn ask_dry_run_prints_retrieval_plan_without_calling_llm() {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("question-")
+                    .starts_with("q-")
             })
             .collect();
         assert!(
@@ -2660,12 +2660,12 @@ fn make_review_item(id: &str, status: ReviewStatus) -> ReviewItem {
             model_version: None,
             tool_version: Some("kb-test".to_string()),
             prompt_template_hash: None,
-            dependencies: vec!["artifact-q1".to_string()],
-            output_paths: vec![PathBuf::from("outputs/questions/q1/answer.md")],
+            dependencies: vec!["art-q1".to_string()],
+            output_paths: vec![PathBuf::from("outputs/questions/q-q1/answer.md")],
             status: Status::NeedsReview,
         },
         kind: ReviewKind::Promotion,
-        target_entity_id: "artifact-q1".to_string(),
+        target_entity_id: "art-q1".to_string(),
         proposed_destination: Some(PathBuf::from("wiki/questions/test.md")),
         citations: vec!["src-1#intro".to_string()],
         affected_pages: vec![PathBuf::from("wiki/questions/test.md")],
@@ -2827,8 +2827,8 @@ fn approved_promotion_passes_orphan_lint_with_real_source_ids() {
 
     // Seed the answer artifact that `execute_promotion` will read. Its frontmatter
     // carries the real `source_document_ids` (as `kb_query::write_artifact` would).
-    let question_id = "question-promote-orphan";
-    let artifact_id = "artifact-promote-orphan";
+    let question_id = "q-promote-orphan";
+    let artifact_id = "art-promote-orphan";
     let q_dir = kb_root.join("outputs/questions").join(question_id);
     fs::create_dir_all(&q_dir).expect("create question dir");
     fs::write(
@@ -2898,8 +2898,8 @@ fn approved_promotion_passes_orphan_lint_with_real_source_ids() {
         .as_array()
         .expect("source_document_ids array");
     let source_strs: Vec<&str> = sources.iter().filter_map(Value::as_str).collect();
-    assert!(!source_strs.iter().any(|s| s.starts_with("question-")));
-    assert!(!source_strs.iter().any(|s| s.starts_with("artifact-")));
+    assert!(!source_strs.iter().any(|s| s.starts_with("q-")));
+    assert!(!source_strs.iter().any(|s| s.starts_with("art-")));
     assert!(source_strs.contains(&doc_id));
 
     // Now run kb lint --check orphans. It must pass.
@@ -5659,8 +5659,8 @@ fn approve_refreshes_indexes_and_renders_question_title() {
     init_kb(&kb_root);
 
     // Seed the answer artifact that `execute_promotion` reads.
-    let question_id = "question-arc-vs-lru";
-    let artifact_id = "artifact-arc-vs-lru";
+    let question_id = "q-arc-vs-lru";
+    let artifact_id = "art-arc-vs-lru";
     let q_dir = kb_root.join("outputs/questions").join(question_id);
     fs::create_dir_all(&q_dir).expect("create question dir");
     fs::write(

@@ -515,7 +515,10 @@ mod tests {
     fn sample_artifact(question_id: &str) -> Artifact {
         Artifact {
             metadata: EntityMetadata {
-                id: format!("artifact-{question_id}"),
+                id: format!(
+                    "art-{}",
+                    question_id.strip_prefix("q-").unwrap_or(question_id)
+                ),
                 created_at_millis: 1_000_000,
                 updated_at_millis: 1_000_000,
                 source_hashes: Vec::new(),
