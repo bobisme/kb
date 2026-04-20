@@ -55,8 +55,16 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
     let question_id = &input.question.metadata.id;
     let base_dir = PathBuf::from("outputs/questions").join(question_id);
 
+    // The answer file name tracks the requested format so `--format=json` lands
+    // on disk as `answer.json`, not `answer.md`. Marp still renders as
+    // markdown (Marp IS markdown with a frontmatter flag), so it keeps `.md`.
+    let answer_file_name = match input.question.requested_format.as_str() {
+        "json" => "answer.json",
+        _ => "answer.md",
+    };
+
     let question_rel = base_dir.join("question.json");
-    let answer_rel = base_dir.join("answer.md");
+    let answer_rel = base_dir.join(answer_file_name);
     let metadata_rel = base_dir.join("metadata.json");
     let plan_rel = base_dir.join("retrieval_plan.json");
 
@@ -66,9 +74,6 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
     let question_json =
         serde_json::to_string_pretty(input.question).map_err(json_io_err)?;
     atomic_write(input.root.join(&question_rel), question_json.as_bytes())?;
-
-    let answer_md = render_answer_frontmatter(input).map_err(yaml_io_err)?;
-    atomic_write(input.root.join(&answer_rel), answer_md.as_bytes())?;
 
     let source_doc_ids = resolve_source_document_ids(input.root, &input.retrieval_plan.candidates);
 
@@ -83,6 +88,15 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
                 )
             },
         );
+
+    if input.question.requested_format == "json" {
+        let answer_json = render_answer_json(input, &source_doc_ids, &valid_citations)
+            .map_err(json_io_err)?;
+        atomic_write(input.root.join(&answer_rel), answer_json.as_bytes())?;
+    } else {
+        let answer_md = render_answer_frontmatter(input).map_err(yaml_io_err)?;
+        atomic_write(input.root.join(&answer_rel), answer_md.as_bytes())?;
+    }
 
     let sidecar = ArtifactSidecar {
         question_id: question_id.clone(),
@@ -105,6 +119,122 @@ pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteAr
         metadata_path: metadata_rel,
         retrieval_plan_path: plan_rel,
     })
+}
+
+/// Serializes the answer as a structured JSON document.
+///
+/// Mirrors the metadata captured by the markdown answer's YAML frontmatter —
+/// id, question linkage, generation timestamp, model, requested format,
+/// source document IDs, retrieval candidates, citations — and wraps the
+/// existing markdown body verbatim as the `body` field. Downstream tools can
+/// parse this without re-rendering the answer.
+fn render_answer_json(
+    input: &WriteArtifactInput<'_>,
+    source_document_ids: &[String],
+    valid_citations: &[u32],
+) -> Result<String, serde_json::Error> {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "id".into(),
+        serde_json::Value::String(input.artifact.metadata.id.clone()),
+    );
+    obj.insert(
+        "type".into(),
+        serde_json::Value::String("question_answer".into()),
+    );
+    obj.insert(
+        "question_id".into(),
+        serde_json::Value::String(input.question.metadata.id.clone()),
+    );
+    obj.insert(
+        "generated_at".into(),
+        serde_json::Value::Number(input.artifact.metadata.created_at_millis.into()),
+    );
+    if let Some(prov) = input.provenance {
+        obj.insert(
+            "generated_by".into(),
+            serde_json::Value::String(format!("{}/{}", prov.harness, prov.model)),
+        );
+    }
+    if let Some(tool) = &input.artifact.metadata.tool_version {
+        obj.insert(
+            "tool_version".into(),
+            serde_json::Value::String(tool.clone()),
+        );
+    }
+    if let Some(build_id) = input.build_record_id {
+        obj.insert(
+            "build_record_id".into(),
+            serde_json::Value::String(build_id.to_string()),
+        );
+    }
+    if let Some(model) = &input.artifact.metadata.model_version {
+        obj.insert("model".into(), serde_json::Value::String(model.clone()));
+    }
+    obj.insert(
+        "requested_format".into(),
+        serde_json::Value::String(input.question.requested_format.clone()),
+    );
+    obj.insert(
+        "source_document_ids".into(),
+        serde_json::Value::Array(
+            source_document_ids
+                .iter()
+                .map(|s| serde_json::Value::String(s.clone()))
+                .collect(),
+        ),
+    );
+    obj.insert(
+        "retrieval_candidates".into(),
+        serde_json::to_value(&input.retrieval_plan.candidates)?,
+    );
+    // Citations: surface the indices the LLM actually cited, paired with the
+    // candidate path/kind. Entries are derived from the retrieval plan by
+    // position (1-indexed) to match how `[n]` references resolve in the body.
+    let citations: Vec<serde_json::Value> = valid_citations
+        .iter()
+        .filter_map(|idx| {
+            let i = *idx as usize;
+            if i == 0 || i > input.retrieval_plan.candidates.len() {
+                return None;
+            }
+            let cand = &input.retrieval_plan.candidates[i - 1];
+            let kind = if cand.id.starts_with("wiki/concepts/") {
+                "concept"
+            } else if cand.id.starts_with("wiki/sources/") {
+                "source"
+            } else {
+                "fulldocument"
+            };
+            let mut c = serde_json::Map::new();
+            c.insert("index".into(), serde_json::Value::Number((*idx).into()));
+            c.insert("path".into(), serde_json::Value::String(cand.id.clone()));
+            c.insert("kind".into(), serde_json::Value::String(kind.into()));
+            Some(serde_json::Value::Object(c))
+        })
+        .collect();
+    obj.insert("citations".into(), serde_json::Value::Array(citations));
+
+    let source_hashes: Vec<serde_json::Value> = input
+        .question
+        .metadata
+        .source_hashes
+        .iter()
+        .map(|h| serde_json::Value::String(h.clone()))
+        .collect();
+    if !source_hashes.is_empty() {
+        obj.insert(
+            "source_revision_ids".into(),
+            serde_json::Value::Array(source_hashes),
+        );
+    }
+
+    obj.insert(
+        "body".into(),
+        serde_json::Value::String(input.artifact_body.to_string()),
+    );
+
+    serde_json::to_string_pretty(&serde_json::Value::Object(obj))
 }
 
 /// Resolves retrieval candidate paths to the underlying `source_document_id`
@@ -596,6 +726,74 @@ mod tests {
         let sidecar_str = std::fs::read_to_string(root.join(&output.metadata_path)).unwrap();
         let sidecar: ArtifactSidecar = serde_json::from_str(&sidecar_str).unwrap();
         assert_eq!(sidecar.build_record_id.as_deref(), Some("build:ask:q6"));
+    }
+
+    /// Regression (bn-iiq): `--format=json` must produce `answer.json`, not
+    /// `answer.md`, and the JSON must carry the documented envelope fields.
+    #[test]
+    fn json_format_writes_structured_answer_json() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Seed a source page so source_document_ids resolve to a real src-* id.
+        seed_source_page(root, "rust-overview", "src-rust-overview");
+
+        let mut question = sample_question("q-json");
+        question.requested_format = "json".into();
+        let mut artifact = sample_artifact("q-json");
+        artifact.format = "json".into();
+        artifact.artifact_kind = ArtifactKind::JsonSpec;
+        artifact.output_path = PathBuf::from("outputs/questions/q-json/answer.json");
+        let plan = sample_plan();
+
+        let result = ArtifactResult {
+            body: "Markdown body with a citation [1].".into(),
+            valid_citations: vec![1],
+            invalid_citations: vec![],
+            has_uncertainty_banner: false,
+        };
+
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &question,
+            artifact: &artifact,
+            retrieval_plan: &plan,
+            artifact_result: Some(&result),
+            provenance: None,
+            artifact_body: &result.body,
+            build_record_id: Some("build:ask:q-json"),
+        })
+        .unwrap();
+
+        // Filename must be answer.json, no stray answer.md.
+        assert!(
+            output.answer_path.to_string_lossy().ends_with("answer.json"),
+            "answer_path should end with answer.json: {}",
+            output.answer_path.display()
+        );
+        assert!(
+            !root.join("outputs/questions/q-json/answer.md").exists(),
+            "json format must not emit answer.md"
+        );
+
+        let raw = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+        assert_eq!(parsed["type"], "question_answer");
+        assert_eq!(parsed["question_id"], "q-json");
+        assert_eq!(parsed["requested_format"], "json");
+        assert_eq!(parsed["body"], "Markdown body with a citation [1].");
+        assert_eq!(parsed["build_record_id"], "build:ask:q-json");
+        assert_eq!(parsed["model"], "gpt-5.4");
+        assert_eq!(
+            parsed["source_document_ids"],
+            serde_json::json!(["src-rust-overview"])
+        );
+        let citations = parsed["citations"].as_array().unwrap();
+        assert_eq!(citations.len(), 1);
+        assert_eq!(citations[0]["index"], 1);
+        assert_eq!(citations[0]["path"], "wiki/sources/rust-overview.md");
+        assert_eq!(citations[0]["kind"], "source");
+        assert!(parsed["retrieval_candidates"].is_array());
     }
 
     /// Regression: retrieval candidates are wiki page paths. The promoted

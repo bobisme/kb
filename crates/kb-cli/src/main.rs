@@ -1130,6 +1130,18 @@ fn run_ask(
     let requested_format =
         normalize_ask_format(requested_format.unwrap_or(cfg.ask.artifact_default_format.as_str()))?;
 
+    // `png` is accepted by clap (so `--help` keeps advertising it as a
+    // placeholder for future support) but we refuse it cleanly rather than
+    // silently writing markdown under a `.png` label. See bn-iiq.
+    if requested_format == "png" {
+        return Err(ExitCodeError {
+            exit_code: 1,
+            message: "--format png is not yet supported; supported formats: md, marp, json"
+                .to_string(),
+        }
+        .into());
+    }
+
     let retrieval_plan =
         kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
 
@@ -1159,9 +1171,15 @@ fn run_ask(
     let timestamp = now_millis()?;
     let question_id = format!("question-{}", unique_question_suffix(timestamp, query));
 
+    // Filename tracks the requested format. JSON gets `.json`; everything
+    // else (md/marp) stays as `.md`. Keep in sync with `kb_query::write_artifact`.
+    let answer_file_name = match requested_format {
+        "json" => "answer.json",
+        _ => "answer.md",
+    };
     let answer_rel = PathBuf::from("outputs/questions")
         .join(&question_id)
-        .join("answer.md");
+        .join(answer_file_name);
     let question_rel = PathBuf::from("outputs/questions")
         .join(&question_id)
         .join("question.json");
@@ -1244,7 +1262,7 @@ fn run_ask(
         },
         format: requested_format.to_string(),
         output_path: PathBuf::from(format!(
-            "outputs/questions/{question_id}/answer.md"
+            "outputs/questions/{question_id}/{answer_file_name}"
         )),
     };
 

@@ -876,6 +876,179 @@ fn ask_stdin_empty_still_errors() {
 }
 
 #[test]
+fn ask_format_png_refuses_cleanly() {
+    // Regression (bn-iiq): `--format png` used to silently produce `answer.md`.
+    // It now errors with a clear "not yet supported" message and writes no files.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask")
+        .arg("--format")
+        .arg("png")
+        .arg("What is testing?");
+    let output = cmd.output().expect("run kb ask --format=png");
+
+    assert!(
+        !output.status.success(),
+        "kb ask --format=png unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--format png is not yet supported"),
+        "expected stderr to mention png-not-supported, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("md, marp, json"),
+        "expected stderr to list supported formats, got: {stderr}"
+    );
+
+    // No question directory should have been created.
+    let outputs_dir = kb_root.join("outputs/questions");
+    if outputs_dir.exists() {
+        let count = fs::read_dir(&outputs_dir)
+            .expect("read outputs/questions")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("question-")
+            })
+            .count();
+        assert_eq!(
+            count, 0,
+            "failed --format=png run should not create question artifacts"
+        );
+    }
+}
+
+#[test]
+fn ask_format_md_writes_markdown_answer() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("md")
+        .arg("What is md?");
+    let output = cmd.output().expect("run kb ask --format=md");
+    assert!(
+        output.status.success(),
+        "kb ask --format=md failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let artifact_path = kb_root.join(
+        envelope["data"]["artifact_path"]
+            .as_str()
+            .expect("artifact_path"),
+    );
+    assert!(
+        artifact_path.extension().and_then(|e| e.to_str()) == Some("md"),
+        "md format should produce .md file, got: {}",
+        artifact_path.display()
+    );
+    let content = fs::read_to_string(&artifact_path).expect("read answer");
+    assert!(content.starts_with("---\n"), "md answer should have YAML frontmatter");
+    assert!(content.contains("requested_format: md"));
+}
+
+#[test]
+fn ask_format_marp_writes_markdown_with_marp_flag() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("marp")
+        .arg("What is marp?");
+    let output = cmd.output().expect("run kb ask --format=marp");
+    assert!(
+        output.status.success(),
+        "kb ask --format=marp failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let artifact_path = kb_root.join(
+        envelope["data"]["artifact_path"]
+            .as_str()
+            .expect("artifact_path"),
+    );
+    // Marp IS markdown; keeps the .md extension.
+    assert_eq!(
+        artifact_path.extension().and_then(|e| e.to_str()),
+        Some("md"),
+        "marp format should produce .md file, got: {}",
+        artifact_path.display()
+    );
+    let content = fs::read_to_string(&artifact_path).expect("read answer");
+    assert!(content.contains("marp: true"), "marp answer should set marp: true");
+    assert!(content.contains("requested_format: marp"));
+}
+
+#[test]
+fn ask_format_json_writes_structured_artifact() {
+    // Regression (bn-iiq): `--format json` used to silently produce `answer.md`
+    // with a lying `requested_format: json` frontmatter line. It now emits a
+    // structured `answer.json` artifact.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("json")
+        .arg("What is json?");
+    let output = cmd.output().expect("run kb ask --format=json");
+    assert!(
+        output.status.success(),
+        "kb ask --format=json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let artifact_path = kb_root.join(
+        envelope["data"]["artifact_path"]
+            .as_str()
+            .expect("artifact_path"),
+    );
+    assert_eq!(
+        artifact_path.extension().and_then(|e| e.to_str()),
+        Some("json"),
+        "json format should produce .json file, got: {}",
+        artifact_path.display()
+    );
+
+    // The file must parse as JSON and carry the documented fields.
+    let raw = fs::read_to_string(&artifact_path).expect("read answer.json");
+    let answer: Value = serde_json::from_str(&raw).expect("answer.json is valid JSON");
+    assert_eq!(answer["type"], "question_answer");
+    assert_eq!(answer["requested_format"], "json");
+    assert!(answer["id"].is_string(), "id should be a string");
+    assert!(answer["question_id"].is_string(), "question_id should be a string");
+    assert!(answer["generated_at"].is_number(), "generated_at should be a number");
+    assert!(answer["body"].is_string(), "body should be a string");
+    assert!(answer["source_document_ids"].is_array());
+    assert!(answer["retrieval_candidates"].is_array());
+    assert!(answer["citations"].is_array());
+
+    // No stray answer.md sitting next to answer.json.
+    let stray_md = artifact_path.with_file_name("answer.md");
+    assert!(
+        !stray_md.exists(),
+        "json format must not also write answer.md at {}",
+        stray_md.display()
+    );
+}
+
+#[test]
 fn inspect_rejects_empty_target() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
