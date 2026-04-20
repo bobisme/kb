@@ -2075,9 +2075,35 @@ fn read_stdin_to_end() -> Result<String> {
 /// never leave a failed-job manifest behind (bn-1jx semantics).
 fn read_interactive_multiline() -> Result<String> {
     use reedline::{
-        default_emacs_keybindings, DefaultPrompt, DefaultPromptSegment, EditCommand, Emacs,
-        KeyCode, KeyModifiers, Reedline, ReedlineEvent, Signal,
+        default_emacs_keybindings, EditCommand, Emacs, KeyCode, KeyModifiers, Prompt,
+        PromptEditMode, PromptHistorySearch, Reedline, ReedlineEvent, Signal,
     };
+    use std::borrow::Cow;
+
+    // Reedline's DefaultPrompt renders "<segment>〉". We want a plain `>>> `
+    // prompt for the first line and `... ` as the continuation indicator —
+    // standard REPL conventions that are also familiar to Python users.
+    struct AskPrompt;
+    impl Prompt for AskPrompt {
+        fn render_prompt_left(&self) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+        fn render_prompt_right(&self) -> Cow<'_, str> {
+            Cow::Borrowed("")
+        }
+        fn render_prompt_indicator(&self, _: PromptEditMode) -> Cow<'_, str> {
+            Cow::Borrowed(">>> ")
+        }
+        fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+            Cow::Borrowed("... ")
+        }
+        fn render_prompt_history_search_indicator(
+            &self,
+            _: PromptHistorySearch,
+        ) -> Cow<'_, str> {
+            Cow::Borrowed("(search) ")
+        }
+    }
 
     eprintln!("Enter your question (multi-line; Ctrl-D to submit, Ctrl-C to abort):");
 
@@ -2115,10 +2141,7 @@ fn read_interactive_multiline() -> Result<String> {
 
     let edit_mode = Box::new(Emacs::new(keybindings));
     let mut line_editor = Reedline::create().with_edit_mode(edit_mode);
-    let prompt = DefaultPrompt::new(
-        DefaultPromptSegment::Basic("ask".to_string()),
-        DefaultPromptSegment::Empty,
-    );
+    let prompt = AskPrompt;
 
     match line_editor.read_line(&prompt) {
         Ok(Signal::Success(text)) => {
