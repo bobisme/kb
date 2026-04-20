@@ -986,7 +986,14 @@ fn preview_graph_prune(root: &Path, src_id: &str) -> Result<usize> {
 }
 
 fn is_src_id(token: &str) -> bool {
-    token.starts_with("src-") && token.len() > 4 && token[4..].chars().all(|c| c.is_ascii_hexdigit())
+    // terseid hashes are base36 (lowercase alphanumeric). Older KBs minted
+    // 8-char hex ids; base36 is a strict superset of hex so this check
+    // accepts both — legacy KBs continue to resolve until they regenerate.
+    token.starts_with("src-")
+        && token.len() > 4
+        && token[4..]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
 }
 
 /// Best-effort read of `raw/inbox/<src>/source_document.json::stable_location`.
@@ -1020,12 +1027,19 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn is_src_id_accepts_hex_ids() {
+    fn is_src_id_accepts_base36_ids() {
+        // New terseid-minted ids are base36 (lowercase alphanumeric).
+        assert!(is_src_id("src-a7x"));
+        assert!(is_src_id("src-a7x3q9"));
+        // Legacy 8-hex ids still round-trip via the base36 superset.
         assert!(is_src_id("src-0639ebb0"));
         assert!(is_src_id("src-abcdef"));
         assert!(!is_src_id("src-"));
         assert!(!is_src_id("foo"));
-        assert!(!is_src_id("src-xyz"));
+        // Mixed case / punctuation is rejected: our minter always outputs
+        // lowercase, and the upstream parser keeps the namespace tight.
+        assert!(!is_src_id("src-ABC"));
+        assert!(!is_src_id("src-a.b"));
     }
 
     #[test]

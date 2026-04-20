@@ -1230,6 +1230,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "tempfile",
+ "terseid",
  "thiserror 2.0.18",
  "toml",
  "tracing",

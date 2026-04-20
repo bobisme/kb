@@ -340,7 +340,7 @@ fn ingest_file(
 
     let imported_at_millis = now_millis()?;
     let modified_at_millis = fs_metadata.modified().ok().and_then(system_time_to_millis);
-    let source_document_id = mint_source_document_id(SourceKind::File, &stable_location);
+    let source_document_id = mint_file_source_id(root, &stable_location);
     let source_revision_id = mint_source_revision_id(&content);
     let content_hash = source_revision_content_hash(&content);
 
@@ -629,6 +629,78 @@ fn system_time_to_millis(value: SystemTime) -> Option<u64> {
         .duration_since(UNIX_EPOCH)
         .ok()
         .and_then(|duration| duration.as_millis().try_into().ok())
+}
+
+/// Mints the `src-` id for a local-file source, wiring terseid's collision
+/// probe into this KB's on-disk layout.
+fn mint_file_source_id(root: &Path, stable_location: &str) -> String {
+    let existing_count = count_source_documents(root);
+    mint_source_document_id(
+        SourceKind::File,
+        stable_location,
+        existing_count,
+        |candidate| source_id_taken_by_other(root, candidate, stable_location),
+    )
+}
+
+/// Approximate count of source documents already registered in this KB.
+///
+/// Used to seed `terseid`'s adaptive-length calculation. An exact count
+/// isn't required — `terseid` uses the birthday-problem approximation on
+/// this to pick a hash length that keeps collision probability under 25%.
+/// We count top-level entries in `raw/inbox/` and `raw/web/` (each source
+/// kind gets its own registry) and sum them.
+fn count_source_documents(root: &Path) -> usize {
+    let mut total = 0;
+    for bucket in ["raw/inbox", "raw/web"] {
+        if let Ok(entries) = fs::read_dir(root.join(bucket)) {
+            total += entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_dir()))
+                .count();
+        }
+    }
+    total
+}
+
+/// Returns `true` iff the candidate src-id is already taken by a source
+/// whose `stable_location` differs from ours.
+///
+/// Re-ingesting the same file must round-trip to the same id, so we don't
+/// treat "the candidate dir already exists AND is us" as a collision.
+fn source_id_taken_by_other(root: &Path, candidate: &str, stable_location: &str) -> bool {
+    let document_record = root
+        .join("raw")
+        .join("inbox")
+        .join(candidate)
+        .join(SOURCE_DOCUMENT_RECORD);
+    if let Ok(record) = read_json::<SourceDocument>(&document_record) {
+        return record.stable_location != stable_location;
+    }
+
+    // URL sources live under `raw/web/<id>/`. The stable_location for URL
+    // ingest is the normalized URL; we don't have a canonical JSON record
+    // for URL source_documents yet, so any directory presence counts as
+    // collision unless the caller can prove otherwise. In practice terseid's
+    // nonce escalation handles this by retrying with a different seed byte.
+    let web_dir = root.join("raw").join("web").join(candidate);
+    if web_dir.is_dir() {
+        // Best-effort: inspect origin.json if present.
+        let origin = root.join("normalized").join(candidate).join("origin.json");
+        if let Ok(contents) = fs::read_to_string(&origin)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents)
+            && let Some(url) = value.get("original_url").and_then(|v| v.as_str())
+        {
+            // The stored URL is the raw input; the caller's stable_location
+            // is the normalized form. Re-normalize for comparison.
+            if let Ok(normalized) = kb_core::normalize_url_stable_location(url) {
+                return normalized != stable_location;
+            }
+        }
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]

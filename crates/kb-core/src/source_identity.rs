@@ -3,13 +3,20 @@ use std::io;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use terseid::{IdConfig, IdGenerator};
 use url::Url;
 
 use crate::{SourceKind, hash_bytes};
 
 pub const SOURCE_DOCUMENT_ID_PREFIX: &str = "src";
 pub const SOURCE_REVISION_ID_PREFIX: &str = "rev";
-const SHORT_HASH_LEN: usize = 8;
+
+/// Fixed length (in base36 chars) of the content-addressed revision hash. The
+/// rev-id is derived purely from the content hash, so we skip `IdGenerator`'s
+/// collision-retry machinery — two different revisions with different content
+/// should always produce different rev-ids at this length, and two identical
+/// contents must round-trip to the same rev-id on ingest/re-ingest.
+const REVISION_HASH_LEN: usize = 6;
 
 /// Returns a canonical stable location string for a file source.
 ///
@@ -78,22 +85,52 @@ pub fn normalize_url_stable_location(raw_url: &str) -> Result<String> {
     Ok(url.into())
 }
 
-/// Mints a short source document ID from a source kind and normalized location.
+/// Mints a short source document ID from a source kind and normalized
+/// location, using `terseid` for adaptive-length hashes with collision retry.
+///
+/// `existing_count` is the number of source documents already in the KB; it
+/// drives `terseid`'s adaptive-length heuristic so small KBs get 3-char ids
+/// and larger KBs automatically grow. `exists` is the caller-supplied
+/// collision probe — it should return `true` only when the candidate id is
+/// already taken by a *different* source (otherwise re-ingesting the same
+/// file would mint a fresh id on every pass).
 #[must_use]
-pub fn mint_source_document_id(source_kind: SourceKind, stable_location: &str) -> String {
-    let kind = match source_kind {
+pub fn mint_source_document_id(
+    source_kind: SourceKind,
+    stable_location: &str,
+    existing_count: usize,
+    exists: impl Fn(&str) -> bool,
+) -> String {
+    let kind = source_kind_tag(source_kind);
+    let seed_material = format!("{kind}\n{stable_location}");
+
+    let generator = IdGenerator::new(IdConfig::new(SOURCE_DOCUMENT_ID_PREFIX));
+    generator.generate(
+        |nonce| {
+            if nonce == 0 {
+                seed_material.as_bytes().to_vec()
+            } else {
+                // Nonce escalation: terseid retries with a bumped seed when
+                // the primary candidate collides. Appending the nonce keeps
+                // nonce=0 identical to the content-free seed so the common
+                // "no collision" path is deterministic across re-ingests.
+                format!("{seed_material}|{nonce}").into_bytes()
+            }
+        },
+        existing_count,
+        |candidate| exists(candidate),
+    )
+}
+
+const fn source_kind_tag(source_kind: SourceKind) -> &'static str {
+    match source_kind {
         SourceKind::File => "file",
         SourceKind::Url => "url",
         SourceKind::Repo => "repo",
         SourceKind::Image => "image",
         SourceKind::Dataset => "dataset",
         SourceKind::Other => "other",
-    };
-
-    mint_short_id(
-        SOURCE_DOCUMENT_ID_PREFIX,
-        &format!("{kind}\n{stable_location}"),
-    )
+    }
 }
 
 /// Returns the full BLAKE3 content hash for a fetched source revision.
@@ -102,36 +139,53 @@ pub fn source_revision_content_hash(content: &[u8]) -> String {
     hash_bytes(content).to_hex()
 }
 
-/// Mints a short source revision ID from fetched content bytes.
+/// Mints a short, content-addressable source revision ID from fetched bytes.
+///
+/// We deliberately bypass `IdGenerator`'s collision-retry machinery here: the
+/// rev-id must be a pure function of the content so that re-fetching the
+/// same bytes (even under a different URL) yields the same rev-id. We use
+/// `terseid::hash` with a fixed 6-char length, prefixed with `rev-`.
 #[must_use]
 pub fn mint_source_revision_id(content: &[u8]) -> String {
-    mint_short_id(
-        SOURCE_REVISION_ID_PREFIX,
-        &source_revision_content_hash(content),
-    )
+    let content_hash = source_revision_content_hash(content);
+    let short = terseid::hash(&content_hash, REVISION_HASH_LEN);
+    format!("{SOURCE_REVISION_ID_PREFIX}-{short}")
 }
 
 /// Canonicalizes a file path and mints the corresponding source document ID.
 ///
 /// # Errors
 /// Returns an error if the path cannot be canonicalized.
-pub fn source_document_id_for_file(path: impl AsRef<Path>) -> io::Result<String> {
+pub fn source_document_id_for_file(
+    path: impl AsRef<Path>,
+    existing_count: usize,
+    exists: impl Fn(&str) -> bool,
+) -> io::Result<String> {
     let stable_location = normalize_file_stable_location(path)?;
-    Ok(mint_source_document_id(SourceKind::File, &stable_location))
+    Ok(mint_source_document_id(
+        SourceKind::File,
+        &stable_location,
+        existing_count,
+        exists,
+    ))
 }
 
 /// Normalizes a URL and mints the corresponding source document ID.
 ///
 /// # Errors
 /// Returns an error if the URL cannot be parsed.
-pub fn source_document_id_for_url(raw_url: &str) -> Result<String> {
+pub fn source_document_id_for_url(
+    raw_url: &str,
+    existing_count: usize,
+    exists: impl Fn(&str) -> bool,
+) -> Result<String> {
     let stable_location = normalize_url_stable_location(raw_url)?;
-    Ok(mint_source_document_id(SourceKind::Url, &stable_location))
-}
-
-fn mint_short_id(prefix: &str, material: &str) -> String {
-    let hash = hash_bytes(material.as_bytes()).to_hex();
-    format!("{prefix}-{}", &hash[..SHORT_HASH_LEN])
+    Ok(mint_source_document_id(
+        SourceKind::Url,
+        &stable_location,
+        existing_count,
+        exists,
+    ))
 }
 
 #[cfg(test)]
@@ -140,6 +194,33 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// Convenience: no-collision existence predicate for tests that aren't
+    /// exercising the retry path.
+    const fn never_exists(_: &str) -> bool {
+        false
+    }
+
+    #[test]
+    fn source_document_id_has_src_prefix_and_short_hash() {
+        let id = mint_source_document_id(SourceKind::File, "/tmp/x.md", 0, never_exists);
+        assert!(id.starts_with("src-"), "expected src- prefix, got {id}");
+        // 3 chars at count=0 is terseid's adaptive minimum for tiny corpora.
+        let hash = id.trim_start_matches("src-");
+        assert_eq!(
+            hash.len(),
+            3,
+            "expected 3-char adaptive hash for empty KB, got {id}"
+        );
+    }
+
+    #[test]
+    fn source_revision_id_has_rev_prefix_and_six_char_hash() {
+        let id = mint_source_revision_id(b"hello");
+        assert!(id.starts_with("rev-"), "expected rev- prefix, got {id}");
+        let hash = id.trim_start_matches("rev-");
+        assert_eq!(hash.len(), 6, "rev-id hash must be fixed-length 6, got {id}");
+    }
 
     #[test]
     fn file_reingest_produces_same_source_document_id() {
@@ -150,14 +231,49 @@ mod tests {
         let file = nested.join("source.txt");
         fs::write(&file, b"hello world").unwrap();
 
-        let via_direct = source_document_id_for_file(&file).unwrap();
+        let via_direct = source_document_id_for_file(&file, 0, never_exists).unwrap();
         let via_relative_segments =
-            source_document_id_for_file(nested.join("../nested/source.txt")).unwrap();
+            source_document_id_for_file(nested.join("../nested/source.txt"), 0, never_exists)
+                .unwrap();
 
         assert_eq!(via_direct, via_relative_segments);
         assert_eq!(
             normalize_file_stable_location(&file).unwrap(),
             normalize_file_stable_location(nested.join("../nested/source.txt")).unwrap()
+        );
+    }
+
+    #[test]
+    fn same_content_different_paths_share_rev_id_but_not_src_id() {
+        // Content-addressable rev-ids: the same bytes at two different
+        // stable_locations must mint distinct src-ids but an identical
+        // rev-id. This is the contract downstream code relies on when it
+        // dedupes revisions across URLs / filesystem paths.
+        let src_a =
+            mint_source_document_id(SourceKind::File, "/tmp/a.md", 0, never_exists);
+        let src_b =
+            mint_source_document_id(SourceKind::File, "/tmp/b.md", 0, never_exists);
+        assert_ne!(src_a, src_b);
+
+        let rev_a = mint_source_revision_id(b"identical bytes");
+        let rev_b = mint_source_revision_id(b"identical bytes");
+        assert_eq!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn collision_forces_length_extension() {
+        // Simulate every 3-char id for this prefix being taken. terseid's
+        // nonce-escalation exhausts at length 3, then bumps to length 4.
+        let id = mint_source_document_id(
+            SourceKind::File,
+            "/tmp/needs-longer-id.md",
+            0,
+            |candidate| candidate.trim_start_matches("src-").len() == 3,
+        );
+        let hash = id.trim_start_matches("src-");
+        assert!(
+            hash.len() >= 4,
+            "exists-check should have pushed past 3 chars, got {id}"
         );
     }
 
@@ -196,8 +312,10 @@ mod tests {
 
     #[test]
     fn url_document_id_is_stable_for_equivalent_urls() {
-        let first = source_document_id_for_url("https://Example.com/a?b=2&a=1").unwrap();
-        let second = source_document_id_for_url("https://example.com/a?a=1&b=2").unwrap();
+        let first =
+            source_document_id_for_url("https://Example.com/a?b=2&a=1", 0, never_exists).unwrap();
+        let second =
+            source_document_id_for_url("https://example.com/a?a=1&b=2", 0, never_exists).unwrap();
 
         assert_eq!(first, second);
     }
@@ -208,16 +326,20 @@ mod tests {
         // `https://` must collide, otherwise `kb ingest HTTPS://example.com/foo`
         // and `kb ingest https://example.com/foo` would mint different
         // src-ids for the same resource.
-        let upper = source_document_id_for_url("HTTPS://example.com/foo").unwrap();
-        let lower = source_document_id_for_url("https://example.com/foo").unwrap();
+        let upper =
+            source_document_id_for_url("HTTPS://example.com/foo", 0, never_exists).unwrap();
+        let lower =
+            source_document_id_for_url("https://example.com/foo", 0, never_exists).unwrap();
 
         assert_eq!(upper, lower);
     }
 
     #[test]
     fn url_document_id_collapses_trailing_slash_on_nonroot_path() {
-        let with_slash = source_document_id_for_url("https://foo.com/bar/").unwrap();
-        let without_slash = source_document_id_for_url("https://foo.com/bar").unwrap();
+        let with_slash =
+            source_document_id_for_url("https://foo.com/bar/", 0, never_exists).unwrap();
+        let without_slash =
+            source_document_id_for_url("https://foo.com/bar", 0, never_exists).unwrap();
 
         assert_eq!(with_slash, without_slash);
     }
@@ -227,8 +349,9 @@ mod tests {
         // `https://foo.com/` is the canonical root form that URL parsers
         // produce from `https://foo.com`. We leave it intact — there's no
         // shorter non-empty path to collapse it to.
-        let with_slash = source_document_id_for_url("https://foo.com/").unwrap();
-        let implicit = source_document_id_for_url("https://foo.com").unwrap();
+        let with_slash =
+            source_document_id_for_url("https://foo.com/", 0, never_exists).unwrap();
+        let implicit = source_document_id_for_url("https://foo.com", 0, never_exists).unwrap();
 
         // Both inputs normalize to the same root form, so the IDs still match.
         assert_eq!(with_slash, implicit);
@@ -244,8 +367,9 @@ mod tests {
         // Exercises both normalization paths in one go, as called out in
         // bn-nnd. Host lowercasing is already covered by the `url` crate and
         // is asserted here for completeness.
-        let messy = source_document_id_for_url("HTTPS://FOO.COM/bar/").unwrap();
-        let clean = source_document_id_for_url("https://foo.com/bar").unwrap();
+        let messy =
+            source_document_id_for_url("HTTPS://FOO.COM/bar/", 0, never_exists).unwrap();
+        let clean = source_document_id_for_url("https://foo.com/bar", 0, never_exists).unwrap();
 
         assert_eq!(messy, clean);
     }

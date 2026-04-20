@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 regex.workspace = true
+terseid = "0.1"
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true

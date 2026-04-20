@@ -6,7 +6,8 @@ use anyhow::{Context, Result, bail};
 use kb_core::fs::atomic_write;
 use kb_core::{
     EntityMetadata, NormalizedDocument, Status, hash_bytes, mint_source_revision_id,
-    source_document_id_for_url, source_revision_content_hash, write_normalized_document,
+    normalize_url_stable_location, source_document_id_for_url, source_revision_content_hash,
+    write_normalized_document,
 };
 use regex::Regex;
 use reqwest::Client;
@@ -61,8 +62,7 @@ pub async fn ingest_url_with_options(
     raw_url: &str,
     dry_run: bool,
 ) -> Result<UrlIngestReport> {
-    let source_id =
-        source_document_id_for_url(raw_url).context("failed to derive source document ID")?;
+    let source_id = mint_url_source_id(root, raw_url)?;
 
     let client = Client::builder()
         .user_agent(FETCH_UA)
@@ -479,6 +479,56 @@ fn epoch_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// Mints the `src-` id for a URL source, threading terseid's collision
+/// probe into this KB's on-disk layout. The seed is the normalized URL so
+/// re-ingesting the same URL deterministically returns the same id.
+fn mint_url_source_id(root: &Path, raw_url: &str) -> Result<String> {
+    let stable_location = normalize_url_stable_location(raw_url)
+        .context("failed to derive source document ID")?;
+    let existing_count = count_url_sources(root);
+    source_document_id_for_url(raw_url, existing_count, |candidate| {
+        url_source_id_taken_by_other(root, candidate, &stable_location)
+    })
+    .context("failed to derive source document ID")
+}
+
+/// Counts existing URL source documents under `raw/web/<id>/` and local
+/// sources under `raw/inbox/<id>/`. Both share the `src-` namespace, so
+/// terseid's collision math needs the combined count.
+fn count_url_sources(root: &Path) -> usize {
+    let mut total = 0;
+    for bucket in ["raw/web", "raw/inbox"] {
+        if let Ok(entries) = std::fs::read_dir(root.join(bucket)) {
+            total += entries
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_ok_and(|ft| ft.is_dir()))
+                .count();
+        }
+    }
+    total
+}
+
+/// True if `candidate` already names a source document on disk whose
+/// origin URL normalizes to something other than `stable_location`. We
+/// inspect the origin sidecar at `normalized/<candidate>/origin.json`
+/// when present so that re-ingesting the same URL returns the same id.
+fn url_source_id_taken_by_other(root: &Path, candidate: &str, stable_location: &str) -> bool {
+    let origin = root.join("normalized").join(candidate).join("origin.json");
+    if let Ok(contents) = std::fs::read_to_string(&origin)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents)
+        && let Some(stored_url) = value.get("original_url").and_then(|v| v.as_str())
+    {
+        return normalize_url_stable_location(stored_url)
+            .map_or(true, |normalized| normalized != stable_location);
+    }
+
+    // No origin sidecar on disk: check whether any top-level directory under
+    // raw/web or raw/inbox already owns this id (from a partially-written
+    // previous ingest) and, if so, treat it as a collision we can't resolve.
+    root.join("raw").join("web").join(candidate).is_dir()
+        || root.join("raw").join("inbox").join(candidate).is_dir()
 }
 
 #[cfg(test)]

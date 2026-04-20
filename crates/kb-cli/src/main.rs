@@ -2460,10 +2460,15 @@ fn resolve_source_id(root: &Path, target: &str) -> Option<PathBuf> {
 }
 
 fn is_source_id(s: &str) -> bool {
-    let Some(hex) = s.strip_prefix("src-") else {
+    // terseid hashes are lowercase base36. Legacy hex ids are a strict
+    // subset of base36, so this accepts both.
+    let Some(hash) = s.strip_prefix("src-") else {
         return false;
     };
-    !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
+    !hash.is_empty()
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
 }
 
 /// Extend `kb_core::find_build_records_for_output` with a fallback match on
