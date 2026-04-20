@@ -260,6 +260,12 @@ pub enum ReviewKind {
     /// Emitted by the `missing_concepts` lint; approval creates a concept
     /// page from the mentions via an LLM pass.
     ConceptCandidate,
+    /// A concept whose `sources[].quote` entries appear (per the LLM) to
+    /// make contradictory claims. Emitted by the `contradictions` lint.
+    /// Approval marks the contradiction acknowledged (no auto-fix);
+    /// rejection flags the pair as "intended nuance" so the same
+    /// concept+quote-set doesn't re-fire on subsequent runs.
+    Contradiction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

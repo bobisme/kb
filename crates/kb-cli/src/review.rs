@@ -31,6 +31,7 @@ const fn kind_label(kind: ReviewKind) -> &'static str {
         ReviewKind::AliasMerge => "alias_merge",
         ReviewKind::Canonicalization => "canonicalization",
         ReviewKind::ConceptCandidate => "concept_candidate",
+        ReviewKind::Contradiction => "contradiction",
     }
 }
 
@@ -96,7 +97,7 @@ pub fn run_review_list(root: &Path, json: bool, emit_json: &dyn Fn(&str, serde_j
     let rejected_count = items.iter().filter(|i| i.status == ReviewStatus::Rejected).count();
 
     let mut kind_counts = Vec::new();
-    for kind in &[ReviewKind::Promotion, ReviewKind::ConceptMerge, ReviewKind::AliasMerge, ReviewKind::Canonicalization, ReviewKind::ConceptCandidate] {
+    for kind in &[ReviewKind::Promotion, ReviewKind::ConceptMerge, ReviewKind::AliasMerge, ReviewKind::Canonicalization, ReviewKind::ConceptCandidate, ReviewKind::Contradiction] {
         let count = items.iter().filter(|i| i.kind == *kind && i.status == ReviewStatus::Pending).count();
         if count > 0 {
             kind_counts.push(KindCount {
@@ -188,6 +189,20 @@ pub fn run_review_show(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(&st
                      page from mentions via LLM is not yet implemented (see \
                      bone spec 'Approve workflow'). Work around by creating \
                      wiki/concepts/<slug>.md manually, then run 'kb compile'."
+                );
+            }
+            ReviewKind::Contradiction => {
+                println!(
+                    "On approve: the contradiction is marked acknowledged — \
+                     no auto-fix is applied. The same concept + quote-set \
+                     will be skipped on future runs so the LLM doesn't \
+                     re-flag it."
+                );
+                println!(
+                    "On reject: the contradiction is marked 'intended nuance' \
+                     — the same concept + quote-set is still suppressed on \
+                     future runs, but the rejected status is preserved so you \
+                     can tell apart deliberate nuance from acknowledged bugs."
                 );
             }
         }

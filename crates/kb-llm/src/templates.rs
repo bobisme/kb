@@ -59,6 +59,9 @@ impl Template {
                 Ok(include_str!("../prompts/merge_concept_candidates.md").to_string())
             }
             "concept_body.md" => Ok(include_str!("../prompts/concept_body.md").to_string()),
+            "detect_contradictions.md" => {
+                Ok(include_str!("../prompts/detect_contradictions.md").to_string())
+            }
             _ => Err(anyhow!(
                 "template '{name}' not found in project and no bundled default available"
             )),

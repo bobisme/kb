@@ -2852,6 +2852,135 @@ fn lint_missing_concepts_flags_term_appearing_in_three_sources() {
 }
 
 #[test]
+fn lint_contradictions_emits_review_item_when_llm_detects_conflict() {
+    // bn-3axp: cross-source contradictions are LLM-powered. The pass is
+    // gated behind `--check contradictions` (never part of the default
+    // sweep) and relies on the configured runner to decide whether the
+    // concept's cited quotes disagree.
+    //
+    // Harness-fake strategy: install a fake `opencode` binary on PATH that
+    // prints the exact JSON body the adapter expects to see from the real
+    // runner (a `DetectContradictionsResponse` with `contradiction: true`).
+    // The kb binary calls it, parses the JSON, and must persist a
+    // `reviews/contradictions/*.json` review item.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed two normalized source documents — the heading-anchor on each
+    // quote is how the lint attributes a quote to its source.
+    let normalized_root = kb_root.join("normalized");
+    for (doc_id, heading) in [("src-alpha", "claim-alpha"), ("src-beta", "claim-beta")] {
+        let dir = normalized_root.join(doc_id);
+        fs::create_dir_all(&dir).expect("create normalized doc dir");
+        let metadata = serde_json::json!({
+            "source_revision_id": format!("rev-{doc_id}"),
+            "heading_ids": [heading],
+        });
+        fs::write(dir.join("metadata.json"), metadata.to_string())
+            .expect("write metadata");
+        fs::write(
+            dir.join("source.md"),
+            format!("# {doc_id}\n\n## {heading}\n\nsome body\n"),
+        )
+        .expect("write body");
+    }
+
+    // Seed a concept page that cites one quote from each source.
+    let concepts = kb_root.join("wiki").join("concepts");
+    fs::create_dir_all(&concepts).expect("create concepts dir");
+    let concept_body = r"---
+id: concept:widget
+name: Widget
+source_document_ids:
+- src-alpha
+- src-beta
+sources:
+- heading_anchor: claim-alpha
+  quote: Widgets are always blue.
+- heading_anchor: claim-beta
+  quote: Widgets are always red.
+---
+
+# Widget
+";
+    fs::write(concepts.join("widget.md"), concept_body).expect("write concept page");
+
+    // Install a fake `opencode` that prints the contradiction JSON on
+    // stdout. Any arguments are ignored. The adapter parses the stdout
+    // directly (no JSON envelope — opencode output is the raw response).
+    let bin_dir = kb_root.join("fake-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    let fake_script = r#"#!/bin/sh
+# Ignore every argument; print the exact JSON the adapter expects. The
+# `run` subcommand's output is returned verbatim by the opencode adapter.
+cat <<'JSON'
+{"contradiction": true, "explanation": "One quote says widgets are blue, the other says they are red — these cannot both be true.", "conflicting_quotes": [0, 1]}
+JSON
+"#;
+    write_executable(bin_dir.join("opencode").as_path(), fake_script);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&bin_dir));
+    cmd.arg("--json")
+        .arg("lint")
+        .arg("--check")
+        .arg("contradictions");
+    let output = cmd.output().expect("run kb lint --check contradictions");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(envelope["command"], "lint");
+    let checks = envelope["data"]["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["check"], "contradictions");
+    let issues = checks[0]["issues"].as_array().expect("issues array");
+    assert_eq!(issues.len(), 1, "expected exactly one contradiction issue: {issues:?}");
+    assert_eq!(issues[0]["kind"], "contradiction");
+    assert_eq!(issues[0]["severity"], "warning");
+    assert_eq!(issues[0]["target"], "concept:widget");
+
+    // The lint must also have persisted a ReviewKind::Contradiction item
+    // under reviews/contradictions/ so `kb review` can surface it.
+    let review_path = kb_root
+        .join("reviews")
+        .join("contradictions")
+        .join("lint:contradiction:widget.json");
+    assert!(
+        review_path.is_file(),
+        "expected review item at {}",
+        review_path.display()
+    );
+    let raw = fs::read_to_string(&review_path).expect("read review item");
+    let item: Value = serde_json::from_str(&raw).expect("parse review item json");
+    assert_eq!(item["kind"], "contradiction");
+    assert_eq!(item["status"], "pending");
+    assert_eq!(item["target_entity_id"], "concept:widget");
+    let comment = item["comment"].as_str().expect("comment string");
+    assert!(
+        comment.contains("Widget") && comment.contains("blue"),
+        "review comment should reference the concept + LLM explanation: {comment}"
+    );
+    // Citations should list each conflicting quote with its source label.
+    let citations = item["citations"].as_array().expect("citations array");
+    assert_eq!(citations.len(), 2, "expected two citations: {citations:?}");
+    assert!(
+        citations.iter().any(|c| c.as_str().is_some_and(|s| s.contains("src-alpha"))),
+        "missing src-alpha citation: {citations:?}"
+    );
+    assert!(
+        citations.iter().any(|c| c.as_str().is_some_and(|s| s.contains("src-beta"))),
+        "missing src-beta citation: {citations:?}"
+    );
+}
+
+#[test]
 fn doctor_returns_zero_when_all_checks_pass() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);

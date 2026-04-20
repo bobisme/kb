@@ -7,12 +7,13 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use crate::adapter::{
-    AnswerQuestionRequest, AnswerQuestionResponse, ExtractConceptsRequest, ExtractConceptsResponse,
+    AnswerQuestionRequest, AnswerQuestionResponse, DetectContradictionsRequest,
+    DetectContradictionsResponse, ExtractConceptsRequest, ExtractConceptsResponse,
     GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateSlidesRequest,
     GenerateSlidesResponse, LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest,
     MergeConceptCandidatesResponse, RunHealthCheckRequest, RunHealthCheckResponse,
-    SummarizeDocumentRequest, SummarizeDocumentResponse, parse_extract_concepts_json,
-    parse_merge_concept_candidates_json,
+    SummarizeDocumentRequest, SummarizeDocumentResponse, parse_detect_contradictions_json,
+    parse_extract_concepts_json, parse_merge_concept_candidates_json,
 };
 use crate::provenance::ProvenanceRecord;
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -459,6 +460,52 @@ impl LlmAdapter for OpencodeAdapter {
         ))
     }
 
+    fn detect_contradictions(
+        &self,
+        request: DetectContradictionsRequest,
+    ) -> Result<(DetectContradictionsResponse, ProvenanceRecord), LlmAdapterError> {
+        let template = Template::load(
+            "detect_contradictions.md",
+            self.config.project_root.as_deref(),
+        )
+        .map_err(|err| {
+            LlmAdapterError::Other(format!("load detect_contradictions template: {err}"))
+        })?;
+
+        let mut context = HashMap::new();
+        context.insert("concept_name".to_string(), request.concept_name.clone());
+        context.insert(
+            "quotes".to_string(),
+            format_contradiction_quotes_for_prompt(&request.quotes),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render detect_contradictions template: {err}"))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        let raw = self.run_prompt(&rendered.content)?;
+        let response = parse_detect_contradictions_json(&raw)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((response, provenance))
+    }
+
     fn generate_slides(
         &self,
         _request: GenerateSlidesRequest,
@@ -593,6 +640,30 @@ fn format_quotes_for_prompt(quotes: &[String]) -> String {
             .collect::<Vec<_>>()
             .join("\n")
     }
+}
+
+/// Format quotes for the `detect_contradictions.md` prompt. Mirrors the Claude
+/// adapter's helper — numbered zero-based entries with source labels so the
+/// model's `conflicting_quotes: [index, …]` output can be mapped back to the
+/// input list.
+fn format_contradiction_quotes_for_prompt(
+    quotes: &[crate::adapter::ContradictionQuote],
+) -> String {
+    if quotes.is_empty() {
+        return "(no quotes)".to_string();
+    }
+    quotes
+        .iter()
+        .enumerate()
+        .map(|(idx, q)| {
+            format!(
+                "[{idx}] source: {source}\n    quote: {text}",
+                source = q.source_label.trim(),
+                text = q.text.trim(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Strip wrapping code fences from a plain-text LLM response. Defensive —

@@ -15,6 +15,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
+pub mod contradictions;
+pub use contradictions::{ContradictionsConfig, check_contradictions, detect_contradictions_issues};
+
 const WIKI_DIR: &str = "wiki";
 const MD_EXT: &str = "md";
 
@@ -26,6 +29,10 @@ pub enum LintRule {
     StaleArtifacts,
     MissingCitations,
     MissingConcepts,
+    /// Cross-source factual inconsistencies in a concept's cited quotes.
+    /// LLM-powered and expensive — never runs as part of `LintRule::All`.
+    /// Callers must select it explicitly via `--check contradictions`.
+    Contradictions,
     All,
 }
 
@@ -50,6 +57,10 @@ impl LintRule {
                 "missing-concepts" | "missing_concepts" | "missingconcepts" | "concept-candidates"
                 | "concept_candidates",
             ) => Ok(Self::MissingConcepts),
+            Some(
+                "contradictions" | "contradiction" | "cross-source-contradictions"
+                | "cross_source_contradictions",
+            ) => Ok(Self::Contradictions),
             Some(other) => Err(anyhow!("unsupported lint rule: {other}")),
         }
     }
@@ -63,6 +74,7 @@ impl LintRule {
             Self::StaleArtifacts => "stale",
             Self::MissingCitations => "missing-citations",
             Self::MissingConcepts => "missing-concepts",
+            Self::Contradictions => "contradictions",
             Self::All => "all",
         }
     }
@@ -123,6 +135,9 @@ pub enum IssueKind {
     MissingCitations,
     InvalidFrontmatter,
     ConceptCandidate,
+    /// Concept has quotes from ≥ 2 different source documents that make
+    /// contradictory claims (per the LLM judge).
+    Contradiction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -217,6 +217,74 @@ pub struct GenerateSlidesResponse {
     pub slide_count: usize,
 }
 
+/// Request to check a set of source quotes about a concept for mutual
+/// contradictions. One request == one concept; indices in the response refer
+/// back to positions in the supplied `quotes` list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DetectContradictionsRequest {
+    /// Display name for the concept the quotes are about (for the prompt).
+    pub concept_name: String,
+    /// Ordered quotes from different source documents. `source_label` is a
+    /// human-readable origin (e.g. source-doc id) used only for the prompt;
+    /// the LLM refers to quotes by their numeric index when reporting.
+    pub quotes: Vec<ContradictionQuote>,
+}
+
+/// One quote fed to the contradiction detector.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContradictionQuote {
+    /// The source document id (or other stable origin label) this quote came
+    /// from. Used both to bucket quotes by source (the check only fires when
+    /// quotes span ≥ 2 sources) and to render the prompt.
+    pub source_label: String,
+    /// The quote text itself.
+    pub text: String,
+}
+
+/// Response from a contradiction-detection pass.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DetectContradictionsResponse {
+    /// `true` when the quotes make contradictory claims about the concept.
+    pub contradiction: bool,
+    /// Short natural-language explanation of the contradiction (or a brief
+    /// "no contradiction" note when `contradiction` is `false`).
+    pub explanation: String,
+    /// Zero-based indices into the request's `quotes` list naming the
+    /// specific quotes that disagree. Empty when `contradiction` is `false`.
+    #[serde(default)]
+    pub conflicting_quotes: Vec<usize>,
+}
+
+/// Parse a `DetectContradictionsResponse` from LLM text output. Accepts raw
+/// JSON or fenced code blocks (```json ... ```).
+///
+/// # Errors
+///
+/// Returns [`LlmAdapterError::Parse`] when the text is empty, not valid JSON,
+/// or does not match the expected contradiction-response schema.
+pub fn parse_detect_contradictions_json(
+    text: &str,
+) -> Result<DetectContradictionsResponse, LlmAdapterError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(LlmAdapterError::Parse(
+            "detect_contradictions response was empty".to_string(),
+        ));
+    }
+
+    let json_text = trimmed
+        .strip_prefix("```")
+        .and_then(|body| body.split_once('\n').map(|(_, rest)| rest))
+        .and_then(|body| body.rsplit_once("```").map(|(json, _)| json.trim()))
+        .unwrap_or(trimmed);
+
+    serde_json::from_str(json_text).map_err(|err| {
+        LlmAdapterError::Parse(format!(
+            "detect_contradictions response had invalid shape: {err}"
+        ))
+    })
+}
+
 /// Request to run a health check on the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunHealthCheckRequest {
@@ -370,6 +438,28 @@ pub trait LlmAdapter: Send + Sync {
     ) -> Result<(GenerateConceptBodyResponse, ProvenanceRecord), LlmAdapterError> {
         Err(LlmAdapterError::Other(
             "generate_concept_body is not implemented by this adapter".to_string(),
+        ))
+    }
+
+    /// Detect whether a set of source quotes about a single concept make
+    /// contradictory claims.
+    ///
+    /// The default implementation returns [`LlmAdapterError::Other`] so that
+    /// adapters that do not yet implement the contradiction prompt cause the
+    /// caller to skip the check rather than hard-fail. See
+    /// `crates/kb-llm/prompts/detect_contradictions.md` for the prompt
+    /// contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmAdapterError` if the backend cannot be reached, times out,
+    /// fails to parse the response, or the adapter does not implement this call.
+    fn detect_contradictions(
+        &self,
+        _request: DetectContradictionsRequest,
+    ) -> Result<(DetectContradictionsResponse, ProvenanceRecord), LlmAdapterError> {
+        Err(LlmAdapterError::Other(
+            "detect_contradictions is not implemented by this adapter".to_string(),
         ))
     }
 

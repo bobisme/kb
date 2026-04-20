@@ -3405,6 +3405,15 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Resul
         min_sources: cfg.lint.missing_concepts.min_sources,
         min_mentions: cfg.lint.missing_concepts.min_mentions,
     };
+    let contradictions_cfg = kb_lint::ContradictionsConfig {
+        // bn-3axp: when the user asks for `--check contradictions` we
+        // honor the request even if the TOML says `enabled = false`.
+        // The config flag only controls whether it runs as part of
+        // `LintRule::All` (which currently never includes it). Run-mode
+        // override happens below when we dispatch the rule.
+        enabled: cfg.lint.contradictions.enabled,
+        min_sources: cfg.lint.contradictions.min_sources,
+    };
     let options = kb_lint::LintOptions {
         require_citations: cfg.lint.require_citations,
         missing_citations_level,
@@ -3425,7 +3434,15 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Resul
 
     for rule in &rules {
         let rule = *rule;
-        let report = kb_lint::run_lint_with_options(root, rule, &options)?;
+        let report = if matches!(rule, kb_lint::LintRule::Contradictions) {
+            // Contradictions is the only rule that calls the LLM — it has a
+            // dedicated dispatch path that builds the adapter and persists
+            // review items in one place. Everything else routes through the
+            // pure `run_lint_with_options`.
+            run_contradictions_lint(root, &cfg, &contradictions_cfg)?
+        } else {
+            kb_lint::run_lint_with_options(root, rule, &options)?
+        };
         let mut warning_count = 0;
         let mut error_count = 0;
         for issue in &report.issues {
@@ -3498,7 +3515,73 @@ fn lint_rules_for_root(
     if missing_concepts_enabled {
         rules.push(kb_lint::LintRule::MissingConcepts);
     }
+    // Deliberately exclude LintRule::Contradictions: it's LLM-powered and
+    // expensive, so it's opt-in per-command via `kb lint --check contradictions`,
+    // never part of the default lint sweep.
     rules
+}
+
+/// Dispatch the LLM-powered contradictions check.
+///
+/// Builds the configured adapter, runs the pass, persists any flagged
+/// concepts as `ReviewKind::Contradiction` items so `kb review` can see
+/// them, and returns a `LintReport` for the normal lint printer.
+fn run_contradictions_lint(
+    root: &Path,
+    cfg: &Config,
+    contradictions_cfg: &kb_lint::ContradictionsConfig,
+) -> Result<kb_lint::LintReport> {
+    // The user explicitly selected this rule. Honor the request even if
+    // `[lint.contradictions] enabled = false` — the TOML flag is about
+    // inclusion in `LintRule::All` (which we never populate with this
+    // rule), not about whether `--check contradictions` is allowed.
+    let forced_cfg = kb_lint::ContradictionsConfig {
+        enabled: true,
+        min_sources: contradictions_cfg.min_sources,
+    };
+
+    let adapter = create_ask_adapter(cfg, root)?;
+
+    let items = kb_lint::check_contradictions(root, adapter.as_ref(), &forced_cfg)
+        .context("run contradictions check")?;
+
+    for item in &items {
+        if let Err(err) = kb_core::save_review_item(root, item) {
+            tracing::warn!(
+                "failed to persist contradiction review item '{}': {err}",
+                item.metadata.id
+            );
+        }
+    }
+
+    // Produce the same shape of issues as `detect_contradictions_issues`
+    // but reuse the already-computed review items so we don't double-call
+    // the LLM.
+    let issues: Vec<kb_lint::LintIssue> = items
+        .into_iter()
+        .map(|item| kb_lint::LintIssue {
+            severity: kb_lint::IssueSeverity::Warning,
+            kind: kb_lint::IssueKind::Contradiction,
+            referring_page: item
+                .affected_pages
+                .first()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            line: 0,
+            target: item.target_entity_id.clone(),
+            message: item.comment.clone(),
+            suggested_fix: Some(format!(
+                "run 'kb review show {}' to inspect, then approve (acknowledge) or reject (mark intended nuance)",
+                item.metadata.id
+            )),
+        })
+        .collect();
+
+    Ok(kb_lint::LintReport {
+        rule: kb_lint::LintRule::Contradictions.as_str().to_string(),
+        issue_count: issues.len(),
+        issues,
+    })
 }
 
 /// Persist concept-candidate review items to `reviews/concept_candidates/`

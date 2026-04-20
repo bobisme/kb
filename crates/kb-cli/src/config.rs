@@ -287,6 +287,7 @@ pub struct LintConfig {
     pub require_citations: bool,
     pub missing_citations_level: String,
     pub missing_concepts: LintMissingConceptsConfig,
+    pub contradictions: LintContradictionsConfig,
 }
 
 impl Default for LintConfig {
@@ -295,6 +296,7 @@ impl Default for LintConfig {
             require_citations: true,
             missing_citations_level: "warn".to_string(),
             missing_concepts: LintMissingConceptsConfig::default(),
+            contradictions: LintContradictionsConfig::default(),
         }
     }
 }
@@ -319,6 +321,30 @@ impl Default for LintMissingConceptsConfig {
             enabled: true,
             min_sources: 3,
             min_mentions: 5,
+        }
+    }
+}
+
+/// `[lint.contradictions]` section of `kb.toml`. Controls the LLM-powered
+/// cross-source contradiction check added in bn-3axp.
+///
+/// Default is `enabled = false` because each enabled concept triggers one
+/// LLM round-trip; this check is opt-in per pass via
+/// `kb lint --check contradictions` regardless of the TOML value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct LintContradictionsConfig {
+    pub enabled: bool,
+    pub min_sources: usize,
+}
+
+impl Default for LintContradictionsConfig {
+    fn default() -> Self {
+        // Mirrors `kb_lint::ContradictionsConfig::default()`.
+        Self {
+            enabled: false,
+            min_sources: 2,
         }
     }
 }

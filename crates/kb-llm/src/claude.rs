@@ -6,12 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::adapter::{
-    AnswerQuestionRequest, AnswerQuestionResponse, ExtractConceptsRequest, ExtractConceptsResponse,
+    AnswerQuestionRequest, AnswerQuestionResponse, DetectContradictionsRequest,
+    DetectContradictionsResponse, ExtractConceptsRequest, ExtractConceptsResponse,
     GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateSlidesRequest,
     GenerateSlidesResponse, LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest,
     MergeConceptCandidatesResponse, RunHealthCheckRequest, RunHealthCheckResponse,
-    SummarizeDocumentRequest, SummarizeDocumentResponse, parse_extract_concepts_json,
-    parse_merge_concept_candidates_json,
+    SummarizeDocumentRequest, SummarizeDocumentResponse, parse_detect_contradictions_json,
+    parse_extract_concepts_json, parse_merge_concept_candidates_json,
 };
 use crate::provenance::{ProvenanceRecord, TokenUsage};
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -451,6 +452,69 @@ impl LlmAdapter for ClaudeCliAdapter {
         ))
     }
 
+    fn detect_contradictions(
+        &self,
+        request: DetectContradictionsRequest,
+    ) -> Result<(DetectContradictionsResponse, ProvenanceRecord), LlmAdapterError> {
+        let template = Template::load(
+            "detect_contradictions.md",
+            self.config.project_root.as_deref(),
+        )
+        .map_err(|err| {
+            LlmAdapterError::Other(format!("load detect_contradictions template: {err}"))
+        })?;
+
+        let mut context = HashMap::new();
+        context.insert("concept_name".to_string(), request.concept_name.clone());
+        context.insert(
+            "quotes".to_string(),
+            format_contradiction_quotes_for_prompt(&request.quotes),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render detect_contradictions template: {err}"))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        let command = self.build_command(&rendered.content);
+        let output =
+            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+
+        if output.exit_code != Some(0) {
+            return Err(classify_nonzero_exit(
+                output.exit_code,
+                &output.stderr,
+                &output.stdout,
+            ));
+        }
+
+        let parsed = parse_claude_json(&output.stdout)?;
+        let response = parse_detect_contradictions_json(&parsed.text)?;
+        let ended_at = unix_time_ms()?;
+
+        let model = parsed
+            .model
+            .or_else(|| self.config.model.clone())
+            .unwrap_or_else(|| "claude".to_string());
+
+        let provenance = ProvenanceRecord {
+            harness: "claude".to_string(),
+            harness_version: None,
+            model,
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: parsed.tokens,
+            cost_estimate: parsed.cost_estimate,
+        };
+
+        Ok((response, provenance))
+    }
+
     fn generate_slides(
         &self,
         _request: GenerateSlidesRequest,
@@ -730,6 +794,30 @@ fn format_aliases_for_prompt(aliases: &[String]) -> String {
     } else {
         aliases.join(", ")
     }
+}
+
+/// Format quotes for the `detect_contradictions.md` prompt. Each quote is
+/// rendered as a numbered entry (zero-based index) with its source label,
+/// matching the response contract (`conflicting_quotes` is a list of
+/// zero-based indices into the request's quotes list).
+fn format_contradiction_quotes_for_prompt(
+    quotes: &[crate::adapter::ContradictionQuote],
+) -> String {
+    if quotes.is_empty() {
+        return "(no quotes)".to_string();
+    }
+    quotes
+        .iter()
+        .enumerate()
+        .map(|(idx, q)| {
+            format!(
+                "[{idx}] source: {source}\n    quote: {text}",
+                source = q.source_label.trim(),
+                text = q.text.trim(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Format candidate quotes as bullet lines for the `concept_body.md` prompt.
