@@ -1489,18 +1489,53 @@ mod tests {
 
 const WIKI_CONCEPTS_DIR: &str = "wiki/concepts";
 const DEFAULT_SIMILARITY_THRESHOLD: f64 = 0.85;
+/// Minimum word-bigram overlap required between two concept definition hints
+/// before a name-similarity hit will be treated as a near-duplicate. Chosen
+/// deliberately low: genuine duplicates tend to restate the same idea, so any
+/// non-trivial overlap clears the bar, while structurally distinct concepts
+/// that merely share a topic word ("consensus", "causal") score near zero.
+const DEFAULT_DEFINITION_SIMILARITY_THRESHOLD: f64 = 0.15;
+
+/// Common technical words that dominate concept names in a distributed-systems
+/// / programming-languages corpus and therefore drive bigram false positives
+/// (e.g. every "... consensus" concept matches every other "... consensus").
+/// We strip these before name-similarity scoring so the comparison happens on
+/// the distinguishing part of the term.
+///
+/// Keep this list *small* and lowercase. Words here must be topic markers, not
+/// discriminators — adding something like "checker" would break genuine dups
+/// like "Borrow check" vs "Borrow checker".
+const STOP_WORDS: &[&str] = &[
+    "consensus",
+    "causal",
+    "lock",
+    "data",
+    "store",
+    "system",
+    "tree",
+    "model",
+    "protocol",
+];
 
 /// Configuration for the duplicate-concepts lint check.
 #[derive(Debug, Clone)]
 pub struct DuplicateConceptsConfig {
-    /// Similarity threshold for flagging pairs (0.0–1.0). Default: 0.85.
+    /// Name/alias similarity threshold for flagging pairs (0.0–1.0). Default: 0.85.
     pub similarity_threshold: f64,
+    /// Definition-text similarity threshold (word-bigram Dice). A pair must
+    /// clear both `similarity_threshold` on names *and* this value on
+    /// definitions to be flagged. Default: 0.15.
+    ///
+    /// When both concepts lack a definition hint, this check is bypassed so
+    /// we still catch duplicates discovered before bodies are populated.
+    pub definition_similarity_threshold: f64,
 }
 
 impl Default for DuplicateConceptsConfig {
     fn default() -> Self {
         Self {
             similarity_threshold: DEFAULT_SIMILARITY_THRESHOLD,
+            definition_similarity_threshold: DEFAULT_DEFINITION_SIMILARITY_THRESHOLD,
         }
     }
 }
@@ -1510,6 +1545,9 @@ struct ConceptRecord {
     id: String,
     name: String,
     aliases: Vec<String>,
+    /// First paragraph of the concept body (the "definition hint" rendered by
+    /// the merge pipeline). Empty when the page has no body.
+    definition_hint: String,
 }
 
 /// Scan concept pages under `wiki/concepts/` and return a `ReviewItem` for every
@@ -1533,11 +1571,30 @@ pub fn check_duplicate_concepts(
 
     for (i, a) in concepts.iter().enumerate() {
         for b in concepts.iter().skip(i + 1) {
-            if let Some((term_a, term_b, score)) = best_term_pair(a, b) {
-                if score >= config.similarity_threshold {
-                    items.push(build_review_item(a, b, &term_a, &term_b, score, now));
+            let Some((term_a, term_b, score)) = best_term_pair(a, b) else {
+                continue;
+            };
+            if score < config.similarity_threshold {
+                continue;
+            }
+
+            // Require definition-text overlap in addition to name/alias
+            // similarity. Pairs like "Byzantine consensus" vs "Raft consensus"
+            // share the topic word but describe different ideas — their
+            // definition hints have near-zero n-gram overlap.
+            //
+            // If neither side has a definition (fresh concepts with empty
+            // bodies, or synthetic tests), we fall back to name-only to
+            // avoid regressing the pre-definition behavior.
+            let have_defs = !a.definition_hint.is_empty() && !b.definition_hint.is_empty();
+            if have_defs {
+                let def_score = definition_similarity(&a.definition_hint, &b.definition_hint);
+                if def_score < config.definition_similarity_threshold {
+                    continue;
                 }
             }
+
+            items.push(build_review_item(a, b, &term_a, &term_b, score, now));
         }
     }
 
@@ -1577,7 +1634,7 @@ fn load_concepts(root: &Path) -> Result<Vec<ConceptRecord>> {
 }
 
 fn parse_concept_page(path: &Path) -> Result<ConceptRecord> {
-    let (frontmatter, _body) = read_frontmatter(path)
+    let (frontmatter, body) = read_frontmatter(path)
         .with_context(|| format!("read frontmatter from {}", path.display()))?;
 
     let id = frontmatter
@@ -1603,7 +1660,72 @@ fn parse_concept_page(path: &Path) -> Result<ConceptRecord> {
         })
         .unwrap_or_default();
 
-    Ok(ConceptRecord { id, name, aliases })
+    let definition_hint = extract_definition_hint(&body);
+
+    Ok(ConceptRecord {
+        id,
+        name,
+        aliases,
+        definition_hint,
+    })
+}
+
+/// Extract the first non-heading paragraph from a concept page body.
+///
+/// Concept pages render as:
+///
+/// ```text
+/// # Concept name
+///
+/// <definition hint paragraph(s)>
+///
+/// ## Backlinks
+/// <!-- kb:begin id=backlinks -->
+/// ...
+/// ```
+///
+/// We return the paragraph text (joined), stripped of surrounding whitespace.
+/// Managed regions (like the backlinks block) and any `## ...` section are
+/// excluded so auto-generated backlinks don't contaminate the similarity score.
+fn extract_definition_hint(body: &str) -> String {
+    let mut collected: Vec<&str> = Vec::new();
+    let mut started = false;
+    for raw in body.lines() {
+        let line = raw.trim();
+
+        // Stop as soon as we hit a new section (## Backlinks, ## Sources, ...).
+        // Also stop at any kb-managed region marker.
+        if line.starts_with("## ") || line.starts_with("<!-- kb:begin") {
+            break;
+        }
+
+        // Skip the leading '# Name' heading and any blank lines preceding the
+        // first paragraph.
+        if !started {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            started = true;
+        } else if line.is_empty() {
+            // Allow blank lines inside the first section (between paragraphs)
+            // but stop as soon as we've collected at least one paragraph and
+            // hit the *second* blank line gap — prevents pulling in unrelated
+            // trailing content that isn't explicitly sectioned.
+            if collected.last().is_some_and(|p: &&str| p.is_empty()) {
+                break;
+            }
+            collected.push("");
+            continue;
+        }
+
+        collected.push(line);
+    }
+
+    collected
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn all_terms(concept: &ConceptRecord) -> Vec<String> {
@@ -1619,7 +1741,19 @@ fn best_term_pair(a: &ConceptRecord, b: &ConceptRecord) -> Option<(String, Strin
     let mut best: Option<(String, String, f64)> = None;
     for ta in &a_terms {
         for tb in &b_terms {
-            let score = bigram_similarity(&normalize_term(ta), &normalize_term(tb));
+            // Strip common topic words ("consensus", "causal", …) before
+            // scoring. When a term is *entirely* stop-words after stripping,
+            // fall back to the raw normalized form so legitimate single-word
+            // names (e.g. "Ownership") still compare.
+            let na = normalize_term(ta);
+            let nb = normalize_term(tb);
+            let sa = strip_stop_words(&na);
+            let sb = strip_stop_words(&nb);
+            let (la, lb) = match (sa.is_empty(), sb.is_empty()) {
+                (false, false) => (sa, sb),
+                _ => (na, nb),
+            };
+            let score = bigram_similarity(&la, &lb);
             let is_better = best.as_ref().is_none_or(|entry| score > entry.2);
             if is_better {
                 best = Some((ta.clone(), tb.clone(), score));
@@ -1635,6 +1769,68 @@ fn normalize_term(s: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Remove every whole-word occurrence of a `STOP_WORDS` entry from an
+/// already-lowercased, whitespace-normalized term. Operates at word granularity
+/// so "lockfile" survives while "lock" is stripped.
+fn strip_stop_words(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|w| !STOP_WORDS.contains(w))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Dice coefficient over *word* bigrams (plus unigrams as a fallback) for two
+/// definition-hint strings. Word-level is a better fit than char-level for
+/// longer text because it captures phrase overlap without being dominated by
+/// common character sequences.
+#[allow(clippy::cast_precision_loss)]
+fn definition_similarity(a: &str, b: &str) -> f64 {
+    let a_words: Vec<String> = a
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+    let b_words: Vec<String> = b
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if a_words.is_empty() || b_words.is_empty() {
+        return 0.0;
+    }
+
+    // Use word bigrams when both sides have at least two words; otherwise
+    // fall back to word unigrams so single-sentence fragments still compare.
+    let build_grams = |words: &[String]| -> Vec<String> {
+        if words.len() >= 2 {
+            words.windows(2).map(|w| format!("{} {}", w[0], w[1])).collect()
+        } else {
+            words.to_vec()
+        }
+    };
+
+    let a_grams = build_grams(&a_words);
+    let mut b_remaining = build_grams(&b_words);
+
+    if a_grams.is_empty() || b_remaining.is_empty() {
+        return 0.0;
+    }
+
+    let total = a_grams.len() + b_remaining.len();
+    let mut intersection: usize = 0;
+    for g in &a_grams {
+        if let Some(pos) = b_remaining.iter().position(|x| x == g) {
+            intersection += 1;
+            b_remaining.swap_remove(pos);
+        }
+    }
+
+    2.0 * intersection as f64 / total as f64
 }
 
 /// Dice coefficient over character bigrams for two pre-normalized strings.
@@ -1733,6 +1929,16 @@ mod duplicate_concept_tests {
     use tempfile::TempDir;
 
     fn write_concept(dir: &Path, slug: &str, name: &str, aliases: &[&str]) -> PathBuf {
+        write_concept_with_body(dir, slug, name, aliases, "")
+    }
+
+    fn write_concept_with_body(
+        dir: &Path,
+        slug: &str,
+        name: &str,
+        aliases: &[&str],
+        body: &str,
+    ) -> PathBuf {
         use std::fmt::Write as _;
         let path = dir.join(format!("{slug}.md"));
         let mut content = format!("---\nid: concept:{slug}\nname: {name}\n");
@@ -1744,6 +1950,11 @@ mod duplicate_concept_tests {
         }
         content.push_str("---\n\n");
         writeln!(content, "# {name}").unwrap();
+        if !body.is_empty() {
+            content.push('\n');
+            content.push_str(body);
+            content.push('\n');
+        }
         fs::write(&path, &content).unwrap();
         path
     }
@@ -1845,12 +2056,14 @@ mod duplicate_concept_tests {
         // At high threshold, should not flag
         let strict = DuplicateConceptsConfig {
             similarity_threshold: 0.99,
+            ..DuplicateConceptsConfig::default()
         };
         let strict_items = check_duplicate_concepts(dir.path(), &strict).expect("strict check");
 
         // At low threshold, should flag
         let lenient = DuplicateConceptsConfig {
             similarity_threshold: 0.5,
+            ..DuplicateConceptsConfig::default()
         };
         let lenient_items = check_duplicate_concepts(dir.path(), &lenient).expect("lenient check");
 
@@ -1926,5 +2139,204 @@ mod duplicate_concept_tests {
         // One side too short → no bigrams possible → 0
         assert!(bigram_similarity("ab", "a") < f64::EPSILON);
         assert!(bigram_similarity("a", "ab") < f64::EPSILON);
+    }
+
+    // ---- stop-word filter -------------------------------------------------
+
+    #[test]
+    fn strip_stop_words_removes_common_topic_words() {
+        assert_eq!(strip_stop_words("raft consensus"), "raft");
+        assert_eq!(strip_stop_words("causal order"), "order");
+        // Non-stop-word compounds survive intact.
+        assert_eq!(strip_stop_words("borrow checker"), "borrow checker");
+        // Multi-word stripping.
+        assert_eq!(strip_stop_words("distributed consensus protocol"), "distributed");
+    }
+
+    #[test]
+    fn strip_stop_words_preserves_subword_matches() {
+        // "lockfile" is a single word — only whole-word "lock" is stripped.
+        assert_eq!(strip_stop_words("lockfile"), "lockfile");
+        assert_eq!(strip_stop_words("datastore"), "datastore");
+    }
+
+    // ---- definition similarity --------------------------------------------
+
+    #[test]
+    fn definition_similarity_unrelated_definitions_low() {
+        // Byzantine-consensus vs Raft-consensus paragraphs from the pass-7
+        // corpus. They share the word "consensus"/"algorithm" but almost no
+        // phrase-level overlap.
+        let byzantine = "Consensus under adversarial or malicious faults, typically requiring \
+                         3F+1 nodes to tolerate F Byzantine failures.";
+        let raft = "A replicated-log consensus algorithm designed to be easier to understand \
+                    than Paxos.";
+        let score = definition_similarity(byzantine, raft);
+        assert!(
+            score < 0.15,
+            "byzantine vs raft definitions should be dissimilar, got {score}"
+        );
+    }
+
+    #[test]
+    fn definition_similarity_overlapping_definitions_high() {
+        let a = "Tokio is an asynchronous runtime for the Rust programming language that \
+                 provides the building blocks for writing network applications.";
+        let b = "The tokio runtime is an asynchronous runtime for the Rust programming \
+                 language used to build network applications.";
+        let score = definition_similarity(a, b);
+        assert!(
+            score > 0.3,
+            "overlapping definitions should score high, got {score}"
+        );
+    }
+
+    // ---- extract_definition_hint -----------------------------------------
+
+    #[test]
+    fn extract_definition_hint_reads_first_paragraph() {
+        let body = "\n# Byzantine consensus\n\n\
+                    Consensus under adversarial faults.\n\n\
+                    ## Backlinks\n<!-- kb:begin id=backlinks -->\n- [[x]]\n\
+                    <!-- kb:end id=backlinks -->\n";
+        let hint = extract_definition_hint(body);
+        assert_eq!(hint, "Consensus under adversarial faults.");
+    }
+
+    #[test]
+    fn extract_definition_hint_empty_body() {
+        assert_eq!(extract_definition_hint(""), "");
+        assert_eq!(extract_definition_hint("\n# Heading\n\n"), "");
+    }
+
+    // ---- false-positive regressions (the bones) --------------------------
+
+    #[test]
+    fn byzantine_vs_raft_is_not_flagged() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept_with_body(
+            &concepts_dir,
+            "byzantine-consensus",
+            "Byzantine consensus",
+            &["Byzantine fault-tolerant consensus", "BFT consensus"],
+            "Consensus under adversarial or malicious faults, typically requiring 3F+1 \
+             nodes to tolerate F Byzantine failures.",
+        );
+        write_concept_with_body(
+            &concepts_dir,
+            "raft-consensus",
+            "Raft consensus",
+            &["Raft", "Raft leader election"],
+            "A replicated-log consensus algorithm designed to be easier to understand \
+             than Paxos.",
+        );
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert!(
+            items.is_empty(),
+            "Byzantine vs Raft should NOT flag (false positive), got: {:?}",
+            items.iter().map(|i| &i.comment).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn crdt_vs_happens_before_is_not_flagged() {
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept_with_body(
+            &concepts_dir,
+            "conflict-free-replicated-data-type",
+            "Conflict-free Replicated Data Type",
+            &["CRDT", "CRDTs", "causal ordering", "reliable causal delivery"],
+            "A network delivery property ensuring operations are delivered in causal order, \
+             which operation-based CRDTs rely on for correct convergence.",
+        );
+        write_concept_with_body(
+            &concepts_dir,
+            "happens-before-relation",
+            "Happens-before relation",
+            &["causal order", "causality"],
+            "The partial order over distributed events that captures whether one event could \
+             have causally influenced another.",
+        );
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert!(
+            items.is_empty(),
+            "CRDT vs happens-before should NOT flag (false positive), got: {:?}",
+            items.iter().map(|i| &i.comment).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn true_positive_tokio_still_flags() {
+        // A genuine duplicate: "Tokio" (with alias "tokio runtime") vs a
+        // separately-extracted "Tokio runtime" concept. The alias vs name
+        // comparison hits 1.0 and the definitions share phrases like
+        // "asynchronous runtime" and "Rust programming language".
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept_with_body(
+            &concepts_dir,
+            "tokio",
+            "Tokio",
+            &["tokio runtime"],
+            "Tokio is an asynchronous runtime for the Rust programming language that provides \
+             the building blocks for writing network applications.",
+        );
+        write_concept_with_body(
+            &concepts_dir,
+            "tokio-runtime",
+            "Tokio runtime",
+            &[],
+            "The Tokio runtime is an asynchronous runtime for the Rust programming language \
+             used to build network applications.",
+        );
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert_eq!(
+            items.len(),
+            1,
+            "Tokio vs tokio runtime should flag as duplicate, got: {items:?}"
+        );
+    }
+
+    #[test]
+    fn high_name_similarity_but_different_definitions_is_not_flagged() {
+        // Defense-in-depth: two concepts whose names are near-identical but
+        // whose bodies describe different ideas should NOT flag once
+        // definition gating is in place. (If someone regresses the gate, this
+        // test catches it before it ships.)
+        let dir = TempDir::new().unwrap();
+        let concepts_dir = setup_kb(&dir);
+        write_concept_with_body(
+            &concepts_dir,
+            "write-amplification",
+            "Write amplification",
+            &[],
+            "The ratio of physical bytes written to storage versus logical bytes written by the \
+             application, typical of log-structured merge trees.",
+        );
+        write_concept_with_body(
+            &concepts_dir,
+            "write-verification",
+            "Write verification",
+            &[],
+            "Checksumming or re-reading a written record to confirm durability before \
+             acknowledging the client.",
+        );
+
+        let items = check_duplicate_concepts(dir.path(), &DuplicateConceptsConfig::default())
+            .expect("check duplicates");
+        assert!(
+            items.is_empty(),
+            "distinct-topic near-identical names should not flag when definitions \
+             disagree, got: {:?}",
+            items.iter().map(|i| &i.comment).collect::<Vec<_>>()
+        );
     }
 }
