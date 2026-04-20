@@ -380,6 +380,7 @@ fn run(cli: Cli) -> Result<()> {
             let force = cli.force;
             let dry_run = cli.dry_run;
             let json = cli.json;
+            let quiet = cli.quiet;
             let cli_model = cli.model.clone();
             if dry_run {
                 // Dry-run reads graph/hashes and prints what would happen; it
@@ -387,7 +388,15 @@ fn run(cli: Cli) -> Result<()> {
                 // so we neither block on the root lock (held by an in-flight
                 // real compile) nor leave a job manifest behind if the caller
                 // SIGPIPEs us (e.g. `kb compile --dry-run | head`).
-                run_compile_action(compile_root, force, true, json, cli_model.as_deref(), None)
+                run_compile_action(
+                    compile_root,
+                    force,
+                    true,
+                    json,
+                    quiet,
+                    cli_model.as_deref(),
+                    None,
+                )
             } else {
                 execute_mutating_command_with_handle(Some(compile_root), "compile", move |handle| {
                     // Stream per-pass events into `state/jobs/<id>.log` so a
@@ -397,6 +406,7 @@ fn run(cli: Cli) -> Result<()> {
                         force,
                         false,
                         json,
+                        quiet,
                         cli_model.as_deref(),
                         Some(handle.log_sink()),
                     )
@@ -1845,21 +1855,40 @@ fn try_generate_answer(
 ///
 /// `log_sink` is `Some` only for real compiles (streamed into the job's
 /// on-disk log); dry-run passes `None`.
+#[allow(clippy::fn_params_excessive_bools)]
 fn run_compile_action(
     compile_root: &Path,
     force: bool,
     dry_run: bool,
     json: bool,
+    quiet: bool,
     cli_model: Option<&str>,
     log_sink: Option<std::sync::Arc<dyn kb_compile::pipeline::LogSink>>,
 ) -> Result<()> {
+    // Choose the renderer by the effective stdout context:
+    //   TTY + no --json + no --quiet  → indicatif multi-progress bars
+    //   everything else               → line-by-line [run]/[ok] on stderr
+    // --quiet uses a reduced LineLogReporter that suppresses per-item lines
+    // (banner + final render still print).
+    let reporter: std::sync::Arc<dyn kb_compile::progress::ProgressReporter> =
+        if !json && !quiet && std::io::stdout().is_terminal() {
+            std::sync::Arc::new(kb_compile::progress::IndicatifReporter::new())
+        } else if quiet {
+            std::sync::Arc::new(kb_compile::progress::LineLogReporter::quiet())
+        } else {
+            std::sync::Arc::new(kb_compile::progress::LineLogReporter::new())
+        };
+
     let options = kb_compile::pipeline::CompileOptions {
         force,
         dry_run,
-        // Progress lines go to stderr so `--json` stdout stays clean.
-        // Suppress entirely under --json to avoid log noise.
-        progress: !json,
+        // Progress rendering is now owned by `reporter`; the legacy
+        // `progress: bool` is suppressed under --json and --quiet to match
+        // the old stderr-suppression semantics for any code path that still
+        // looks at the flag.
+        progress: !json && !quiet,
         log_sink,
+        reporter: Some(reporter),
     };
 
     // Dry-run does not call the LLM; skip adapter construction so users can

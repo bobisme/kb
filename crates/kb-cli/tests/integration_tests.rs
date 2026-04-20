@@ -1972,6 +1972,57 @@ fn compile_builds_lexical_index() {
     assert_eq!(entries.len(), 2, "should index 2 pages");
 }
 
+// bn-327j: when stdout is piped (not a TTY) the compile output must fall back
+// to plain line-by-line text so downstream `grep`/`sed` keep working, even
+// though a TTY invocation would render indicatif progress bars. `assert_cmd`
+// always captures stdout via a pipe, so the IsTerminal check naturally
+// returns false — we assert the stderr is pure ASCII text and contains the
+// legacy `compile: N source(s)` banner with no terminal escape sequences.
+#[test]
+fn compile_piped_stdout_emits_plain_text_without_escape_codes() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    write_source_page(
+        &kb_root,
+        "rust-book",
+        "The Rust Programming Language",
+        "Memory safety.",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("compile");
+    let output = cmd.output().expect("run kb compile");
+    assert!(
+        output.status.success(),
+        "kb compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // indicatif renders bars with ANSI escape sequences (ESC + `[`). Piped
+    // stdout must drop into the line-by-line fallback where neither stream
+    // ever contains those escapes.
+    assert!(
+        !stderr.contains('\x1b'),
+        "piped stderr must not contain ANSI escape codes; got {stderr:?}"
+    );
+    assert!(
+        !stdout.contains('\x1b'),
+        "piped stdout must not contain ANSI escape codes; got {stdout:?}"
+    );
+
+    // The final report is printed to stdout in plain text format ("compile:
+    // N source(s), K stale"). This also runs as the stderr banner but the
+    // stdout copy is what scripts parse.
+    assert!(
+        stdout.contains("compile:"),
+        "expected 'compile:' banner on stdout for plain-text fallback; got stdout={stdout:?}"
+    );
+}
+
 // bn-k79: promoted question pages must be surfaced in both the top-level
 // wiki/index.md (as a dedicated Questions section) and a per-category
 // wiki/questions/index.md, mirroring the existing sources/concepts layout.

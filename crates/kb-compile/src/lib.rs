@@ -5,6 +5,7 @@ pub mod concept_extraction;
 pub mod concept_merge;
 pub mod index_page;
 pub mod pipeline;
+pub mod progress;
 pub mod promotion;
 pub mod source_page;
 pub mod source_summary;
