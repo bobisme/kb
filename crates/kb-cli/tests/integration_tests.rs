@@ -542,6 +542,94 @@ fn ingest_skips_empty_file_with_warning_and_exit_zero() {
     );
 }
 
+/// After a clean empty-file skip, neither `kb status` nor `kb doctor` should
+/// flag any interrupted job runs. Regression guard for bn-36x: the bn-40r
+/// empty-skip path used to leave the ingest job manifest in its initial
+/// `Running` state so the stale-job reaper later relabeled it "interrupted",
+/// polluting both `kb status` and `kb doctor` forever.
+#[test]
+fn ingest_empty_file_does_not_leave_interrupted_job() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let fake_bin = install_fake_harnesses(&kb_root);
+
+    let empty = kb_root.join("empty.md");
+    fs::write(&empty, b"").expect("write empty");
+
+    let mut ingest_cmd = kb_cmd(&kb_root);
+    ingest_cmd.arg("ingest").arg(&empty);
+    let ingest_output = ingest_cmd.output().expect("run kb ingest on empty");
+    assert!(
+        ingest_output.status.success(),
+        "kb ingest on empty file should exit 0, got stderr: {}",
+        String::from_utf8_lossy(&ingest_output.stderr)
+    );
+
+    // `kb status --json` must report zero interrupted job runs after the
+    // cleanly-skipped empty ingest.
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let status_output = status_cmd.output().expect("run kb status");
+    assert!(
+        status_output.status.success(),
+        "kb status should exit 0, got stderr: {}",
+        String::from_utf8_lossy(&status_output.stderr)
+    );
+    let status_envelope: Value =
+        serde_json::from_slice(&status_output.stdout).expect("parse status json");
+    let interrupted = status_envelope["data"]["interrupted_jobs"]
+        .as_array()
+        .expect("interrupted_jobs array");
+    assert!(
+        interrupted.is_empty(),
+        "empty-file ingest must not leave an interrupted job run, got: {interrupted:?}"
+    );
+
+    // The ingest job itself should be recorded as succeeded.
+    let recent = status_envelope["data"]["recent_jobs"]
+        .as_array()
+        .expect("recent_jobs array");
+    let ingest_jobs: Vec<&Value> = recent
+        .iter()
+        .filter(|job| job["command"] == "ingest")
+        .collect();
+    assert_eq!(
+        ingest_jobs.len(),
+        1,
+        "exactly one ingest job expected, got: {ingest_jobs:?}"
+    );
+    assert_eq!(
+        ingest_jobs[0]["status"], "succeeded",
+        "empty-file ingest job should be marked succeeded, got: {:?}",
+        ingest_jobs[0]
+    );
+    assert_eq!(ingest_jobs[0]["exit_code"], 0);
+
+    // `kb doctor` must exit 0 with no interrupted-job warning.
+    let mut doctor_cmd = kb_cmd(&kb_root);
+    doctor_cmd.env("PATH", prepend_path(&fake_bin));
+    doctor_cmd.arg("--json").arg("doctor");
+    let doctor_output = doctor_cmd.output().expect("run kb doctor");
+    assert!(
+        doctor_output.status.success(),
+        "kb doctor should exit 0 after empty-file ingest, got stderr: {}",
+        String::from_utf8_lossy(&doctor_output.stderr)
+    );
+    let doctor_envelope: Value =
+        serde_json::from_slice(&doctor_output.stdout).expect("parse doctor json");
+    let checks = doctor_envelope["data"]["checks"]
+        .as_array()
+        .expect("checks array");
+    let interrupted_check = checks
+        .iter()
+        .find(|check| check["name"] == "interrupted_jobs")
+        .expect("interrupted_jobs check present");
+    assert_eq!(
+        interrupted_check["status"], "ok",
+        "interrupted_jobs check should be OK, got: {interrupted_check:?}"
+    );
+}
+
 #[test]
 fn ingest_skips_frontmatter_only_file() {
     let (_temp_dir, kb_root) = make_temp_kb();
