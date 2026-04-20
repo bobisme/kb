@@ -698,6 +698,16 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
             continue;
         }
 
+        // bn-1yvn: `kb forget` flags promoted question pages with an
+        // `orphaned_sources:` frontmatter list rather than rewriting them.
+        // A doc-id listed there is a user-acknowledged orphan — suppress the
+        // orphan error for that specific src-id. Errors for doc-ids NOT in
+        // the marker list still fire.
+        let acknowledged_sources: BTreeSet<String> =
+            frontmatter_string_list(&frontmatter, "orphaned_source", "orphaned_sources")
+                .into_iter()
+                .collect();
+
         let rel_page = relative_to_root(root, &page);
         let rel_page_str = rel_page.to_string_lossy().into_owned();
         let existing_docs: Vec<_> = doc_ids
@@ -711,16 +721,21 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
             .cloned()
             .collect();
 
-        for missing_doc in doc_ids
+        let missing_docs: Vec<&String> = doc_ids
             .iter()
             .filter(|doc_id| !existing_docs.contains(*doc_id))
-        {
+            .collect();
+
+        for missing_doc in &missing_docs {
+            if acknowledged_sources.contains(*missing_doc) {
+                continue;
+            }
             issues.push(LintIssue {
                 severity: IssueSeverity::Error,
                 kind: IssueKind::SourceDocumentMissing,
                 referring_page: rel_page_str.clone(),
                 line: 0,
-                target: missing_doc.clone(),
+                target: (*missing_doc).clone(),
                 message: format!("referenced source document '{missing_doc}' is missing"),
                 suggested_fix: None,
             });
@@ -735,6 +750,11 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
         // them match the page's recorded revision ids — is a *stale revision*
         // (source re-ingested, page not yet recompiled) and lives in its own
         // `stale_revision` lint class. See `detect_stale_revisions`.
+        //
+        // bn-1yvn: if every missing doc-id is acknowledged via
+        // `orphaned_sources`, the revision-missing signal is just the
+        // downstream echo of that acknowledged state; suppress it. If *any*
+        // missing doc is un-acknowledged, the revision errors still fire.
         if !rev_ids.is_empty() {
             let live_revision_ids: BTreeSet<_> = existing_docs
                 .iter()
@@ -746,7 +766,12 @@ fn detect_orphan_pages(root: &Path) -> Result<Vec<LintIssue>> {
                 })
                 .collect();
 
-            if live_revision_ids.is_empty() {
+            let all_missing_acknowledged = !missing_docs.is_empty()
+                && missing_docs
+                    .iter()
+                    .all(|doc_id| acknowledged_sources.contains(*doc_id));
+
+            if live_revision_ids.is_empty() && !all_missing_acknowledged {
                 for revision_id in &rev_ids {
                     issues.push(LintIssue {
                         severity: IssueSeverity::Error,
@@ -1551,6 +1576,100 @@ mod tests {
         assert!(
             stale.is_clean(),
             "stale_revision must not fire on orphans: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn orphans_suppressed_when_orphaned_sources_marker_acknowledges_missing_src() {
+        // bn-1yvn: `kb forget` stamps `orphaned_sources: [src-X]` on promoted
+        // question pages instead of rewriting them. The orphans lint must
+        // trust that marker and stay quiet for the acknowledged src-id.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/questions/how.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\n\
+             id: q-1\n\
+             title: How\n\
+             source_document_ids:\n  - src-X\n\
+             source_revision_ids:\n  - rev-X\n\
+             orphaned_sources:\n  - src-X\n\
+             ---\n\n# q\n",
+        )
+        .expect("write page");
+        // No normalized/src-X/ — doc is gone, but user acknowledged it.
+
+        let report = run_lint(root, LintRule::Orphans).expect("lint report");
+        assert!(
+            report.is_clean(),
+            "orphans must honor orphaned_sources marker: {report:?}"
+        );
+    }
+
+    #[test]
+    fn orphans_still_fire_when_no_orphaned_sources_marker_is_present() {
+        // bn-1yvn: the suppression is keyed strictly on the marker. A page
+        // with no `orphaned_sources:` field still reports missing docs.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/questions/how.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\n\
+             id: q-1\n\
+             title: How\n\
+             source_document_ids:\n  - src-X\n\
+             source_revision_ids:\n  - rev-X\n\
+             ---\n\n# q\n",
+        )
+        .expect("write page");
+
+        let report = run_lint(root, LintRule::Orphans).expect("lint report");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|issue| issue.kind == IssueKind::SourceDocumentMissing
+                    && issue.target == "src-X"),
+            "unmarked orphan must still fire: {report:?}"
+        );
+    }
+
+    #[test]
+    fn orphans_fire_for_unflagged_src_even_when_another_src_is_acknowledged() {
+        // bn-1yvn: if the page flags src-X but ALSO references src-Y which
+        // is missing and NOT flagged, the lint must fire for src-Y only.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let page = root.join("wiki/questions/how.md");
+        fs::create_dir_all(page.parent().expect("parent")).expect("create wiki dir");
+        fs::write(
+            &page,
+            "---\n\
+             id: q-1\n\
+             title: How\n\
+             source_document_ids:\n  - src-X\n  - src-Y\n\
+             source_revision_ids:\n  - rev-X\n  - rev-Y\n\
+             orphaned_sources:\n  - src-X\n\
+             ---\n\n# q\n",
+        )
+        .expect("write page");
+        // Neither src-X nor src-Y has a normalized dir — both are gone.
+
+        let report = run_lint(root, LintRule::Orphans).expect("lint report");
+        let missing_doc_targets: Vec<&str> = report
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == IssueKind::SourceDocumentMissing)
+            .map(|issue| issue.target.as_str())
+            .collect();
+        assert_eq!(
+            missing_doc_targets,
+            vec!["src-Y"],
+            "only the unflagged src should fire: {report:?}"
         );
     }
 
