@@ -2378,22 +2378,31 @@ fn check_missing_concepts_raw(
             .with_context(|| format!("read normalized source {}", source_path.display()))?;
         let scan_body = strip_code_blocks(&body);
 
-        for cap in multiword_re.find_iter(&scan_body) {
-            let raw = cap.as_str().trim();
-            // The multi-word regex is greedy, so "The FooBar System" matches
-            // as a single span. Peel leading stopword tokens ("The", "This",
-            // "We", …) so the actual candidate phrase is evaluated. Stop as
-            // soon as the remaining phrase still has at least two words and
-            // starts with a non-stopword; if peeling leaves fewer than two
-            // words, drop the match entirely (single-word candidates are
-            // out-of-scope — too noisy).
-            let Some(term) = strip_leading_stopwords(raw) else {
-                continue;
-            };
-            if !accept_candidate_term(&term, &existing_terms) {
-                continue;
+        // Scan paragraph-by-paragraph so the multi-word regex's `\s+`
+        // connector can't bridge two paragraphs (e.g. a trailing
+        // "FooBar System" at the end of paragraph N joining with a
+        // sentence-opening "The FooBar" at the start of paragraph N+1 into
+        // the junk candidate "FooBar System The FooBar"). Paragraphs are
+        // separated by one or more blank lines.
+        for paragraph in split_paragraphs(&scan_body) {
+            for cap in multiword_re.find_iter(paragraph) {
+                let raw = cap.as_str().trim();
+                // The multi-word regex is greedy, so "The FooBar System"
+                // matches as a single span. Peel stopword tokens from both
+                // ends so phrases like "The FooBar System" surface as
+                // "FooBar System" and "Tree Storage Engines The" surface as
+                // "Tree Storage Engines". Stop as soon as the remaining
+                // phrase still has at least two words; if peeling leaves
+                // fewer than two words, drop the match entirely (single-word
+                // candidates are out-of-scope — too noisy).
+                let Some(term) = strip_leading_stopwords(raw) else {
+                    continue;
+                };
+                if !accept_candidate_term(&term, &existing_terms) {
+                    continue;
+                }
+                record_hit(&mut tally, &term, &doc_id);
             }
-            record_hit(&mut tally, &term, &doc_id);
         }
 
         for cap in backtick_re.captures_iter(&body) {
@@ -2506,6 +2515,16 @@ fn accept_candidate_term(term: &str, existing: &BTreeSet<String>) -> bool {
     if trimmed.len() < 3 || trimmed.len() > 80 {
         return false;
     }
+    // Reject pure-lowercase-alpha words (e.g. `country`, `price`, `append`,
+    // `template`). These come from the backtick-identifier regex admitting
+    // plain English words in inline backticks — noise for a KB. A real
+    // identifier has at least one capital letter, digit, or non-alpha
+    // character (`/`, `.`, `-`, `_`, `:`) so this filter only drops the
+    // pure-lowercase-English-word case. Multi-word phrases contain a space
+    // (not `[a-z]`) so they pass through untouched.
+    if !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_lowercase()) {
+        return false;
+    }
     let lowered = trimmed.to_ascii_lowercase();
     if existing.contains(&lowered) {
         return false;
@@ -2519,10 +2538,11 @@ fn accept_candidate_term(term: &str, existing: &BTreeSet<String>) -> bool {
     true
 }
 
-/// Peel leading stopword tokens from a multi-word candidate so phrases like
-/// `"The FooBar System"` surface as `"FooBar System"`. Returns `None` when
-/// the remaining phrase has fewer than two tokens (single-word candidates
-/// are out-of-scope for this check — too noisy).
+/// Peel stopword tokens from both ends of a multi-word candidate so phrases
+/// like `"The FooBar System"` surface as `"FooBar System"` and
+/// `"Tree Storage Engines The"` surface as `"Tree Storage Engines"`.
+/// Returns `None` when the remaining phrase has fewer than two tokens
+/// (single-word candidates are out-of-scope for this check — too noisy).
 fn strip_leading_stopwords(raw: &str) -> Option<String> {
     let tokens: Vec<&str> = raw.split_whitespace().collect();
     if tokens.is_empty() {
@@ -2532,11 +2552,61 @@ fn strip_leading_stopwords(raw: &str) -> Option<String> {
     while start < tokens.len() && is_stopword(tokens[start]) {
         start += 1;
     }
-    let rest = &tokens[start..];
+    let mut end = tokens.len();
+    while end > start && is_stopword(tokens[end - 1]) {
+        end -= 1;
+    }
+    let rest = &tokens[start..end];
     if rest.len() < 2 {
         return None;
     }
     Some(rest.join(" "))
+}
+
+/// Split a scan body into paragraphs on blank-line boundaries. Used by the
+/// multi-word regex pass so `\s+` can't bridge two paragraphs.
+///
+/// A "blank line" here is any run of one-or-more lines that contain only
+/// whitespace. Returned paragraphs are the non-blank spans between those
+/// boundaries; empty strings are filtered out so consumers don't have to.
+fn split_paragraphs(body: &str) -> Vec<&str> {
+    let mut out: Vec<&str> = Vec::new();
+    let mut start: Option<usize> = None;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Find end of current line.
+        let line_start = i;
+        let mut line_end = i;
+        while line_end < bytes.len() && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let line = &body[line_start..line_end];
+        let blank = line.chars().all(char::is_whitespace);
+        if blank {
+            if let Some(s) = start.take() {
+                let para = body[s..line_start].trim_end_matches('\n');
+                if !para.is_empty() {
+                    out.push(para);
+                }
+            }
+        } else if start.is_none() {
+            start = Some(line_start);
+        }
+        // Advance past the newline (if any).
+        i = if line_end < bytes.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+    }
+    if let Some(s) = start {
+        let para = body[s..].trim_end_matches('\n');
+        if !para.is_empty() {
+            out.push(para);
+        }
+    }
+    out
 }
 
 fn is_stopword(token: &str) -> bool {
@@ -3821,6 +3891,127 @@ mod missing_concepts_tests {
             !hits.iter().any(|h| h.name == "Actual Rust Code Here"),
             "fenced code block should be ignored: {hits:?}"
         );
+    }
+
+    #[test]
+    fn split_paragraphs_handles_blank_runs() {
+        let body = "alpha\nbeta\n\ngamma\n\n\ndelta\n";
+        let paras = split_paragraphs(body);
+        assert_eq!(paras, vec!["alpha\nbeta", "gamma", "delta"]);
+    }
+
+    #[test]
+    fn strip_leading_stopwords_peels_both_ends() {
+        let out = strip_leading_stopwords("The FooBar System The").expect("some");
+        assert_eq!(out, "FooBar System");
+        let out = strip_leading_stopwords("Query Optimization The").expect("some");
+        assert_eq!(out, "Query Optimization");
+        // All stopwords → None.
+        assert!(strip_leading_stopwords("The The The").is_none());
+        // After peeling leaves fewer than 2 tokens → None.
+        assert!(strip_leading_stopwords("The Widget The").is_none());
+    }
+
+    #[test]
+    fn multiword_does_not_cross_paragraph_boundary() {
+        // 'FooBar System' at the end of paragraph N must not merge with
+        // 'The FooBar' at the start of paragraph N+1 into the junk candidate
+        // 'FooBar System The FooBar'. Three sources are required to clear
+        // the min_sources=3 / min_mentions=5 thresholds.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let body = "FooBar System enables X.\n\nThe FooBar System is great.\nFooBar System rules.\n";
+        write_normalized_source(root, "doc-a", body);
+        write_normalized_source(root, "doc-b", body);
+        write_normalized_source(root, "doc-c", body);
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            !hits.iter().any(|h| h.name.contains("The FooBar")
+                || h.name == "FooBar System The FooBar"),
+            "paragraph-crossing candidate must not be produced: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h.name == "FooBar System"),
+            "expected 'FooBar System' candidate, got: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_stopword_is_peeled() {
+        // "Query Optimization\n\nThe next paragraph" must not produce
+        // 'Optimization The' or 'Query Optimization The' — the trailing
+        // 'The' belongs to the next paragraph.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let body = "Tree Storage Engines\n\nThe next paragraph.\nTree Storage Engines again.\nQuery Optimization\n\nThe wrap.\nTree Storage Engines and Query Optimization.\n";
+        write_normalized_source(root, "doc-a", body);
+        write_normalized_source(root, "doc-b", body);
+        write_normalized_source(root, "doc-c", body);
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        for h in &hits {
+            let name_lower = h.name.to_lowercase();
+            assert!(
+                !name_lower.ends_with(" the"),
+                "candidate must not end with a stopword: {h:?}"
+            );
+            assert_ne!(
+                h.name, "Optimization The",
+                "cross-paragraph stopword peel failed: {hits:?}"
+            );
+            assert_ne!(
+                h.name, "Query Optimization The",
+                "trailing-stopword peel failed: {hits:?}"
+            );
+            assert_ne!(
+                h.name, "Tree Storage Engines The",
+                "trailing-stopword peel failed: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backtick_pure_lowercase_english_is_rejected() {
+        // `country` in inline backticks is a plain English word, not a
+        // code identifier — it should never surface as a concept candidate.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let body = "Set `country` on the row.\n`country` is a column.\n`country` filters apply.\n";
+        write_normalized_source(root, "doc-a", body);
+        write_normalized_source(root, "doc-b", body);
+        write_normalized_source(root, "doc-c", body);
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            !hits.iter().any(|h| h.name == "country"),
+            "pure-lowercase-English backtick word must be rejected: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn backtick_real_identifiers_survive() {
+        // Identifiers with a capital letter, digit, or non-alpha character
+        // are legitimate code identifiers and must still be picked up.
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // Each identifier appears in 3 sources with >=5 mentions each.
+        let body = "The `recLSN` pointer, `go/types` package, `FooBar` struct, and `LSM_tree` all matter.\nRepeat: `recLSN` `go/types` `FooBar` `LSM_tree`.\n";
+        write_normalized_source(root, "doc-a", body);
+        write_normalized_source(root, "doc-b", body);
+        write_normalized_source(root, "doc-c", body);
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        for ident in &["recLSN", "go/types", "FooBar", "LSM_tree"] {
+            assert!(
+                hits.iter().any(|h| h.name == *ident),
+                "expected identifier '{ident}' to be flagged: {hits:?}"
+            );
+        }
     }
 
     #[test]
