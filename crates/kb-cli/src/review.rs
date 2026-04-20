@@ -1,14 +1,22 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
-use kb_compile::concept_merge::{AppliedMerge, apply_concept_merge};
+use kb_compile::concept_merge::{AppliedMerge, WIKI_CONCEPTS_DIR, apply_concept_merge};
 use kb_compile::promotion::execute_promotion;
 use kb_core::{
     ReviewItem, ReviewKind, ReviewStatus, list_review_items, load_review_item, save_review_item,
 };
+
+/// Prefix used by `kb-lint`'s duplicate-concepts check when it queues a
+/// `concept_merge` review item. These items encode both concept ids in the
+/// review id (`lint:duplicate-concepts:<a_id>:<b_id>`) and use
+/// `reviews/merges/<slug>.json` as their `proposed_destination`. Auto-apply
+/// has to derive the canonical concept page from the id instead of reading
+/// `proposed_destination` (which points at the proposal sidecar, not a page).
+const LINT_DUPLICATE_CONCEPTS_PREFIX: &str = "lint:duplicate-concepts:";
 
 fn now_millis() -> Result<u64> {
     let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
@@ -264,11 +272,25 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
             }
         }
         ReviewKind::ConceptMerge => {
-            let applied = apply_concept_merge(root, &item)
+            // `lint:duplicate-concepts:...` items have a different shape from the
+            // merge-pass-produced `merge:<slug>` items: their
+            // `proposed_destination` points at the proposal JSON sidecar, not a
+            // concept page, so they can't be fed to `apply_concept_merge`
+            // as-is. Rewrite the item in-memory to the shape apply expects (see
+            // `prepare_lint_duplicate_concepts_merge`), then delegate.
+            let apply_item = if id.starts_with(LINT_DUPLICATE_CONCEPTS_PREFIX) {
+                prepare_lint_duplicate_concepts_merge(&item)
+                    .with_context(|| format!("prepare lint-duplicate-concepts apply for '{id}'"))?
+            } else {
+                item.clone()
+            };
+
+            let applied = apply_concept_merge(root, &apply_item)
                 .with_context(|| format!("apply concept merge for review '{id}'"))?;
 
             let prior_status = item.status;
-            // Flip status on first apply; a re-apply leaves it approved.
+            // Flip status on first apply; a re-apply leaves it approved. Persist
+            // the original (on-disk) item, not the synthesized apply-item.
             if prior_status == ReviewStatus::Pending {
                 let mut approved = item;
                 approved.status = ReviewStatus::Approved;
@@ -309,6 +331,88 @@ pub fn run_review_approve(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(
     }
 
     Ok(())
+}
+
+/// Rewrite a `lint:duplicate-concepts:<a_id>:<b_id>` review item into the shape
+/// `apply_concept_merge` expects.
+///
+/// The original item's `proposed_destination` points at the proposal JSON
+/// sidecar (`reviews/merges/<slug>.json`) because `save_review_item` also uses
+/// it as the item's output path. Apply needs a concept page path instead.
+///
+/// Parsing convention (mirrors how the lint emitter builds the id — see
+/// `crates/kb-lint/src/lib.rs::build_review_item`): the two concept ids are
+/// joined with `:` after the fixed prefix. The *second* id is treated as the
+/// canonical page (the duplicate-detection comment is phrased "A is a
+/// near-duplicate of B", so B is the surviving page). The *first* id is folded
+/// into the canonical.
+///
+/// Concept ids have the shape `concept:<slug>` with slugs restricted to
+/// `[a-z0-9-]+` (see `kb_core::slug_from_title`), so splitting on `:concept:`
+/// is unambiguous. Each id's slug (the part after `concept:`) is also the file
+/// stem of its `wiki/concepts/<slug>.md` page.
+///
+/// The synthesized item keeps the original id (used only for error messages
+/// inside apply) but carries `proposed_destination` = canonical page path and
+/// `dependencies` = \[`canonical_slug`, `merged_from_slug`\] — which
+/// `apply_concept_merge` then slugs to find each member file. Because
+/// `slug_from_title("raft-consensus") == "raft-consensus"`, the slug of the
+/// canonical dependency matches the canonical page stem (so apply skips it)
+/// and the slug of the merged-from dependency finds the right member file.
+fn prepare_lint_duplicate_concepts_merge(item: &ReviewItem) -> Result<ReviewItem> {
+    let id = &item.metadata.id;
+    let payload = id
+        .strip_prefix(LINT_DUPLICATE_CONCEPTS_PREFIX)
+        .with_context(|| format!("review id '{id}' missing expected lint-duplicate prefix"))?;
+
+    // `payload` is `<a_id>:<b_id>` with each id in the form `concept:<slug>`.
+    // Split on the single `:concept:` separator that joins them.
+    let (merged_from_id, canonical_id) = split_concept_pair(payload).with_context(|| {
+        format!(
+            "cannot parse pair of concept ids from review id '{id}' (expected \
+             '{LINT_DUPLICATE_CONCEPTS_PREFIX}concept:<a>:concept:<b>')"
+        )
+    })?;
+
+    let canonical_slug = canonical_id
+        .strip_prefix("concept:")
+        .with_context(|| format!("canonical id '{canonical_id}' does not start with 'concept:'"))?;
+    let merged_from_slug = merged_from_id.strip_prefix("concept:").with_context(|| {
+        format!("merged-from id '{merged_from_id}' does not start with 'concept:'")
+    })?;
+
+    if canonical_slug.is_empty() || merged_from_slug.is_empty() {
+        bail!("review id '{id}' encodes an empty concept slug; cannot apply");
+    }
+
+    let canonical_rel = PathBuf::from(WIKI_CONCEPTS_DIR).join(format!("{canonical_slug}.md"));
+
+    let mut synthesized = item.clone();
+    synthesized.proposed_destination = Some(canonical_rel);
+    // `apply_concept_merge` slugs each dependency with `slug_from_title`. Feed
+    // it the bare slugs so they round-trip to the correct file stems (feeding
+    // the raw ids like `concept:raft-consensus` would slug to
+    // `concept-raft-consensus` and miss the file).
+    synthesized.metadata.dependencies =
+        vec![canonical_slug.to_string(), merged_from_slug.to_string()];
+
+    Ok(synthesized)
+}
+
+/// Split a `concept:<a>:concept:<b>` string into `(concept:<a>, concept:<b>)`.
+///
+/// Returns `None` if the separator `:concept:` is missing.
+fn split_concept_pair(payload: &str) -> Option<(&str, &str)> {
+    // Skip the leading `concept:` so the first `:concept:` we find is the
+    // separator between the two ids, not a prefix match on the opening id.
+    let after_first = payload.strip_prefix("concept:")?;
+    let sep = after_first.find(":concept:")?;
+    let first_slug = &after_first[..sep];
+    let second_with_prefix = &after_first[sep + 1..]; // drop the leading ':'
+    // Reconstruct the first id with its `concept:` prefix restored.
+    let first_id_end = "concept:".len() + first_slug.len();
+    let first_id = &payload[..first_id_end];
+    Some((first_id, second_with_prefix))
 }
 
 fn emit_concept_merge_applied(

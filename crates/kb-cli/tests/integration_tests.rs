@@ -3384,3 +3384,188 @@ fn lint_ignores_stale_compile_metadata_from_dead_pid() {
         "stale metadata from a dead pid must not trigger the warning: {stderr}"
     );
 }
+
+// ── lint:duplicate-concepts auto-apply tests ─────────────────────────────────
+
+/// Seed a `lint:duplicate-concepts:...` review item that mimics what
+/// `kb-lint`'s duplicate-concepts check produces: `proposed_destination` points
+/// at the proposal JSON sidecar (NOT a concept page), and `dependencies` holds
+/// the two concept ids. The auto-apply path has to recover the canonical
+/// concept page from the review id.
+fn seed_lint_duplicate_concepts_review(
+    root: &Path,
+    merged_from_concept_id: &str,
+    canonical_concept_id: &str,
+) -> (String, PathBuf) {
+    let id = format!("lint:duplicate-concepts:{merged_from_concept_id}:{canonical_concept_id}");
+    // Mirror the lint emitter: proposed_destination is a slugged JSON path
+    // under reviews/merges/ (NOT a wiki/concepts/ page path). This is what
+    // bn-1e9's auto-apply mistakenly tried to read as a concept page.
+    let slug_a = merged_from_concept_id.replace(':', "-");
+    let slug_b = canonical_concept_id.replace(':', "-");
+    let proposal_rel = PathBuf::from(format!(
+        "reviews/merges/lint-duplicate-concepts-{slug_a}-{slug_b}.json"
+    ));
+    let item = ReviewItem {
+        metadata: EntityMetadata {
+            id: id.clone(),
+            created_at_millis: 1_000,
+            updated_at_millis: 1_000,
+            source_hashes: vec![],
+            model_version: None,
+            tool_version: Some("kb-test".to_string()),
+            prompt_template_hash: None,
+            dependencies: vec![
+                merged_from_concept_id.to_string(),
+                canonical_concept_id.to_string(),
+            ],
+            output_paths: vec![proposal_rel.clone()],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::ConceptMerge,
+        target_entity_id: merged_from_concept_id.to_string(),
+        proposed_destination: Some(proposal_rel),
+        citations: vec![],
+        affected_pages: vec![],
+        created_at_millis: 1_000,
+        status: ReviewStatus::Pending,
+        comment: format!(
+            "Near-duplicate of '{canonical_concept_id}' (similarity: 1.00; matched: 'x' \u{2248} 'x')"
+        ),
+    };
+    save_review_item(root, &item).expect("save lint-duplicate review item");
+    let saved_path = root.join(format!("reviews/merges/{id}.json"));
+    (id, saved_path)
+}
+
+#[test]
+fn review_approve_applies_lint_duplicate_concepts() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // By convention, the *second* concept id in the review id is the canonical
+    // (the page that survives). Here: `raft-consensus` is canonical,
+    // `byzantine-consensus` is folded in and deleted.
+    let canonical = seed_concept_page(
+        &kb_root,
+        "wiki/concepts/raft-consensus.md",
+        "id: concept:raft-consensus\nname: Raft consensus\naliases:\n  - raft\n",
+        "\n# Raft consensus\n\nLeader-based consensus.\n",
+    );
+    let merged_from = seed_concept_page(
+        &kb_root,
+        "wiki/concepts/byzantine-consensus.md",
+        "id: concept:byzantine-consensus\nname: Byzantine consensus\naliases:\n  - bft\nsource_document_ids:\n  - src-bft\n",
+        "\n# Byzantine consensus\n\nBFT.\n",
+    );
+
+    let (id, review_path) = seed_lint_duplicate_concepts_review(
+        &kb_root,
+        "concept:byzantine-consensus",
+        "concept:raft-consensus",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg(&id);
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        output.status.success(),
+        "kb review approve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("concept_merge"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("wiki/concepts/raft-consensus.md"),
+        "stdout should show canonical path: {stdout}"
+    );
+    assert!(
+        stdout.contains("byzantine-consensus"),
+        "stdout should mention subsumed member: {stdout}"
+    );
+
+    // Merged-from file is deleted; canonical remains.
+    assert!(
+        !merged_from.exists(),
+        "subsumed concept page should be deleted"
+    );
+    assert!(canonical.exists(), "canonical concept page must survive");
+
+    // Canonical absorbed the member's alias + source id.
+    let canonical_text = fs::read_to_string(&canonical).expect("read canonical");
+    assert!(
+        canonical_text.contains("- bft"),
+        "member alias merged: {canonical_text}"
+    );
+    assert!(
+        canonical_text.contains("src-bft"),
+        "member source id merged: {canonical_text}"
+    );
+    assert!(
+        canonical_text.contains("- raft"),
+        "pre-existing alias preserved: {canonical_text}"
+    );
+
+    // Review item flipped to approved; proposed_destination is preserved
+    // unchanged on disk (we only rewrite it in-memory for the apply call).
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).expect("read review"))
+            .expect("parse");
+    assert_eq!(saved["status"], "approved");
+
+    // Re-approve is an idempotent no-op.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg(&id);
+    let output = cmd.output().expect("run kb review approve (reapply)");
+    assert!(
+        output.status.success(),
+        "re-approve must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let canonical_text_after = fs::read_to_string(&canonical).expect("read canonical again");
+    assert_eq!(
+        canonical_text, canonical_text_after,
+        "re-apply must not mutate canonical page"
+    );
+}
+
+#[test]
+fn review_approve_lint_duplicate_concepts_missing_canonical_bails() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Only the merged-from page exists; the canonical is missing. Apply must
+    // error cleanly and leave the review item pending.
+    let merged_from = seed_concept_page(
+        &kb_root,
+        "wiki/concepts/byzantine-consensus.md",
+        "id: concept:byzantine-consensus\nname: Byzantine consensus\n",
+        "\n# Byzantine consensus\n",
+    );
+
+    let (id, review_path) = seed_lint_duplicate_concepts_review(
+        &kb_root,
+        "concept:byzantine-consensus",
+        "concept:raft-consensus",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("review").arg("approve").arg(&id);
+    let output = cmd.output().expect("run kb review approve");
+    assert!(
+        !output.status.success(),
+        "approve should fail when canonical page is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("canonical") || stderr.contains("raft-consensus"),
+        "stderr should mention missing canonical: {stderr}"
+    );
+
+    // Review still pending; merged-from file untouched.
+    let saved: Value =
+        serde_json::from_str(&fs::read_to_string(&review_path).expect("read review"))
+            .expect("parse");
+    assert_eq!(saved["status"], "pending");
+    assert!(merged_from.exists(), "merged-from page must not be deleted");
+}
