@@ -1208,3 +1208,39 @@
 1776713764201505	bob	itc:v3:AWKSc8kyZJPJk5EAAAAAQau9WtV610AAAAEzCA		item.update	bn-6y85	{"field":"urgency","value":"punt"}	blake3:vKokPFYoUXNtqOEzn4vBcyFdR5SY0CP-_RIE7XZ-QMc
 1776713764209776	bob	itc:v3:AWKSc8kyZJPJk5EAAAAAQau9WtV610AAAAEzCQ		item.update	bn-6y85	{"field":"labels","value":[]}	blake3:cs0GQkcbeJAKM-P2xatJvK3PLqVwhiP5_wIKgFVK7YE
 1776713850573037	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtiAY		item.move	bn-uh3n	{"state":"done"}	blake3:0clGNT600a4PF_Er2urtJ6JpFVCh5d8NV2jIN-t9mB4
+1776719860889061	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtiQY		item.move	bn-1sl5	{"state":"doing"}	blake3:fVvYGyjcfbDeFajL2TZLLQOqqvUzypt8dTl3N-3TMuA
+1776719860899137	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtigY		item.assign	bn-1sl5	{"action":"assign","agent":"kb-dev"}	blake3:CsD6xkzfBkt2wjIuVDiwGGNXX9k4Cr5uwTVl4ifXgZw
+1776719881337332	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtiwY		item.move	bn-31lt	{"state":"doing"}	blake3:VWTYvLyBh1_CRqHgxdxqq4Dih37yHawUoBhc3MwXyDw
+1776719881347578	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtjAY		item.assign	bn-31lt	{"action":"assign","agent":"kb-dev"}	blake3:MrVcffOjY7T5pVcGfZ6XPSFTKgGE1T9Yn4yRMLwreJ4
+1776719892787334	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtjQY		item.move	bn-eqx7	{"state":"doing"}	blake3:UNNLw7aWnjLgDXc4QKQqIxoH8AtDuoWaXQpTvN_wARg
+1776719892797199	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtjgY		item.assign	bn-eqx7	{"action":"assign","agent":"kb-dev"}	blake3:sDjwt59gPYRNasoXU1Z6hp5py54OSUNRV3qy4tI7gWI
+1776719907871359	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtjwY		item.move	bn-35ap	{"state":"doing"}	blake3:_tmlEKTMaxBsFNPopdBoqmegblSLAWxcFkKkw64LM0s
+1776719907881607	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtkAY		item.assign	bn-35ap	{"action":"assign","agent":"kb-dev"}	blake3:F5U_fmWm5p2SFm_kOO6q9jzc-1OABTTHpPO1AcayKmk
+1776719931246510	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtkQY		item.move	bn-6y85	{"state":"doing"}	blake3:sRcAoxFLeF5xhcsFCDqVZmJqu66oSxMW7lrp2iMDTc0
+1776719931256642	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtkgY		item.assign	bn-6y85	{"action":"assign","agent":"kb-dev"}	blake3:TSg3KpxhVwEgcpYyirLKgqBreFkHlmDBKRxOy-UogFE
+1776720344110580	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtkwY		item.move	bn-6y85	{"state":"done"}	blake3:88fr9ZzdVQ2V1C7UYYQE6X8Oy7wSBzjRZ62gK4QKYck
+1776720583451290	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtlAY		item.move	bn-35ap	{"state":"done"}	blake3:SCZEqxP2_BEltaAljwYWealrtBJHwPD-8MabSlfnwiQ
+1776720611265751	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtlQY		item.move	bn-eqx7	{"state":"done"}	blake3:vEf2vYMxWf9q3k16Lo0lrIlWhp7p9ek2dRNOeuWr4Mc
+1776720768112011	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtlgY		item.move	bn-1sl5	{"state":"done"}	blake3:M3xGATzC6N4nB5oqXMUAs9_5Ct5p64ruInUPFfq_hXI
+1776720820421475	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtlwY		item.move	bn-31lt	{"state":"done"}	blake3:KqtAqg7yTQ87_TJP852DFKrwQfOnVwbf_kN6YoAmcyc
+1776720825348852	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtmAY		item.create	bn-lw06	{"description":"bn-31lt added the missing_concepts lint and concept_candidate review kind, but the approve handler is stubbed. When a user runs 'kb review approve concept-candidate:<name>', currently it flips the item to Approved and prints a note. Complete the flow: call the LLM with the term + source snippets, have it produce a concept page (name, aliases, definition, source_document_ids), write wiki/concepts/<slug>.md, run backlinks refresh. Target: mirrors the existing concept_merge apply flow.","kind":"task","title":"feat(lint): wire concept-candidate approve handler to LLM-driven concept-page generation"}	blake3:CBPlQQmpQwrgz5KKWXTpxGxSdt7ZW2D0P4YyBt7jTR0
+1776720881891679	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtmQY		item.move	bn-23am	{"state":"doing"}	blake3:Gz6hGDuRqNOdkqorwZtcWOWSZKIWyDR8FnYkeJyiQ0I
+1776720881903688	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtmgY		item.assign	bn-23am	{"action":"assign","agent":"kb-dev"}	blake3:TSRIsiVrHL2dFw9tDPaWaGRtZ0iGVij1ulwJgdFRgfg
+1776720905228295	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtmwY		item.move	bn-3axp	{"state":"doing"}	blake3:eGGnuZb_nGqFLPpIra6CSqpVKzoJoqUcXw1_p7tEhtU
+1776720905232543	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtnAY		item.assign	bn-3axp	{"action":"assign","agent":"kb-dev"}	blake3:lrNfDZpvlGBcErML5jNqfWveKauS6G9sDP2DTNSpxZg
+1776720922933020	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtnQY		item.move	bn-3dkw	{"state":"doing"}	blake3:syiv-x-bnUw0OI7AETH4Ugan92xmF66iD_T1U5tn9qE
+1776720922945178	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtngY		item.assign	bn-3dkw	{"action":"assign","agent":"kb-dev"}	blake3:uPNCjntq7jLX_4kJ7Uxk9KNbBOOUHaca-F1ogYhuNH8
+1776720945862246	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtnwY		item.move	bn-lw06	{"state":"doing"}	blake3:_EwP1IDDgfeTNYeavVdZSqu-yJ3yTnYIR22Kan68I9g
+1776720945874391	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtoAY		item.assign	bn-lw06	{"action":"assign","agent":"kb-dev"}	blake3:VR27Wsuy8IPSIDDeSTlYM5fUSqRCvuO8kVyRQ5hh5KA
+1776721691374872	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtoQY		item.move	bn-3dkw	{"state":"done"}	blake3:WlPkbVrBOkSwY1AVavdP2V1fe3hG0zi1BS4rdlWRgDo
+1776721741831013	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtogY		item.comment	bn-23am	{"body":"implementation complete on ws bn-23am; feat(ingest) commit fe9fd7f; just check green; mock via sh shim + whitespace-split command string"}	blake3:gzPN8K1BpUgwp3FJkEINYerluVG7Tunm_kOlDmClsio
+1776721786961957	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtowY		item.move	bn-23am	{"state":"done"}	blake3:53i4VUCEsM5uQk0grgu-aZq1acJ8nVBHd6DKnWvhLTE
+1776721959797969	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtpAY		item.move	bn-3axp	{"state":"done"}	blake3:0i7plsAba-wZ5ZcIODJ4EID0YNdQ5s0Baoiv0pR60_4
+1776722269118931	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtpQY		item.move	bn-lw06	{"state":"done"}	blake3:ndiS0EVQwvNaFXGbvxs4xO1uy0GKzV5fzArKahrbEBE
+1776722321454763	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtpgY		item.move	bn-xt4o	{"state":"doing"}	blake3:wWCUkldcIV9FdH1NTQYUvh-RCUO9xWKl3uaG_KfXd34
+1776722321458575	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtpwY		item.assign	bn-xt4o	{"action":"assign","agent":"kb-dev"}	blake3:5ovWH7aCoTsvSj6o8MgDQHklGMZMdlRwQM3wYBTTAzY
+1776722340864016	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtqAY		item.move	bn-2t3t	{"state":"doing"}	blake3:PsLlTWLLQ_QxIUrbljxfMRsMFIAnZha9btfHQ14l7kQ
+1776722340873995	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtqQY		item.assign	bn-2t3t	{"action":"assign","agent":"kb-dev"}	blake3:w0Rnh-_nllrIcv9OF90ENM-NsSyHrzh5GOIf8DnWEG8
+1776722909258063	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtqgY		item.move	bn-2t3t	{"state":"done"}	blake3:cT7itxJoklCp4Rbj0nSlxqaHHv4Y20yylFwwXnTXzhQ
+1776723916664255	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtqwY		item.comment	bn-xt4o	{"body":"kb-dev: feat complete in ws/bn-xt4o. --impute gated flag, web-search tools flipped on per-call (opencode webfetch / claude WebSearch+WebFetch), MissingConcept + ThinConceptBody supported, apply handler preserves managed regions, integration test covers full thin-body round-trip, just check clean. DO NOT MERGE — handing off to lead."}	blake3:HLc0V7deQg1NNGvmrXaq0DnFnw6ipCaYnsF8RRT2PZA
+1776723994928639	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEtrAY		item.move	bn-xt4o	{"state":"done"}	blake3:matGQl5L1NcD6fY1GUnW9INjEHz7XEJ0Ezu-n4iP2eM
