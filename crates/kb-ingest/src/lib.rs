@@ -413,7 +413,8 @@ fn ingest_file(
         // (compile, query) can consume the ingested source. The raw/ tree
         // remains the immutable source archive; normalized/ is the derived
         // view keyed by source-document id.
-        write_normalized_for_file(root, &document, &revision, &content)?;
+        let md_dir = canonical_source.parent().unwrap_or_else(|| Path::new(""));
+        write_normalized_for_file(root, &document, &revision, &content, md_dir)?;
     }
 
     let outcome = if !document_exists {
@@ -551,11 +552,40 @@ fn write_normalized_for_file(
     document: &SourceDocument,
     revision: &SourceRevision,
     content: &[u8],
+    markdown_dir: &Path,
 ) -> Result<()> {
-    let canonical_text = std::str::from_utf8(content).map_or_else(
+    let raw_text = std::str::from_utf8(content).map_or_else(
         |_| String::from_utf8_lossy(content).into_owned(),
         ToOwned::to_owned,
     );
+
+    // Stage images into a per-document scratch dir before handing them to
+    // `write_normalized_document`. The staging dir's basenames become the
+    // destination basenames under `normalized/<src>/assets/`, so this is also
+    // where we resolve collisions between two source paths that share a
+    // file name.
+    let staging_dir = root
+        .join("normalized")
+        .join(&document.metadata.id)
+        .join(".staging-assets");
+    fs::create_dir_all(&staging_dir).with_context(|| {
+        format!(
+            "failed to create asset staging dir {}",
+            staging_dir.display()
+        )
+    })?;
+
+    // Scan the markdown for `![alt](path.png)` references and stage any that
+    // point at local files passing the size/extension gates. The returned
+    // `rewritten_markdown` is what we persist as normalized source.md — its
+    // image paths are all either external URLs (untouched) or rewritten to
+    // `assets/<basename>` relative to `normalized/<src>/`.
+    let image_refs::CopiedImages {
+        normalized_assets,
+        rewritten_markdown,
+    } = image_refs::scan_and_stage(&raw_text, markdown_dir, &staging_dir)
+        .with_context(|| format!("failed to stage images for {}", document.metadata.id))?;
+    let canonical_text = rewritten_markdown;
     let heading_ids = extract_heading_ids(&canonical_text);
 
     let now = now_millis()?;
@@ -583,12 +613,18 @@ fn write_normalized_for_file(
         metadata: normalized_metadata,
         source_revision_id: revision.metadata.id.clone(),
         canonical_text,
-        normalized_assets: Vec::new(),
+        normalized_assets,
         heading_ids,
     };
 
     write_normalized_document(root, &normalized)
         .with_context(|| format!("failed to write normalized document {}", document.metadata.id))?;
+
+    // Staging dir is only a copy hop for `copy_and_validate_assets`; once the
+    // canonical `normalized/<src>/assets/` files exist, the scratch is
+    // disposable. Swallow cleanup errors — they're cosmetic and wouldn't
+    // affect correctness.
+    let _ = fs::remove_dir_all(&staging_dir);
     Ok(())
 }
 
@@ -1056,6 +1092,243 @@ mod tests {
         assert!(reports[0].ingested.copied_path.ends_with("notes.md"));
     }
 
+    /// bn-1geb Part A acceptance: a markdown file with a local PNG
+    /// reference copies the image into `normalized/<src>/assets/` and
+    /// rewrites the reference to `assets/<basename>`.
+    #[test]
+    fn ingest_markdown_with_png_copies_and_rewrites() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+
+        // A fake PNG — the first 8 bytes pass the text check trivially on
+        // the markdown file and the asset itself is never fed to the text
+        // probe (it's referenced, not ingested as a source).
+        let png_bytes = b"\x89PNG\r\n\x1a\nfake";
+        fs::write(source_root.path().join("pic.png"), png_bytes).expect("write png");
+        let md = source_root.path().join("notes.md");
+        fs::write(&md, "# Notes\n\n![alpha](./pic.png)\n").expect("write md");
+
+        let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
+        assert_eq!(ingested.len(), 1);
+        let src_id = &ingested[0].document.metadata.id;
+
+        let asset_path = kb_root
+            .path()
+            .join("normalized")
+            .join(src_id)
+            .join("assets")
+            .join("pic.png");
+        assert!(
+            asset_path.is_file(),
+            "ingested asset should exist at {}",
+            asset_path.display()
+        );
+        assert_eq!(
+            fs::read(&asset_path).expect("read asset"),
+            png_bytes,
+            "asset bytes must match original"
+        );
+
+        let normalized_source = kb_root
+            .path()
+            .join("normalized")
+            .join(src_id)
+            .join("source.md");
+        let rewritten = fs::read_to_string(&normalized_source).expect("read normalized md");
+        assert!(
+            rewritten.contains("![alpha](assets/pic.png)"),
+            "source.md should have rewritten ref; got: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains("./pic.png"),
+            "original relative ref should not survive: {rewritten}"
+        );
+    }
+
+    /// bn-1geb Part A acceptance: two PNGs with the same basename in
+    /// different directories each land as a separate asset with a
+    /// hash-suffixed name.
+    #[test]
+    fn ingest_basename_collision_hashes_suffix() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let a_dir = source_root.path().join("a");
+        let b_dir = source_root.path().join("b");
+        fs::create_dir_all(&a_dir).expect("mkdir a");
+        fs::create_dir_all(&b_dir).expect("mkdir b");
+        fs::write(a_dir.join("pic.png"), b"AAA").expect("write a png");
+        fs::write(b_dir.join("pic.png"), b"BBB").expect("write b png");
+
+        let md = source_root.path().join("notes.md");
+        fs::write(&md, "![one](./a/pic.png)\n![two](./b/pic.png)\n")
+            .expect("write md");
+
+        let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
+        let src_id = &ingested[0].document.metadata.id;
+
+        let assets_dir = kb_root
+            .path()
+            .join("normalized")
+            .join(src_id)
+            .join("assets");
+        let entries: Vec<String> = fs::read_dir(&assets_dir)
+            .expect("read assets")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(entries.len(), 2, "expected 2 assets, got: {entries:?}");
+        // Both distinct filenames, both end in .png
+        assert_ne!(entries[0], entries[1]);
+        for name in &entries {
+            assert!(
+                Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("png")),
+                "unexpected asset: {name}"
+            );
+        }
+    }
+
+    /// bn-1geb Part A acceptance: a broken image reference logs a warning
+    /// but does not fail the ingest. The original reference survives into
+    /// the normalized source.
+    #[test]
+    fn ingest_missing_png_warns_and_continues() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let md = source_root.path().join("notes.md");
+        fs::write(&md, "body\n\n![x](./does-not-exist.png)\n").expect("write md");
+
+        let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
+        assert_eq!(ingested.len(), 1);
+        let src_id = &ingested[0].document.metadata.id;
+
+        let assets_dir = kb_root
+            .path()
+            .join("normalized")
+            .join(src_id)
+            .join("assets");
+        let entries: Vec<_> = fs::read_dir(&assets_dir)
+            .expect("read assets")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(entries.is_empty(), "no assets should be staged");
+
+        let rewritten = fs::read_to_string(
+            kb_root
+                .path()
+                .join("normalized")
+                .join(src_id)
+                .join("source.md"),
+        )
+        .expect("read normalized");
+        assert!(
+            rewritten.contains("./does-not-exist.png"),
+            "original broken ref should be preserved; got: {rewritten}"
+        );
+    }
+
+    /// bn-1geb Part A acceptance: URL images are left byte-identical and
+    /// never copied.
+    #[test]
+    fn ingest_url_image_untouched() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        let md = source_root.path().join("notes.md");
+        fs::write(&md, "![ext](https://example.com/pic.png)\n").expect("write md");
+
+        let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
+        let src_id = &ingested[0].document.metadata.id;
+        let rewritten = fs::read_to_string(
+            kb_root
+                .path()
+                .join("normalized")
+                .join(src_id)
+                .join("source.md"),
+        )
+        .expect("read normalized");
+        assert!(
+            rewritten.contains("https://example.com/pic.png"),
+            "URL ref must survive verbatim: {rewritten}"
+        );
+
+        let assets_dir = kb_root
+            .path()
+            .join("normalized")
+            .join(src_id)
+            .join("assets");
+        let entries: Vec<_> = fs::read_dir(&assets_dir)
+            .expect("read assets")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(entries.is_empty(), "no assets should be staged for URL");
+    }
+
+    /// bn-1geb Part A acceptance: images above the 10MB per-file cap are
+    /// skipped with a warning; the reference is preserved unchanged.
+    #[test]
+    fn ingest_oversized_image_skipped() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        // 11 MiB of zero bytes; the size probe only checks `metadata.len()`
+        // so we don't need a valid PNG header here.
+        let big_bytes = vec![0u8; 11 * 1024 * 1024];
+        fs::write(source_root.path().join("huge.png"), &big_bytes).expect("write huge");
+
+        let md = source_root.path().join("notes.md");
+        fs::write(&md, "![big](./huge.png)\n").expect("write md");
+
+        let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
+        let src_id = &ingested[0].document.metadata.id;
+
+        let asset = kb_root
+            .path()
+            .join("normalized")
+            .join(src_id)
+            .join("assets")
+            .join("huge.png");
+        assert!(!asset.exists(), "oversized asset must not be copied");
+        let rewritten = fs::read_to_string(
+            kb_root
+                .path()
+                .join("normalized")
+                .join(src_id)
+                .join("source.md"),
+        )
+        .expect("read normalized");
+        assert!(
+            rewritten.contains("./huge.png"),
+            "original ref must be preserved for oversized images: {rewritten}"
+        );
+    }
+
+    /// bn-1geb Part A acceptance: only allow-listed image extensions are
+    /// copied. A markdown reference pointing at a CSV file is left alone
+    /// — we don't want to pull random binary/data files into the KB tree.
+    #[test]
+    fn ingest_unsupported_extension_skipped() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+        fs::write(source_root.path().join("data.csv"), b"col\n1\n2\n").expect("write csv");
+        let md = source_root.path().join("notes.md");
+        fs::write(&md, "see ![data](./data.csv)\n").expect("write md");
+
+        let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
+        let src_id = &ingested[0].document.metadata.id;
+
+        let assets_dir = kb_root
+            .path()
+            .join("normalized")
+            .join(src_id)
+            .join("assets");
+        let entries: Vec<_> = fs::read_dir(&assets_dir)
+            .expect("read assets")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(entries.is_empty(), "no assets should be staged for csv ref");
+    }
+
     #[test]
     fn dry_run_reports_changes_without_writing_files() {
         let kb_root = init_kb_root();
@@ -1084,7 +1357,9 @@ mod tests {
 }
 
 mod headings;
+mod image_refs;
 mod url;
 
 pub use headings::extract_heading_ids;
+pub use image_refs::{CopiedImages, rewrite_asset_refs, scan_and_stage};
 pub use url::{UrlIngestReport, ingest_url, ingest_url_with_options};

@@ -32,7 +32,18 @@ pub fn run_publish(
     let dest_root = resolve_dest(root, &target_cfg.path);
     let filter = target_cfg.filter.as_deref().unwrap_or("");
 
-    let candidates = collect_matching_files(root, filter)?;
+    let mut candidates = collect_matching_files(root, filter)?;
+    // Implicit extra include: any `normalized/<src>/assets/<file>` that is
+    // referenced by the published wiki tree needs to travel with it,
+    // otherwise the `../../normalized/<src>/assets/<file>` refs on the
+    // wiki source pages (set up in Part B) break on the target.
+    //
+    // We mirror the tree as-is (Approach 1): assets land at the same
+    // relative path on the target, so no wiki-page rewriting is needed at
+    // publish time. Users don't get a knob to disable this — a publish
+    // that loses image files isn't the behaviour anyone wants.
+    append_unique(&mut candidates, collect_asset_files(root)?);
+    candidates.sort();
 
     let mut results = Vec::new();
 
@@ -56,9 +67,15 @@ pub fn run_publish(
             fs::create_dir_all(parent)?;
         }
 
-        let content = fs::read_to_string(&src)?;
-        let rewritten = rewrite_links(&content, root, rel);
-        fs::write(&dest, rewritten.as_bytes())?;
+        if is_asset_path(rel) {
+            // Asset files may be binary (png, jpg, etc.) — copy bytes
+            // verbatim without the markdown link-rewriting pass.
+            fs::copy(&src, &dest)?;
+        } else {
+            let content = fs::read_to_string(&src)?;
+            let rewritten = rewrite_links(&content, root, rel);
+            fs::write(&dest, rewritten.as_bytes())?;
+        }
 
         results.push(PublishFileResult {
             source: source_str,
@@ -151,6 +168,92 @@ fn collect_recursive(
     }
 
     Ok(())
+}
+
+/// Walk `root`/normalized/ and collect every file under
+/// `normalized/<src>/assets/`. These travel alongside the wiki tree so that
+/// `../../normalized/<src>/assets/<basename>` references (set up by Part B)
+/// resolve on the published target.
+fn collect_asset_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let normalized_root = root.join("normalized");
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(&normalized_root) else {
+        // No normalized tree yet (e.g. a freshly-initialized KB). Nothing to
+        // publish under assets/.
+        return Ok(out);
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let assets_dir = entry.path().join("assets");
+        if !assets_dir.is_dir() {
+            continue;
+        }
+        collect_files_under(root, &assets_dir, &mut out)?;
+    }
+    Ok(out)
+}
+
+/// Recursively collect every file under `dir`, returning paths relative to
+/// `root`. Used for mirroring the asset tree without applying the publish
+/// filter.
+fn collect_files_under(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_files_under(root, &path, out)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .map_err(|_| anyhow::anyhow!("asset path escapes root"))?
+            .to_path_buf();
+        out.push(rel);
+    }
+    Ok(())
+}
+
+/// Append items from `extra` to `list`, skipping any paths already present.
+/// Used to merge the implicit asset tree with the filter-matched wiki files.
+fn append_unique(list: &mut Vec<PathBuf>, extra: Vec<PathBuf>) {
+    for item in extra {
+        if !list.iter().any(|existing| existing == &item) {
+            list.push(item);
+        }
+    }
+}
+
+/// True for paths shaped like `normalized/<src>/assets/<...>` — the implicit
+/// asset tree we carry along with every publish.
+fn is_asset_path(rel: &Path) -> bool {
+    let mut components = rel.components();
+    let Some(first) = components.next() else {
+        return false;
+    };
+    if first.as_os_str() != std::ffi::OsStr::new("normalized") {
+        return false;
+    }
+    // skip <src>
+    if components.next().is_none() {
+        return false;
+    }
+    let Some(third) = components.next() else {
+        return false;
+    };
+    third.as_os_str() == std::ffi::OsStr::new("assets")
 }
 
 fn dir_could_match(dir_rel: &str, filter: &str) -> bool {
@@ -366,5 +469,93 @@ mod tests {
 
         let published = dest.path().join("wiki").join("a.md");
         assert!(published.exists(), "file should exist after both runs");
+    }
+
+    /// bn-1geb Part C acceptance: `normalized/<src>/assets/*` files ride
+    /// along with a `wiki/**` publish so the wiki pages'
+    /// `../../normalized/<src>/assets/<name>` image refs (set up by
+    /// Part B) resolve on the target. Byte content must be preserved —
+    /// the asset branch must not run content through the markdown link
+    /// rewriter (which would corrupt a PNG).
+    #[test]
+    fn publish_copies_assets_to_target() {
+        let kb = tempdir().expect("kb dir");
+        let dest = tempdir().expect("dest dir");
+
+        // Seed a minimal ingest+compile shape by hand: the publish walker
+        // only needs `wiki/**` + `normalized/<src>/assets/*` on disk.
+        let wiki_sources = kb.path().join("wiki/sources");
+        fs::create_dir_all(&wiki_sources).expect("mkdir wiki/sources");
+        fs::write(
+            wiki_sources.join("src-abc.md"),
+            "# Source\n\n![fig](../../normalized/src-abc/assets/diagram.png)\n",
+        )
+        .expect("write wiki source");
+
+        let assets = kb.path().join("normalized/src-abc/assets");
+        fs::create_dir_all(&assets).expect("mkdir assets");
+        // Use raw bytes with a NUL byte embedded — that way any accidental
+        // `read_to_string` + link-rewrite pass would fail with an InvalidData
+        // error, making bugs loud.
+        let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nfake\0image\0bytes";
+        fs::write(assets.join("diagram.png"), png_bytes).expect("write png");
+
+        let target_cfg = crate::config::PublishTargetConfig {
+            path: dest.path().to_string_lossy().into_owned(),
+            filter: Some("wiki/**".to_string()),
+            format: None,
+        };
+
+        run_publish(kb.path(), "notes", &target_cfg, false, false).expect("publish");
+
+        // Wiki page was published…
+        let wiki_out = dest.path().join("wiki/sources/src-abc.md");
+        assert!(wiki_out.is_file(), "wiki source page should exist");
+
+        // …AND the asset rode along at the mirrored path.
+        let asset_out = dest.path().join("normalized/src-abc/assets/diagram.png");
+        assert!(
+            asset_out.is_file(),
+            "asset should be mirrored into target at {}",
+            asset_out.display()
+        );
+        let published_bytes = fs::read(&asset_out).expect("read published asset");
+        assert_eq!(
+            published_bytes, png_bytes,
+            "asset bytes must survive publish unchanged (no text rewriting on binaries)"
+        );
+    }
+
+    /// Publishing a tree with no assets must still succeed — the implicit
+    /// asset collection step must tolerate a missing `normalized/` dir.
+    #[test]
+    fn publish_without_any_assets_still_succeeds() {
+        let kb = tempdir().expect("kb dir");
+        let dest = tempdir().expect("dest dir");
+
+        let wiki = kb.path().join("wiki");
+        fs::create_dir_all(&wiki).expect("create wiki");
+        fs::write(wiki.join("only.md"), "# Only\n").expect("write md");
+
+        let target_cfg = crate::config::PublishTargetConfig {
+            path: dest.path().to_string_lossy().into_owned(),
+            filter: Some("wiki/**".to_string()),
+            format: None,
+        };
+
+        run_publish(kb.path(), "notes", &target_cfg, false, false)
+            .expect("publish with no assets");
+        assert!(dest.path().join("wiki/only.md").is_file());
+    }
+
+    #[test]
+    fn is_asset_path_identifies_normalized_assets_tree() {
+        assert!(is_asset_path(Path::new("normalized/src-abc/assets/pic.png")));
+        assert!(is_asset_path(Path::new(
+            "normalized/src-abc/assets/sub/nested.png"
+        )));
+        assert!(!is_asset_path(Path::new("normalized/src-abc/source.md")));
+        assert!(!is_asset_path(Path::new("wiki/sources/src-abc.md")));
+        assert!(!is_asset_path(Path::new("other/foo.md")));
     }
 }

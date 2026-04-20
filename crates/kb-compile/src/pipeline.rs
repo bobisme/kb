@@ -957,6 +957,15 @@ fn run_per_document_passes(
             .collect();
 
         let generated_at = summary_artifact.build_record.metadata.created_at_millis;
+        // Re-anchor any `![alt](assets/foo.png)` refs the LLM preserved in
+        // the summary. The normalized source stores them relative to
+        // `normalized/<src>/`; the wiki source page is at
+        // `wiki/sources/<src>.md` (two levels deep from root) so it needs
+        // `../../normalized/<src>/assets/...` to resolve the same file.
+        let rewritten_summary = crate::source_page::rewrite_summary_image_refs(
+            &summary_artifact.summary,
+            doc_id,
+        );
         let page_input = crate::source_page::SourcePageInput {
             page_id: &page_id,
             title: &title,
@@ -964,7 +973,7 @@ fn run_per_document_passes(
             source_revision_id: &doc.source_revision_id,
             generated_at,
             build_record_id: &summary_artifact.build_record.metadata.id,
-            summary: &summary_artifact.summary,
+            summary: &rewritten_summary,
             key_topics: &summary_artifact.key_headings,
             citations: &citations_display,
         };

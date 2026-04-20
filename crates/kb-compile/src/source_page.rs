@@ -1,7 +1,9 @@
 use std::path::PathBuf;
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use kb_core::rewrite_managed_region;
+use regex::Regex;
 use serde_yaml::{Mapping, Number, Value};
 
 const TITLE_REGION_ID: &str = "title";
@@ -33,6 +35,66 @@ pub struct SourcePageArtifact {
 #[must_use]
 pub fn source_page_path_for_id(source_id: &str) -> PathBuf {
     PathBuf::from("wiki/sources").join(format!("{}.md", slug_for_path(source_id)))
+}
+
+/// Regex matching `![alt](path)` image references in markdown.
+///
+/// Mirrors the scanner in `kb_ingest::image_refs` but is redeclared here to
+/// avoid pulling `kb-ingest` into kb-compile's dependency graph just for one
+/// regex. The pattern is intentionally conservative — `[^\]]*` for the alt
+/// text and `[^)\s]+` for the path — so it ignores reference-style links,
+/// titles, and footnotes.
+static IMAGE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"!\[([^\]]*)\]\(([^)\s]+)\)").expect("hard-coded image regex is valid")
+});
+
+/// Rewrite `![alt](assets/<basename>)` references in `text` so they resolve
+/// from the wiki source page's location.
+///
+/// Normalized sources store image refs as `assets/<basename>` — relative to
+/// `normalized/<src>/source.md`. The wiki source page lives at
+/// `wiki/sources/<src>.md`, which is two directories away from KB root plus
+/// two dirs away from `normalized/<src>/assets/`. The correct relative path
+/// from a wiki source page to its source's assets is therefore
+/// `../../normalized/<src>/assets/<basename>`.
+///
+/// Only refs whose path starts with `assets/` are rewritten — we don't touch
+/// external URLs or refs that have already been re-anchored.
+#[must_use]
+pub fn rewrite_summary_image_refs(text: &str, source_id: &str) -> String {
+    let new_prefix = format!("../../normalized/{source_id}/assets");
+    rewrite_asset_refs_with_prefix(text, &new_prefix)
+}
+
+fn rewrite_asset_refs_with_prefix(text: &str, new_prefix: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    for capture in IMAGE_REF_RE.captures_iter(text) {
+        let whole = capture.get(0).expect("regex always has group 0");
+        out.push_str(&text[cursor..whole.start()]);
+        cursor = whole.end();
+
+        let alt = capture.get(1).map_or("", |m| m.as_str());
+        let path = capture.get(2).map_or("", |m| m.as_str());
+
+        if let Some(rest) = path.strip_prefix("assets/") {
+            out.push_str("![");
+            out.push_str(alt);
+            out.push_str("](");
+            out.push_str(new_prefix);
+            if !new_prefix.ends_with('/') {
+                out.push('/');
+            }
+            out.push_str(rest);
+            out.push(')');
+        } else {
+            out.push_str(whole.as_str());
+        }
+    }
+
+    out.push_str(&text[cursor..]);
+    out
 }
 
 /// Render or update a source wiki page with managed regions and source metadata.
@@ -299,5 +361,38 @@ mod tests {
     fn render_source_page_uses_empty_placeholder_lists() {
         let artifact = render_source_page(&input(&[], &[]), None).expect("render");
         assert!(artifact.body.contains("- _None yet._"));
+    }
+
+    /// bn-1geb Part B acceptance: `rewrite_summary_image_refs` re-anchors
+    /// normalized `assets/foo.png` references so they resolve from
+    /// `wiki/sources/<src>.md`'s location — which is two directories away
+    /// from KB root and two dirs away from `normalized/<src>/assets/`.
+    #[test]
+    fn compile_rewrites_image_paths_in_source_page() {
+        let summary = "See ![fig](assets/diagram.png) and ![url](https://x/y.png).";
+        let out = rewrite_summary_image_refs(summary, "src-abc");
+        assert!(
+            out.contains("![fig](../../normalized/src-abc/assets/diagram.png)"),
+            "rewritten summary must re-anchor assets/ refs: {out}"
+        );
+        // External URLs untouched.
+        assert!(out.contains("![url](https://x/y.png)"));
+    }
+
+    #[test]
+    fn rewrite_summary_image_refs_is_noop_when_no_image_refs() {
+        let summary = "plain prose with [a link](other.md)\n";
+        let out = rewrite_summary_image_refs(summary, "src-xyz");
+        assert_eq!(out, summary);
+    }
+
+    /// Regression guard: references that have already been re-anchored
+    /// (somehow — e.g. an LLM quoting the normalized form verbatim) aren't
+    /// rewritten twice. Only `assets/...` matches.
+    #[test]
+    fn rewrite_summary_image_refs_skips_non_assets_paths() {
+        let summary = "![a](../../normalized/src-xyz/assets/already.png)\n![b](other/thing.png)\n";
+        let out = rewrite_summary_image_refs(summary, "src-xyz");
+        assert_eq!(out, summary);
     }
 }
