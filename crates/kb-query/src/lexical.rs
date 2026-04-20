@@ -23,6 +23,31 @@ const DEFAULT_RETRIEVAL_TOP_K: usize = 25;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MIN_ENTRY_TOKEN_ESTIMATE: u32 = 32;
 
+/// Minimum number of positively-scored candidates that must be produced
+/// before the low-coverage fallback is skipped. See [`LexicalIndex::plan_retrieval`].
+const MIN_CANDIDATES_BEFORE_FALLBACK: usize = 3;
+/// Minimum top-candidate score required to avoid the low-coverage fallback.
+/// Any positive match (score >= 1) keeps the fallback from firing.
+const MIN_TOP_SCORE_BEFORE_FALLBACK: usize = 1;
+/// Upper bound on the number of source-summary pages the fallback will add on
+/// top of the three index pages.
+const FALLBACK_SOURCE_SUMMARY_LIMIT: usize = 5;
+
+/// Reason string stamped on each candidate the low-coverage fallback adds.
+pub const FALLBACK_CANDIDATE_REASON: &str =
+    "fallback: low-coverage (added to provide baseline context)";
+/// Value stored in [`RetrievalPlan::fallback_reason`] when the low-coverage
+/// fallback fires.
+pub const FALLBACK_REASON_LOW_COVERAGE: &str = "low-coverage";
+
+/// Relative paths of the three auto-generated wiki index pages the fallback
+/// always tries to include (in this order).
+const FALLBACK_INDEX_PAGES: &[&str] = &[
+    "wiki/index.md",
+    "wiki/concepts/index.md",
+    "wiki/sources/index.md",
+];
+
 /// Common English stopwords stripped from query tokens before scoring.
 ///
 /// Kept small and hand-picked: we only want to drop terms that add noise to
@@ -83,6 +108,11 @@ pub struct RetrievalPlan {
     pub token_budget: u32,
     pub estimated_tokens: u32,
     pub candidates: Vec<RetrievalCandidate>,
+    /// Populated when the low-coverage fallback expanded the candidate set.
+    /// `None` for normal, well-scored plans; legacy plans without this field
+    /// round-trip as `None` via `serde(default)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
 }
 
 /// A ranked candidate selected for retrieval.
@@ -210,8 +240,24 @@ impl LexicalIndex {
     /// Stopwords are filtered out of the query tokens before scoring so that
     /// common words ("is", "the", "what", ...) don't dominate the plan's
     /// ranking reasons. If the filter removes every token, the plan is empty.
+    ///
+    /// When regular scoring produces fewer than
+    /// [`MIN_CANDIDATES_BEFORE_FALLBACK`] positive candidates, or the top
+    /// candidate's score is below [`MIN_TOP_SCORE_BEFORE_FALLBACK`], a
+    /// low-coverage fallback kicks in: up to three auto-generated wiki index
+    /// pages (see [`FALLBACK_INDEX_PAGES`]) and up to
+    /// [`FALLBACK_SOURCE_SUMMARY_LIMIT`] source summaries (most recently
+    /// modified first) are appended as baseline context. Added candidates are
+    /// stamped with [`FALLBACK_CANDIDATE_REASON`] and the plan's
+    /// [`RetrievalPlan::fallback_reason`] is set to
+    /// [`FALLBACK_REASON_LOW_COVERAGE`]. Pages that don't exist under `root`
+    /// are quietly skipped — freshly-initialized KBs may not have them yet.
+    ///
+    /// The `root` argument is only read for the fallback's existence checks
+    /// and mtime-based ordering; it is otherwise unused, so callers with no
+    /// on-disk KB can pass any path.
     #[must_use]
-    pub fn plan_retrieval(&self, query: &str, token_budget: u32) -> RetrievalPlan {
+    pub fn plan_retrieval(&self, query: &str, token_budget: u32, root: &Path) -> RetrievalPlan {
         let query_tokens = tokenize_query(query);
         if query_tokens.is_empty() || token_budget == 0 {
             return RetrievalPlan {
@@ -219,6 +265,7 @@ impl LexicalIndex {
                 token_budget,
                 estimated_tokens: 0,
                 candidates: Vec::new(),
+                fallback_reason: None,
             };
         }
 
@@ -239,6 +286,10 @@ impl LexicalIndex {
 
         let mut estimated_tokens = 0_u32;
         let mut candidates = Vec::new();
+        let mut included_ids: Vec<String> = Vec::new();
+
+        let top_score = scored.first().map_or(0, |(analysis, _)| analysis.score);
+        let positive_candidate_count = scored.len();
 
         for (analysis, entry) in scored.into_iter().take(DEFAULT_RETRIEVAL_TOP_K) {
             let entry_tokens = estimate_entry_tokens(entry);
@@ -247,6 +298,7 @@ impl LexicalIndex {
             }
 
             estimated_tokens = estimated_tokens.saturating_add(entry_tokens);
+            included_ids.push(entry.id.clone());
             candidates.push(RetrievalCandidate {
                 id: entry.id.clone(),
                 title: entry.title.clone(),
@@ -256,13 +308,170 @@ impl LexicalIndex {
             });
         }
 
+        // Low-coverage fallback: when scoring found too few (or too weak)
+        // candidates, append baseline context so the LLM has at least the
+        // three auto-generated index pages plus a handful of source
+        // summaries to reason from. This makes high-level meta queries
+        // like "what is this wiki about?" answerable instead of returning
+        // zero citations. See bn-1yvv.
+        let fallback_reason = if positive_candidate_count < MIN_CANDIDATES_BEFORE_FALLBACK
+            || top_score < MIN_TOP_SCORE_BEFORE_FALLBACK
+        {
+            append_low_coverage_fallback(
+                root,
+                token_budget,
+                &mut candidates,
+                &mut estimated_tokens,
+                &mut included_ids,
+            );
+            Some(FALLBACK_REASON_LOW_COVERAGE.to_string())
+        } else {
+            None
+        };
+
         RetrievalPlan {
             query: query.to_string(),
             token_budget,
             estimated_tokens,
             candidates,
+            fallback_reason,
         }
     }
+}
+
+/// Append the low-coverage fallback candidates to `candidates`.
+///
+/// Adds, in order:
+/// 1. Each existing page in [`FALLBACK_INDEX_PAGES`].
+/// 2. Up to [`FALLBACK_SOURCE_SUMMARY_LIMIT`] source-summary pages from
+///    `wiki/sources/`, ordered by file mtime descending (most recent first),
+///    with filename as a stable tie-breaker.
+///
+/// Candidates already present in `included_ids` are skipped so the fallback
+/// never duplicates a page the main scorer already picked. Individual
+/// candidates that would push `estimated_tokens` past `token_budget` are
+/// skipped; the fallback never silently inflates the token usage beyond the
+/// caller's cap.
+///
+/// Each appended candidate is stamped with [`FALLBACK_CANDIDATE_REASON`] so
+/// introspection tools (and the retrieval plan JSON) can show why the page
+/// was included even though it had zero query match.
+fn append_low_coverage_fallback(
+    root: &Path,
+    token_budget: u32,
+    candidates: &mut Vec<RetrievalCandidate>,
+    estimated_tokens: &mut u32,
+    included_ids: &mut Vec<String>,
+) {
+    let try_push = |rel_id: &str,
+                    candidates: &mut Vec<RetrievalCandidate>,
+                    estimated_tokens: &mut u32,
+                    included_ids: &mut Vec<String>| {
+        if included_ids.iter().any(|id| id == rel_id) {
+            return;
+        }
+        let abs = root.join(rel_id);
+        if !abs.is_file() {
+            return;
+        }
+        let tokens = estimate_path_tokens(&abs);
+        if estimated_tokens.saturating_add(tokens) > token_budget {
+            return;
+        }
+        *estimated_tokens = estimated_tokens.saturating_add(tokens);
+        included_ids.push(rel_id.to_string());
+        candidates.push(RetrievalCandidate {
+            id: rel_id.to_string(),
+            title: fallback_title_for(&abs, rel_id),
+            score: 0,
+            estimated_tokens: tokens,
+            reasons: vec![FALLBACK_CANDIDATE_REASON.to_string()],
+        });
+    };
+
+    for index_page in FALLBACK_INDEX_PAGES {
+        try_push(index_page, candidates, estimated_tokens, included_ids);
+    }
+
+    for rel_id in collect_fallback_source_summaries(root) {
+        try_push(&rel_id, candidates, estimated_tokens, included_ids);
+    }
+}
+
+/// Collect up to [`FALLBACK_SOURCE_SUMMARY_LIMIT`] source-summary page
+/// relative paths ordered by mtime descending (newest first), with filename
+/// as a tie-breaker for deterministic output when mtimes match (common on
+/// filesystems that only track second-granularity mtimes, or during tests
+/// that write files in a tight loop).
+///
+/// `wiki/sources/index.md` is skipped because it's already covered by
+/// [`FALLBACK_INDEX_PAGES`]. A missing directory returns an empty list so
+/// freshly-initialized KBs don't panic here.
+fn collect_fallback_source_summaries(root: &Path) -> Vec<String> {
+    let dir = root.join(WIKI_SOURCES);
+    let Ok(read_dir) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut entries: Vec<(std::time::SystemTime, String, String)> = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        let file_name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+        if file_name == "index.md" {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let rel_id = format!("{WIKI_SOURCES}/{file_name}");
+        entries.push((mtime, file_name, rel_id));
+    }
+
+    // Sort newest first, with filename ascending as tie-breaker.
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    entries.truncate(FALLBACK_SOURCE_SUMMARY_LIMIT);
+    entries.into_iter().map(|(_, _, rel)| rel).collect()
+}
+
+/// Estimate token usage for a file on disk using the same ~4-chars-per-token
+/// ratio the rest of the module uses, falling back to
+/// [`MIN_ENTRY_TOKEN_ESTIMATE`] when the file can't be read (e.g. permission
+/// error) so the fallback still accounts for its presence in the budget.
+fn estimate_path_tokens(path: &Path) -> u32 {
+    let Ok(meta) = fs::metadata(path) else {
+        return MIN_ENTRY_TOKEN_ESTIMATE;
+    };
+    let bytes = usize::try_from(meta.len()).unwrap_or(usize::MAX);
+    let estimated = bytes.div_ceil(APPROX_CHARS_PER_TOKEN);
+    u32::try_from(estimated)
+        .unwrap_or(u32::MAX)
+        .max(MIN_ENTRY_TOKEN_ESTIMATE)
+}
+
+/// Best-effort title for a fallback candidate. Prefers the frontmatter
+/// `title` (sources) or `name` (concepts) so the plan JSON reads nicely;
+/// falls back to the relative path when frontmatter can't be parsed.
+fn fallback_title_for(path: &Path, rel_id: &str) -> String {
+    if let Ok((frontmatter, _)) = read_frontmatter(path) {
+        if let Some(title) = frontmatter.get("title").and_then(Value::as_str) {
+            if !title.is_empty() {
+                return title.to_string();
+            }
+        }
+        if let Some(name) = frontmatter.get("name").and_then(Value::as_str) {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    rel_id.to_string()
 }
 
 /// Assemble full-text retrieval context from a ranked retrieval plan.
@@ -1070,7 +1279,7 @@ mod tests {
 
         let index = build_lexical_index(root).unwrap();
         let budget = estimate_entry_tokens(&index.entries[0]);
-        let plan = index.plan_retrieval("rust", budget);
+        let plan = index.plan_retrieval("rust", budget, root);
 
         assert_eq!(plan.token_budget, budget);
         assert_eq!(plan.candidates.len(), 1);
@@ -1087,7 +1296,7 @@ mod tests {
         write_concept_page(&concepts, "borrow-checker", "Borrow checker", &["borrowck"]);
 
         let index = build_lexical_index(root).unwrap();
-        let plan = index.plan_retrieval("borrowck checker", 1_000);
+        let plan = index.plan_retrieval("borrowck checker", 1_000, root);
 
         assert_eq!(plan.candidates.len(), 1);
         assert!(plan.candidates[0]
@@ -1125,6 +1334,7 @@ mod tests {
                 estimated_tokens: 20,
                 reasons: vec!["title matched 'ownership' 1x (+4)".to_string()],
             }],
+            fallback_reason: None,
         };
 
         let assembled = assemble_context(root, &plan).unwrap();
@@ -1187,6 +1397,7 @@ mod tests {
                 estimated_tokens: 20,
                 reasons: vec!["summary matched 'borrowing' 1x (+1)".to_string()],
             }],
+            fallback_reason: None,
         };
 
         let assembled = assemble_context(root, &plan).unwrap();
@@ -1353,7 +1564,7 @@ mod tests {
         );
 
         let index = build_lexical_index(root).unwrap();
-        let plan = index.plan_retrieval("What is Raft?", 1_000);
+        let plan = index.plan_retrieval("What is Raft?", 1_000, root);
         assert_eq!(plan.candidates.len(), 1);
         for reason in &plan.candidates[0].reasons {
             assert!(
@@ -1434,7 +1645,7 @@ mod tests {
         );
 
         let index = build_lexical_index(root).unwrap();
-        let plan = index.plan_retrieval("How does scheduling differ from Y?", 1_000);
+        let plan = index.plan_retrieval("How does scheduling differ from Y?", 1_000, root);
         assert_eq!(plan.candidates.len(), 1);
         for reason in &plan.candidates[0].reasons {
             assert!(
@@ -1458,5 +1669,234 @@ mod tests {
             "STOPWORDS grew past the design cap of 70 (now {}): review additions for scope creep",
             STOPWORDS.len()
         );
+    }
+
+    /// Write a placeholder index page at `rel_path` under `root`. Content
+    /// doesn't matter for fallback selection — we only check existence — but
+    /// we still write valid frontmatter + body so `fallback_title_for` can
+    /// extract a title.
+    fn write_index_page(root: &Path, rel_path: &str, title: &str) {
+        let abs = root.join(rel_path);
+        fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        let content = format!("---\ntitle: {title}\n---\n\n# {title}\n\nIndex page body.\n");
+        fs::write(&abs, content).unwrap();
+    }
+
+    #[test]
+    fn low_coverage_fallback_adds_index_pages_and_source_summaries() {
+        // Seed a KB whose only source has a summary that won't match the
+        // query. Regular scoring produces zero candidates, so the fallback
+        // must kick in and add (1) every existing index page and (2) the
+        // source summary as a baseline context candidate.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(
+            &sources,
+            "borrow-checker",
+            "Borrow Checker",
+            "Ownership moves and lifetimes.",
+        );
+        write_index_page(root, "wiki/index.md", "Wiki");
+        write_index_page(root, "wiki/concepts/index.md", "Concepts");
+        write_index_page(root, "wiki/sources/index.md", "Sources");
+
+        let index = build_lexical_index(root).unwrap();
+        // Query uses only meta terms that don't appear in the summary.
+        let plan = index.plan_retrieval("what is this wiki about?", 100_000, root);
+
+        assert_eq!(plan.fallback_reason.as_deref(), Some("low-coverage"));
+
+        let ids: Vec<&str> = plan.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"wiki/index.md"), "missing wiki/index.md in {ids:?}");
+        assert!(
+            ids.contains(&"wiki/concepts/index.md"),
+            "missing wiki/concepts/index.md in {ids:?}"
+        );
+        assert!(
+            ids.contains(&"wiki/sources/index.md"),
+            "missing wiki/sources/index.md in {ids:?}"
+        );
+        assert!(
+            ids.contains(&"wiki/sources/borrow-checker.md"),
+            "missing source summary in {ids:?}"
+        );
+
+        // Every fallback-added candidate must carry the dedicated reason so
+        // introspection can explain its presence.
+        for candidate in &plan.candidates {
+            if candidate.score == 0 {
+                assert_eq!(
+                    candidate.reasons,
+                    vec![FALLBACK_CANDIDATE_REASON.to_string()],
+                    "fallback candidate {} missing reason stamp",
+                    candidate.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn low_coverage_fallback_skips_missing_index_pages() {
+        // Freshly-initialized KBs may not have any of the three index pages
+        // yet. The fallback must tolerate their absence instead of panicking
+        // or inserting broken references.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(&sources, "alpha", "Alpha", "Totally unrelated.");
+
+        let index = build_lexical_index(root).unwrap();
+        let plan = index.plan_retrieval("hdfs federation", 100_000, root);
+
+        assert_eq!(plan.fallback_reason.as_deref(), Some("low-coverage"));
+        let ids: Vec<&str> = plan.candidates.iter().map(|c| c.id.as_str()).collect();
+        assert!(!ids.contains(&"wiki/index.md"));
+        assert!(!ids.contains(&"wiki/concepts/index.md"));
+        assert!(!ids.contains(&"wiki/sources/index.md"));
+        // The source summary still shows up as a baseline contributor.
+        assert!(
+            ids.contains(&"wiki/sources/alpha.md"),
+            "missing source summary in {ids:?}"
+        );
+    }
+
+    #[test]
+    fn strong_matches_do_not_trigger_fallback() {
+        // Seed a KB with enough well-scoring candidates that the fallback
+        // thresholds are never tripped. The plan must omit `fallback_reason`
+        // and MUST NOT include any of the index pages even though they
+        // exist on disk.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        for slug in &["raft-one", "raft-two", "raft-three", "raft-four"] {
+            write_source_page(
+                &sources,
+                slug,
+                &format!("Raft {slug}"),
+                "Raft consensus protocol details.",
+            );
+        }
+        write_index_page(root, "wiki/index.md", "Wiki");
+        write_index_page(root, "wiki/concepts/index.md", "Concepts");
+        write_index_page(root, "wiki/sources/index.md", "Sources");
+
+        let index = build_lexical_index(root).unwrap();
+        let plan = index.plan_retrieval("raft", 100_000, root);
+
+        assert!(plan.fallback_reason.is_none(), "fallback fired unexpectedly");
+        let ids: Vec<&str> = plan.candidates.iter().map(|c| c.id.as_str()).collect();
+        for index_page in FALLBACK_INDEX_PAGES {
+            assert!(
+                !ids.contains(index_page),
+                "index page {index_page} leaked into a strong-match plan: {ids:?}"
+            );
+        }
+        // Every candidate here came from real scoring; none carries the
+        // fallback reason stamp.
+        for candidate in &plan.candidates {
+            assert!(
+                !candidate.reasons.iter().any(|r| r == FALLBACK_CANDIDATE_REASON),
+                "scored candidate {} wrongly stamped with fallback reason",
+                candidate.id,
+            );
+        }
+    }
+
+    #[test]
+    fn low_coverage_fallback_caps_source_summaries_at_five() {
+        // When more than FALLBACK_SOURCE_SUMMARY_LIMIT source summaries
+        // exist, the fallback must keep at most five of them. Exact
+        // selection order is tested separately via `collect_fallback_source_summaries`.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        for slug in &["a", "b", "c", "d", "e", "f", "g"] {
+            write_source_page(&sources, slug, slug, "Unrelated body.");
+        }
+
+        let index = build_lexical_index(root).unwrap();
+        let plan = index.plan_retrieval("zzzz-no-match", 100_000, root);
+        assert_eq!(plan.fallback_reason.as_deref(), Some("low-coverage"));
+
+        let source_ids: Vec<&str> = plan
+            .candidates
+            .iter()
+            .filter(|c| c.id.starts_with("wiki/sources/") && c.id != "wiki/sources/index.md")
+            .map(|c| c.id.as_str())
+            .collect();
+
+        assert_eq!(
+            source_ids.len(),
+            FALLBACK_SOURCE_SUMMARY_LIMIT,
+            "fallback kept {} source summaries, expected exactly {}",
+            source_ids.len(),
+            FALLBACK_SOURCE_SUMMARY_LIMIT,
+        );
+    }
+
+    #[test]
+    fn collect_fallback_source_summaries_orders_newest_first() {
+        // Directly exercise the mtime-sorted summary picker. Writing each
+        // page with a spaced-out sleep between writes gives us monotonically
+        // increasing mtimes regardless of filesystem granularity.
+        use std::thread::sleep;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+
+        // Write in chronological order: a (oldest) ... g (newest).
+        for slug in &["a", "b", "c", "d", "e", "f", "g"] {
+            write_source_page(&sources, slug, slug, "Body.");
+            sleep(Duration::from_millis(20));
+        }
+
+        let picked = collect_fallback_source_summaries(root);
+        assert_eq!(picked.len(), FALLBACK_SOURCE_SUMMARY_LIMIT);
+        // Newest 5 should be the last five writes: g, f, e, d, c (in mtime
+        // descending order).
+        assert_eq!(
+            picked,
+            vec![
+                "wiki/sources/g.md".to_string(),
+                "wiki/sources/f.md".to_string(),
+                "wiki/sources/e.md".to_string(),
+                "wiki/sources/d.md".to_string(),
+                "wiki/sources/c.md".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn low_coverage_fallback_skips_duplicates_already_in_plan() {
+        // If scoring already included `wiki/sources/alpha.md` as a positive
+        // match, the fallback must NOT add a duplicate copy — even if it
+        // would otherwise pick that file when iterating source summaries.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let sources = root.join("wiki/sources");
+        fs::create_dir_all(&sources).unwrap();
+        write_source_page(&sources, "alpha", "Alpha", "Raft safety discussion.");
+
+        let index = build_lexical_index(root).unwrap();
+        // Query matches "raft" (found in summary) — 1 positive candidate,
+        // which is below MIN_CANDIDATES_BEFORE_FALLBACK, so fallback fires.
+        let plan = index.plan_retrieval("raft", 100_000, root);
+        assert_eq!(plan.fallback_reason.as_deref(), Some("low-coverage"));
+
+        let count = plan
+            .candidates
+            .iter()
+            .filter(|c| c.id == "wiki/sources/alpha.md")
+            .count();
+        assert_eq!(count, 1, "duplicate fallback entry for wiki/sources/alpha.md");
     }
 }

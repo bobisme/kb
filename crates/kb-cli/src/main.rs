@@ -1514,7 +1514,7 @@ fn run_ask(
     }
 
     let retrieval_plan =
-        kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget);
+        kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget, root);
 
     if dry_run {
         if json {

@@ -548,6 +548,7 @@ mod tests {
                 estimated_tokens: 500,
                 reasons: vec!["title match".into()],
             }],
+            fallback_reason: None,
         }
     }
 
@@ -916,6 +917,7 @@ mod tests {
                     reasons: vec![],
                 },
             ],
+            fallback_reason: None,
         };
 
         // Both pages are cited (simulated — in real use this comes from valid
@@ -1017,6 +1019,7 @@ mod tests {
                     reasons: vec![],
                 },
             ],
+            fallback_reason: None,
         };
 
         // Only alpha and gamma were cited by the answer.
@@ -1144,6 +1147,7 @@ mod tests {
                 estimated_tokens: 100,
                 reasons: vec![],
             }],
+            fallback_reason: None,
         };
 
         let cited = vec!["wiki/concepts/hdfs.md".to_string()];
@@ -1222,6 +1226,7 @@ mod tests {
                     reasons: vec![],
                 },
             ],
+            fallback_reason: None,
         };
 
         // Citations [1, 3] map to candidates at index 0 and 2 — i.e. "one"

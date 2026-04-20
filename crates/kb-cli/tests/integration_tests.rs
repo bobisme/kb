@@ -331,6 +331,21 @@ fn ask_persists_ranked_retrieval_plan_after_compile() {
         "Rust Overview",
         "Rust ownership and borrowing basics.",
     );
+    // Extra sources so the retrieval scorer returns 3+ positive candidates
+    // and the low-coverage fallback (bn-1yvv) stays quiet — this test is
+    // specifically about ranking of real matches, not the fallback.
+    write_source_page(
+        &kb_root,
+        "rust-memory",
+        "Rust Memory Model",
+        "Rust memory safety guarantees.",
+    );
+    write_source_page(
+        &kb_root,
+        "rust-guide",
+        "Rust Guide",
+        "A guide to the Rust programming language.",
+    );
     write_concept_page(&kb_root, "borrow-checker", "Borrow checker", &["borrowck"]);
 
     let mut compile_cmd = kb_cmd(&kb_root);
@@ -377,7 +392,14 @@ fn ask_persists_ranked_retrieval_plan_after_compile() {
     let candidates = retrieval_plan["candidates"]
         .as_array()
         .expect("candidates array");
-    assert_eq!(candidates.len(), 2);
+    // Strong-match scenario: three Rust source pages plus the concept all
+    // score positively, so fallback MUST NOT fire. `fallback_reason` must
+    // be absent from the persisted plan.
+    assert!(
+        retrieval_plan.get("fallback_reason").is_none(),
+        "fallback_reason should be absent on strong-match plan, got: {retrieval_plan:?}",
+    );
+    assert_eq!(candidates.len(), 4);
     assert_eq!(candidates[0]["id"], "wiki/concepts/borrow-checker.md");
     let first_score = candidates[0]["score"].as_u64().expect("first score");
     let second_score = candidates[1]["score"].as_u64().expect("second score");
