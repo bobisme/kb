@@ -2753,6 +2753,105 @@ fn lint_missing_citations_can_fail_when_configured_as_error() {
 }
 
 #[test]
+fn lint_missing_concepts_flags_term_appearing_in_three_sources() {
+    // bn-31lt: the missing-concepts lint walks normalized source bodies and
+    // emits a review item for terms mentioned in >= min_sources distinct
+    // documents that don't correspond to an existing concept page.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed three normalized source documents that all mention the term
+    // "FooBar System". The term appears 5+ times across the corpus and is
+    // not a concept — it should produce a concept_candidate review item.
+    let normalized_root = kb_root.join("normalized");
+    for (doc_id, body) in [
+        (
+            "doc-a",
+            "# A\n\nThe FooBar System is interesting. FooBar System has many parts.\n",
+        ),
+        (
+            "doc-b",
+            "# B\n\nFooBar System unique aspects. The FooBar System model.\n",
+        ),
+        (
+            "doc-c",
+            "# C\n\nAnother look at FooBar System for comparison.\n",
+        ),
+    ] {
+        let dir = normalized_root.join(doc_id);
+        fs::create_dir_all(&dir).expect("create normalized doc dir");
+        fs::write(
+            dir.join("metadata.json"),
+            format!("{{\"source_revision_id\":\"rev-{doc_id}\"}}"),
+        )
+        .expect("write metadata");
+        fs::write(dir.join("source.md"), body).expect("write source body");
+    }
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("lint")
+        .arg("--check")
+        .arg("missing-concepts");
+    let output = cmd.output().expect("run kb lint");
+
+    // Missing-concepts findings are warnings, so exit code should be 0 in
+    // default (non-strict) mode.
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(envelope["command"], "lint");
+    let payload = &envelope["data"];
+    let checks = payload["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 1);
+    let check = &checks[0];
+    assert_eq!(check["check"], "missing-concepts");
+    let issues = check["issues"].as_array().expect("issues array");
+    assert!(
+        issues.iter().any(|i| {
+            i["kind"] == "concept_candidate"
+                && i["severity"] == "warning"
+                && i["target"].as_str().is_some_and(|t| t.contains("FooBar System"))
+        }),
+        "expected concept_candidate warning for 'FooBar System', got: {issues:?}"
+    );
+
+    // Running the lint must also persist a review item with the
+    // concept_candidate kind so users can `kb review approve` it later.
+    let review_path = kb_root
+        .join("reviews")
+        .join("concept_candidates")
+        .join("lint:concept-candidate:foobar-system.json");
+    assert!(
+        review_path.is_file(),
+        "expected review item file at {}",
+        review_path.display()
+    );
+    let raw = fs::read_to_string(&review_path).expect("read review item");
+    let item: Value = serde_json::from_str(&raw).expect("parse review item json");
+    assert_eq!(item["kind"], "concept_candidate");
+    assert_eq!(item["status"], "pending");
+    assert!(
+        item["comment"]
+            .as_str()
+            .is_some_and(|c| c.contains("FooBar System")),
+        "review item comment must name the term: {raw}"
+    );
+    let deps = item["metadata"]["dependencies"].as_array().expect("deps");
+    assert_eq!(
+        deps.len(),
+        3,
+        "expected three source-document ids in deps: {deps:?}"
+    );
+}
+
+#[test]
 fn doctor_returns_zero_when_all_checks_pass() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);

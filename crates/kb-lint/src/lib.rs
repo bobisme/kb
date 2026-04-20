@@ -25,6 +25,7 @@ pub enum LintRule {
     StaleRevision,
     StaleArtifacts,
     MissingCitations,
+    MissingConcepts,
     All,
 }
 
@@ -45,6 +46,10 @@ impl LintRule {
             Some("missing-citations" | "missing_citations" | "missingcitations") => {
                 Ok(Self::MissingCitations)
             }
+            Some(
+                "missing-concepts" | "missing_concepts" | "missingconcepts" | "concept-candidates"
+                | "concept_candidates",
+            ) => Ok(Self::MissingConcepts),
             Some(other) => Err(anyhow!("unsupported lint rule: {other}")),
         }
     }
@@ -57,6 +62,7 @@ impl LintRule {
             Self::StaleRevision => "stale-revision",
             Self::StaleArtifacts => "stale",
             Self::MissingCitations => "missing-citations",
+            Self::MissingConcepts => "missing-concepts",
             Self::All => "all",
         }
     }
@@ -116,6 +122,7 @@ pub enum IssueKind {
     BuildRecordOutputMissing,
     MissingCitations,
     InvalidFrontmatter,
+    ConceptCandidate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,10 +141,11 @@ impl MissingCitationsLevel {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LintOptions {
     pub require_citations: bool,
     pub missing_citations_level: MissingCitationsLevel,
+    pub missing_concepts: MissingConceptsConfig,
 }
 
 impl Default for LintOptions {
@@ -145,6 +153,7 @@ impl Default for LintOptions {
         Self {
             require_citations: true,
             missing_citations_level: MissingCitationsLevel::Warn,
+            missing_concepts: MissingConceptsConfig::default(),
         }
     }
 }
@@ -181,7 +190,12 @@ pub fn run_lint_with_options(
         issues.extend(detect_stale_artifacts(root)?);
     }
     if options.require_citations && matches!(rule, LintRule::MissingCitations | LintRule::All) {
-        issues.extend(detect_missing_citations(root, *options)?);
+        issues.extend(detect_missing_citations(root, options)?);
+    }
+    if options.missing_concepts.enabled
+        && matches!(rule, LintRule::MissingConcepts | LintRule::All)
+    {
+        issues.extend(detect_missing_concepts_issues(root, &options.missing_concepts)?);
     }
 
     Ok(LintReport {
@@ -1079,7 +1093,7 @@ fn normalized_metadata_for_doc(root: &Path, doc_id: &str) -> Result<Option<Norma
     Ok(Some(metadata))
 }
 
-fn detect_missing_citations(root: &Path, options: LintOptions) -> Result<Vec<LintIssue>> {
+fn detect_missing_citations(root: &Path, options: &LintOptions) -> Result<Vec<LintIssue>> {
     let mut issues = Vec::new();
 
     for page in markdown_files_under(&root.join(WIKI_DIR))? {
@@ -2058,6 +2072,7 @@ mod tests {
             &LintOptions {
                 require_citations: true,
                 missing_citations_level: MissingCitationsLevel::Error,
+                missing_concepts: MissingConceptsConfig::default(),
             },
         )
         .expect("lint report");
@@ -2065,6 +2080,446 @@ mod tests {
         assert_eq!(report.issues[0].severity, IssueSeverity::Error);
         assert!(report.has_errors());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Missing-concept detection (bn-31lt)
+// ---------------------------------------------------------------------------
+//
+// Walks every `normalized/<doc>/source.md` body, extracts capitalized
+// multi-word spans and backtick-quoted identifiers, and emits a review item of
+// kind `concept_candidate` for terms that:
+//
+// 1. appear in at least `min_sources` distinct source documents,
+// 2. have at least `min_mentions` total mentions across the corpus,
+// 3. are not already the name/alias of an existing concept page,
+// 4. are not English stopwords or generic filler.
+//
+// This is a cheap, regex-based first pass — noisy but fast. The cross-source
+// filter (rule #1) is what prevents every "Smith" in a single document from
+// being flagged.
+
+/// Configuration for the `missing_concepts` lint check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingConceptsConfig {
+    /// Whether the check runs at all. Default: `true`.
+    pub enabled: bool,
+    /// A candidate term must appear in at least this many distinct source
+    /// documents to be flagged. Default: `3`.
+    pub min_sources: usize,
+    /// A candidate term must have at least this many total mentions across
+    /// the corpus. Default: `5`.
+    pub min_mentions: usize,
+}
+
+impl Default for MissingConceptsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_sources: 3,
+            min_mentions: 5,
+        }
+    }
+}
+
+/// A single candidate term flagged by the missing-concepts lint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConceptCandidateHit {
+    /// The surface form most commonly used for the candidate (e.g.
+    /// `FooBar System` or `Byzantine Fault Tolerance`).
+    pub name: String,
+    /// Sorted, deduplicated list of source-document ids in which the term
+    /// appears.
+    pub source_ids: Vec<String>,
+    /// Total mention count across the corpus.
+    pub mention_count: usize,
+}
+
+/// Capitalized multi-word span extractor.
+///
+/// Matches 2–4 consecutive Titlecase or CamelCase words (e.g. `Rust
+/// Language`, `Byzantine Fault Tolerance`, `FooBar System`). Single
+/// Titlecase words are intentionally *not* matched — too noisy
+/// (sentence-initial words, proper nouns like "The", "Mr.", etc.).
+///
+/// The inner word pattern `[A-Z][A-Za-z]+` allows internal uppercase
+/// letters so CamelCase identifiers flow through — the bone spec called
+/// this out explicitly: "catches proper nouns and CamelCase".
+fn multiword_term_regex() -> Regex {
+    Regex::new(r"\b[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+){1,3}\b")
+        .expect("valid multiword term regex")
+}
+
+/// Backtick-quoted identifier extractor.
+///
+/// Matches anything between single backticks that looks like a code identifier
+/// — letters, digits, `_`, `-`, `.`, `:`, `/`. Bounds the match length to a
+/// sensible identifier size to avoid capturing code snippets.
+fn backtick_identifier_regex() -> Regex {
+    Regex::new(r"`([A-Za-z][A-Za-z0-9_\-./:]{2,63})`").expect("valid backtick identifier regex")
+}
+
+/// Lowercased English stopwords + common filler used to discard candidates
+/// whose first token is a throwaway English word. Importing the query-side
+/// list wholesale would drag `kb-llm` + `tokio` into `kb-lint`; the set below
+/// is a straight copy of the hand-picked list in `kb-query::lexical::STOPWORDS`
+/// plus a handful of extra capitalized-sentence-start words that creep into
+/// the multi-word regex (e.g. "The Next", "This Means"). Keep it small — it's
+/// a noise filter, not a content filter.
+const MISSING_CONCEPTS_STOPWORDS: &[&str] = &[
+    // Core (mirrors kb-query::lexical::STOPWORDS; copied rather than depended
+    // on to keep kb-lint's dep tree small).
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "has", "have", "had",
+    "of", "in", "on", "at", "by", "for", "with", "to", "from", "and", "or", "but", "not", "it",
+    "its", "this", "that", "these", "those", "as", "if", "so", "such", "do", "does", "did", "can",
+    "will", "would", "should", "could", "how", "why", "when", "where", "which", "whose", "whom",
+    "also", "then", "than", "some", "any", "most", "many", "about", "across", "around", "between",
+    "during", "into", "onto", "over", "under", "while",
+    // Extras: sentence-initial capitalized words that leak through the
+    // multi-word regex because they're followed by another Titlecase word.
+    "there", "here", "we", "you", "they", "our", "your", "their", "his", "her",
+    "section", "chapter", "figure", "table", "page", "example", "note", "see",
+    "use", "using", "used", "one", "two", "three", "four", "five", "first",
+    "second", "third", "last", "next", "new", "old", "both", "either", "neither",
+];
+
+/// Entry point that emits `LintIssue`s for the `kb lint --check
+/// missing-concepts` surface. Mirrors the review-item-producing
+/// [`check_missing_concepts`] but renders the findings as warnings so the
+/// existing lint reporter can display them.
+fn detect_missing_concepts_issues(
+    root: &Path,
+    config: &MissingConceptsConfig,
+) -> Result<Vec<LintIssue>> {
+    let hits = check_missing_concepts_raw(root, config)?;
+    Ok(hits
+        .into_iter()
+        .map(|hit| LintIssue {
+            severity: IssueSeverity::Warning,
+            kind: IssueKind::ConceptCandidate,
+            referring_page: String::new(),
+            line: 0,
+            target: hit.name.clone(),
+            message: format!(
+                "concept candidate '{}' mentioned in {} source(s) ({} total mentions) but no concept page exists",
+                hit.name,
+                hit.source_ids.len(),
+                hit.mention_count,
+            ),
+            suggested_fix: Some(format!(
+                "create wiki/concepts/{}.md (or approve review item 'concept-candidate:{}')",
+                slug_from_title(&hit.name),
+                slug_from_title(&hit.name),
+            )),
+        })
+        .collect())
+}
+
+/// Scan normalized source bodies and return one `ReviewItem` per concept
+/// candidate that passes the `min_sources` / `min_mentions` thresholds and is
+/// not already covered by a concept page.
+///
+/// # Errors
+///
+/// Returns an error when the `normalized/` or `wiki/concepts/` directories
+/// cannot be scanned, a file cannot be read, or the system clock cannot be
+/// queried for timestamps.
+pub fn check_missing_concepts(
+    root: &Path,
+    config: &MissingConceptsConfig,
+) -> Result<Vec<ReviewItem>> {
+    let hits = check_missing_concepts_raw(root, config)?;
+    if hits.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let now = unix_time_ms()?;
+    let mut items = Vec::with_capacity(hits.len());
+    for hit in hits {
+        items.push(build_concept_candidate_review_item(&hit, now));
+    }
+    Ok(items)
+}
+
+fn build_concept_candidate_review_item(hit: &ConceptCandidateHit, now: u64) -> ReviewItem {
+    let slug = slug_from_title(&hit.name);
+    let id = format!("lint:concept-candidate:{slug}");
+    let destination = PathBuf::from(WIKI_CONCEPTS_DIR).join(format!("{slug}.md"));
+
+    // Hash the candidate name + source ids so save_review_item's
+    // rejected-item dedup works across re-runs against the same corpus.
+    let mut fingerprint_parts: Vec<&[u8]> = vec![hit.name.as_bytes()];
+    for src in &hit.source_ids {
+        fingerprint_parts.push(src.as_bytes());
+    }
+    let fingerprint = kb_core::hash_many(&fingerprint_parts).to_hex();
+
+    let comment = format!(
+        "Term '{}' is mentioned in {} source(s) ({} total mention(s)) but has no concept page. \
+         Sources: {}. Approve to draft wiki/concepts/{}.md from the mentions (LLM step \
+         currently stubbed — see bone bn-31lt).",
+        hit.name,
+        hit.source_ids.len(),
+        hit.mention_count,
+        hit.source_ids.join(", "),
+        slug,
+    );
+
+    ReviewItem {
+        metadata: EntityMetadata {
+            id: id.clone(),
+            created_at_millis: now,
+            updated_at_millis: now,
+            source_hashes: vec![fingerprint],
+            model_version: None,
+            tool_version: Some(format!(
+                "{}/{}",
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION")
+            )),
+            prompt_template_hash: None,
+            dependencies: hit.source_ids.clone(),
+            output_paths: vec![destination.clone()],
+            status: Status::NeedsReview,
+        },
+        kind: ReviewKind::ConceptCandidate,
+        target_entity_id: id,
+        proposed_destination: Some(destination.clone()),
+        citations: hit.source_ids.clone(),
+        affected_pages: vec![destination],
+        created_at_millis: now,
+        status: ReviewStatus::Pending,
+        comment,
+    }
+}
+
+/// Core extractor + filter. Shared by `detect_missing_concepts_issues` (lint
+/// surface) and `check_missing_concepts` (review-queue writer). Deterministic:
+/// the returned list is sorted by (source count desc, mention count desc,
+/// name asc) so lint output and review-item ordering are stable across runs.
+fn check_missing_concepts_raw(
+    root: &Path,
+    config: &MissingConceptsConfig,
+) -> Result<Vec<ConceptCandidateHit>> {
+    if !config.enabled {
+        return Ok(Vec::new());
+    }
+
+    let normalized_root = root.join("normalized");
+    if !normalized_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    // Build the exclusion set: concept names + aliases (lowercased, trimmed).
+    let existing_terms = load_existing_concept_terms(root)?;
+
+    let multiword_re = multiword_term_regex();
+    let backtick_re = backtick_identifier_regex();
+
+    // candidate_key -> (canonical_display_form, source_ids_set, total_mentions)
+    let mut tally: BTreeMap<String, CandidateAgg> = BTreeMap::new();
+
+    for entry in fs::read_dir(&normalized_root)
+        .with_context(|| format!("scan normalized dir {}", normalized_root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(doc_id) = entry.file_name().into_string() else {
+            continue;
+        };
+        let source_path = entry.path().join("source.md");
+        if !source_path.exists() {
+            continue;
+        }
+        let body = fs::read_to_string(&source_path)
+            .with_context(|| format!("read normalized source {}", source_path.display()))?;
+        let scan_body = strip_code_blocks(&body);
+
+        for cap in multiword_re.find_iter(&scan_body) {
+            let raw = cap.as_str().trim();
+            // The multi-word regex is greedy, so "The FooBar System" matches
+            // as a single span. Peel leading stopword tokens ("The", "This",
+            // "We", …) so the actual candidate phrase is evaluated. Stop as
+            // soon as the remaining phrase still has at least two words and
+            // starts with a non-stopword; if peeling leaves fewer than two
+            // words, drop the match entirely (single-word candidates are
+            // out-of-scope — too noisy).
+            let Some(term) = strip_leading_stopwords(raw) else {
+                continue;
+            };
+            if !accept_candidate_term(&term, &existing_terms) {
+                continue;
+            }
+            record_hit(&mut tally, &term, &doc_id);
+        }
+
+        for cap in backtick_re.captures_iter(&body) {
+            let Some(m) = cap.get(1) else { continue };
+            let term = m.as_str().trim();
+            if !accept_candidate_term(term, &existing_terms) {
+                continue;
+            }
+            record_hit(&mut tally, term, &doc_id);
+        }
+    }
+
+    let mut hits: Vec<ConceptCandidateHit> = tally
+        .into_iter()
+        .filter_map(|(_key, agg)| {
+            let source_count = agg.source_ids.len();
+            if source_count < config.min_sources {
+                return None;
+            }
+            if agg.mention_count < config.min_mentions {
+                return None;
+            }
+            Some(ConceptCandidateHit {
+                name: agg.display,
+                source_ids: agg.source_ids.into_iter().collect(),
+                mention_count: agg.mention_count,
+            })
+        })
+        .collect();
+
+    // Deterministic ordering: source count desc, then mention count desc,
+    // then name asc. Stable across runs so snapshots / test assertions
+    // don't flap on equal-weight candidates.
+    hits.sort_by(|a, b| {
+        b.source_ids
+            .len()
+            .cmp(&a.source_ids.len())
+            .then_with(|| b.mention_count.cmp(&a.mention_count))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+
+    Ok(hits)
+}
+
+struct CandidateAgg {
+    display: String,
+    source_ids: BTreeSet<String>,
+    mention_count: usize,
+}
+
+fn record_hit(tally: &mut BTreeMap<String, CandidateAgg>, term: &str, doc_id: &str) {
+    let key = term.to_ascii_lowercase();
+    let entry = tally.entry(key).or_insert_with(|| CandidateAgg {
+        display: term.to_string(),
+        source_ids: BTreeSet::new(),
+        mention_count: 0,
+    });
+    entry.source_ids.insert(doc_id.to_string());
+    entry.mention_count += 1;
+}
+
+/// Load every existing concept's name and aliases (lowercased) so the lint
+/// doesn't flag terms that are already covered.
+fn load_existing_concept_terms(root: &Path) -> Result<BTreeSet<String>> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    let concepts_dir = root.join(WIKI_CONCEPTS_DIR);
+    if !concepts_dir.exists() {
+        return Ok(set);
+    }
+    for entry in fs::read_dir(&concepts_dir)
+        .with_context(|| format!("scan concept pages dir {}", concepts_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        if path.file_name().is_some_and(|n| n == "index.md") {
+            continue;
+        }
+        let Ok((frontmatter, _)) = read_frontmatter(&path) else {
+            continue;
+        };
+        if let Some(name) = frontmatter.get(Value::String("name".to_string())).and_then(Value::as_str) {
+            set.insert(name.trim().to_ascii_lowercase());
+        }
+        if let Some(Value::Sequence(aliases)) =
+            frontmatter.get(Value::String("aliases".to_string()))
+        {
+            for alias in aliases {
+                if let Some(s) = alias.as_str() {
+                    set.insert(s.trim().to_ascii_lowercase());
+                }
+            }
+        }
+        // Also suppress flagging based on the file stem, since the stem is
+        // the canonical slug and occasionally the only identity a page has
+        // (e.g. historical pages without a `name:` frontmatter key).
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            set.insert(stem.trim().to_ascii_lowercase());
+        }
+    }
+    Ok(set)
+}
+
+/// Gate a raw candidate string against length bounds and the set of
+/// already-covered concept terms. Leading-stopword peeling is done by
+/// [`strip_leading_stopwords`] before this check is called.
+fn accept_candidate_term(term: &str, existing: &BTreeSet<String>) -> bool {
+    let trimmed = term.trim();
+    if trimmed.len() < 3 || trimmed.len() > 80 {
+        return false;
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if existing.contains(&lowered) {
+        return false;
+    }
+    // Reject all-stopword phrases (rare after leading-peel, but defends
+    // against edge cases like "Next One" that slipped through peeling).
+    let all_stop = trimmed.split_whitespace().all(is_stopword);
+    if all_stop {
+        return false;
+    }
+    true
+}
+
+/// Peel leading stopword tokens from a multi-word candidate so phrases like
+/// `"The FooBar System"` surface as `"FooBar System"`. Returns `None` when
+/// the remaining phrase has fewer than two tokens (single-word candidates
+/// are out-of-scope for this check — too noisy).
+fn strip_leading_stopwords(raw: &str) -> Option<String> {
+    let tokens: Vec<&str> = raw.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut start = 0;
+    while start < tokens.len() && is_stopword(tokens[start]) {
+        start += 1;
+    }
+    let rest = &tokens[start..];
+    if rest.len() < 2 {
+        return None;
+    }
+    Some(rest.join(" "))
+}
+
+fn is_stopword(token: &str) -> bool {
+    let lower = token.to_ascii_lowercase();
+    MISSING_CONCEPTS_STOPWORDS.contains(&lower.as_str())
+}
+
+/// Replace fenced ``` ``` code blocks with blank space so the multi-word
+/// regex doesn't pick up code identifiers (those are handled by the backtick
+/// regex separately). Inline single-backtick spans are left alone — the
+/// backtick regex picks identifiers out of them and the multi-word regex
+/// skips them naturally because they aren't `TitleCase` phrases.
+fn strip_code_blocks(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_fence = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        } else if !in_fence {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2921,6 +3376,290 @@ mod duplicate_concept_tests {
             "distinct-topic near-identical names should not flag when definitions \
              disagree, got: {:?}",
             items.iter().map(|i| &i.comment).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod missing_concepts_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_normalized_source(root: &Path, doc_id: &str, body: &str) {
+        let dir = root.join("normalized").join(doc_id);
+        fs::create_dir_all(&dir).unwrap();
+        // metadata.json is not required by the missing-concepts walker but
+        // keeping it aligned with production shape prevents surprises.
+        fs::write(
+            dir.join("metadata.json"),
+            format!("{{\"source_revision_id\":\"rev-{doc_id}\"}}"),
+        )
+        .unwrap();
+        fs::write(dir.join("source.md"), body).unwrap();
+    }
+
+    fn write_concept(root: &Path, slug: &str, name: &str, aliases: &[&str]) {
+        use std::fmt::Write as _;
+        let dir = root.join("wiki/concepts");
+        fs::create_dir_all(&dir).unwrap();
+        let mut content = format!("---\nid: concept:{slug}\nname: {name}\n");
+        if !aliases.is_empty() {
+            content.push_str("aliases:\n");
+            for a in aliases {
+                writeln!(content, "  - {a}").unwrap();
+            }
+        }
+        content.push_str("---\n\n");
+        writeln!(content, "# {name}").unwrap();
+        fs::write(dir.join(format!("{slug}.md")), content).unwrap();
+    }
+
+    #[test]
+    fn returns_empty_when_no_normalized_dir() {
+        let dir = TempDir::new().unwrap();
+        let hits = check_missing_concepts_raw(dir.path(), &MissingConceptsConfig::default())
+            .expect("run check");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn term_in_three_sources_is_flagged() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // 'FooBarSystem' appears in three sources with five+ mentions total.
+        write_normalized_source(
+            root,
+            "doc-a",
+            "# A\n\nThe FooBar System is interesting. FooBar System has many parts.\n",
+        );
+        write_normalized_source(
+            root,
+            "doc-b",
+            "# B\n\nFooBar System unique aspects. The FooBar System model.\n",
+        );
+        write_normalized_source(
+            root,
+            "doc-c",
+            "# C\n\nAnother look at FooBar System.\n",
+        );
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            hits.iter().any(|h| h.name == "FooBar System"),
+            "expected 'FooBar System' to be flagged, got: {hits:?}"
+        );
+        let hit = hits.iter().find(|h| h.name == "FooBar System").unwrap();
+        assert_eq!(hit.source_ids.len(), 3);
+        assert!(hit.mention_count >= 5);
+    }
+
+    #[test]
+    fn term_in_only_two_sources_is_not_flagged() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_normalized_source(root, "doc-a", "BetaGamma Cluster is important. BetaGamma Cluster again.\n");
+        write_normalized_source(root, "doc-b", "BetaGamma Cluster explained. BetaGamma Cluster design. BetaGamma Cluster rules.\n");
+        // Third source has a different capitalization case, not the term.
+        write_normalized_source(root, "doc-c", "Nothing here.\n");
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            !hits.iter().any(|h| h.name == "BetaGamma Cluster"),
+            "term in only 2 sources must not flag: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn existing_concept_name_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_concept(root, "widget-engine", "Widget Engine", &[]);
+        write_normalized_source(root, "doc-a", "Widget Engine is fast.\nWidget Engine excels.\n");
+        write_normalized_source(root, "doc-b", "Widget Engine usage. Widget Engine tips.\n");
+        write_normalized_source(root, "doc-c", "Widget Engine internals.\n");
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            !hits.iter().any(|h| h.name.eq_ignore_ascii_case("widget engine")),
+            "existing concept must not be flagged: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn existing_concept_alias_is_excluded() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_concept(root, "wgt", "Wgt", &["Widget Engine"]);
+        write_normalized_source(root, "doc-a", "Widget Engine is fast.\nWidget Engine excels.\n");
+        write_normalized_source(root, "doc-b", "Widget Engine usage. Widget Engine tips.\n");
+        write_normalized_source(root, "doc-c", "Widget Engine internals.\n");
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            !hits.iter().any(|h| h.name.eq_ignore_ascii_case("widget engine")),
+            "alias match must suppress candidate: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn stopword_starter_is_filtered() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // 'The Next' starts with a stopword and should never fire.
+        write_normalized_source(root, "doc-a", "The Next part. The Next section.\nThe Next block.\n");
+        write_normalized_source(root, "doc-b", "The Next concept. The Next part.\nThe Next idea.\n");
+        write_normalized_source(root, "doc-c", "The Next step. The Next thing. The Next loop.\n");
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            !hits.iter().any(|h| h.name.to_lowercase().starts_with("the ")),
+            "stopword-starter must not be flagged: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn backtick_identifier_is_flagged_when_threshold_met() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_normalized_source(
+            root,
+            "doc-a",
+            "Use `my_special_ident` to configure things.\n`my_special_ident` is strict.\n",
+        );
+        write_normalized_source(
+            root,
+            "doc-b",
+            "Example: `my_special_ident` for the token.\n`my_special_ident` wins.\n",
+        );
+        write_normalized_source(
+            root,
+            "doc-c",
+            "You also configure `my_special_ident` here.\n",
+        );
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            hits.iter().any(|h| h.name == "my_special_ident"),
+            "backtick identifier must be picked up: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn disabled_config_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_normalized_source(root, "doc-a", "Common Widget appears. Common Widget again.\n");
+        write_normalized_source(root, "doc-b", "Common Widget works. Common Widget here.\n");
+        write_normalized_source(root, "doc-c", "Common Widget is fine.\n");
+
+        let cfg = MissingConceptsConfig {
+            enabled: false,
+            ..MissingConceptsConfig::default()
+        };
+        let hits = check_missing_concepts_raw(root, &cfg).expect("run");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn check_missing_concepts_emits_review_item() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_normalized_source(
+            root,
+            "doc-a",
+            "The FooBar System is useful. FooBar System does X.\n",
+        );
+        write_normalized_source(
+            root,
+            "doc-b",
+            "FooBar System usage. FooBar System designed.\n",
+        );
+        write_normalized_source(root, "doc-c", "Another view of FooBar System.\n");
+
+        let items =
+            check_missing_concepts(root, &MissingConceptsConfig::default()).expect("check");
+        let hit = items
+            .iter()
+            .find(|i| i.metadata.id == "lint:concept-candidate:foobar-system")
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected lint:concept-candidate:foobar-system review item, got: {:?}",
+                    items.iter().map(|i| &i.metadata.id).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(hit.kind, ReviewKind::ConceptCandidate);
+        assert_eq!(hit.status, ReviewStatus::Pending);
+        assert_eq!(hit.metadata.status, Status::NeedsReview);
+        assert_eq!(hit.metadata.dependencies.len(), 3);
+        assert_eq!(
+            hit.proposed_destination.as_deref(),
+            Some(Path::new("wiki/concepts/foobar-system.md"))
+        );
+        assert!(hit.comment.contains("FooBar System"));
+        assert!(hit.comment.contains("doc-a"));
+    }
+
+    #[test]
+    fn code_block_contents_are_ignored_for_multiword_regex() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        // A plain-English phrase appears only inside fenced code blocks. The
+        // multi-word regex should ignore it; with no other mentions it must
+        // not be flagged.
+        let body = "# Title\n\nSome prose.\n\n```\nActual Rust Code Here\nActual Rust Code Here\nActual Rust Code Here\n```\n";
+        write_normalized_source(root, "doc-a", body);
+        write_normalized_source(root, "doc-b", body);
+        write_normalized_source(root, "doc-c", body);
+
+        let hits =
+            check_missing_concepts_raw(root, &MissingConceptsConfig::default()).expect("run");
+        assert!(
+            !hits.iter().any(|h| h.name == "Actual Rust Code Here"),
+            "fenced code block should be ignored: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn lint_issues_are_warnings_not_errors() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        write_normalized_source(
+            root,
+            "doc-a",
+            "The FooBar System is useful. FooBar System does X.\n",
+        );
+        write_normalized_source(
+            root,
+            "doc-b",
+            "FooBar System usage. FooBar System designed.\n",
+        );
+        write_normalized_source(root, "doc-c", "Another view of FooBar System.\n");
+
+        let report =
+            run_lint_with_options(root, LintRule::MissingConcepts, &LintOptions::default())
+                .expect("lint");
+        assert!(!report.issues.is_empty(), "expected at least one issue");
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| i.severity == IssueSeverity::Warning),
+            "missing-concepts should emit warnings, not errors: {report:?}"
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.kind == IssueKind::ConceptCandidate),
+            "expected ConceptCandidate kind: {report:?}"
         );
     }
 }

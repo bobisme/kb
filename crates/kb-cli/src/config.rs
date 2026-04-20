@@ -285,6 +285,7 @@ impl Default for AskConfig {
 pub struct LintConfig {
     pub require_citations: bool,
     pub missing_citations_level: String,
+    pub missing_concepts: LintMissingConceptsConfig,
 }
 
 impl Default for LintConfig {
@@ -292,6 +293,31 @@ impl Default for LintConfig {
         Self {
             require_citations: true,
             missing_citations_level: "warn".to_string(),
+            missing_concepts: LintMissingConceptsConfig::default(),
+        }
+    }
+}
+
+/// `[lint.missing_concepts]` section of `kb.toml`. Controls the
+/// `missing_concepts` lint check: whether it runs by default and the
+/// frequency thresholds used to filter out noise.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct LintMissingConceptsConfig {
+    pub enabled: bool,
+    pub min_sources: usize,
+    pub min_mentions: usize,
+}
+
+impl Default for LintMissingConceptsConfig {
+    fn default() -> Self {
+        // Mirrors `kb_lint::MissingConceptsConfig::default()`. Kept in sync
+        // so the TOML defaults and the library defaults agree.
+        Self {
+            enabled: true,
+            min_sources: 3,
+            min_mentions: 5,
         }
     }
 }

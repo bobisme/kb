@@ -30,6 +30,7 @@ const fn kind_label(kind: ReviewKind) -> &'static str {
         ReviewKind::ConceptMerge => "concept_merge",
         ReviewKind::AliasMerge => "alias_merge",
         ReviewKind::Canonicalization => "canonicalization",
+        ReviewKind::ConceptCandidate => "concept_candidate",
     }
 }
 
@@ -95,7 +96,7 @@ pub fn run_review_list(root: &Path, json: bool, emit_json: &dyn Fn(&str, serde_j
     let rejected_count = items.iter().filter(|i| i.status == ReviewStatus::Rejected).count();
 
     let mut kind_counts = Vec::new();
-    for kind in &[ReviewKind::Promotion, ReviewKind::ConceptMerge, ReviewKind::AliasMerge, ReviewKind::Canonicalization] {
+    for kind in &[ReviewKind::Promotion, ReviewKind::ConceptMerge, ReviewKind::AliasMerge, ReviewKind::Canonicalization, ReviewKind::ConceptCandidate] {
         let count = items.iter().filter(|i| i.kind == *kind && i.status == ReviewStatus::Pending).count();
         if count > 0 {
             kind_counts.push(KindCount {
@@ -179,6 +180,14 @@ pub fn run_review_show(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(&st
                 println!(
                     "On approve: the decision is recorded; the corresponding edit \
                      must be made manually, then run 'kb compile'."
+                );
+            }
+            ReviewKind::ConceptCandidate => {
+                println!(
+                    "On approve: the decision is recorded; creating the concept \
+                     page from mentions via LLM is not yet implemented (see \
+                     bone spec 'Approve workflow'). Work around by creating \
+                     wiki/concepts/<slug>.md manually, then run 'kb compile'."
                 );
             }
         }

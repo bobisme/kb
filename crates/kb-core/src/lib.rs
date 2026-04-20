@@ -256,6 +256,10 @@ pub enum ReviewKind {
     ConceptMerge,
     AliasMerge,
     Canonicalization,
+    /// A term mentioned heavily across sources that lacks a concept page.
+    /// Emitted by the `missing_concepts` lint; approval creates a concept
+    /// page from the mentions via an LLM pass.
+    ConceptCandidate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

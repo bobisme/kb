@@ -3320,40 +3320,45 @@ fn render_inspect_report(report: &InspectReport) -> String {
     sections.join("\n\n")
 }
 
-fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Result<()> {
-    // Peek at the root lock before we walk the tree. If another process is
-    // mid-compile the on-disk state is a moving target (half-written source
-    // pages, not-yet-rendered concept pages), and running lint against that
-    // snapshot produces scary false positives (missing citations, orphans,
-    // broken links) that resolve themselves silently once compile finishes.
-    //
-    // Default mode: warn on stderr and keep going — lint is still useful
-    // advice and the operator may want to see it anyway.
-    //
-    // --strict mode: refuse to run. A strict run that fires off stale
-    // warnings defeats the point of --strict (it's used in CI to gate merges
-    // on a clean tree).
-    //
-    // The peek deliberately does not acquire the lock; lint is read-only and
-    // must remain runnable concurrently when no one is writing.
-    if let Some(holder) = jobs::peek_root_lock(root) {
-        if holder.command.contains("compile") {
-            if strict {
-                return Err(ExitCodeError {
-                    exit_code: 1,
-                    message: format!(
-                        "refusing to run --strict while kb compile is in flight (pid {}, command=`{}`); re-run after compile completes",
-                        holder.pid, holder.command
-                    ),
-                }
-                .into());
-            }
-            eprintln!(
-                "warning: kb compile is in flight (pid {}, command=`{}`); lint output may be stale",
-                holder.pid, holder.command
-            );
-        }
+/// Peek at the root lock before a lint pass. If another process is mid-compile
+/// the on-disk state is a moving target (half-written source pages, not-yet-
+/// rendered concept pages), and running lint against that snapshot produces
+/// scary false positives that resolve themselves silently once compile
+/// finishes.
+///
+/// * Default mode: warn on stderr and keep going — lint is still useful advice.
+/// * `--strict` mode: refuse to run. A strict run that fires off stale warnings
+///   defeats the point of `--strict` (it's used in CI to gate merges on a clean
+///   tree).
+///
+/// The peek deliberately does not acquire the lock; lint is read-only and must
+/// remain runnable concurrently when no one is writing.
+fn guard_lint_against_concurrent_compile(root: &Path, strict: bool) -> Result<()> {
+    let Some(holder) = jobs::peek_root_lock(root) else {
+        return Ok(());
+    };
+    if !holder.command.contains("compile") {
+        return Ok(());
     }
+    if strict {
+        return Err(ExitCodeError {
+            exit_code: 1,
+            message: format!(
+                "refusing to run --strict while kb compile is in flight (pid {}, command=`{}`); re-run after compile completes",
+                holder.pid, holder.command
+            ),
+        }
+        .into());
+    }
+    eprintln!(
+        "warning: kb compile is in flight (pid {}, command=`{}`); lint output may be stale",
+        holder.pid, holder.command
+    );
+    Ok(())
+}
+
+fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Result<()> {
+    guard_lint_against_concurrent_compile(root, strict)?;
 
     let cfg = Config::load_from_root(root, None)?;
     let check = kb_lint::LintRule::parse(check)?;
@@ -3364,16 +3369,24 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Resul
             "invalid lint.missing_citations_level in kb.toml: {other} (expected warn or error)"
         ),
     };
+    let missing_concepts_cfg = kb_lint::MissingConceptsConfig {
+        enabled: cfg.lint.missing_concepts.enabled,
+        min_sources: cfg.lint.missing_concepts.min_sources,
+        min_mentions: cfg.lint.missing_concepts.min_mentions,
+    };
     let options = kb_lint::LintOptions {
         require_citations: cfg.lint.require_citations,
         missing_citations_level,
+        missing_concepts: missing_concepts_cfg.clone(),
     };
 
     let rules = if matches!(check, kb_lint::LintRule::All) {
-        lint_rules_for_root(cfg.lint.require_citations)
+        lint_rules_for_root(cfg.lint.require_citations, missing_concepts_cfg.enabled)
     } else {
         vec![check]
     };
+
+    persist_concept_candidate_review_items(root, &rules, &missing_concepts_cfg);
 
     let mut total_warnings = 0;
     let mut total_errors = 0;
@@ -3438,7 +3451,10 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Resul
         Ok(())
     }
 }
-fn lint_rules_for_root(require_citations: bool) -> Vec<kb_lint::LintRule> {
+fn lint_rules_for_root(
+    require_citations: bool,
+    missing_concepts_enabled: bool,
+) -> Vec<kb_lint::LintRule> {
     let mut rules = vec![
         kb_lint::LintRule::BrokenLinks,
         kb_lint::LintRule::Orphans,
@@ -3448,7 +3464,49 @@ fn lint_rules_for_root(require_citations: bool) -> Vec<kb_lint::LintRule> {
     if require_citations {
         rules.push(kb_lint::LintRule::MissingCitations);
     }
+    if missing_concepts_enabled {
+        rules.push(kb_lint::LintRule::MissingConcepts);
+    }
     rules
+}
+
+/// Persist concept-candidate review items to `reviews/concept_candidates/`
+/// whenever the `missing_concepts` rule is part of this lint pass.
+///
+/// Mirrors how `kb compile` saves duplicate-concepts review items: lint is
+/// the discovery surface, and the queue is what makes findings approvable
+/// via `kb review`. Errors are logged as warnings rather than propagated —
+/// the lint itself already succeeded, and queue-write failures shouldn't
+/// mask the lint output.
+fn persist_concept_candidate_review_items(
+    root: &Path,
+    rules: &[kb_lint::LintRule],
+    missing_concepts_cfg: &kb_lint::MissingConceptsConfig,
+) {
+    if !missing_concepts_cfg.enabled {
+        return;
+    }
+    let should_run = rules
+        .iter()
+        .any(|r| matches!(r, kb_lint::LintRule::MissingConcepts | kb_lint::LintRule::All));
+    if !should_run {
+        return;
+    }
+    match kb_lint::check_missing_concepts(root, missing_concepts_cfg) {
+        Ok(items) => {
+            for item in &items {
+                if let Err(err) = kb_core::save_review_item(root, item) {
+                    tracing::warn!(
+                        "failed to persist concept-candidate review item '{}': {err}",
+                        item.metadata.id
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!("missing-concepts review-item write skipped: {err}");
+        }
+    }
 }
 
 fn print_lint_check_report(
