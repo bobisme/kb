@@ -337,11 +337,42 @@ fn scan_page_for_broken_links(
         Regex::new(r"(!?)\[[^\]]*\]\(([^)]+)\)").expect("valid markdown link regex");
 
     let mut issues = Vec::new();
+    let mut in_frontmatter = false;
+    let mut past_frontmatter_start = false;
+    let mut in_code_block = false;
 
     for (idx, line) in content.lines().enumerate() {
         let line_number = idx + 1;
 
-        for capture in wikilink_re.captures_iter(line) {
+        // Detect and skip YAML frontmatter at the very start of the document.
+        if !past_frontmatter_start {
+            past_frontmatter_start = true;
+            if line.trim_end() == "---" {
+                in_frontmatter = true;
+                continue;
+            }
+        } else if in_frontmatter {
+            if line.trim_end() == "---" {
+                in_frontmatter = false;
+            }
+            continue;
+        }
+
+        // Toggle fenced code block state on lines that start with ```.
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block {
+            continue;
+        }
+
+        // Strip inline code spans (text between matching single backticks) so
+        // that `[[inside-code]]` does not trigger the wiki-link scanner.
+        let scan_line = strip_inline_code_spans(line);
+
+        for capture in wikilink_re.captures_iter(&scan_line) {
             let Some(raw_target) = capture.get(1).map(|m| m.as_str()) else {
                 continue;
             };
@@ -350,7 +381,7 @@ fn scan_page_for_broken_links(
             }
         }
 
-        for capture in markdown_link_re.captures_iter(line) {
+        for capture in markdown_link_re.captures_iter(&scan_line) {
             if capture.get(1).is_some_and(|m| m.as_str() == "!") {
                 continue;
             }
@@ -367,6 +398,47 @@ fn scan_page_for_broken_links(
     }
 
     issues
+}
+
+/// Replace inline code spans (text between single backticks) with spaces while
+/// preserving line length and byte positions. Non-span backticks are left as-is.
+fn strip_inline_code_spans(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            // Find the matching closing backtick on this line.
+            if let Some(close_offset) = bytes[i + 1..].iter().position(|&b| b == b'`') {
+                let close = i + 1 + close_offset;
+                // Replace the entire span (including both backticks) with spaces
+                // of equal byte length to keep offsets stable.
+                for _ in i..=close {
+                    out.push(' ');
+                }
+                i = close + 1;
+                continue;
+            }
+            // Unmatched backtick: copy it and stop trying to strip further spans.
+            out.push('`');
+            i += 1;
+            // Copy the rest of the line verbatim.
+            while i < bytes.len() {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            break;
+        }
+        // Copy the current UTF-8 codepoint.
+        let ch_start = i;
+        // Advance to next codepoint boundary.
+        i += 1;
+        while i < bytes.len() && (bytes[i] & 0b1100_0000) == 0b1000_0000 {
+            i += 1;
+        }
+        out.push_str(&line[ch_start..i]);
+    }
+    out
 }
 
 fn validate_link(
@@ -1132,6 +1204,75 @@ mod tests {
             report.issues[1].suggested_fix.as_deref(),
             Some("wiki/concepts/rust#summary")
         );
+    }
+
+    #[test]
+    fn broken_link_lint_ignores_wikilinks_in_yaml_frontmatter() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+        Manifest::default().save(root).expect("save manifest");
+
+        fs::write(
+            root.join("wiki/sources/page.md"),
+            "---\nsources:\n  - quote: \"See also: [[raft-overview]]\"\n---\n# Page\n\nBroken [[wiki/concepts/bar]].\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::BrokenLinks).expect("run lint");
+        assert_eq!(
+            report.issue_count, 1,
+            "expected only body wiki-link reported, got: {report:?}"
+        );
+        assert_eq!(report.issues[0].line, 7);
+        assert_eq!(report.issues[0].target, "wiki/concepts/bar");
+    }
+
+    #[test]
+    fn broken_link_lint_ignores_wikilinks_in_fenced_code_blocks() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+        Manifest::default().save(root).expect("save manifest");
+
+        fs::write(
+            root.join("wiki/sources/page.md"),
+            "# Page\n\n```\n[[inside-code]]\n```\n\nBroken [[wiki/concepts/missing]].\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::BrokenLinks).expect("run lint");
+        assert_eq!(
+            report.issue_count, 1,
+            "expected only body wiki-link reported, got: {report:?}"
+        );
+        assert_eq!(report.issues[0].line, 7);
+        assert_eq!(report.issues[0].target, "wiki/concepts/missing");
+    }
+
+    #[test]
+    fn broken_link_lint_ignores_wikilinks_in_inline_code_spans() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+        Manifest::default().save(root).expect("save manifest");
+
+        fs::write(
+            root.join("wiki/sources/page.md"),
+            "# Page\n\nExample: `[[inline-code]]` and real [[wiki/concepts/missing]].\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::BrokenLinks).expect("run lint");
+        assert_eq!(
+            report.issue_count, 1,
+            "expected only body wiki-link reported, got: {report:?}"
+        );
+        assert_eq!(report.issues[0].line, 3);
+        assert_eq!(report.issues[0].target, "wiki/concepts/missing");
     }
 
     #[test]
