@@ -12,7 +12,7 @@ mod root;
 
 use std::env;
 use std::fs;
-use std::io::Read as _;
+use std::io::{IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1940,19 +1940,64 @@ fn create_ask_adapter(
 }
 
 fn resolve_query(query: Option<String>) -> Result<String> {
+    // bn-3iq4: when invoked with no query arg on a TTY, open an interactive
+    // multi-line readline editor. Piped stdin and explicit `-` keep the
+    // original read-to-EOF behavior.
     match query {
+        // Non-empty query arg — fast path. (run_ask still enforces the
+        // whitespace-only bail via ValidationError, so we don't duplicate
+        // it here.)
         Some(q) if q != "-" => Ok(q),
-        _ => {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)?;
-            let trimmed = buf.trim().to_string();
-            if trimmed.is_empty() {
-                bail!("no question provided (pass as argument or pipe via stdin)");
+        // Explicit `-` — always read stdin, regardless of TTY.
+        Some(_) => read_stdin_to_end(),
+        None => {
+            if std::io::stdin().is_terminal() {
+                read_interactive_multiline()
+            } else {
+                read_stdin_to_end()
             }
-            Ok(trimmed)
         }
     }
+}
+
+fn read_stdin_to_end() -> Result<String> {
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf)?;
+    let trimmed = buf.trim().to_string();
+    if trimmed.is_empty() {
+        bail!("no question provided (pass as argument or pipe via stdin)");
+    }
+    Ok(trimmed)
+}
+
+/// Interactive multi-line readline editor for `kb ask` with no query arg
+/// on a TTY (bn-3iq4). Ctrl-D submits, Ctrl-C aborts. Empty submit is
+/// a `ValidationError` so it doesn't pollute `kb status` — though since
+/// this runs before `execute_mutating_command` opens a job manifest,
+/// any error here is fine.
+fn read_interactive_multiline() -> Result<String> {
+    use rustyline::{DefaultEditor, error::ReadlineError};
+
+    eprintln!("Enter your question (multi-line; Ctrl-D to submit, Ctrl-C to abort):");
+    let mut rl = DefaultEditor::new().context("init readline")?;
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        let prompt = if lines.is_empty() { "> " } else { "... " };
+        match rl.readline(prompt) {
+            Ok(line) => {
+                let _ = rl.add_history_entry(line.as_str());
+                lines.push(line);
+            }
+            Err(ReadlineError::Eof) => break,
+            Err(ReadlineError::Interrupted) => bail!("ask: aborted"),
+            Err(e) => return Err(e).context("readline"),
+        }
+    }
+    let query = lines.join("\n");
+    if query.trim().is_empty() {
+        bail!("ask: question cannot be empty");
+    }
+    Ok(query)
 }
 
 fn normalize_ask_format(format: &str) -> Result<&str> {
