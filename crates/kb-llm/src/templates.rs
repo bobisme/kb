@@ -66,6 +66,7 @@ impl Template {
                 "../prompts/generate_concept_from_candidate.md"
             )
             .to_string()),
+            "impute_gap.md" => Ok(include_str!("../prompts/impute_gap.md").to_string()),
             _ => Err(anyhow!(
                 "template '{name}' not found in project and no bundled default available"
             )),

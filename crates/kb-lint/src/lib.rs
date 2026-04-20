@@ -18,6 +18,12 @@ use serde_yaml::Value;
 pub mod contradictions;
 pub use contradictions::{ContradictionsConfig, check_contradictions, detect_contradictions_issues};
 
+pub mod impute;
+pub use impute::{
+    ImputeConfig, ImputeKindSelector, ImputeOutcome, ImputedFixPayload, ImputedItem,
+    load_imputed_fix_payload, outcomes_to_lint_issues, run_impute_pass, save_imputed_fix_payload,
+};
+
 const WIKI_DIR: &str = "wiki";
 const MD_EXT: &str = "md";
 
@@ -138,6 +144,10 @@ pub enum IssueKind {
     /// Concept has quotes from ≥ 2 different source documents that make
     /// contradictory claims (per the LLM judge).
     Contradiction,
+    /// Concept page exists but its body is empty or too short to be
+    /// useful. Surfaced by the `thin_concepts` discovery pass used by
+    /// `kb lint --impute` (bn-xt4o).
+    ThinConceptBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2308,6 +2318,22 @@ fn build_concept_candidate_review_item(hit: &ConceptCandidateHit, now: u64) -> R
     }
 }
 
+/// Public wrapper around the missing-concepts extractor.
+///
+/// The impute module (and other callers that need the per-hit source ids
+/// and mention counts) can reuse the same filtering logic as the lint and
+/// review-queue paths.
+///
+/// # Errors
+///
+/// Returns an error when the KB directory cannot be scanned.
+pub fn check_missing_concepts_hits(
+    root: &Path,
+    config: &MissingConceptsConfig,
+) -> Result<Vec<ConceptCandidateHit>> {
+    check_missing_concepts_raw(root, config)
+}
+
 /// Core extractor + filter. Shared by `detect_missing_concepts_issues` (lint
 /// surface) and `check_missing_concepts` (review-queue writer). Deterministic:
 /// the returned list is sorted by (source count desc, mention count desc,
@@ -2972,6 +2998,161 @@ fn unix_time_ms() -> Result<u64> {
         .as_millis()
         .try_into()
         .context("system time exceeds u64 millisecond range")
+}
+
+// ---------------------------------------------------------------------------
+// Thin-concept-body discovery (bn-xt4o)
+// ---------------------------------------------------------------------------
+//
+// Lightweight, non-LLM scan over `wiki/concepts/*.md`. A concept is "thin"
+// when its body (everything after the frontmatter + leading `# Title`
+// heading, excluding `<!-- kb:* -->` managed regions) contains fewer than
+// `min_body_words` words. Used by `kb lint --impute` to pick concepts that
+// are worth asking a web-search agent to backfill.
+
+/// Configuration for the thin-concept-body discovery pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinConceptBodyConfig {
+    /// A concept body with strictly fewer than this many words is flagged
+    /// as thin. Default: `12` — just barely enough for a single-sentence
+    /// general definition.
+    pub min_body_words: usize,
+}
+
+impl Default for ThinConceptBodyConfig {
+    fn default() -> Self {
+        Self { min_body_words: 12 }
+    }
+}
+
+/// One thin-body concept. The path is relative to the KB root; the
+/// `body_words` count is the post-trim post-managed-region word count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThinConceptHit {
+    /// Relative path of the concept page.
+    pub page_path: PathBuf,
+    /// `id` frontmatter field (`concept:<slug>`). Empty when the page has
+    /// no `id:` key — we still emit the hit so the user sees it, but the
+    /// impute apply step relies on the `name` field and file stem.
+    pub concept_id: String,
+    /// `name` frontmatter field (falls back to the file stem).
+    pub name: String,
+    /// Current body text (trimmed, managed-regions stripped). Handed to the
+    /// LLM as `existing_body` so the model can decide whether to rewrite or
+    /// extend.
+    pub body: String,
+    /// Number of words in `body`.
+    pub body_words: usize,
+}
+
+/// Walk `wiki/concepts/*.md` and flag concepts with too-short bodies.
+///
+/// A concept is thin when its body has fewer than `min_body_words` words.
+/// Skips `index.md` and any file that fails frontmatter parsing (matches
+/// the rest of kb-lint's "best effort" approach to malformed inputs).
+///
+/// # Errors
+///
+/// Returns an error when the concepts dir cannot be scanned or a file
+/// cannot be read.
+pub fn detect_thin_concept_bodies(
+    root: &Path,
+    config: &ThinConceptBodyConfig,
+) -> Result<Vec<ThinConceptHit>> {
+    let concepts_dir = root.join(WIKI_CONCEPTS_DIR);
+    if !concepts_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for entry in fs::read_dir(&concepts_dir)
+        .with_context(|| format!("scan concepts dir {}", concepts_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "md") {
+            continue;
+        }
+        if path.file_name().is_some_and(|n| n == "index.md") {
+            continue;
+        }
+
+        let Ok((fm, full_body)) = read_frontmatter(&path) else {
+            continue;
+        };
+
+        let body = extract_concept_body_text(&full_body);
+        let word_count = body.split_whitespace().count();
+        if word_count >= config.min_body_words {
+            continue;
+        }
+
+        let concept_id = fm
+            .get(Value::String("id".into()))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let name_from_fm = fm
+            .get(Value::String("name".into()))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let name = name_from_fm.unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .replace('-', " ")
+        });
+
+        let rel_path = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+
+        hits.push(ThinConceptHit {
+            page_path: rel_path,
+            concept_id,
+            name,
+            body,
+            body_words: word_count,
+        });
+    }
+    hits.sort_by(|a, b| a.page_path.cmp(&b.page_path));
+    Ok(hits)
+}
+
+/// Strip the leading `# Heading` line (if any), drop `<!-- kb:begin/end -->`
+/// managed regions, and return the remaining body content trimmed of
+/// leading/trailing whitespace.
+fn extract_concept_body_text(full_body: &str) -> String {
+    // Drop kb-managed regions — those are auto-generated (backlinks, etc.)
+    // and don't count as human-authored body text. Keep the text simple:
+    // line-based filter, not a proper markdown parser.
+    let mut in_managed = false;
+    let mut lines = Vec::new();
+    for line in full_body.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("<!-- kb:begin") {
+            in_managed = true;
+            continue;
+        }
+        if trimmed.starts_with("<!-- kb:end") {
+            in_managed = false;
+            continue;
+        }
+        if in_managed {
+            continue;
+        }
+        lines.push(line);
+    }
+
+    // Drop the first leading blank lines, then the first `# ...` line if
+    // present — we want the body text, not the page title.
+    let mut cursor = 0;
+    while cursor < lines.len() && lines[cursor].trim().is_empty() {
+        cursor += 1;
+    }
+    if cursor < lines.len() {
+        let stripped = lines[cursor].trim_start();
+        if stripped.starts_with("# ") {
+            cursor += 1;
+        }
+    }
+    lines[cursor..].join("\n").trim().to_string()
 }
 
 #[cfg(test)]

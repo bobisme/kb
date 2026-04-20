@@ -266,6 +266,14 @@ pub enum ReviewKind {
     /// rejection flags the pair as "intended nuance" so the same
     /// concept+quote-set doesn't re-fire on subsequent runs.
     Contradiction,
+    /// A draft fix for a lint gap (missing concept body, thin concept) drafted
+    /// by a web-search-capable LLM agent. Emitted by `kb lint --impute`
+    /// (bn-xt4o). Approval applies the imputed content (creates or extends a
+    /// concept page); rejection records a dismissal so the same gap doesn't
+    /// re-fire. Contents are held in the review item's `comment` as rendered
+    /// markdown (plus a JSON payload in `metadata.output_paths[0]` for the
+    /// apply step).
+    ImputedFix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

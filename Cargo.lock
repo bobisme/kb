@@ -1497,6 +1497,7 @@ dependencies = [
  "ignore",
  "indicatif",
  "kb-core",
+ "kb-lint",
  "kb-llm",
  "kb-query",
  "regex",

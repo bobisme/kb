@@ -4,6 +4,7 @@ pub mod backlinks;
 pub mod concept_candidate;
 pub mod concept_extraction;
 pub mod concept_merge;
+pub mod imputed_fix;
 pub mod index_page;
 pub mod pipeline;
 pub mod progress;

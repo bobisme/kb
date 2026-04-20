@@ -2981,6 +2981,159 @@ JSON
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn lint_impute_queues_imputed_fix_review_items_from_thin_concept_body() {
+    // bn-xt4o: `kb lint --impute` walks concept pages with thin bodies,
+    // calls a web-search-capable LLM, and queues the draft as a
+    // `ReviewKind::ImputedFix` review item. No direct edits — the user
+    // approves via `kb review approve lint:imputed-fix:<id>`.
+    //
+    // Harness-fake strategy mirrors the contradictions test: install a
+    // fake opencode on PATH that prints the exact JSON an
+    // `ImputeGapResponse` serializes to. The adapter parses the stdout
+    // and the impute pass wraps it into a review item.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed a concept page with a body short enough to trip the thin-body
+    // detector (the default threshold is 12 words; "thin." has one).
+    let concepts = kb_root.join("wiki").join("concepts");
+    fs::create_dir_all(&concepts).expect("create concepts dir");
+    let concept_body = "---\nid: concept:widget\nname: Widget\n---\n\n# Widget\n\nthin.\n";
+    fs::write(concepts.join("widget.md"), concept_body).expect("write concept");
+
+    // Fake opencode prints the JSON the impute adapter expects.
+    let bin_dir = kb_root.join("fake-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+    let fake_script = r#"#!/bin/sh
+cat <<'JSON'
+{"definition": "Widget is a general-purpose example concept used in kb integration tests to exercise the impute pass.", "sources": [{"url": "https://example.com/widget", "title": "Widget overview", "note": "Canonical test reference."}], "confidence": "medium", "rationale": "Picked the general test variant because the local KB body is thin."}
+JSON
+"#;
+    write_executable(bin_dir.join("opencode").as_path(), fake_script);
+    // `just check`-style `claude` stub needed in case the adapter path
+    // ever falls back to it (it won't in this config, but kb-cli doctors
+    // expect it on PATH when resolving runners).
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&bin_dir));
+    cmd.arg("--json").arg("lint").arg("--impute");
+    let output = cmd.output().expect("run kb lint --impute");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    assert_eq!(envelope["command"], "lint");
+    let checks = envelope["data"]["checks"].as_array().expect("checks array");
+    let impute_check = checks
+        .iter()
+        .find(|c| c["check"] == "impute")
+        .expect("expected an 'impute' check entry");
+    let issues = impute_check["issues"].as_array().expect("issues array");
+    assert!(
+        !issues.is_empty(),
+        "impute pass should have emitted at least one issue: {issues:?}"
+    );
+
+    // The impute pass must have persisted an imputed-fix review item and
+    // its payload sidecar so `kb review approve` can find it.
+    let review_path = kb_root
+        .join("reviews")
+        .join("imputed_fixes")
+        .join("lint:imputed-fix:thin_concept_body:widget.json");
+    assert!(
+        review_path.is_file(),
+        "expected review item at {}",
+        review_path.display()
+    );
+    let raw = fs::read_to_string(&review_path).expect("read review item");
+    let item: Value = serde_json::from_str(&raw).expect("parse review item json");
+    assert_eq!(item["kind"], "imputed_fix");
+    assert_eq!(item["status"], "pending");
+    assert_eq!(item["target_entity_id"], "concept:widget");
+    let citations = item["citations"].as_array().expect("citations array");
+    assert!(
+        citations
+            .iter()
+            .any(|c| c.as_str().is_some_and(|s| s.contains("https://example.com/widget"))),
+        "expected web-source citation: {citations:?}"
+    );
+
+    let sidecar_path = kb_root
+        .join("reviews")
+        .join("imputed_fixes")
+        .join("lint:imputed-fix:thin_concept_body:widget.payload.json");
+    assert!(
+        sidecar_path.is_file(),
+        "expected payload sidecar at {}",
+        sidecar_path.display()
+    );
+    let payload_raw = fs::read_to_string(&sidecar_path).expect("read payload sidecar");
+    let payload: Value = serde_json::from_str(&payload_raw).expect("parse payload sidecar");
+    assert_eq!(payload["gap_kind"], "thin_concept_body");
+    assert_eq!(payload["concept_id"], "concept:widget");
+    assert!(
+        payload["definition"]
+            .as_str()
+            .is_some_and(|s| s.contains("Widget is a")),
+        "definition should start with concept name: {payload:?}"
+    );
+    assert!(
+        payload["sources"]
+            .as_array()
+            .is_some_and(|arr| !arr.is_empty()),
+        "payload must carry at least one web source"
+    );
+
+    // Approve should rewrite the body while preserving the frontmatter.
+    let mut approve_cmd = kb_cmd(&kb_root);
+    approve_cmd.env("PATH", prepend_path(&bin_dir));
+    approve_cmd
+        .arg("--json")
+        .arg("review")
+        .arg("approve")
+        .arg("lint:imputed-fix:thin_concept_body:widget");
+    let approve_output = approve_cmd
+        .output()
+        .expect("run kb review approve lint:imputed-fix:...");
+    assert_eq!(
+        approve_output.status.code(),
+        Some(0),
+        "approve stdout: {} stderr: {}",
+        String::from_utf8_lossy(&approve_output.stdout),
+        String::from_utf8_lossy(&approve_output.stderr)
+    );
+
+    let written = fs::read_to_string(concepts.join("widget.md")).expect("read concept post-approve");
+    assert!(
+        written.contains("id: concept:widget"),
+        "frontmatter id preserved: {written}"
+    );
+    assert!(
+        written.contains("Widget is a general-purpose example concept"),
+        "body replaced with imputed definition: {written}"
+    );
+    assert!(
+        written.contains("## Sources (imputed)"),
+        "sources section rendered: {written}"
+    );
+    assert!(
+        written.contains("https://example.com/widget"),
+        "cited URL rendered in sources section: {written}"
+    );
+}
+
+#[test]
 fn doctor_returns_zero_when_all_checks_pass() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);

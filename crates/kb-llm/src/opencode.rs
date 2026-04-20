@@ -11,10 +11,12 @@ use crate::adapter::{
     DetectContradictionsResponse, ExtractConceptsRequest, ExtractConceptsResponse,
     GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateConceptFromCandidateRequest,
     GenerateConceptFromCandidateResponse, GenerateSlidesRequest, GenerateSlidesResponse,
-    LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse,
-    RunHealthCheckRequest, RunHealthCheckResponse, SummarizeDocumentRequest,
-    SummarizeDocumentResponse, parse_detect_contradictions_json, parse_extract_concepts_json,
-    parse_generate_concept_from_candidate_json, parse_merge_concept_candidates_json,
+    ImputeGapRequest, ImputeGapResponse, LlmAdapter, LlmAdapterError,
+    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
+    RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
+    parse_detect_contradictions_json, parse_extract_concepts_json,
+    parse_generate_concept_from_candidate_json, parse_impute_gap_json,
+    parse_merge_concept_candidates_json,
 };
 use crate::provenance::ProvenanceRecord;
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -85,19 +87,34 @@ impl OpencodeAdapter {
     /// earlier manual `remove_dir_all` call that could leak the directory if the
     /// process was killed between config write and cleanup.
     fn write_config(&self) -> Result<(TempDir, PathBuf), LlmAdapterError> {
+        self.write_config_with_extra_tools(&[])
+    }
+
+    /// Like [`write_config`](Self::write_config) but merges extra boolean tool
+    /// entries into the agent's `tools` map. bn-xt4o: the `impute_gap` call
+    /// turns on opencode's `webfetch` tool here so the model can browse
+    /// external sources, without affecting other calls.
+    fn write_config_with_extra_tools(
+        &self,
+        extra_tools: &[(&str, bool)],
+    ) -> Result<(TempDir, PathBuf), LlmAdapterError> {
         let dir = tempfile::Builder::new()
             .prefix("kb-opencode-")
             .tempdir()
             .map_err(|e| LlmAdapterError::Other(format!("create config dir: {e}")))?;
 
+        let mut tools = serde_json::Map::new();
+        tools.insert("read".to_string(), json!(self.config.tools_read));
+        tools.insert("write".to_string(), json!(self.config.tools_write));
+        tools.insert("edit".to_string(), json!(self.config.tools_edit));
+        tools.insert("bash".to_string(), json!(self.config.tools_bash));
+        for (name, enabled) in extra_tools {
+            tools.insert((*name).to_string(), json!(*enabled));
+        }
+
         let agent_config = json!({
             "model": self.config.model,
-            "tools": {
-                "read": self.config.tools_read,
-                "write": self.config.tools_write,
-                "edit": self.config.tools_edit,
-                "bash": self.config.tools_bash,
-            }
+            "tools": tools,
         });
         let mut agent_map = serde_json::Map::new();
         agent_map.insert(self.config.agent_name.clone(), agent_config);
@@ -201,6 +218,42 @@ impl OpencodeAdapter {
     /// Generate config, invoke opencode, and return the stripped response text.
     fn run_prompt(&self, prompt: &str) -> Result<String, LlmAdapterError> {
         self.run_prompt_with_attachments(prompt, &[])
+    }
+
+    /// Like [`run_prompt`](Self::run_prompt) but writes the per-call config
+    /// with extra boolean tool entries merged in. bn-xt4o: the `impute_gap`
+    /// call uses this to flip on `webfetch` so the agent can browse.
+    fn run_prompt_with_extra_tools(
+        &self,
+        prompt: &str,
+        extra_tools: &[(&str, bool)],
+    ) -> Result<String, LlmAdapterError> {
+        let (_temp_dir, config_path) = self.write_config_with_extra_tools(extra_tools)?;
+        let command = self.build_command(&config_path, prompt);
+        let result = run_shell_command(&command, self.config.timeout);
+
+        let output = result.map_err(|e| match e {
+            SubprocessError::TimedOut { timeout, .. } => {
+                LlmAdapterError::Timeout(format!("opencode exceeded timeout of {timeout:?}"))
+            }
+            SubprocessError::Other(err) => {
+                LlmAdapterError::Transport(format!("failed to invoke opencode: {err}"))
+            }
+        })?;
+
+        if output.exit_code != Some(0) {
+            let stderr = output.stderr.trim().to_string();
+            let details = if stderr.is_empty() {
+                output.stdout.trim().to_string()
+            } else {
+                stderr
+            };
+            return Err(LlmAdapterError::Other(format!(
+                "opencode exited with error: {details}"
+            )));
+        }
+
+        Ok(strip_ansi_header(&output.stdout))
     }
 
     /// Like [`run_prompt`](Self::run_prompt) but forwards `image_paths` as
@@ -439,6 +492,64 @@ impl LlmAdapter for OpencodeAdapter {
         let started_at = unix_time_ms()?;
         let raw = self.run_prompt(&rendered.content)?;
         let response = parse_generate_concept_from_candidate_json(&raw)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((response, provenance))
+    }
+
+    fn impute_gap(
+        &self,
+        request: ImputeGapRequest,
+    ) -> Result<(ImputeGapResponse, ProvenanceRecord), LlmAdapterError> {
+        let template =
+            Template::load("impute_gap.md", self.config.project_root.as_deref()).map_err(|err| {
+                LlmAdapterError::Other(format!("load impute_gap template: {err}"))
+            })?;
+
+        let mut context = HashMap::new();
+        context.insert("gap_kind".to_string(), request.gap_kind.prompt_description().to_string());
+        context.insert("concept_name".to_string(), request.concept_name.clone());
+        context.insert(
+            "existing_body".to_string(),
+            if request.existing_body.trim().is_empty() {
+                "(none)".to_string()
+            } else {
+                request.existing_body.clone()
+            },
+        );
+        context.insert(
+            "local_snippets".to_string(),
+            format_candidate_snippets_for_prompt(&request.local_snippets),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render impute_gap template: {err}"))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        // bn-xt4o: flip on opencode's `webfetch` tool for this call so the
+        // model can browse external sources. All other adapter calls leave
+        // it off (costly + unnecessary for KB-internal reasoning).
+        let raw = self.run_prompt_with_extra_tools(
+            &rendered.content,
+            &[("webfetch", true)],
+        )?;
+        let response = parse_impute_gap_json(&raw)?;
         let ended_at = unix_time_ms()?;
 
         let provenance = ProvenanceRecord {

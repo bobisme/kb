@@ -39,6 +39,7 @@ fn review_kind_dir(root: &Path, kind: ReviewKind) -> PathBuf {
         ReviewKind::Canonicalization => "canonicalization",
         ReviewKind::ConceptCandidate => "concept_candidates",
         ReviewKind::Contradiction => "contradictions",
+        ReviewKind::ImputedFix => "imputed_fixes",
     };
     review_queue_dir(root).join(leaf)
 }
@@ -59,6 +60,7 @@ pub fn load_review_item(root: &Path, id: &str) -> Result<Option<ReviewItem>> {
         ReviewKind::Canonicalization,
         ReviewKind::ConceptCandidate,
         ReviewKind::Contradiction,
+        ReviewKind::ImputedFix,
     ] {
         let path = review_kind_dir(root, *kind).join(&filename);
         if path.exists() {
@@ -87,6 +89,7 @@ pub fn list_review_items(root: &Path) -> Result<Vec<ReviewItem>> {
         ReviewKind::Canonicalization,
         ReviewKind::ConceptCandidate,
         ReviewKind::Contradiction,
+        ReviewKind::ImputedFix,
     ] {
         let dir = review_kind_dir(root, *kind);
         if !dir.exists() {

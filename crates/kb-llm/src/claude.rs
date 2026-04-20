@@ -10,10 +10,12 @@ use crate::adapter::{
     DetectContradictionsResponse, ExtractConceptsRequest, ExtractConceptsResponse,
     GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateConceptFromCandidateRequest,
     GenerateConceptFromCandidateResponse, GenerateSlidesRequest, GenerateSlidesResponse,
-    LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse,
-    RunHealthCheckRequest, RunHealthCheckResponse, SummarizeDocumentRequest,
-    SummarizeDocumentResponse, parse_detect_contradictions_json, parse_extract_concepts_json,
-    parse_generate_concept_from_candidate_json, parse_merge_concept_candidates_json,
+    ImputeGapRequest, ImputeGapResponse, LlmAdapter, LlmAdapterError,
+    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
+    RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
+    parse_detect_contradictions_json, parse_extract_concepts_json,
+    parse_generate_concept_from_candidate_json, parse_impute_gap_json,
+    parse_merge_concept_candidates_json,
 };
 use crate::provenance::{ProvenanceRecord, TokenUsage};
 use crate::subprocess::{SubprocessError, run_shell_command};
@@ -160,6 +162,16 @@ impl ClaudeCliAdapter {
     }
 
     fn build_command(&self, prompt: &str) -> String {
+        self.build_command_with_extra_tools(prompt, &[])
+    }
+
+    /// Build a `claude -p` command with an explicit set of additional tools
+    /// appended via `--allowedTools`. bn-xt4o: the `impute_gap` call uses
+    /// this to turn on `WebSearch` + `WebFetch` so the agent can browse.
+    /// Claude's default `--tools` set is left alone when `extra_tools` is
+    /// empty so other calls continue to work with whatever the user
+    /// configured.
+    fn build_command_with_extra_tools(&self, prompt: &str, extra_tools: &[&str]) -> String {
         let mut parts = vec![self.config.command.clone(), "-p".to_string()];
 
         if let Some(model) = &self.config.model {
@@ -170,6 +182,14 @@ impl ClaudeCliAdapter {
         if let Some(permission_mode) = &self.config.permission_mode {
             parts.push("--permission-mode".to_string());
             parts.push(shell_quote(permission_mode));
+        }
+
+        if !extra_tools.is_empty() {
+            parts.push("--allowedTools".to_string());
+            // Claude's `--allowedTools` takes a comma-or-space separated
+            // list. Use a comma-joined form so a single shell-quoted arg
+            // carries all of them.
+            parts.push(shell_quote(&extra_tools.join(",")));
         }
 
         parts.push("--output-format".to_string());
@@ -562,6 +582,80 @@ impl LlmAdapter for ClaudeCliAdapter {
 
         let parsed = parse_claude_json(&output.stdout)?;
         let response = parse_detect_contradictions_json(&parsed.text)?;
+        let ended_at = unix_time_ms()?;
+
+        let model = parsed
+            .model
+            .or_else(|| self.config.model.clone())
+            .unwrap_or_else(|| "claude".to_string());
+
+        let provenance = ProvenanceRecord {
+            harness: "claude".to_string(),
+            harness_version: None,
+            model,
+            prompt_template_name: template.name,
+            prompt_template_hash: template.template_hash,
+            prompt_render_hash: rendered.render_hash,
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: parsed.tokens,
+            cost_estimate: parsed.cost_estimate,
+        };
+
+        Ok((response, provenance))
+    }
+
+    fn impute_gap(
+        &self,
+        request: ImputeGapRequest,
+    ) -> Result<(ImputeGapResponse, ProvenanceRecord), LlmAdapterError> {
+        let template = Template::load("impute_gap.md", self.config.project_root.as_deref())
+            .map_err(|err| LlmAdapterError::Other(format!("load impute_gap template: {err}")))?;
+
+        let mut context = HashMap::new();
+        context.insert(
+            "gap_kind".to_string(),
+            request.gap_kind.prompt_description().to_string(),
+        );
+        context.insert("concept_name".to_string(), request.concept_name.clone());
+        context.insert(
+            "existing_body".to_string(),
+            if request.existing_body.trim().is_empty() {
+                "(none)".to_string()
+            } else {
+                request.existing_body.clone()
+            },
+        );
+        context.insert(
+            "local_snippets".to_string(),
+            format_candidate_snippets_for_prompt(&request.local_snippets),
+        );
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render impute_gap template: {err}"))
+        })?;
+
+        let started_at = unix_time_ms()?;
+        // bn-xt4o: enable claude's `WebSearch` + `WebFetch` tools for this
+        // call so the agent can browse external sources. Other calls leave
+        // the allowed-tools set at the user's default.
+        let command =
+            self.build_command_with_extra_tools(&rendered.content, &["WebSearch", "WebFetch"]);
+        let output =
+            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+
+        if output.exit_code != Some(0) {
+            return Err(classify_nonzero_exit(
+                output.exit_code,
+                &output.stderr,
+                &output.stdout,
+            ));
+        }
+
+        let parsed = parse_claude_json(&output.stdout)?;
+        let response = parse_impute_gap_json(&parsed.text)?;
         let ended_at = unix_time_ms()?;
 
         let model = parsed

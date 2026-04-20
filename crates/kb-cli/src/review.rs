@@ -7,6 +7,7 @@ use serde::Serialize;
 use kb_compile::backlinks;
 use kb_compile::concept_candidate::apply_concept_candidate;
 use kb_compile::concept_merge::{AppliedMerge, WIKI_CONCEPTS_DIR, apply_concept_merge};
+use kb_compile::imputed_fix::apply_imputed_fix;
 use kb_compile::index_page;
 use kb_compile::promotion::execute_promotion;
 use kb_core::{
@@ -35,6 +36,7 @@ const fn kind_label(kind: ReviewKind) -> &'static str {
         ReviewKind::Canonicalization => "canonicalization",
         ReviewKind::ConceptCandidate => "concept_candidate",
         ReviewKind::Contradiction => "contradiction",
+        ReviewKind::ImputedFix => "imputed_fix",
     }
 }
 
@@ -100,7 +102,7 @@ pub fn run_review_list(root: &Path, json: bool, emit_json: &dyn Fn(&str, serde_j
     let rejected_count = items.iter().filter(|i| i.status == ReviewStatus::Rejected).count();
 
     let mut kind_counts = Vec::new();
-    for kind in &[ReviewKind::Promotion, ReviewKind::ConceptMerge, ReviewKind::AliasMerge, ReviewKind::Canonicalization, ReviewKind::ConceptCandidate, ReviewKind::Contradiction] {
+    for kind in &[ReviewKind::Promotion, ReviewKind::ConceptMerge, ReviewKind::AliasMerge, ReviewKind::Canonicalization, ReviewKind::ConceptCandidate, ReviewKind::Contradiction, ReviewKind::ImputedFix] {
         let count = items.iter().filter(|i| i.kind == *kind && i.status == ReviewStatus::Pending).count();
         if count > 0 {
             kind_counts.push(KindCount {
@@ -157,6 +159,64 @@ pub fn run_review_list(root: &Path, json: bool, emit_json: &dyn Fn(&str, serde_j
     Ok(())
 }
 
+/// Print the "On approve / On reject" narrative shown by
+/// `run_review_show` for pending items. Split out so `run_review_show`
+/// stays under clippy's function-length cap.
+fn print_pending_kind_narrative(kind: ReviewKind) {
+    match kind {
+        ReviewKind::ConceptMerge => {
+            println!(
+                "On approve: the canonical page absorbs member aliases + sources \
+                 and the subsumed member concept files are deleted."
+            );
+        }
+        ReviewKind::Promotion => {
+            println!("On approve: the promotion is executed and the wiki page written.");
+        }
+        ReviewKind::AliasMerge | ReviewKind::Canonicalization => {
+            println!(
+                "On approve: the decision is recorded; the corresponding edit \
+                 must be made manually, then run 'kb compile'."
+            );
+        }
+        ReviewKind::ConceptCandidate => {
+            println!(
+                "On approve: the decision is recorded; creating the concept \
+                 page from mentions via LLM is not yet implemented (see \
+                 bone spec 'Approve workflow'). Work around by creating \
+                 wiki/concepts/<slug>.md manually, then run 'kb compile'."
+            );
+        }
+        ReviewKind::Contradiction => {
+            println!(
+                "On approve: the contradiction is marked acknowledged — \
+                 no auto-fix is applied. The same concept + quote-set \
+                 will be skipped on future runs so the LLM doesn't \
+                 re-flag it."
+            );
+            println!(
+                "On reject: the contradiction is marked 'intended nuance' \
+                 — the same concept + quote-set is still suppressed on \
+                 future runs, but the rejected status is preserved so you \
+                 can tell apart deliberate nuance from acknowledged bugs."
+            );
+        }
+        ReviewKind::ImputedFix => {
+            println!(
+                "On approve: the imputed draft is applied — for \
+                 missing-concept gaps a new concept page is written; \
+                 for thin-body gaps the existing page's body is \
+                 rewritten (frontmatter and managed regions preserved)."
+            );
+            println!(
+                "On reject: the draft is discarded and the same gap is \
+                 skipped on future impute runs (acknowledged via \
+                 fingerprint)."
+            );
+        }
+    }
+}
+
 pub fn run_review_show(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(&str, serde_json::Value) -> Result<()>) -> Result<()> {
     let item = load_review_item(root, id)?
         .with_context(|| format!("review item '{id}' not found"))?;
@@ -170,45 +230,7 @@ pub fn run_review_show(root: &Path, id: &str, json: bool, emit_json: &dyn Fn(&st
     println!("Kind:   {}", kind_label(item.kind));
     println!("Status: {}", status_label(item.status));
     if item.status == ReviewStatus::Pending {
-        match item.kind {
-            ReviewKind::ConceptMerge => {
-                println!(
-                    "On approve: the canonical page absorbs member aliases + sources \
-                     and the subsumed member concept files are deleted."
-                );
-            }
-            ReviewKind::Promotion => {
-                println!("On approve: the promotion is executed and the wiki page written.");
-            }
-            ReviewKind::AliasMerge | ReviewKind::Canonicalization => {
-                println!(
-                    "On approve: the decision is recorded; the corresponding edit \
-                     must be made manually, then run 'kb compile'."
-                );
-            }
-            ReviewKind::ConceptCandidate => {
-                println!(
-                    "On approve: the decision is recorded; creating the concept \
-                     page from mentions via LLM is not yet implemented (see \
-                     bone spec 'Approve workflow'). Work around by creating \
-                     wiki/concepts/<slug>.md manually, then run 'kb compile'."
-                );
-            }
-            ReviewKind::Contradiction => {
-                println!(
-                    "On approve: the contradiction is marked acknowledged — \
-                     no auto-fix is applied. The same concept + quote-set \
-                     will be skipped on future runs so the LLM doesn't \
-                     re-flag it."
-                );
-                println!(
-                    "On reject: the contradiction is marked 'intended nuance' \
-                     — the same concept + quote-set is still suppressed on \
-                     future runs, but the rejected status is preserved so you \
-                     can tell apart deliberate nuance from acknowledged bugs."
-                );
-            }
-        }
+        print_pending_kind_narrative(item.kind);
     }
     println!("Comment: {}", item.comment);
     println!("Target: {}", item.target_entity_id);
@@ -359,6 +381,9 @@ pub fn run_review_approve(
                 adapter_factory,
             )?;
         }
+        ReviewKind::ImputedFix => {
+            approve_imputed_fix(root, id, item, now, json, emit_json)?;
+        }
         other => {
             // alias_merge and canonicalization remain decision-only for now: we
             // flip status so the queue moves on but the reviewer must make the
@@ -455,6 +480,71 @@ fn approve_concept_candidate(
         println!("  Page: {}", applied.concept_path.display());
         if !applied.source_document_ids.is_empty() {
             println!("  Sources: {}", applied.source_document_ids.join(", "));
+        }
+        if backlinks_refreshed {
+            println!("  Backlinks refreshed.");
+        }
+        if index_pages_refreshed {
+            println!("  Wiki indexes refreshed.");
+        }
+    }
+    Ok(())
+}
+
+/// Apply an `ImputedFix` review item (bn-xt4o). For missing-concept gaps
+/// this writes a new concept page; for thin-body gaps it rewrites the
+/// existing page's body while preserving frontmatter + managed regions.
+/// Best-effort backlink + index refreshes run inline so the new content
+/// is visible in the wiki without a follow-up `kb compile`.
+fn approve_imputed_fix(
+    root: &Path,
+    id: &str,
+    item: kb_core::ReviewItem,
+    now: u64,
+    json: bool,
+    emit_json: &dyn Fn(&str, serde_json::Value) -> Result<()>,
+) -> Result<()> {
+    let applied = apply_imputed_fix(root, &item)
+        .with_context(|| format!("apply imputed fix for review '{id}'"))?;
+
+    // Flip review item → approved before the layout refresh so the queue
+    // moves on even if backlinks/index refresh fails.
+    let mut approved = item;
+    approved.status = ReviewStatus::Approved;
+    approved.metadata.updated_at_millis = now;
+    save_review_item(root, &approved)
+        .with_context(|| format!("save approved review item '{id}'"))?;
+
+    let backlinks_refreshed = refresh_backlinks(root);
+    let index_pages_refreshed = refresh_wiki_indexes(root);
+
+    if json {
+        emit_json(
+            "review.approve",
+            serde_json::json!({
+                "id": id,
+                "action": "approved",
+                "kind": "imputed_fix",
+                "gap_kind": applied.gap_kind,
+                "concept_path": applied.concept_path.display().to_string(),
+                "concept_name": applied.concept_name,
+                "created_new_page": applied.created_new_page,
+                "cited_sources": applied.cited_sources,
+                "backlinks_refreshed": backlinks_refreshed,
+                "index_pages_refreshed": index_pages_refreshed,
+            }),
+        )?;
+    } else {
+        println!("Approved: {id} (imputed_fix)");
+        println!("  Gap kind: {}", applied.gap_kind);
+        println!("  Concept:  {}", applied.concept_name);
+        let verb = if applied.created_new_page { "Wrote" } else { "Rewrote body of" };
+        println!("  {verb}: {}", applied.concept_path.display());
+        if !applied.cited_sources.is_empty() {
+            println!("  Web sources cited:");
+            for src in &applied.cited_sources {
+                println!("    - {src}");
+            }
         }
         if backlinks_refreshed {
             println!("  Backlinks refreshed.");

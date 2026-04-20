@@ -372,6 +372,130 @@ pub fn parse_detect_contradictions_json(
     })
 }
 
+/// The kind of lint gap being imputed.
+///
+/// Controls prompt wording (e.g. "the concept does not exist yet" vs.
+/// "the concept's body is too thin") and informs the approve handler
+/// whether to create a new page or extend an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImputeGapKind {
+    /// No concept page exists for a term mentioned across several sources.
+    /// Approve drafts a new `wiki/concepts/<slug>.md`.
+    MissingConcept,
+    /// A concept page exists but its body is empty or too short to be
+    /// useful. Approve extends the existing page's body.
+    ThinConceptBody,
+}
+
+impl ImputeGapKind {
+    /// Human-readable name used in prompts and UI. Stable — changes here
+    /// change prompt render hashes.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingConcept => "missing_concept",
+            Self::ThinConceptBody => "thin_concept_body",
+        }
+    }
+
+    /// One-sentence description used to hint the LLM at what the fix should
+    /// look like. Visible in the prompt, kept minimal so prompt rendering
+    /// stays compact.
+    #[must_use]
+    pub const fn prompt_description(self) -> &'static str {
+        match self {
+            Self::MissingConcept => {
+                "No concept page exists yet for this term. Draft a from-scratch general-scope definition."
+            }
+            Self::ThinConceptBody => {
+                "A concept page exists but its body is empty or too short. Draft a replacement body (general-scope)."
+            }
+        }
+    }
+}
+
+/// Request to impute (web-search-backfill) missing or thin KB content.
+///
+/// The adapter MUST enable the runner's web-search tool when it exposes
+/// one — this is the one call kb makes that expects the model to browse
+/// external sources, not just reason over the KB.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImputeGapRequest {
+    /// What kind of gap this is (missing vs. thin body).
+    pub gap_kind: ImputeGapKind,
+    /// Display name for the concept being imputed.
+    pub concept_name: String,
+    /// Existing body text (empty string when `gap_kind == MissingConcept`).
+    /// For `ThinConceptBody` this is the current page body so the model can
+    /// decide whether to extend or rewrite.
+    pub existing_body: String,
+    /// Short snippets from local sources that mention the concept — used to
+    /// disambiguate which variant of the term the KB cares about. The
+    /// adapter treats these as opaque text; the caller truncates before
+    /// passing them in.
+    pub local_snippets: Vec<CandidateSourceSnippet>,
+}
+
+/// One web source cited by an imputed fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImputedWebSource {
+    /// The page URL the model browsed.
+    pub url: String,
+    /// Page title as displayed by the source.
+    pub title: String,
+    /// Short (<= 20 words) reason why this source supports the definition.
+    pub note: String,
+}
+
+/// Response with the drafted definition + cited web sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImputeGapResponse {
+    /// The imputed 2-4 sentence definition (general-scope). First sentence
+    /// must start with the concept name followed by a linking verb; the
+    /// prompt enforces this but callers should still tolerate minor drift.
+    pub definition: String,
+    /// Web sources the model used (between 1 and 3).
+    #[serde(default)]
+    pub sources: Vec<ImputedWebSource>,
+    /// Model's self-assessed confidence. Surfaced in `kb review show` so
+    /// reviewers know how much to trust the draft.
+    pub confidence: String,
+    /// 1-2 sentence note on which variant of the concept was picked and why.
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// Parse an [`ImputeGapResponse`] from LLM text output.
+///
+/// Accepts raw JSON or a fenced code block. Unknown fields are ignored so
+/// model drift doesn't break parsing.
+///
+/// # Errors
+///
+/// Returns [`LlmAdapterError::Parse`] when the text is empty, not valid JSON,
+/// or does not match the expected schema.
+pub fn parse_impute_gap_json(text: &str) -> Result<ImputeGapResponse, LlmAdapterError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(LlmAdapterError::Parse(
+            "impute_gap response was empty".to_string(),
+        ));
+    }
+
+    let json_text = trimmed
+        .strip_prefix("```")
+        .and_then(|body| body.split_once('\n').map(|(_, rest)| rest))
+        .and_then(|body| body.rsplit_once("```").map(|(json, _)| json.trim()))
+        .unwrap_or(trimmed);
+
+    serde_json::from_str(json_text).map_err(|err| {
+        LlmAdapterError::Parse(format!(
+            "impute_gap response had invalid shape: {err}"
+        ))
+    })
+}
+
 /// Request to run a health check on the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunHealthCheckRequest {
@@ -571,6 +695,29 @@ pub trait LlmAdapter: Send + Sync {
     ) -> Result<(GenerateConceptFromCandidateResponse, ProvenanceRecord), LlmAdapterError> {
         Err(LlmAdapterError::Other(
             "generate_concept_from_candidate is not implemented by this adapter".to_string(),
+        ))
+    }
+
+    /// Draft fill-in content for a lint gap using a web-search-capable
+    /// agent. bn-xt4o — called from `kb lint --impute`. The adapter MUST
+    /// turn on the runner's web-search tool access when calling the model;
+    /// this is the one kb call that expects external browsing.
+    ///
+    /// Default implementation returns [`LlmAdapterError::Other`] so that
+    /// test-double adapters and adapters that can't grant web access (e.g.
+    /// a future air-gapped backend) cause `--impute` to skip the gap with
+    /// a clear error rather than crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmAdapterError` if the backend cannot be reached, times out,
+    /// fails to parse the response, or the adapter does not implement this call.
+    fn impute_gap(
+        &self,
+        _request: ImputeGapRequest,
+    ) -> Result<(ImputeGapResponse, ProvenanceRecord), LlmAdapterError> {
+        Err(LlmAdapterError::Other(
+            "impute_gap is not implemented by this adapter".to_string(),
         ))
     }
 

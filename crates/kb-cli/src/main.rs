@@ -168,6 +168,13 @@ enum Command {
         /// Treat warnings as errors (exit 1 on warnings-only)
         #[arg(long)]
         strict: bool,
+        /// bn-xt4o: after lint finishes, call a web-search-capable LLM to
+        /// draft fill-in content for missing concepts and thin concept
+        /// bodies, then queue each draft as a review item. Never applies
+        /// changes directly — every draft lands in `kb review` for human
+        /// approval. Off by default (expensive + external network).
+        #[arg(long)]
+        impute: bool,
     },
     /// Run health checks on the knowledge base
     Doctor,
@@ -554,13 +561,13 @@ fn run(cli: Cli) -> Result<()> {
                 execute_mutating_command(root.as_deref(), "ingest", action)
             }
         }
-        Some(Command::Lint { check, strict }) => {
+        Some(Command::Lint { check, strict, impute }) => {
             // Lint is read-only: it walks generated artifacts and surfaces findings.
             // It must not take the root lock, so users can `kb lint` during a compile.
             let lint_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            run_lint(lint_root, cli.json, check.as_deref(), strict)
+            run_lint(lint_root, cli.json, check.as_deref(), strict, impute)
         }
         Some(Command::Publish { target }) => {
             let publish_root = root
@@ -3457,7 +3464,13 @@ fn guard_lint_against_concurrent_compile(root: &Path, strict: bool) -> Result<()
     Ok(())
 }
 
-fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Result<()> {
+fn run_lint(
+    root: &Path,
+    json: bool,
+    check: Option<&str>,
+    strict: bool,
+    impute: bool,
+) -> Result<()> {
     guard_lint_against_concurrent_compile(root, strict)?;
 
     let cfg = Config::load_from_root(root, None)?;
@@ -3512,31 +3525,38 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Resul
         } else {
             kb_lint::run_lint_with_options(root, rule, &options)?
         };
-        let mut warning_count = 0;
-        let mut error_count = 0;
-        for issue in &report.issues {
-            if matches!(issue.severity, kb_lint::IssueSeverity::Warning) {
-                warning_count += 1;
-            } else {
-                error_count += 1;
-            }
-        }
-        total_warnings += warning_count;
-        total_errors += error_count;
-
-        print_lint_check_report(&report, rule, warning_count, error_count, json);
-        reports.push(LintCheckReport {
-            check: report.rule,
-            issue_count: report.issue_count,
-            warning_count,
-            error_count,
-            issues: report.issues,
-        });
+        accumulate_lint_report(
+            &mut reports,
+            &mut total_warnings,
+            &mut total_errors,
+            report,
+            rule,
+            json,
+        );
     }
+
+    // bn-xt4o: `--impute` runs after the normal lint sweep. It calls a
+    // web-search-capable LLM to draft fill-in content for missing
+    // concepts and thin concept bodies, then queues each draft as a
+    // `ReviewKind::ImputedFix` review item. Never applies changes
+    // directly — the user approves via `kb review approve
+    // lint:imputed-fix:<...>`.
+    if impute {
+        let report = run_impute_mode(root, &cfg, &missing_concepts_cfg)?;
+        accumulate_lint_report(
+            &mut reports,
+            &mut total_warnings,
+            &mut total_errors,
+            report,
+            kb_lint::LintRule::MissingConcepts,
+            json,
+        );
+    }
+
     if json {
         emit_json("lint", LintReportPayload {
             checks: reports,
-            checks_ran: rules.len(),
+            checks_ran: rules.len() + usize::from(impute),
             total_issue_count: total_warnings + total_errors,
             warning_count: total_warnings,
             error_count: total_errors,
@@ -3568,6 +3588,39 @@ fn run_lint(root: &Path, json: bool, check: Option<&str>, strict: bool) -> Resul
         Ok(())
     }
 }
+/// Tally a single `LintReport`, print it to stdout (when not in JSON
+/// mode), and push its `LintCheckReport` shape onto the running reports
+/// list. Factored out of `run_lint` so the function stays under clippy's
+/// line cap.
+fn accumulate_lint_report(
+    reports: &mut Vec<LintCheckReport>,
+    total_warnings: &mut usize,
+    total_errors: &mut usize,
+    report: kb_lint::LintReport,
+    rule: kb_lint::LintRule,
+    json: bool,
+) {
+    let mut warning_count = 0;
+    let mut error_count = 0;
+    for issue in &report.issues {
+        if matches!(issue.severity, kb_lint::IssueSeverity::Warning) {
+            warning_count += 1;
+        } else {
+            error_count += 1;
+        }
+    }
+    *total_warnings += warning_count;
+    *total_errors += error_count;
+    print_lint_check_report(&report, rule, warning_count, error_count, json);
+    reports.push(LintCheckReport {
+        check: report.rule,
+        issue_count: report.issue_count,
+        warning_count,
+        error_count,
+        issues: report.issues,
+    });
+}
+
 fn lint_rules_for_root(
     require_citations: bool,
     missing_concepts_enabled: bool,
@@ -3648,6 +3701,51 @@ fn run_contradictions_lint(
 
     Ok(kb_lint::LintReport {
         rule: kb_lint::LintRule::Contradictions.as_str().to_string(),
+        issue_count: issues.len(),
+        issues,
+    })
+}
+
+/// bn-xt4o: dispatch the `--impute` pass. Builds the configured LLM
+/// adapter, runs [`kb_lint::run_impute_pass`], persists every successful
+/// outcome as a `ReviewKind::ImputedFix` review item (with its payload
+/// sidecar), and returns a `LintReport` shaped like the rest of the lint
+/// output. Skipped outcomes surface as warning-level issues too so the
+/// user knows the pass ran even when every call failed.
+fn run_impute_mode(
+    root: &Path,
+    cfg: &Config,
+    missing_concepts_cfg: &kb_lint::MissingConceptsConfig,
+) -> Result<kb_lint::LintReport> {
+    let adapter = create_ask_adapter(cfg, root)?;
+    let impute_cfg = kb_lint::ImputeConfig {
+        missing_concepts: missing_concepts_cfg.clone(),
+        ..Default::default()
+    };
+    let outcomes = kb_lint::run_impute_pass(root, adapter.as_ref(), &impute_cfg)
+        .context("run impute pass")?;
+
+    for outcome in &outcomes {
+        if let kb_lint::ImputeOutcome::Item(imputed) = outcome {
+            if let Err(err) = kb_core::save_review_item(root, &imputed.item) {
+                tracing::warn!(
+                    "failed to persist imputed-fix review item '{}': {err}",
+                    imputed.item.metadata.id
+                );
+                continue;
+            }
+            if let Err(err) = kb_lint::save_imputed_fix_payload(root, &imputed.item, &imputed.payload) {
+                tracing::warn!(
+                    "failed to persist imputed-fix payload sidecar for '{}': {err}",
+                    imputed.item.metadata.id
+                );
+            }
+        }
+    }
+
+    let issues = kb_lint::outcomes_to_lint_issues(&outcomes);
+    Ok(kb_lint::LintReport {
+        rule: "impute".to_string(),
         issue_count: issues.len(),
         issues,
     })

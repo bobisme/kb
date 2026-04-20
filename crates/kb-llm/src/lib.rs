@@ -14,10 +14,12 @@ pub use adapter::{
     ExtractConceptsRequest, ExtractConceptsResponse, GenerateConceptBodyRequest,
     GenerateConceptBodyResponse, GenerateConceptFromCandidateRequest,
     GenerateConceptFromCandidateResponse, GenerateSlidesRequest, GenerateSlidesResponse,
-    LlmAdapter, LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse,
-    MergeGroup, RunHealthCheckRequest, RunHealthCheckResponse, SourceAnchor,
-    SummarizeDocumentRequest, SummarizeDocumentResponse, parse_detect_contradictions_json,
-    parse_generate_concept_from_candidate_json, parse_merge_concept_candidates_json,
+    ImputeGapKind, ImputeGapRequest, ImputeGapResponse, ImputedWebSource, LlmAdapter,
+    LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, MergeGroup,
+    RunHealthCheckRequest, RunHealthCheckResponse, SourceAnchor, SummarizeDocumentRequest,
+    SummarizeDocumentResponse, parse_detect_contradictions_json,
+    parse_generate_concept_from_candidate_json, parse_impute_gap_json,
+    parse_merge_concept_candidates_json,
 };
 pub use claude::{ClaudeCliAdapter, ClaudeCliConfig};
 pub use opencode::{OpencodeAdapter, OpencodeConfig};

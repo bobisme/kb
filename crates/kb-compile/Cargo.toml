@@ -12,6 +12,7 @@ workspace = true
 anyhow.workspace = true
 indicatif = "0.17"
 kb-core.workspace = true
+kb-lint.workspace = true
 kb-llm.workspace = true
 kb-query.workspace = true
 regex.workspace = true
