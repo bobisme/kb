@@ -8,6 +8,8 @@ use kb_core::rewrite_managed_region;
 use regex::Regex;
 use serde_yaml::Value;
 
+use crate::source_page::source_page_path_for_id;
+
 const WIKI_DIR: &str = "wiki";
 const CONCEPT_DIR: &str = "wiki/concepts";
 const SOURCE_DIR: &str = "wiki/sources";
@@ -84,7 +86,7 @@ pub fn run_backlinks_pass(root: &Path) -> Result<Vec<BacklinksArtifact>> {
         &mut concept_backlinks,
         &mut source_referenced_by,
     )?;
-    collect_mention_backlinks(&concept_pages, &source_pages, &mut concept_backlinks)?;
+    collect_mention_backlinks(&concept_pages, &source_pages, &mut concept_backlinks, root)?;
 
     let mut artifacts = Vec::with_capacity(concept_pages.len() + source_pages.len());
 
@@ -140,10 +142,24 @@ pub fn persist_backlinks_artifacts(artifacts: &[BacklinksArtifact]) -> Result<()
 fn discover_wiki_pages(root: &Path, relative_dir: &str) -> Result<BTreeMap<String, PathBuf>> {
     let mut pages = BTreeMap::new();
     for path in list_markdown_files(root, relative_dir)? {
+        if is_index_page(&path) {
+            continue;
+        }
         let page_id = page_id_from_path(root, &path)?;
         pages.insert(page_id, path);
     }
     Ok(pages)
+}
+
+/// Auto-generated index pages (`wiki/index.md`, `wiki/sources/index.md`,
+/// `wiki/concepts/index.md`) enumerate every source/concept and therefore
+/// would inflate backlink sets with false positives (both as wiki-link
+/// sources citing every concept and — in the mention-scanner — as source
+/// pages whose body contains every concept's name). Skip them globally.
+fn is_index_page(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name == "index.md")
 }
 
 /// Walk `normalized/<source_document_id>/metadata.json` to build a reverse index
@@ -201,6 +217,9 @@ fn collect_wiki_link_backlinks(
     let link_re = Regex::new(r"\[\[([^\]\r\n]+)\]\]").context("compile wikilink regex")?;
 
     for page in list_markdown_files(root, WIKI_DIR)? {
+        if is_index_page(&page) {
+            continue;
+        }
         let source_id = page_id_from_path(root, &page)?;
         let markdown = std::fs::read_to_string(&page)
             .with_context(|| format!("read wiki page {}", page.display()))?;
@@ -346,10 +365,15 @@ const MENTION_STOPWORDS: &[&str] = &[
 ];
 
 /// For each concept page, collect its `name` + `aliases` as mention tokens and
-/// scan every source page's body. A source page that mentions a concept token
+/// scan every `normalized/<src>/source.md` body (the full original text after
+/// frontmatter strip). A source whose normalized body mentions a concept token
 /// as a standalone word (case-insensitive, Unicode word boundaries) OR that
 /// contains a `[[<slug>]]`-style wiki-link whose normalized target matches the
-/// concept's slug or an alias slug is added to the concept's backlinks set.
+/// concept's slug or an alias slug is added to the concept's backlinks set,
+/// keyed by the source's `wiki/sources/<src>` page id.
+///
+/// Walking the normalized source text (not the wiki source summary body)
+/// ensures we don't miss mentions that the 100-word LLM summary elided.
 ///
 /// This is additive on top of the source_document_ids-gated primary path, and
 /// is deduped via the `concept_backlinks` `BTreeSet`.
@@ -435,6 +459,7 @@ fn collect_mention_backlinks(
     concept_pages: &BTreeMap<String, PathBuf>,
     source_pages: &BTreeMap<String, PathBuf>,
     concept_backlinks: &mut BTreeMap<String, BTreeSet<String>>,
+    root: &Path,
 ) -> Result<()> {
     let mut matchers: Vec<ConceptMatcher> = Vec::with_capacity(concept_pages.len());
     for (concept_id, path) in concept_pages {
@@ -443,28 +468,64 @@ fn collect_mention_backlinks(
 
     let wiki_link_re = Regex::new(r"\[\[([^\]\r\n]+)\]\]").context("compile wikilink regex")?;
 
-    // Scan each source page body once and test every concept matcher against it.
-    for (source_id, path) in source_pages {
-        let markdown = std::fs::read_to_string(path)
-            .with_context(|| format!("read source page {}", path.display()))?;
+    // Scan each normalized source's full original text (after frontmatter and
+    // code-block/span stripping) and credit concepts to the corresponding
+    // `wiki/sources/<src>.md` page. Walking `normalized/<src>/source.md`
+    // (not `wiki/sources/<src>.md`) avoids missing mentions that the 100-word
+    // LLM summary elided from the wiki source page body.
+    let normalized_root = root.join(NORMALIZED_DIR);
+    if !normalized_root.exists() {
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(&normalized_root)
+        .with_context(|| format!("read normalized dir {}", normalized_root.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("walk {}", normalized_root.display()))?;
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let src_id = entry.file_name().to_string_lossy().into_owned();
+        let source_md_path = entry.path().join("source.md");
+        if !source_md_path.is_file() {
+            continue;
+        }
+
+        // Map `normalized/<src_id>/` to the corresponding `wiki/sources/<slug>`
+        // page id by reusing the same slug rule the source-page generator uses.
+        // We only credit this src_id if it has a matching entry in `source_pages`;
+        // otherwise the source has no wiki page to link to.
+        let source_page_rel = source_page_path_for_id(&src_id);
+        let source_page_id = source_page_rel
+            .to_string_lossy()
+            .replace('\\', "/")
+            .trim_end_matches(".md")
+            .to_string();
+        if !source_pages.contains_key(&source_page_id) {
+            continue;
+        }
+
+        let markdown = std::fs::read_to_string(&source_md_path)
+            .with_context(|| format!("read normalized source {}", source_md_path.display()))?;
         let body = match split_frontmatter(&markdown) {
             Some((_fm, body)) => body,
-            None => markdown.clone(),
+            None => markdown,
         };
+        // Strip fenced code blocks and inline code spans so that tokens
+        // appearing only inside `code` / ```fences``` don't trigger
+        // backlinks. This mirrors bn-bup's existing skip rules used elsewhere.
+        let scanned = strip_code_regions(&body);
 
         // Precollect the normalized wiki-link targets present in this body.
         let mut wiki_targets: BTreeSet<String> = BTreeSet::new();
-        // Also collect raw bare forms (e.g. `[[raft]]` -> "raft") so we can
-        // match alias-slug style links that don't carry a `wiki/concepts/` prefix.
         let mut bare_targets: BTreeSet<String> = BTreeSet::new();
-        for capture in wiki_link_re.captures_iter(&body) {
+        for capture in wiki_link_re.captures_iter(&scanned) {
             let Some(raw) = capture.get(1).map(|c| c.as_str()) else {
                 continue;
             };
             if let Some(target) = normalize_wiki_link(raw) {
                 wiki_targets.insert(target);
             }
-            // Bare form: strip alias/anchor but don't require `wiki/concepts/` prefix.
             if let Some(bare) = bare_wiki_link_slug(raw) {
                 bare_targets.insert(bare);
             }
@@ -479,7 +540,6 @@ fn collect_mention_backlinks(
                     hit = true;
                     break;
                 }
-                // Bare-form match: compare the final path segment.
                 if let Some(slug) = target.rsplit('/').next() {
                     if bare_targets.contains(slug) {
                         hit = true;
@@ -491,7 +551,7 @@ fn collect_mention_backlinks(
             // 2) word-boundary match on concept name/aliases.
             if !hit {
                 if let Some(re) = matcher.word_regex.as_ref() {
-                    if re.is_match(&body) {
+                    if re.is_match(&scanned) {
                         hit = true;
                     }
                 }
@@ -499,13 +559,74 @@ fn collect_mention_backlinks(
 
             if hit {
                 if let Some(referers) = concept_backlinks.get_mut(&matcher.concept_id) {
-                    referers.insert(source_id.clone());
+                    referers.insert(source_page_id.clone());
                 }
             }
         }
     }
 
     Ok(())
+}
+
+/// Remove fenced code blocks (```...```) and inline code spans (`...`) from a
+/// markdown body. Replaces the removed content with spaces so byte offsets are
+/// not needed but line structure is preserved enough for word-boundary regex
+/// matching to behave correctly on surrounding text.
+fn strip_code_regions(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_fence = false;
+    for line in body.split_inclusive('\n') {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
+            in_fence = !in_fence;
+            // Replace the fence line itself with a blank so the opening/closing
+            // fence tokens don't survive into the scanned text.
+            for _ in 0..line.len() {
+                out.push(' ');
+            }
+            if line.ends_with('\n') {
+                // Last byte was the newline we already spaced over; restore it.
+                out.pop();
+                out.push('\n');
+            }
+            continue;
+        }
+        if in_fence {
+            for _ in 0..line.len() {
+                out.push(' ');
+            }
+            if line.ends_with('\n') {
+                out.pop();
+                out.push('\n');
+            }
+            continue;
+        }
+        // Strip inline backtick spans.
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'`' {
+                if let Some(close_offset) = bytes[i + 1..].iter().position(|&b| b == b'`') {
+                    let close = i + 1 + close_offset;
+                    for _ in i..=close {
+                        out.push(' ');
+                    }
+                    i = close + 1;
+                    continue;
+                }
+                out.push('`');
+                i += 1;
+                while i < bytes.len() {
+                    out.push(bytes[i] as char);
+                    i += 1;
+                }
+                break;
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Extract the `name` string and `aliases` sequence from a concept's YAML
@@ -1192,26 +1313,43 @@ mod tests {
     fn mention_backlinks_credit_sources_that_mention_concept_name_or_aliases() {
         let root = tempdir().expect("tempdir");
 
-        // Authoritative source for the Raft concept.
+        // Authoritative source for the Raft concept. Wiki page is a short
+        // summary; full original text lives under normalized/<src>/source.md.
         write(
             &root.path().join("wiki/sources/src-a.md"),
-            "---\nid: wiki-source-src-a\ntype: source\ntitle: Raft overview\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Raft overview\n\nRaft is a consensus algorithm.\n",
+            "---\nid: wiki-source-src-a\ntype: source\ntitle: Raft overview\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Raft overview\n\nSummary only.\n",
+        );
+        write(
+            &root.path().join("normalized/src-a/source.md"),
+            "# Raft overview\n\nRaft is a consensus algorithm.\n",
         );
         // Source that only mentions the concept's name as a standalone word.
         // Also contains the word "aircraft" to exercise word-boundary correctness.
         write(
             &root.path().join("wiki/sources/src-b.md"),
-            "---\nid: wiki-source-src-b\ntype: source\ntitle: Read paths\nsource_document_id: src-b\nsource_revision_id: rev-b\n---\n# Read paths\n\nThe Raft leader serves linearizable reads. An aircraft reference should NOT match.\n",
+            "---\nid: wiki-source-src-b\ntype: source\ntitle: Read paths\nsource_document_id: src-b\nsource_revision_id: rev-b\n---\n# Read paths\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-b/source.md"),
+            "# Read paths\n\nThe Raft leader serves linearizable reads. An aircraft reference should NOT match.\n",
         );
         // Source that references the concept via an alias-only mention.
         write(
             &root.path().join("wiki/sources/src-c.md"),
-            "---\nid: wiki-source-src-c\ntype: source\ntitle: Alias mentions\nsource_document_id: src-c\nsource_revision_id: rev-c\n---\n# Alias\n\nSome systems use Raft-Consensus heavily in the design.\n",
+            "---\nid: wiki-source-src-c\ntype: source\ntitle: Alias mentions\nsource_document_id: src-c\nsource_revision_id: rev-c\n---\n# Alias\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-c/source.md"),
+            "# Alias\n\nSome systems use Raft-Consensus heavily in the design.\n",
         );
         // Unrelated source that should NOT be credited.
         write(
             &root.path().join("wiki/sources/src-d.md"),
-            "---\nid: wiki-source-src-d\ntype: source\ntitle: Unrelated\nsource_document_id: src-d\nsource_revision_id: rev-d\n---\n# Unrelated\n\nThe word craft appears here and also aircraft, but no consensus algorithm.\n",
+            "---\nid: wiki-source-src-d\ntype: source\ntitle: Unrelated\nsource_document_id: src-d\nsource_revision_id: rev-d\n---\n# Unrelated\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-d/source.md"),
+            "# Unrelated\n\nThe word craft appears here and also aircraft, but no consensus algorithm.\n",
         );
 
         // Concept page sourced only from src-a; name "Raft", one alias.
@@ -1266,7 +1404,11 @@ mod tests {
 
         write(
             &root.path().join("wiki/sources/src-a.md"),
-            "---\nid: wiki-source-src-a\ntype: source\ntitle: Generic\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Source\n\nThe quick brown fox jumps and AI rules the day.\n",
+            "---\nid: wiki-source-src-a\ntype: source\ntitle: Generic\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Source\n\nSummary only.\n",
+        );
+        write(
+            &root.path().join("normalized/src-a/source.md"),
+            "# Source\n\nThe quick brown fox jumps and AI rules the day.\n",
         );
 
         // Concept with name "ArtificialIntelligence" but aliases "AI" (too short)
@@ -1369,20 +1511,32 @@ mod tests {
         // Source page whose body mentions only the plural "quorums".
         write(
             &root.path().join("wiki/sources/src-plural.md"),
-            "---\nid: wiki-source-src-plural\ntype: source\ntitle: Plural form\nsource_document_id: src-plural\nsource_revision_id: rev-1\n---\n# Plural\n\nMajority quorums are required to commit.\n",
+            "---\nid: wiki-source-src-plural\ntype: source\ntitle: Plural form\nsource_document_id: src-plural\nsource_revision_id: rev-1\n---\n# Plural\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-plural/source.md"),
+            "# Plural\n\nMajority quorums are required to commit.\n",
         );
         // Source that uses a compound mention; since we try the alias as-is and
         // plural, "majority quorum" as a two-word phrase still matches the plain
         // "quorum" token via word-boundary.
         write(
             &root.path().join("wiki/sources/src-compound.md"),
-            "---\nid: wiki-source-src-compound\ntype: source\ntitle: Compound\nsource_document_id: src-compound\nsource_revision_id: rev-2\n---\n# Compound\n\nA majority quorum is the usual protocol requirement.\n",
+            "---\nid: wiki-source-src-compound\ntype: source\ntitle: Compound\nsource_document_id: src-compound\nsource_revision_id: rev-2\n---\n# Compound\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-compound/source.md"),
+            "# Compound\n\nA majority quorum is the usual protocol requirement.\n",
         );
         // Source that should NOT be credited — "craft" must not match "quorum"
         // substring tricks nor should the word "requires" trigger "requirement".
         write(
             &root.path().join("wiki/sources/src-nomatch.md"),
-            "---\nid: wiki-source-src-nomatch\ntype: source\ntitle: Nope\nsource_document_id: src-nomatch\nsource_revision_id: rev-3\n---\n# Nope\n\nThis page is about aircraft and draft notes only.\n",
+            "---\nid: wiki-source-src-nomatch\ntype: source\ntitle: Nope\nsource_document_id: src-nomatch\nsource_revision_id: rev-3\n---\n# Nope\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-nomatch/source.md"),
+            "# Nope\n\nThis page is about aircraft and draft notes only.\n",
         );
 
         // Concept with alias "quorum" (triggers plural expansion) and
@@ -1428,7 +1582,11 @@ mod tests {
         // Source body says "requirements" (plural); concept has alias "requirement".
         write(
             &root.path().join("wiki/sources/src-r.md"),
-            "---\nid: wiki-source-src-r\ntype: source\ntitle: Reqs\nsource_document_id: src-r\nsource_revision_id: rev-r\n---\n# Reqs\n\nFunctional requirements and non-functional requirements both matter.\n",
+            "---\nid: wiki-source-src-r\ntype: source\ntitle: Reqs\nsource_document_id: src-r\nsource_revision_id: rev-r\n---\n# Reqs\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-r/source.md"),
+            "# Reqs\n\nFunctional requirements and non-functional requirements both matter.\n",
         );
 
         write(
@@ -1459,7 +1617,11 @@ mod tests {
         // match inside "SQLs" due to the trailing 's'. Net effect: no backlink.
         write(
             &root.path().join("wiki/sources/src-sql.md"),
-            "---\nid: wiki-source-src-sql\ntype: source\ntitle: Databases\nsource_document_id: src-sql\nsource_revision_id: rev-sql\n---\n# Databases\n\nSome SQLs are bad, and SQLite is fine.\n",
+            "---\nid: wiki-source-src-sql\ntype: source\ntitle: Databases\nsource_document_id: src-sql\nsource_revision_id: rev-sql\n---\n# Databases\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-sql/source.md"),
+            "# Databases\n\nSome SQLs are bad, and SQLite is fine.\n",
         );
 
         write(
@@ -1480,6 +1642,143 @@ mod tests {
     }
 
     #[test]
+    fn mention_backlinks_scan_normalized_source_not_wiki_summary() {
+        // Regression for bn-gdd: the wiki/sources/<src>.md summary is a
+        // ~100-word LLM compression that may omit specific technical terms
+        // present in the original. The mention-scanner must walk
+        // `normalized/<src>/source.md` (the full original) instead.
+        let root = tempdir().expect("tempdir");
+
+        // Summary says nothing about "mutex"; the full normalized body does.
+        write(
+            &root.path().join("wiki/sources/src-kern.md"),
+            "---\nid: wiki-source-src-kern\ntype: source\ntitle: Kernel notes\nsource_document_id: src-kern\nsource_revision_id: rev-k\n---\n# Kernel notes\n\nDiscussion of synchronization primitives.\n",
+        );
+        write(
+            &root.path().join("normalized/src-kern/source.md"),
+            "# Kernel notes\n\nA mutex is held while entering the critical section; mutexes ensure exclusive access.\n",
+        );
+
+        write(
+            &root.path().join("wiki/concepts/mutex.md"),
+            "---\nid: concept:mutex\nname: Mutex\n---\n\n# Mutex\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/mutex.md"))
+            .expect("concept artifact");
+
+        assert!(
+            concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-kern]]"),
+            "mutex concept should backlink to src-kern via normalized source text mention, got:\n{}",
+            concept.updated_markdown
+        );
+    }
+
+    #[test]
+    fn mention_backlinks_exclude_auto_generated_index_pages() {
+        // Regression for bn-gdd: `wiki/sources/index.md` (auto-generated)
+        // lists every source's title; a concept named "Interrupt" would
+        // otherwise spuriously gain the index as a backlink. Index pages
+        // must be filtered out of both the scanned candidate set and the
+        // wiki-link referer set.
+        let root = tempdir().expect("tempdir");
+
+        // A real source whose normalized body legitimately mentions "interrupt".
+        write(
+            &root.path().join("wiki/sources/src-real.md"),
+            "---\nid: wiki-source-src-real\ntype: source\ntitle: Interrupts\nsource_document_id: src-real\nsource_revision_id: rev-r\n---\n# Interrupts\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-real/source.md"),
+            "# Interrupts\n\nHardware interrupts are delivered via IRQ lines.\n",
+        );
+
+        // Auto-generated index listing the source title and a wiki-link to the
+        // interrupt concept. Must NOT appear in any concept's backlinks.
+        write(
+            &root.path().join("wiki/sources/index.md"),
+            "# Sources index\n\n- [[wiki/sources/src-real]] — Interrupts\n- [[wiki/concepts/interrupt]]\n",
+        );
+        write(
+            &root.path().join("wiki/concepts/index.md"),
+            "# Concepts index\n\n- [[wiki/concepts/interrupt]]\n",
+        );
+
+        write(
+            &root.path().join("wiki/concepts/interrupt.md"),
+            "---\nid: concept:interrupt\nname: Interrupt\n---\n\n# Interrupt\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/interrupt.md"))
+            .expect("concept artifact");
+
+        assert!(
+            concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-real]]"),
+            "real source with 'interrupt' in normalized text should be a backlink, got:\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            !concept
+                .updated_markdown
+                .contains("- [[wiki/sources/index]]"),
+            "auto-generated sources index must NOT appear in backlinks:\n{}",
+            concept.updated_markdown
+        );
+        assert!(
+            !concept
+                .updated_markdown
+                .contains("- [[wiki/concepts/index]]"),
+            "auto-generated concepts index must NOT appear in backlinks:\n{}",
+            concept.updated_markdown
+        );
+    }
+
+    #[test]
+    fn mention_backlinks_skip_fenced_code_and_inline_code() {
+        // bn-bup invariant: mentions inside fenced code blocks and inline
+        // code spans must not trigger backlinks.
+        let root = tempdir().expect("tempdir");
+
+        write(
+            &root.path().join("wiki/sources/src-code.md"),
+            "---\nid: wiki-source-src-code\ntype: source\ntitle: Code only\nsource_document_id: src-code\nsource_revision_id: rev-c\n---\n# Code\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-code/source.md"),
+            "# Code only\n\nSee the API.\n\n```\npthread_mutex_lock(&mutex);\n```\n\nAlso `mutex_init()` is called.\n",
+        );
+
+        write(
+            &root.path().join("wiki/concepts/mutex.md"),
+            "---\nid: concept:mutex\nname: Mutex\n---\n\n# Mutex\n",
+        );
+
+        let artifacts = run_backlinks_pass(root.path()).expect("run backlink pass");
+        let concept = artifacts
+            .iter()
+            .find(|a| a.path.ends_with("wiki/concepts/mutex.md"))
+            .expect("concept artifact");
+
+        assert!(
+            !concept
+                .updated_markdown
+                .contains("- [[wiki/sources/src-code]]"),
+            "mentions only inside code regions must not credit the source:\n{}",
+            concept.updated_markdown
+        );
+    }
+
+    #[test]
     fn mention_backlinks_word_boundary_does_not_match_substring() {
         let root = tempdir().expect("tempdir");
 
@@ -1487,11 +1786,19 @@ mod tests {
         // "SGD" as a standalone word (should match).
         write(
             &root.path().join("wiki/sources/src-with-sgd.md"),
-            "---\nid: wiki-source-src-with-sgd\ntype: source\ntitle: Optimizers\nsource_document_id: src-x\nsource_revision_id: rev-x\n---\n# Optimizers\n\nSGD is classic. TSGD and SGDM are variants.\n",
+            "---\nid: wiki-source-src-with-sgd\ntype: source\ntitle: Optimizers\nsource_document_id: src-with-sgd\nsource_revision_id: rev-x\n---\n# Optimizers\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-with-sgd/source.md"),
+            "# Optimizers\n\nSGD is classic. TSGD and SGDM are variants.\n",
         );
         write(
             &root.path().join("wiki/sources/src-substring-only.md"),
-            "---\nid: wiki-source-src-substring-only\ntype: source\ntitle: Substrings only\nsource_document_id: src-y\nsource_revision_id: rev-y\n---\n# Substrings\n\nOnly TSGD and SGDM appear here, never the standalone form.\n",
+            "---\nid: wiki-source-src-substring-only\ntype: source\ntitle: Substrings only\nsource_document_id: src-substring-only\nsource_revision_id: rev-y\n---\n# Substrings\n\nSummary.\n",
+        );
+        write(
+            &root.path().join("normalized/src-substring-only/source.md"),
+            "# Substrings\n\nOnly TSGD and SGDM appear here, never the standalone form.\n",
         );
 
         write(
