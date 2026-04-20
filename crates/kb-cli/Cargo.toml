@@ -28,6 +28,7 @@ kb-query.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
+termimad = "0.34"
 terseid = "0.1"
 toml.workspace = true
 tempfile.workspace = true

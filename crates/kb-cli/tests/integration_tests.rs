@@ -1081,6 +1081,85 @@ fn ask_format_json_writes_structured_artifact() {
     );
 }
 
+// bn-1m02: `kb ask` renders the answer body to stdout after generation. These
+// tests exercise the opt-out paths; rendered-body coverage requires a real LLM
+// and is captured by gold_harness.
+#[test]
+fn ask_json_output_has_no_markdown_rendering() {
+    // --json must stay a pure JSON stream — no markdown body leaks to stdout.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("ask").arg("Does --json stay clean?");
+    let output = cmd.output().expect("run kb ask --json");
+    assert!(
+        output.status.success(),
+        "kb ask --json failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The entire stdout must parse as a single JSON envelope.
+    let envelope: Value = serde_json::from_slice(&output.stdout)
+        .expect("stdout must be a single JSON envelope with no extra text");
+    assert_eq!(envelope["command"], "ask");
+    assert!(envelope["data"]["artifact_path"].is_string());
+}
+
+#[test]
+fn ask_no_render_flag_is_accepted_and_prints_footer() {
+    // --no-render must be accepted by clap and must not break the ask flow.
+    // Without a real LLM the placeholder branch runs; we verify the artifact
+    // path footer is present and no rendered body (which only fires when an
+    // LLM actually answered) sneaks in.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask").arg("--no-render").arg("anything");
+    let output = cmd.output().expect("run kb ask --no-render");
+    assert!(
+        output.status.success(),
+        "kb ask --no-render failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Artifact written:"),
+        "expected path footer, got: {stdout}"
+    );
+}
+
+#[test]
+fn ask_piped_non_tty_stdout_contains_footer() {
+    // Piped stdout (non-TTY — which is always the case in an assert_cmd
+    // child process) must still produce the path footer so scripts that
+    // `kb ask "..." | head -N` can locate the artifact.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask").arg("piped stdout path");
+    let output = cmd.output().expect("run kb ask (piped)");
+    assert!(
+        output.status.success(),
+        "kb ask (piped) failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Artifact written:"),
+        "piped ask must print 'Artifact written:' footer, got: {stdout}"
+    );
+    // No ANSI escape bytes should appear on piped stdout.
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "piped ask must not emit ANSI escapes, got: {stdout:?}"
+    );
+}
+
 #[test]
 fn inspect_rejects_empty_target() {
     let (_temp_dir, kb_root) = make_temp_kb();

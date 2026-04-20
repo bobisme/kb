@@ -127,6 +127,10 @@ enum Command {
         /// (like `git commit`); empty content cancels the ask.
         #[arg(short = 'e', long = "editor")]
         editor: bool,
+
+        /// Don't render the answer body to stdout; show only the artifact path
+        #[arg(long)]
+        no_render: bool,
     },
     /// Lint knowledge base for issues
     Lint {
@@ -405,7 +409,7 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             run_doctor_command(root, cli.json, cli.model.as_deref())
         }
-        Some(Command::Ask { query, format, promote, editor }) => {
+        Some(Command::Ask { query, format, promote, editor, no_render }) => {
             let ask_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
@@ -413,6 +417,7 @@ fn run(cli: Cli) -> Result<()> {
             let model = cli.model.clone();
             let dry_run = cli.dry_run;
             let json = cli.json;
+            let quiet = cli.quiet;
             let action = move || {
                 run_ask(
                     ask_root,
@@ -422,6 +427,8 @@ fn run(cli: Cli) -> Result<()> {
                     json,
                     dry_run,
                     promote,
+                    quiet,
+                    no_render,
                 )
             };
             if dry_run {
@@ -1471,6 +1478,7 @@ struct AskOutput<'a> {
 }
 
 #[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
+#[allow(clippy::too_many_arguments)]
 fn run_ask(
     root: &Path,
     query: &str,
@@ -1479,6 +1487,8 @@ fn run_ask(
     json: bool,
     dry_run: bool,
     promote: bool,
+    quiet: bool,
+    no_render: bool,
 ) -> Result<()> {
     if query.trim().is_empty() {
         // bn-1jx: validation rejection — never reaches the LLM, never writes
@@ -1757,23 +1767,42 @@ fn run_ask(
             artifact_path: &artifact_path,
             requested_format,
         })?;
-    } else if let Some((result, provenance)) = &llm_info {
-        println!("Artifact written: {artifact_path}");
-        println!(
-            "Citations: {} valid, {} unresolved",
-            result.valid_citations.len(),
-            result.invalid_citations.len()
-        );
-        if result.has_uncertainty_banner {
-            println!("Note: low source coverage — uncertainty banner added.");
-        }
-        println!("Model: {} ({}ms)", provenance.model, provenance.latency_ms);
-        if promote {
-            println!("ReviewItem created for promotion.");
-        }
     } else {
+        // Render the answer body to stdout before the footer. Skipped when the
+        // caller opted out (`--quiet`, `--no-render`) or when the requested
+        // format is `json` (body is structured, not markdown) or when the
+        // LLM produced no real body (placeholder artifact).
+        // `artifact_body` is the raw LLM output (no frontmatter), already in
+        // memory; no need to re-read answer.md.
+        let render_body =
+            !quiet && !no_render && requested_format != "json" && llm_info.is_some();
+        if render_body {
+            if std::io::stdout().is_terminal() {
+                // TTY: colorized markdown via termimad.
+                termimad::print_text(&artifact_body);
+            } else {
+                // Piped: raw markdown bytes exactly as persisted to the body.
+                print!("{artifact_body}");
+                if !artifact_body.ends_with('\n') {
+                    println!();
+                }
+            }
+            println!();
+        }
         println!("Artifact written: {artifact_path}");
-        println!("LLM backend unavailable — placeholder artifact created.");
+        if let Some((result, provenance)) = &llm_info {
+            println!(
+                "Citations: {} valid, {} unresolved",
+                result.valid_citations.len(),
+                result.invalid_citations.len()
+            );
+            if result.has_uncertainty_banner {
+                println!("Note: low source coverage — uncertainty banner added.");
+            }
+            println!("Model: {} ({}ms)", provenance.model, provenance.latency_ms);
+        } else {
+            println!("LLM backend unavailable — placeholder artifact created.");
+        }
         if promote {
             println!("ReviewItem created for promotion.");
         }
