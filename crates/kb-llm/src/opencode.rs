@@ -181,12 +181,17 @@ impl OpencodeAdapter {
             parts.push("json".to_string());
         }
 
+        // opencode's yargs config marks `-f / --file` as `[array]`, which
+        // greedily consumes subsequent positionals. Emit the prompt
+        // positional BEFORE any -f flags so it's parsed as the `message`
+        // rather than slurped into the file list.
+        parts.push(shell_quote(prompt));
+
         for image in image_paths {
             parts.push("-f".to_string());
             parts.push(shell_quote(&image.display().to_string()));
         }
 
-        parts.push(shell_quote(prompt));
         parts.join(" ")
     }
 
@@ -1285,6 +1290,17 @@ mod tests {
         assert_eq!(f_flag_count, 2, "expected two -f flags in: {cmd}");
         assert!(cmd.contains("/abs/a.png"), "missing a.png in: {cmd}");
         assert!(cmd.contains("/abs/b.jpg"), "missing b.jpg in: {cmd}");
+
+        // bn-19r7: opencode's yargs config marks `-f / --file` as `[array]`,
+        // which greedily consumes subsequent positionals. The prompt
+        // positional MUST appear before any -f flag or it gets slurped into
+        // the file list ("File not found: <prompt>"). Lock that ordering.
+        let prompt_idx = cmd.find("'prompt'").expect("prompt present");
+        let first_f_idx = cmd.find(" -f ").expect("-f present");
+        assert!(
+            prompt_idx < first_f_idx,
+            "prompt must appear before -f to avoid yargs slurping it: {cmd}"
+        );
     }
 
     #[test]
