@@ -165,8 +165,13 @@ pub struct DataConfig {
 
 impl Default for DataConfig {
     fn default() -> Self {
+        // Stay in sync with `kb_core::paths::prompts_dir` — the LLM template
+        // loader always resolves against `.kb/prompts/`. This field is kept
+        // in the TOML mostly for discoverability (users see the path in
+        // `kb.toml` and know where to drop overrides); changing it does not
+        // relocate the loader's probe.
         Self {
-            prompt_templates: "prompts".to_string(),
+            prompt_templates: format!("{}/prompts", kb_core::KB_DIR),
         }
     }
 }

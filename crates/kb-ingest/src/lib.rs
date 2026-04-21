@@ -9,7 +9,7 @@ use ignore::WalkBuilder;
 use kb_core::{
     EntityMetadata, NormalizedDocument, SourceDocument, SourceKind, SourceRevision, Status,
     mint_source_document_id, mint_source_revision_id, normalize_file_stable_location,
-    source_revision_content_hash, write_normalized_document,
+    normalized_dir, normalized_rel, source_revision_content_hash, write_normalized_document,
 };
 use serde::{Deserialize, Serialize};
 
@@ -679,8 +679,7 @@ fn write_normalized_for_file(
     // destination basenames under `normalized/<src>/assets/`, so this is also
     // where we resolve collisions between two source paths that share a
     // file name.
-    let staging_dir = root
-        .join("normalized")
+    let staging_dir = normalized_dir(root)
         .join(&document.metadata.id)
         .join(".staging-assets");
     fs::create_dir_all(&staging_dir).with_context(|| {
@@ -714,12 +713,8 @@ fn write_normalized_for_file(
         prompt_template_hash: None,
         dependencies: vec![revision.metadata.id.clone()],
         output_paths: vec![
-            PathBuf::from("normalized")
-                .join(&document.metadata.id)
-                .join("source.md"),
-            PathBuf::from("normalized")
-                .join(&document.metadata.id)
-                .join("metadata.json"),
+            normalized_rel(&document.metadata.id).join("source.md"),
+            normalized_rel(&document.metadata.id).join("metadata.json"),
         ],
         status: Status::Fresh,
     };
@@ -838,7 +833,7 @@ fn source_id_taken_by_other(root: &Path, candidate: &str, stable_location: &str)
     let web_dir = root.join("raw").join("web").join(candidate);
     if web_dir.is_dir() {
         // Best-effort: inspect origin.json if present.
-        let origin = root.join("normalized").join(candidate).join("origin.json");
+        let origin = normalized_dir(root).join(candidate).join("origin.json");
         if let Ok(contents) = fs::read_to_string(&origin)
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents)
             && let Some(url) = value.get("original_url").and_then(|v| v.as_str())
@@ -1152,7 +1147,7 @@ mod tests {
                 .next()
                 .is_none()
         );
-        assert!(!kb_root.path().join("normalized").exists());
+        assert!(!normalized_dir(kb_root.path()).exists());
     }
 
     #[test]
@@ -1227,10 +1222,7 @@ mod tests {
         assert_eq!(ingested.len(), 1);
         let src_id = &ingested[0].document.metadata.id;
 
-        let asset_path = kb_root
-            .path()
-            .join("normalized")
-            .join(src_id)
+        let asset_path = normalized_dir(kb_root.path()).join(src_id)
             .join("assets")
             .join("pic.png");
         assert!(
@@ -1244,10 +1236,7 @@ mod tests {
             "asset bytes must match original"
         );
 
-        let normalized_source = kb_root
-            .path()
-            .join("normalized")
-            .join(src_id)
+        let normalized_source = normalized_dir(kb_root.path()).join(src_id)
             .join("source.md");
         let rewritten = fs::read_to_string(&normalized_source).expect("read normalized md");
         assert!(
@@ -1281,10 +1270,7 @@ mod tests {
         let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
         let src_id = &ingested[0].document.metadata.id;
 
-        let assets_dir = kb_root
-            .path()
-            .join("normalized")
-            .join(src_id)
+        let assets_dir = normalized_dir(kb_root.path()).join(src_id)
             .join("assets");
         let entries: Vec<String> = fs::read_dir(&assets_dir)
             .expect("read assets")
@@ -1319,10 +1305,7 @@ mod tests {
         assert_eq!(ingested.len(), 1);
         let src_id = &ingested[0].document.metadata.id;
 
-        let assets_dir = kb_root
-            .path()
-            .join("normalized")
-            .join(src_id)
+        let assets_dir = normalized_dir(kb_root.path()).join(src_id)
             .join("assets");
         let entries: Vec<_> = fs::read_dir(&assets_dir)
             .expect("read assets")
@@ -1331,10 +1314,7 @@ mod tests {
         assert!(entries.is_empty(), "no assets should be staged");
 
         let rewritten = fs::read_to_string(
-            kb_root
-                .path()
-                .join("normalized")
-                .join(src_id)
+            normalized_dir(kb_root.path()).join(src_id)
                 .join("source.md"),
         )
         .expect("read normalized");
@@ -1356,10 +1336,7 @@ mod tests {
         let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
         let src_id = &ingested[0].document.metadata.id;
         let rewritten = fs::read_to_string(
-            kb_root
-                .path()
-                .join("normalized")
-                .join(src_id)
+            normalized_dir(kb_root.path()).join(src_id)
                 .join("source.md"),
         )
         .expect("read normalized");
@@ -1368,10 +1345,7 @@ mod tests {
             "URL ref must survive verbatim: {rewritten}"
         );
 
-        let assets_dir = kb_root
-            .path()
-            .join("normalized")
-            .join(src_id)
+        let assets_dir = normalized_dir(kb_root.path()).join(src_id)
             .join("assets");
         let entries: Vec<_> = fs::read_dir(&assets_dir)
             .expect("read assets")
@@ -1397,18 +1371,12 @@ mod tests {
         let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
         let src_id = &ingested[0].document.metadata.id;
 
-        let asset = kb_root
-            .path()
-            .join("normalized")
-            .join(src_id)
+        let asset = normalized_dir(kb_root.path()).join(src_id)
             .join("assets")
             .join("huge.png");
         assert!(!asset.exists(), "oversized asset must not be copied");
         let rewritten = fs::read_to_string(
-            kb_root
-                .path()
-                .join("normalized")
-                .join(src_id)
+            normalized_dir(kb_root.path()).join(src_id)
                 .join("source.md"),
         )
         .expect("read normalized");
@@ -1432,10 +1400,7 @@ mod tests {
         let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
         let src_id = &ingested[0].document.metadata.id;
 
-        let assets_dir = kb_root
-            .path()
-            .join("normalized")
-            .join(src_id)
+        let assets_dir = normalized_dir(kb_root.path()).join(src_id)
             .join("assets");
         let entries: Vec<_> = fs::read_dir(&assets_dir)
             .expect("read assets")
@@ -1577,7 +1542,7 @@ mod tests {
             // the raw PDF bytes.
             let src_id = &report.ingested.document.metadata.id;
             let normalized =
-                fs::read_to_string(kb_root.path().join("normalized").join(src_id).join("source.md"))
+                fs::read_to_string(normalized_dir(kb_root.path()).join(src_id).join("source.md"))
                     .expect("read normalized");
             assert!(normalized.contains("Content extracted"));
         }

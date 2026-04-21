@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 
-use kb_core::{Hash, hash_bytes};
+use kb_core::{Hash, hash_bytes, prompts_dir};
 
 /// A loaded prompt template with metadata.
 #[derive(Debug, Clone)]
@@ -25,7 +25,7 @@ impl Template {
     /// Returns an error if the template cannot be read or no bundled default is available.
     pub fn load(name: &str, project_root: Option<&Path>) -> Result<Self> {
         let content = if let Some(root) = project_root {
-            let path = root.join("prompts").join(name);
+            let path = prompts_dir(root).join(name);
             if path.exists() {
                 fs::read_to_string(&path)
                     .with_context(|| format!("failed to read template {}", path.display()))?
@@ -125,7 +125,7 @@ impl Template {
     /// Load a persona file from project or bundled defaults.
     fn load_persona(name: &str, project_root: Option<&Path>) -> Result<String> {
         if let Some(root) = project_root {
-            let path = root.join("prompts").join("personas").join(name);
+            let path = prompts_dir(root).join("personas").join(name);
             if path.exists() {
                 return fs::read_to_string(&path)
                     .with_context(|| format!("failed to read persona {}", path.display()));

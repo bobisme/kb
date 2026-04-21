@@ -429,10 +429,16 @@ pub mod fs;
 pub mod hashing;
 pub mod managed_region;
 pub mod normalized;
+pub mod paths;
 pub mod source_identity;
 pub mod state;
 
 pub use hashing::{Hash, hash_bytes, hash_file, hash_many};
+pub use paths::{
+    CACHE_SUBDIR, KB_DIR, LEGACY_MIGRATABLE_SUBDIRS, LOGS_SUBDIR, NORMALIZED_SUBDIR,
+    PROMPTS_SUBDIR, STATE_SUBDIR, TRASH_SUBDIR, cache_dir, kb_dir, logs_dir, normalized_dir,
+    normalized_rel, prompts_dir, state_dir, trash_dir,
+};
 pub use managed_region::{
     ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title,
 };

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use kb_core::state_dir;
 use serde_json::json;
 
 use crate::ValidationError;
@@ -57,7 +58,7 @@ pub fn system_prompt_content(root: &Path) -> String {
          - wiki/sources/src-<id>.md — summaries of each ingested source document\n\
          - wiki/questions/<slug>.md — previously promoted Q&A pages\n\
          - wiki/index.md — top-level navigation (lists sources, concepts, questions)\n\
-         - normalized/src-<id>/source.md — full original text of each source\n\
+         - .kb/normalized/src-<id>/source.md — full original text of each source\n\
          - outputs/questions/q-<id>/ — historical ask artifacts\n\
          \n\
          Use your read and grep/bash tools to answer the user's questions. Start with\n\
@@ -71,10 +72,10 @@ pub fn system_prompt_content(root: &Path) -> String {
     )
 }
 
-/// Write the system prompt to `state/chat/system-prompt-<terseid>.md` and
+/// Write the system prompt to `.kb/state/chat/system-prompt-<terseid>.md` and
 /// return the path. Caller is responsible for removing it on exit.
 pub fn write_system_prompt(root: &Path) -> Result<PathBuf> {
-    let dir = root.join("state").join("chat");
+    let dir = state_dir(root).join("chat");
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create {}", dir.display()))?;
 
@@ -260,8 +261,8 @@ mod tests {
 
         assert!(path.exists(), "prompt file should exist after write");
         assert!(
-            path.starts_with(tmp.path().join("state/chat")),
-            "prompt should live under state/chat/"
+            path.starts_with(state_dir(tmp.path()).join("chat")),
+            "prompt should live under .kb/state/chat/"
         );
         let content = std::fs::read_to_string(&path).expect("read prompt");
         assert!(

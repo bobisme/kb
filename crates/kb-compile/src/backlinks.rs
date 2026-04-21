@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use ignore::WalkBuilder;
 use kb_core::fs::atomic_write;
-use kb_core::rewrite_managed_region;
+use kb_core::{normalized_dir, rewrite_managed_region};
 use regex::Regex;
 use serde_yaml::Value;
 
@@ -13,7 +13,6 @@ use crate::source_page::source_page_path_for_id;
 const WIKI_DIR: &str = "wiki";
 const CONCEPT_DIR: &str = "wiki/concepts";
 const SOURCE_DIR: &str = "wiki/sources";
-const NORMALIZED_DIR: &str = "normalized";
 
 pub const BACKLINKS_REGION_ID: &str = "backlinks";
 pub const REFERENCED_BY_CONCEPTS_REGION_ID: &str = "referenced_by_concepts";
@@ -170,7 +169,7 @@ fn is_index_page(path: &Path) -> bool {
 /// source pages.
 fn build_anchor_to_source_docs(root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let normalized_root = root.join(NORMALIZED_DIR);
+    let normalized_root = normalized_dir(root);
     if !normalized_root.exists() {
         return Ok(map);
     }
@@ -473,7 +472,7 @@ fn collect_mention_backlinks(
     // `wiki/sources/<src>.md` page. Walking `normalized/<src>/source.md`
     // (not `wiki/sources/<src>.md`) avoids missing mentions that the 100-word
     // LLM summary elided from the wiki source page body.
-    let normalized_root = root.join(NORMALIZED_DIR);
+    let normalized_root = normalized_dir(root);
     if !normalized_root.exists() {
         return Ok(());
     }
@@ -1078,7 +1077,7 @@ mod tests {
 
         // normalized metadata: anchor "python-gil" belongs to source document "src-abc"
         write(
-            &root.path().join("normalized/src-abc/metadata.json"),
+            &normalized_dir(root.path()).join("src-abc/metadata.json"),
             r#"{
                 "metadata": {"id": "src-abc"},
                 "source_revision_id": "rev-123",
@@ -1191,7 +1190,7 @@ mod tests {
 
         // Normalized metadata so heading_anchor path resolves.
         write(
-            &root.path().join("normalized/src-abc/metadata.json"),
+            &normalized_dir(root.path()).join("src-abc/metadata.json"),
             r#"{
                 "metadata": {"id": "src-abc"},
                 "source_revision_id": "rev-123",
@@ -1239,7 +1238,7 @@ mod tests {
 
         // Two unrelated sources that happen to share a heading named "summary".
         write(
-            &root.path().join("normalized/src-a/metadata.json"),
+            &normalized_dir(root.path()).join("src-a/metadata.json"),
             r#"{
                 "metadata": {"id": "src-a"},
                 "source_revision_id": "rev-a",
@@ -1247,7 +1246,7 @@ mod tests {
             }"#,
         );
         write(
-            &root.path().join("normalized/src-b/metadata.json"),
+            &normalized_dir(root.path()).join("src-b/metadata.json"),
             r#"{
                 "metadata": {"id": "src-b"},
                 "source_revision_id": "rev-b",
@@ -1320,7 +1319,7 @@ mod tests {
             "---\nid: wiki-source-src-a\ntype: source\ntitle: Raft overview\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Raft overview\n\nSummary only.\n",
         );
         write(
-            &root.path().join("normalized/src-a/source.md"),
+            &normalized_dir(root.path()).join("src-a/source.md"),
             "# Raft overview\n\nRaft is a consensus algorithm.\n",
         );
         // Source that only mentions the concept's name as a standalone word.
@@ -1330,7 +1329,7 @@ mod tests {
             "---\nid: wiki-source-src-b\ntype: source\ntitle: Read paths\nsource_document_id: src-b\nsource_revision_id: rev-b\n---\n# Read paths\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-b/source.md"),
+            &normalized_dir(root.path()).join("src-b/source.md"),
             "# Read paths\n\nThe Raft leader serves linearizable reads. An aircraft reference should NOT match.\n",
         );
         // Source that references the concept via an alias-only mention.
@@ -1339,7 +1338,7 @@ mod tests {
             "---\nid: wiki-source-src-c\ntype: source\ntitle: Alias mentions\nsource_document_id: src-c\nsource_revision_id: rev-c\n---\n# Alias\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-c/source.md"),
+            &normalized_dir(root.path()).join("src-c/source.md"),
             "# Alias\n\nSome systems use Raft-Consensus heavily in the design.\n",
         );
         // Unrelated source that should NOT be credited.
@@ -1348,7 +1347,7 @@ mod tests {
             "---\nid: wiki-source-src-d\ntype: source\ntitle: Unrelated\nsource_document_id: src-d\nsource_revision_id: rev-d\n---\n# Unrelated\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-d/source.md"),
+            &normalized_dir(root.path()).join("src-d/source.md"),
             "# Unrelated\n\nThe word craft appears here and also aircraft, but no consensus algorithm.\n",
         );
 
@@ -1407,7 +1406,7 @@ mod tests {
             "---\nid: wiki-source-src-a\ntype: source\ntitle: Generic\nsource_document_id: src-a\nsource_revision_id: rev-a\n---\n# Source\n\nSummary only.\n",
         );
         write(
-            &root.path().join("normalized/src-a/source.md"),
+            &normalized_dir(root.path()).join("src-a/source.md"),
             "# Source\n\nThe quick brown fox jumps and AI rules the day.\n",
         );
 
@@ -1514,7 +1513,7 @@ mod tests {
             "---\nid: wiki-source-src-plural\ntype: source\ntitle: Plural form\nsource_document_id: src-plural\nsource_revision_id: rev-1\n---\n# Plural\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-plural/source.md"),
+            &normalized_dir(root.path()).join("src-plural/source.md"),
             "# Plural\n\nMajority quorums are required to commit.\n",
         );
         // Source that uses a compound mention; since we try the alias as-is and
@@ -1525,7 +1524,7 @@ mod tests {
             "---\nid: wiki-source-src-compound\ntype: source\ntitle: Compound\nsource_document_id: src-compound\nsource_revision_id: rev-2\n---\n# Compound\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-compound/source.md"),
+            &normalized_dir(root.path()).join("src-compound/source.md"),
             "# Compound\n\nA majority quorum is the usual protocol requirement.\n",
         );
         // Source that should NOT be credited — "craft" must not match "quorum"
@@ -1535,7 +1534,7 @@ mod tests {
             "---\nid: wiki-source-src-nomatch\ntype: source\ntitle: Nope\nsource_document_id: src-nomatch\nsource_revision_id: rev-3\n---\n# Nope\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-nomatch/source.md"),
+            &normalized_dir(root.path()).join("src-nomatch/source.md"),
             "# Nope\n\nThis page is about aircraft and draft notes only.\n",
         );
 
@@ -1585,7 +1584,7 @@ mod tests {
             "---\nid: wiki-source-src-r\ntype: source\ntitle: Reqs\nsource_document_id: src-r\nsource_revision_id: rev-r\n---\n# Reqs\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-r/source.md"),
+            &normalized_dir(root.path()).join("src-r/source.md"),
             "# Reqs\n\nFunctional requirements and non-functional requirements both matter.\n",
         );
 
@@ -1620,7 +1619,7 @@ mod tests {
             "---\nid: wiki-source-src-sql\ntype: source\ntitle: Databases\nsource_document_id: src-sql\nsource_revision_id: rev-sql\n---\n# Databases\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-sql/source.md"),
+            &normalized_dir(root.path()).join("src-sql/source.md"),
             "# Databases\n\nSome SQLs are bad, and SQLite is fine.\n",
         );
 
@@ -1655,7 +1654,7 @@ mod tests {
             "---\nid: wiki-source-src-kern\ntype: source\ntitle: Kernel notes\nsource_document_id: src-kern\nsource_revision_id: rev-k\n---\n# Kernel notes\n\nDiscussion of synchronization primitives.\n",
         );
         write(
-            &root.path().join("normalized/src-kern/source.md"),
+            &normalized_dir(root.path()).join("src-kern/source.md"),
             "# Kernel notes\n\nA mutex is held while entering the critical section; mutexes ensure exclusive access.\n",
         );
 
@@ -1694,7 +1693,7 @@ mod tests {
             "---\nid: wiki-source-src-real\ntype: source\ntitle: Interrupts\nsource_document_id: src-real\nsource_revision_id: rev-r\n---\n# Interrupts\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-real/source.md"),
+            &normalized_dir(root.path()).join("src-real/source.md"),
             "# Interrupts\n\nHardware interrupts are delivered via IRQ lines.\n",
         );
 
@@ -1754,7 +1753,7 @@ mod tests {
             "---\nid: wiki-source-src-code\ntype: source\ntitle: Code only\nsource_document_id: src-code\nsource_revision_id: rev-c\n---\n# Code\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-code/source.md"),
+            &normalized_dir(root.path()).join("src-code/source.md"),
             "# Code only\n\nSee the API.\n\n```\npthread_mutex_lock(&mutex);\n```\n\nAlso `mutex_init()` is called.\n",
         );
 
@@ -1789,7 +1788,7 @@ mod tests {
             "---\nid: wiki-source-src-with-sgd\ntype: source\ntitle: Optimizers\nsource_document_id: src-with-sgd\nsource_revision_id: rev-x\n---\n# Optimizers\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-with-sgd/source.md"),
+            &normalized_dir(root.path()).join("src-with-sgd/source.md"),
             "# Optimizers\n\nSGD is classic. TSGD and SGDM are variants.\n",
         );
         write(
@@ -1797,7 +1796,7 @@ mod tests {
             "---\nid: wiki-source-src-substring-only\ntype: source\ntitle: Substrings only\nsource_document_id: src-substring-only\nsource_revision_id: rev-y\n---\n# Substrings\n\nSummary.\n",
         );
         write(
-            &root.path().join("normalized/src-substring-only/source.md"),
+            &normalized_dir(root.path()).join("src-substring-only/source.md"),
             "# Substrings\n\nOnly TSGD and SGDM appear here, never the standalone form.\n",
         );
 

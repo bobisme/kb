@@ -17,14 +17,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use kb_core::fs::atomic_write;
+use kb_core::state_dir;
 use serde::{Deserialize, Serialize};
 
 use kb_core::{BuildRecord, Hash, hash_many};
 
 pub type NodeId = String;
 
-const GRAPH_PATH: [&str; 2] = ["state", "graph.json"];
-const STATE_HASHES_PATH: &str = "state/hashes.json";
+const GRAPH_FILE: &str = "graph.json";
+const STATE_HASHES_FILE: &str = "hashes.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Graph {
@@ -49,7 +50,7 @@ pub struct GraphInspection {
 impl Graph {
     #[must_use]
     pub fn graph_path(root: &Path) -> PathBuf {
-        root.join(GRAPH_PATH[0]).join(GRAPH_PATH[1])
+        state_dir(root).join(GRAPH_FILE)
     }
 
     /// Load the persisted dependency graph from `state/graph.json`.
@@ -477,7 +478,7 @@ impl HashState {
     /// # Errors
     /// Returns an error if the state file exists but cannot be read or parsed.
     pub fn load_from_root(root: impl AsRef<Path>) -> Result<Self> {
-        Self::load(root.as_ref().join(STATE_HASHES_PATH))
+        Self::load(state_dir(root.as_ref()).join(STATE_HASHES_FILE))
     }
 
     /// Persist the hash state to disk.
@@ -503,7 +504,7 @@ impl HashState {
     /// # Errors
     /// Returns an error if the state cannot be serialized or written.
     pub fn save_to_root(&self, root: impl AsRef<Path>) -> Result<()> {
-        self.save(root.as_ref().join(STATE_HASHES_PATH))
+        self.save(state_dir(root.as_ref()).join(STATE_HASHES_FILE))
     }
 }
 

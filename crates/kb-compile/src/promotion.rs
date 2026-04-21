@@ -707,7 +707,7 @@ mod tests {
         assert!(page.contains("Rust is great."));
         assert!(page.contains("<!-- kb:begin id=answer -->"));
 
-        let record_path = root.join("state/build_records/promote-review-exec-1.json");
+        let record_path = kb_core::state_dir(root).join("build_records/promote-review-exec-1.json");
         assert!(record_path.exists());
 
         let review_path = root.join("reviews/promotions/review-exec-1.json");

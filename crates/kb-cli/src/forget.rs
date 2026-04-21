@@ -36,7 +36,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use kb_compile::{Graph, HashState, backlinks, index_page};
-use kb_core::{BuildRecord, build_records_dir, frontmatter::read_frontmatter, frontmatter::write_frontmatter};
+use kb_core::{
+    BuildRecord, build_records_dir, frontmatter::read_frontmatter,
+    frontmatter::write_frontmatter, normalized_dir, normalized_rel, trash_dir,
+};
 use serde::Serialize;
 use serde_yaml::{Mapping, Value};
 
@@ -168,8 +171,8 @@ impl CascadeRefresh {
 pub fn resolve_target(root: &Path, target: &str) -> Result<(String, Option<String>)> {
     if is_src_id(target) {
         let raw_dir = root.join("raw/inbox").join(target);
-        let normalized_dir = root.join("normalized").join(target);
-        if raw_dir.exists() || normalized_dir.exists() {
+        let normalized_source_dir = normalized_dir(root).join(target);
+        if raw_dir.exists() || normalized_source_dir.exists() {
             let origin = read_stable_location(root, target);
             return Ok((target.to_string(), origin));
         }
@@ -194,7 +197,7 @@ pub fn resolve_target(root: &Path, target: &str) -> Result<(String, Option<Strin
         bail!(
             "no source with id '{target}' found under {} or {}",
             raw_dir.display(),
-            normalized_dir.display()
+            normalized_source_dir.display()
         );
     }
 
@@ -265,12 +268,10 @@ pub fn plan(
         .duration_since(UNIX_EPOCH)
         .context("system clock before UNIX_EPOCH")?
         .as_secs();
-    let trash_dir = root
-        .join("trash")
-        .join(format!("{src_id}-{timestamp}"));
+    let trash_bucket = trash_dir(root).join(format!("{src_id}-{timestamp}"));
 
     let candidates = [
-        root.join("normalized").join(src_id),
+        normalized_dir(root).join(src_id),
         root.join("raw/inbox").join(src_id),
         root.join(kb_compile::source_page::source_page_path_for_id(src_id)),
     ];
@@ -288,7 +289,7 @@ pub fn plan(
     Ok(ForgetPlan {
         src_id: src_id.to_string(),
         origin,
-        trash_dir,
+        trash_dir: trash_bucket,
         moves,
         cascade: cascade_plan,
     })
@@ -442,10 +443,12 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
     if !dir.exists() {
         return Ok(Vec::new());
     }
-    let normalized_prefix = PathBuf::from("normalized").join(src_id);
+    let normalized_prefix = normalized_rel(src_id);
     let wiki_source_path = kb_compile::source_page::source_page_path_for_id(src_id);
-    let concept_candidates_prefix =
-        PathBuf::from("state/concept_candidates").join(src_id);
+    let concept_candidates_prefix = PathBuf::from(kb_core::KB_DIR)
+        .join(kb_core::STATE_SUBDIR)
+        .join("concept_candidates")
+        .join(src_id);
     // `build:<pass>:<src-id>` → the id ends with `:<src-id>`. A suffix check
     // is narrow enough to avoid collisions with records for unrelated srcs
     // whose id happens to embed this src-id as a substring.
@@ -472,7 +475,11 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
                 // `<src>.json` (exact file) and any future subpath.
                 || out.starts_with(&concept_candidates_prefix)
                 || out.to_string_lossy().starts_with(
-                    &format!("state/concept_candidates/{src_id}."),
+                    &format!(
+                        "{}/{}/concept_candidates/{src_id}.",
+                        kb_core::KB_DIR,
+                        kb_core::STATE_SUBDIR,
+                    ),
                 )
         });
         let references_src_via_id = record.metadata.id.ends_with(&id_suffix);
@@ -574,7 +581,7 @@ pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<ExecuteOutcome> {
 
     // Drop the forgotten source from the hash state so `kb status` doesn't
     // immediately re-flag it as "never compiled". Missing file is fine.
-    let hash_state_path = root.join("state/hashes.json");
+    let hash_state_path = kb_core::state_dir(root).join("hashes.json");
     if hash_state_path.exists() {
         let mut state = HashState::load_from_root(root)?;
         let key = format!("normalized/{}", plan.src_id);
@@ -1134,7 +1141,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
         let src = "src-cafef00d";
-        fs::create_dir_all(root.join("normalized").join(src)).expect("create normalized");
+        fs::create_dir_all(normalized_dir(root).join(src)).expect("create normalized");
         // No wiki page, no raw/inbox entry yet.
         let plan = plan(root, src, None, true).expect("plan");
         assert_eq!(plan.src_id, src);
@@ -1148,7 +1155,7 @@ mod tests {
         let root = dir.path();
         let src = "src-abc00001";
         let other = "src-abc00002";
-        fs::create_dir_all(root.join("normalized").join(src)).expect("create normalized");
+        fs::create_dir_all(normalized_dir(root).join(src)).expect("create normalized");
         let orphan = write_concept_page(root, "zab", &[src]);
         let multi = write_concept_page(root, "shared", &[src, other]);
 
@@ -1170,7 +1177,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
         let src = "src-abc00003";
-        fs::create_dir_all(root.join("normalized").join(src)).expect("create normalized");
+        fs::create_dir_all(normalized_dir(root).join(src)).expect("create normalized");
         write_concept_page(root, "zab", &[src]);
 
         let plan = plan(root, src, None, false).expect("plan without cascade");
@@ -1238,7 +1245,7 @@ mod tests {
         let root = dir.path();
         let src = "src-abcdef01";
 
-        let normalized = root.join("normalized").join(src);
+        let normalized = normalized_dir(root).join(src);
         fs::create_dir_all(&normalized).expect("mkdir normalized");
         fs::write(normalized.join("source.md"), "body").expect("write source.md");
 
@@ -1272,7 +1279,10 @@ mod tests {
         assert!(!wiki_page.exists(), "wiki page should be gone");
         assert!(plan.trash_dir.exists(), "trash dir should exist");
         assert!(
-            plan.trash_dir.join(format!("normalized/{src}")).exists(),
+            plan.trash_dir
+                .join(kb_core::KB_DIR)
+                .join(format!("normalized/{src}"))
+                .exists(),
             "normalized dir preserved under trash"
         );
 
@@ -1354,7 +1364,7 @@ mod tests {
         let other = "src-i5ra0002";
 
         // Ingest-like layout: normalized + wiki source page.
-        fs::create_dir_all(root.join("normalized").join(src))
+        fs::create_dir_all(normalized_dir(root).join(src))
             .expect("mkdir normalized");
         let wiki_page = root.join(kb_compile::source_page::source_page_path_for_id(src));
         fs::create_dir_all(wiki_page.parent().expect("parent"))
@@ -1392,7 +1402,7 @@ mod tests {
             "global index still lists trashed orphan concept:\n{global}");
 
         // Lexical index doesn't mention the trashed pages either.
-        let lexical_json = fs::read_to_string(root.join("state/indexes/lexical.json"))
+        let lexical_json = fs::read_to_string(kb_core::state_dir(root).join("indexes/lexical.json"))
             .expect("read lexical index");
         assert!(!lexical_json.contains(&format!("wiki/sources/{src}.md")),
             "lexical index still points at trashed source page");
@@ -1522,7 +1532,7 @@ mod tests {
         let src = "src-3f60a001";
 
         // Minimal on-disk layout so the forget plan has something to move.
-        fs::create_dir_all(root.join("normalized").join(src))
+        fs::create_dir_all(normalized_dir(root).join(src))
             .expect("mkdir normalized");
         let wiki_page = root.join(kb_compile::source_page::source_page_path_for_id(src));
         fs::create_dir_all(wiki_page.parent().expect("parent"))
@@ -1570,7 +1580,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path();
         let src = "src-3f60a010";
-        fs::create_dir_all(root.join("normalized").join(src))
+        fs::create_dir_all(normalized_dir(root).join(src))
             .expect("mkdir normalized");
 
         let plan = plan(root, src, None, true).expect("plan");

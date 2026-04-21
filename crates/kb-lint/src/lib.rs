@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use kb_core::{
     BuildRecord, EntityMetadata, Manifest, ReviewItem, ReviewKind, ReviewStatus, Status,
     build_records_dir, extract_managed_regions, frontmatter::read_frontmatter,
-    load_build_record, slug_from_title,
+    load_build_record, normalized_dir, slug_from_title,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -1107,7 +1107,7 @@ fn same_build_fingerprint(left: &BuildRecord, right: &BuildRecord) -> bool {
 }
 
 fn normalized_metadata_for_doc(root: &Path, doc_id: &str) -> Result<Option<NormalizedMetadata>> {
-    let path = root.join("normalized").join(doc_id).join("metadata.json");
+    let path = normalized_dir(root).join(doc_id).join("metadata.json");
     if !path.exists() {
         return Ok(None);
     }
@@ -1483,7 +1483,7 @@ mod tests {
     }
 
     fn write_normalized_metadata(root: &Path, doc_id: &str, revision_id: &str) {
-        let dir = root.join("normalized").join(doc_id);
+        let dir = normalized_dir(root).join(doc_id);
         fs::create_dir_all(&dir).expect("create normalized dir");
         fs::write(
             dir.join("metadata.json"),
@@ -2345,7 +2345,7 @@ fn check_missing_concepts_raw(
         return Ok(Vec::new());
     }
 
-    let normalized_root = root.join("normalized");
+    let normalized_root = normalized_dir(root);
     if !normalized_root.exists() {
         return Ok(Vec::new());
     }
@@ -3653,7 +3653,7 @@ mod missing_concepts_tests {
     use tempfile::TempDir;
 
     fn write_normalized_source(root: &Path, doc_id: &str, body: &str) {
-        let dir = root.join("normalized").join(doc_id);
+        let dir = normalized_dir(root).join(doc_id);
         fs::create_dir_all(&dir).unwrap();
         // metadata.json is not required by the missing-concepts walker but
         // keeping it aligned with production shape prevents surprises.

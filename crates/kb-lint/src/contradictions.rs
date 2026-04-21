@@ -26,13 +26,12 @@ use anyhow::{Context, Result};
 use kb_core::frontmatter::read_frontmatter;
 use kb_core::{
     EntityMetadata, ReviewItem, ReviewKind, ReviewStatus, Status, hash_many, list_review_items,
-    slug_from_title,
+    normalized_dir, slug_from_title,
 };
 use kb_llm::{ContradictionQuote, DetectContradictionsRequest, LlmAdapter};
 use serde_yaml::Value;
 
 const WIKI_CONCEPTS_DIR: &str = "wiki/concepts";
-const NORMALIZED_DIR: &str = "normalized";
 /// Concepts with more than this many cited quotes are truncated to the first
 /// N quotes per source before the LLM call. The cost model is one LLM call
 /// per concept; a single huge concept won't dominate, but the prompt itself
@@ -558,7 +557,7 @@ fn unix_time_ms() -> Result<u64> {
 /// direction is `kb-compile -> kb-lint` would cycle.
 fn build_anchor_to_source_docs(root: &Path) -> Result<BTreeMap<String, Vec<String>>> {
     let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let normalized_root = root.join(NORMALIZED_DIR);
+    let normalized_root = normalized_dir(root);
     if !normalized_root.exists() {
         return Ok(map);
     }
@@ -757,7 +756,7 @@ mod tests {
     }
 
     fn write_normalized_metadata(root: &Path, src_id: &str, heading_ids: &[&str]) {
-        let dir = root.join(NORMALIZED_DIR).join(src_id);
+        let dir = normalized_dir(root).join(src_id);
         fs::create_dir_all(&dir).unwrap();
         let value = serde_json::json!({ "heading_ids": heading_ids });
         fs::write(dir.join("metadata.json"), value.to_string()).unwrap();

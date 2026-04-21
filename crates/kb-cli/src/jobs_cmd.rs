@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use kb_core::{JobRun, JobRunStatus};
+use kb_core::{JobRun, JobRunStatus, trash_dir};
 use serde::Serialize;
 
 use crate::emit_json;
@@ -235,11 +235,9 @@ pub fn run_prune(
     // collision even if two prune calls land in the same second (the
     // root lock would serialize them anyway, but the naming is
     // independently defensive).
-    let trash_dir = root
-        .join("trash")
-        .join(format!("jobs-{}", now_millis()));
-    fs::create_dir_all(&trash_dir)
-        .with_context(|| format!("create trash dir {}", trash_dir.display()))?;
+    let trash_bucket = trash_dir(root).join(format!("jobs-{}", now_millis()));
+    fs::create_dir_all(&trash_bucket)
+        .with_context(|| format!("create trash dir {}", trash_bucket.display()))?;
 
     let mut pruned = 0usize;
     for job in &to_prune {
@@ -251,7 +249,7 @@ pub fn run_prune(
         // partial prior run) skip and count as pruned so the user isn't
         // confused by a phantom "kept" entry.
         if manifest.exists() {
-            let dest = trash_dir.join(format!("{id}.json"));
+            let dest = trash_bucket.join(format!("{id}.json"));
             move_file(&manifest, &dest).with_context(|| {
                 format!("move {} -> {}", manifest.display(), dest.display())
             })?;
@@ -259,7 +257,7 @@ pub fn run_prune(
         // Move sidecar log if present. Missing logs are fine — early
         // aborts (e.g. lock-timeout jobs) never wrote one.
         if log.exists() {
-            let dest = trash_dir.join(format!("{id}.log"));
+            let dest = trash_bucket.join(format!("{id}.log"));
             move_file(&log, &dest).with_context(|| {
                 format!("move {} -> {}", log.display(), dest.display())
             })?;
@@ -272,7 +270,7 @@ pub fn run_prune(
             "jobs.prune",
             PruneReport {
                 pruned,
-                trash_dir: Some(trash_dir),
+                trash_dir: Some(trash_bucket),
                 kept,
             },
         )?;
@@ -280,7 +278,7 @@ pub fn run_prune(
     }
     println!(
         "Pruned {pruned} job run(s) to {}{}",
-        trash_dir.display(),
+        trash_bucket.display(),
         if kept > 0 {
             format!(" ({kept} newer than {older_than_days} day(s) kept)")
         } else {

@@ -7,6 +7,7 @@ mod id_resolve;
 mod init;
 mod jobs;
 mod jobs_cmd;
+mod migrate;
 mod publish;
 mod review;
 mod root;
@@ -23,7 +24,8 @@ use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
 use kb_core::{
     Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext,
-    ReviewItem, ReviewKind, ReviewStatus, Status, hash_many, slug_from_title,
+    ReviewItem, ReviewKind, ReviewStatus, Status, hash_many, normalized_dir, normalized_rel,
+    slug_from_title, state_dir,
 };
 use kb_llm::{
     ClaudeCliAdapter, ClaudeCliConfig, LlmAdapter, OpencodeAdapter, OpencodeConfig,
@@ -251,6 +253,13 @@ enum Command {
         #[arg(long, default_value_t = 8484)]
         port: u16,
     },
+    /// Migrate a pre-`.kb/` layout into the current layout.
+    ///
+    /// Detects legacy `cache/`, `logs/`, `state/`, `trash/`, `normalized/`,
+    /// and `prompts/` directories at the vault root, creates `.kb/`, and
+    /// moves each one into place via `std::fs::rename`. Idempotent — a
+    /// second run on an already-migrated vault is a no-op.
+    Migrate,
 }
 
 #[derive(clap::Subcommand)]
@@ -418,6 +427,22 @@ fn run(cli: Cli) -> Result<()> {
                 root_path.display()
             )
         })?;
+    }
+
+    // Legacy-layout sentinel: bail fast for every command that would touch
+    // the internal tree (state, cache, normalized, logs). `kb init` is
+    // exempted because it may be overwriting an in-progress install, and
+    // `kb migrate` is the way out. Read-only commands that only look at
+    // wiki/ + outputs/ (e.g. `kb search`) still want the guard because a
+    // legacy vault's state/indexes would be stale and confusing.
+    if let Some(root_path) = root.as_deref() {
+        let skip_sentinel = matches!(
+            cli.command,
+            Some(Command::Init { .. } | Command::Migrate) | None,
+        );
+        if !skip_sentinel {
+            migrate::bail_if_legacy_layout(root_path)?;
+        }
     }
 
     match cli.command {
@@ -824,6 +849,16 @@ fn run(cli: Cli) -> Result<()> {
                 .context("build tokio runtime for kb serve")?;
             rt.block_on(kb_web::serve(&host, port, state))
         }
+        Some(Command::Migrate) => {
+            let migrate_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            // Migrate is a mutating fs operation but it writes to a brand-
+            // new `.kb/` tree that no other command owns yet, so it does
+            // not take the root lock. Running `kb compile` concurrently
+            // would already have bailed out via the legacy-layout sentinel.
+            migrate::run_migrate(migrate_root, cli.json)
+        }
         None => {
             println!("kb: a personal knowledge base compiler");
             println!("Run 'kb --help' for more information");
@@ -996,7 +1031,7 @@ fn run_doctor(root: &Path, json: bool, cli_model: Option<&str>) -> Result<()> {
 }
 
 fn check_root_writable(root: &Path) -> DoctorCheck {
-    let probe = root.join("state").join(".kb-doctor-write-test");
+    let probe = state_dir(root).join(".kb-doctor-write-test");
     match fs::write(&probe, b"ok") {
         Ok(()) => {
             let _ = fs::remove_file(&probe);
@@ -1626,7 +1661,7 @@ fn normalized_dir_for(item: &IngestResult) -> PathBuf {
             .parent()
             .map_or_else(|| item.content_path.clone(), Path::to_path_buf)
     } else {
-        PathBuf::from("normalized").join(&item.source_document_id)
+        normalized_rel(&item.source_document_id)
     }
 }
 
@@ -3010,7 +3045,7 @@ fn build_report_for_resolved(
             // If neither the wiki page nor the normalized source.md exists yet
             // (rare — implies an in-progress compile), fall back to the
             // normalized dir itself so the report still surfaces something.
-            root.join("normalized").join(&resolved.id)
+            normalized_dir(root).join(&resolved.id)
         }),
         id_resolve::IdKind::Concept => root.join("wiki/concepts").join(format!("{}.md", resolved.id)),
         id_resolve::IdKind::Question => {
@@ -3184,7 +3219,7 @@ fn resolve_source_id(root: &Path, target: &str) -> Option<PathBuf> {
     if wiki_page.exists() {
         return Some(wiki_page);
     }
-    let normalized = root.join("normalized").join(target).join("source.md");
+    let normalized = normalized_dir(root).join(target).join("source.md");
     if normalized.exists() {
         return Some(normalized);
     }
@@ -3288,8 +3323,7 @@ fn source_page_freshness(root: &Path, page_path: &Path) -> Option<String> {
         .get(serde_yaml::Value::String("source_revision_id".into()))
         .and_then(serde_yaml::Value::as_str)?;
 
-    let metadata_path = root
-        .join("normalized")
+    let metadata_path = normalized_dir(root)
         .join(source_doc_id)
         .join("metadata.json");
     let raw = fs::read_to_string(&metadata_path).ok()?;
@@ -4204,16 +4238,16 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
 /// don't flag it, because a legacy / hand-placed normalized dir has no
 /// origin to miss.
 fn find_missing_origins(root: &Path) -> Result<Vec<MissingOrigin>> {
-    let normalized_dir = root.join("normalized");
-    if !normalized_dir.exists() {
+    let normalized_root = normalized_dir(root);
+    if !normalized_root.exists() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
-    for entry in fs::read_dir(&normalized_dir)
-        .with_context(|| format!("read {}", normalized_dir.display()))?
+    for entry in fs::read_dir(&normalized_root)
+        .with_context(|| format!("read {}", normalized_root.display()))?
     {
         let entry = entry
-            .with_context(|| format!("read entry in {}", normalized_dir.display()))?;
+            .with_context(|| format!("read entry in {}", normalized_root.display()))?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
@@ -4244,7 +4278,7 @@ fn find_missing_origins(root: &Path) -> Result<Vec<MissingOrigin>> {
 /// missing on a freshly initialized KB that hasn't been ingested into yet —
 /// that's not an error, we just report zero.
 fn count_normalized_sources(root: &Path) -> Result<usize> {
-    let dir = root.join("normalized");
+    let dir = normalized_dir(root);
     if !dir.exists() {
         return Ok(0);
     }
@@ -4409,8 +4443,8 @@ fn scan_changed_inputs(
     root: &Path,
     hash_state: &kb_compile::HashState,
 ) -> Result<ChangedInputsScan> {
-    let normalized_dir = root.join("normalized");
-    if !normalized_dir.exists() {
+    let normalized_root = normalized_dir(root);
+    if !normalized_root.exists() {
         return Ok(ChangedInputsScan {
             entries: Vec::new(),
             revision_mismatched: 0,
@@ -4419,11 +4453,11 @@ fn scan_changed_inputs(
 
     let mut entries = Vec::new();
     let mut revision_mismatched = 0;
-    for entry in std::fs::read_dir(&normalized_dir)
-        .with_context(|| format!("read normalized dir {}", normalized_dir.display()))?
+    for entry in std::fs::read_dir(&normalized_root)
+        .with_context(|| format!("read normalized dir {}", normalized_root.display()))?
     {
         let entry = entry
-            .with_context(|| format!("read normalized entry in {}", normalized_dir.display()))?;
+            .with_context(|| format!("read normalized entry in {}", normalized_root.display()))?;
         if !entry.file_type()?.is_dir() {
             continue;
         }
@@ -4473,8 +4507,7 @@ fn scan_changed_inputs(
 /// A mismatch here means the user ran `kb ingest` after a successful
 /// `kb compile` and the wiki page is now out of date.
 fn source_revision_mismatched(root: &Path, normalized_id: &str) -> Result<bool> {
-    let metadata_path = root
-        .join("normalized")
+    let metadata_path = normalized_dir(root)
         .join(normalized_id)
         .join("metadata.json");
     let Ok(metadata_bytes) = std::fs::read(&metadata_path) else {
@@ -4802,7 +4835,7 @@ mod tests {
         // Missing `normalized/` is not an error.
         assert_eq!(count_normalized_sources(root).expect("no normalized dir"), 0);
 
-        let normalized = root.join("normalized");
+        let normalized = normalized_dir(root);
         fs::create_dir_all(normalized.join("src-a")).expect("create src-a");
         fs::create_dir_all(normalized.join("src-b")).expect("create src-b");
         fs::create_dir_all(normalized.join("src-c")).expect("create src-c");
@@ -4820,7 +4853,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let root = dir.path().join("kb");
         write_kb_config(&root);
-        fs::create_dir_all(root.join("normalized").join("src-42"))
+        fs::create_dir_all(normalized_dir(&root).join("src-42"))
             .expect("create normalized source dir");
 
         let status = gather_status(&root).expect("gather status");
@@ -4897,7 +4930,7 @@ mod tests {
     /// Helper for the re-ingest mismatch tests: fabricate
     /// `normalized/<id>/metadata.json` with the given revision.
     fn write_normalized_metadata(root: &Path, id: &str, revision: &str) {
-        let dir = root.join("normalized").join(id);
+        let dir = normalized_dir(root).join(id);
         fs::create_dir_all(&dir).expect("create normalized dir");
         let metadata = serde_json::json!({
             "metadata": {
@@ -4965,7 +4998,7 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
             changed.into_iter().map(|c| c.normalized_path).collect();
         assert_eq!(
             changed_paths,
-            vec![root.join("normalized").join("src-1")],
+            vec![normalized_dir(root).join("src-1")],
             "re-ingested source with stale wiki page must be reported as changed",
         );
     }
@@ -4983,7 +5016,7 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
             find_changed_inputs(root, &hash_state).expect("find changed (never compiled)");
         let changed_paths: Vec<PathBuf> =
             changed.into_iter().map(|c| c.normalized_path).collect();
-        assert_eq!(changed_paths, vec![root.join("normalized").join("src-fresh")]);
+        assert_eq!(changed_paths, vec![normalized_dir(root).join("src-fresh")]);
     }
 
     /// Regression test for bn-2m2: `gather_status` must count sources whose
@@ -5104,7 +5137,7 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
 
         // No job manifest should have been written — dry-run skips the
         // job lifecycle entirely so SIGPIPE / Ctrl-C can't orphan a run.
-        let jobs_dir = root.join("state").join("jobs");
+        let jobs_dir = state_dir(&root).join("jobs");
         if jobs_dir.exists() {
             let manifests: Vec<_> = fs::read_dir(&jobs_dir)
                 .expect("read jobs dir")

@@ -6,6 +6,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::fs::atomic_write;
+use crate::paths::normalized_dir;
 use crate::{EntityMetadata, NormalizedDocument};
 
 const METADATA_FILE_NAME: &str = "metadata.json";
@@ -44,9 +45,9 @@ impl NormalizedDocumentMetadata {
 /// Writes a `NormalizedDocument` to the standard storage layout.
 ///
 /// Layout under `root`:
-/// - `normalized/<doc-id>/source.md`
-/// - `normalized/<doc-id>/metadata.json`
-/// - `normalized/<doc-id>/assets/` (directory created if needed)
+/// - `.kb/normalized/<doc-id>/source.md`
+/// - `.kb/normalized/<doc-id>/metadata.json`
+/// - `.kb/normalized/<doc-id>/assets/` (directory created if needed)
 ///
 /// # Errors
 /// Returns an error if directories cannot be created, assets are missing or
@@ -55,7 +56,7 @@ pub fn write_normalized_document(
     root: impl AsRef<Path>,
     doc: &NormalizedDocument,
 ) -> io::Result<()> {
-    let base_dir = root.as_ref().join("normalized").join(&doc.metadata.id);
+    let base_dir = normalized_dir(root.as_ref()).join(&doc.metadata.id);
     std::fs::create_dir_all(&base_dir)?;
     let assets_dir = base_dir.join(ASSETS_DIR_NAME);
     std::fs::create_dir_all(&assets_dir)?;
@@ -89,7 +90,7 @@ pub fn read_normalized_document(
     root: impl AsRef<Path>,
     id: &str,
 ) -> io::Result<NormalizedDocument> {
-    let base_dir = root.as_ref().join("normalized").join(id);
+    let base_dir = normalized_dir(root.as_ref()).join(id);
     let metadata_path = base_dir.join(METADATA_FILE_NAME);
     let source_path = base_dir.join(SOURCE_MARKDOWN_FILE_NAME);
 
@@ -251,20 +252,19 @@ mod tests {
         assert_eq!(written_doc.canonical_text, document.canonical_text);
         assert_eq!(written_doc.normalized_assets, document.normalized_assets);
         assert!(
-            root.join("normalized")
+            normalized_dir(root)
                 .join(document.metadata.id.clone())
                 .join("source.md")
                 .is_file()
         );
         assert!(
-            root.join("normalized")
+            normalized_dir(root)
                 .join(document.metadata.id.clone())
                 .join("assets")
                 .join("img.png")
                 .is_file()
         );
-        let metadata_path = root
-            .join("normalized")
+        let metadata_path = normalized_dir(root)
             .join(&document.metadata.id)
             .join("metadata.json");
         let metadata_text = fs::read_to_string(metadata_path)?;
@@ -301,7 +301,7 @@ mod tests {
         write_normalized_document(root, &document)?;
 
         let metadata = fs::read_to_string(
-            root.join("normalized")
+            normalized_dir(root)
                 .join("doc-no-body")
                 .join("metadata.json"),
         )?;

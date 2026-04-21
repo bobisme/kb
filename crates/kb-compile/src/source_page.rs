@@ -52,17 +52,21 @@ static IMAGE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// from the wiki source page's location.
 ///
 /// Normalized sources store image refs as `assets/<basename>` — relative to
-/// `normalized/<src>/source.md`. The wiki source page lives at
-/// `wiki/sources/<src>.md`, which is two directories away from KB root plus
-/// two dirs away from `normalized/<src>/assets/`. The correct relative path
-/// from a wiki source page to its source's assets is therefore
-/// `../../normalized/<src>/assets/<basename>`.
+/// `.kb/normalized/<src>/source.md`. The wiki source page lives at
+/// `wiki/sources/<src>.md`, so going up two components lands at the KB root;
+/// from there we hop into `.kb/normalized/<src>/assets/` to reach the image.
+/// The correct relative path from a wiki source page to its source's assets
+/// is therefore `../../.kb/normalized/<src>/assets/<basename>`.
 ///
 /// Only refs whose path starts with `assets/` are rewritten — we don't touch
 /// external URLs or refs that have already been re-anchored.
 #[must_use]
 pub fn rewrite_summary_image_refs(text: &str, source_id: &str) -> String {
-    let new_prefix = format!("../../normalized/{source_id}/assets");
+    let new_prefix = format!(
+        "../../{}/{}/{source_id}/assets",
+        kb_core::KB_DIR,
+        kb_core::NORMALIZED_SUBDIR
+    );
     rewrite_asset_refs_with_prefix(text, &new_prefix)
 }
 
@@ -372,7 +376,7 @@ mod tests {
         let summary = "See ![fig](assets/diagram.png) and ![url](https://x/y.png).";
         let out = rewrite_summary_image_refs(summary, "src-abc");
         assert!(
-            out.contains("![fig](../../normalized/src-abc/assets/diagram.png)"),
+            out.contains("![fig](../../.kb/normalized/src-abc/assets/diagram.png)"),
             "rewritten summary must re-anchor assets/ refs: {out}"
         );
         // External URLs untouched.
@@ -391,7 +395,7 @@ mod tests {
     /// rewritten twice. Only `assets/...` matches.
     #[test]
     fn rewrite_summary_image_refs_skips_non_assets_paths() {
-        let summary = "![a](../../normalized/src-xyz/assets/already.png)\n![b](other/thing.png)\n";
+        let summary = "![a](../../.kb/normalized/src-xyz/assets/already.png)\n![b](other/thing.png)\n";
         let out = rewrite_summary_image_refs(summary, "src-xyz");
         assert_eq!(out, summary);
     }

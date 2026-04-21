@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use kb_core::normalized_dir;
 use kb_ingest::{IngestOutcome, RepoIngestOptions, ingest_repo, is_git_url};
 use tempfile::TempDir;
 
@@ -113,10 +114,7 @@ fn ingest_repo_walks_default_docs_filter() {
 
     // Each ingested file should have its own normalized document.
     for file in &report.files {
-        let normalized = kb
-            .path()
-            .join("normalized")
-            .join(&file.source_document_id)
+        let normalized = normalized_dir(kb.path()).join(&file.source_document_id)
             .join("source.md");
         assert!(
             normalized.is_file(),
@@ -125,10 +123,7 @@ fn ingest_repo_walks_default_docs_filter() {
             normalized.display()
         );
         // Origin sidecar must record the remote URL + commit SHA.
-        let origin_path = kb
-            .path()
-            .join("normalized")
-            .join(&file.source_document_id)
+        let origin_path = normalized_dir(kb.path()).join(&file.source_document_id)
             .join("origin.json");
         let origin: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&origin_path).unwrap()).unwrap();
@@ -402,10 +397,7 @@ fn pinned_commit_checks_out_that_sha() {
         .iter()
         .find(|f| f.repo_path == "README.md")
         .unwrap();
-    let normalized_src = kb
-        .path()
-        .join("normalized")
-        .join(&readme.source_document_id)
+    let normalized_src = normalized_dir(kb.path()).join(&readme.source_document_id)
         .join("source.md");
     let body = fs::read_to_string(&normalized_src).unwrap();
     assert!(

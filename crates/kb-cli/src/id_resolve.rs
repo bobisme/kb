@@ -26,6 +26,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use kb_core::normalized_dir;
 use terseid::{IdResolver, ResolverConfig, TerseIdError, find_matching_ids};
 
 /// What a successful [`resolve`] call produces.
@@ -177,7 +178,7 @@ const fn default_prefix_for(kind: IdKind) -> &'static str {
 /// against fresh roots that may not have run ingest yet.
 pub fn list_ids(root: &Path, kind: IdKind) -> Result<Vec<String>> {
     match kind {
-        IdKind::Source => list_subdirs(&root.join("normalized"), |name| name.starts_with("src-")),
+        IdKind::Source => list_subdirs(&normalized_dir(root), |name| name.starts_with("src-")),
         IdKind::Concept => list_md_stems(&root.join("wiki/concepts")),
         IdKind::Question => list_subdirs(&root.join("outputs/questions"), |_| true),
     }
@@ -246,7 +247,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn mk_src(root: &Path, id: &str) {
-        fs::create_dir_all(root.join("normalized").join(id)).expect("mkdir normalized/<id>");
+        fs::create_dir_all(normalized_dir(root).join(id)).expect("mkdir normalized/<id>");
     }
 
     fn mk_concept(root: &Path, slug: &str) {

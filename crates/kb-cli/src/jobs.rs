@@ -11,7 +11,7 @@ use fs2::FileExt;
 use kb_compile::pipeline::LogSink;
 use kb_core::EntityMetadata;
 use kb_core::fs::atomic_write;
-use kb_core::{JobRun, JobRunStatus, Status};
+use kb_core::{JobRun, JobRunStatus, Status, state_dir};
 use serde::{Deserialize, Serialize};
 
 /// `LogSink` backed by a job's on-disk log file. Clones share the same path,
@@ -70,11 +70,11 @@ pub struct LockMetadata {
 }
 
 pub fn jobs_dir(root: &Path) -> PathBuf {
-    root.join("state").join("jobs")
+    state_dir(root).join("jobs")
 }
 
 fn locks_dir(root: &Path) -> PathBuf {
-    root.join("state").join("locks")
+    state_dir(root).join("locks")
 }
 
 fn root_lock_path(root: &Path) -> PathBuf {

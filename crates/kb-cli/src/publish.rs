@@ -2,6 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use kb_core::{NORMALIZED_SUBDIR, normalized_dir};
 use regex::Regex;
 use serde::Serialize;
 
@@ -175,7 +176,7 @@ fn collect_recursive(
 /// `../../normalized/<src>/assets/<basename>` references (set up by Part B)
 /// resolve on the published target.
 fn collect_asset_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let normalized_root = root.join("normalized");
+    let normalized_root = normalized_dir(root);
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(&normalized_root) else {
         // No normalized tree yet (e.g. a freshly-initialized KB). Nothing to
@@ -236,24 +237,30 @@ fn append_unique(list: &mut Vec<PathBuf>, extra: Vec<PathBuf>) {
     }
 }
 
-/// True for paths shaped like `normalized/<src>/assets/<...>` — the implicit
-/// asset tree we carry along with every publish.
+/// True for paths shaped like `.kb/normalized/<src>/assets/<...>` — the
+/// implicit asset tree we carry along with every publish.
 fn is_asset_path(rel: &Path) -> bool {
     let mut components = rel.components();
     let Some(first) = components.next() else {
         return false;
     };
-    if first.as_os_str() != std::ffi::OsStr::new("normalized") {
+    if first.as_os_str() != std::ffi::OsStr::new(kb_core::KB_DIR) {
+        return false;
+    }
+    let Some(second) = components.next() else {
+        return false;
+    };
+    if second.as_os_str() != std::ffi::OsStr::new(NORMALIZED_SUBDIR) {
         return false;
     }
     // skip <src>
     if components.next().is_none() {
         return false;
     }
-    let Some(third) = components.next() else {
+    let Some(fourth) = components.next() else {
         return false;
     };
-    third.as_os_str() == std::ffi::OsStr::new("assets")
+    fourth.as_os_str() == std::ffi::OsStr::new("assets")
 }
 
 fn dir_could_match(dir_rel: &str, filter: &str) -> bool {
@@ -492,7 +499,7 @@ mod tests {
         )
         .expect("write wiki source");
 
-        let assets = kb.path().join("normalized/src-abc/assets");
+        let assets = normalized_dir(kb.path()).join("src-abc/assets");
         fs::create_dir_all(&assets).expect("mkdir assets");
         // Use raw bytes with a NUL byte embedded — that way any accidental
         // `read_to_string` + link-rewrite pass would fail with an InvalidData
@@ -513,7 +520,10 @@ mod tests {
         assert!(wiki_out.is_file(), "wiki source page should exist");
 
         // …AND the asset rode along at the mirrored path.
-        let asset_out = dest.path().join("normalized/src-abc/assets/diagram.png");
+        let asset_out = dest
+            .path()
+            .join(kb_core::KB_DIR)
+            .join("normalized/src-abc/assets/diagram.png");
         assert!(
             asset_out.is_file(),
             "asset should be mirrored into target at {}",
@@ -550,11 +560,13 @@ mod tests {
 
     #[test]
     fn is_asset_path_identifies_normalized_assets_tree() {
-        assert!(is_asset_path(Path::new("normalized/src-abc/assets/pic.png")));
+        assert!(is_asset_path(Path::new(".kb/normalized/src-abc/assets/pic.png")));
         assert!(is_asset_path(Path::new(
-            "normalized/src-abc/assets/sub/nested.png"
+            ".kb/normalized/src-abc/assets/sub/nested.png"
         )));
-        assert!(!is_asset_path(Path::new("normalized/src-abc/source.md")));
+        assert!(!is_asset_path(Path::new(".kb/normalized/src-abc/source.md")));
+        // Legacy layout must no longer match — `kb migrate` moved it away.
+        assert!(!is_asset_path(Path::new("normalized/src-abc/assets/pic.png")));
         assert!(!is_asset_path(Path::new("wiki/sources/src-abc.md")));
         assert!(!is_asset_path(Path::new("other/foo.md")));
     }

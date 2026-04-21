@@ -5,8 +5,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use kb_core::{
-    hash_bytes, hash_many, read_normalized_document, save_build_record, slug_from_title,
+    hash_bytes, hash_many, normalized_dir, read_normalized_document, save_build_record,
+    slug_from_title,
 };
+#[cfg(test)]
+use kb_core::{prompts_dir, state_dir};
 use kb_llm::{ConceptCandidate, LlmAdapter};
 
 use crate::progress::{LineLogReporter, ProgressReporter};
@@ -184,14 +187,14 @@ impl CompileReport {
 }
 
 fn discover_normalized_ids(root: &Path) -> Result<Vec<String>> {
-    let normalized_dir = root.join("normalized");
-    if !normalized_dir.exists() {
+    let normalized_root = normalized_dir(root);
+    if !normalized_root.exists() {
         return Ok(Vec::new());
     }
 
     let mut ids = Vec::new();
-    for entry in std::fs::read_dir(&normalized_dir)
-        .with_context(|| format!("scan normalized dir {}", normalized_dir.display()))?
+    for entry in std::fs::read_dir(&normalized_root)
+        .with_context(|| format!("scan normalized dir {}", normalized_root.display()))?
     {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
@@ -238,7 +241,7 @@ const CONCEPT_MERGE_FINGERPRINT_KEY: &str = "concept_merge:global";
 /// Returns an empty string when there are no candidates (caller already
 /// short-circuits on empty candidates separately).
 fn compute_concept_merge_fingerprint(root: &Path) -> Result<String> {
-    let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
+    let candidates_dir = crate::concept_extraction::concept_candidates_dir(root);
     let mut candidate_hashes: Vec<String> = Vec::new();
     if candidates_dir.exists() {
         for entry in std::fs::read_dir(&candidates_dir)
@@ -521,7 +524,7 @@ pub fn run_compile_with_llm(
         // last successful merge — the LLM call is 80s+ for real corpora and
         // would produce identical output. bn-1op.
         let new_merge_fingerprint = compute_concept_merge_fingerprint(root).ok();
-        let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
+        let candidates_dir = crate::concept_extraction::concept_candidates_dir(root);
         let has_candidates = candidates_dir.exists()
             && std::fs::read_dir(&candidates_dir)
                 .map(|it| {
@@ -700,12 +703,12 @@ pub fn run_compile_with_llm(
 fn build_graph_from_state(root: &Path) -> Result<Graph> {
     let mut graph = Graph::default();
 
-    // Source-document nodes: one per `normalized/<src-id>/` directory.
-    let normalized_dir = root.join("normalized");
+    // Source-document nodes: one per `.kb/normalized/<src-id>/` directory.
+    let normalized_root = normalized_dir(root);
     let mut doc_ids: Vec<String> = Vec::new();
-    if normalized_dir.exists() {
-        for entry in std::fs::read_dir(&normalized_dir)
-            .with_context(|| format!("scan {}", normalized_dir.display()))?
+    if normalized_root.exists() {
+        for entry in std::fs::read_dir(&normalized_root)
+            .with_context(|| format!("scan {}", normalized_root.display()))?
         {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
@@ -1142,7 +1145,7 @@ fn run_concept_merge_from_state(
     options: &CompileOptions,
     reporter: &dyn ProgressReporter,
 ) -> Result<MergeRunReport> {
-    let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
+    let candidates_dir = crate::concept_extraction::concept_candidates_dir(root);
     let mut all_candidates: Vec<ConceptCandidate> = Vec::new();
     // Side-map of candidate.name -> sorted list of originating source document IDs
     // (the filename stem of each `state/concept_candidates/<src-id>.json`). Same
@@ -1316,7 +1319,7 @@ mod tests {
     }
 
     fn setup_kb(root: &Path) {
-        std::fs::create_dir_all(root.join("state")).expect("create state dir");
+        std::fs::create_dir_all(state_dir(root)).expect("create state dir");
         std::fs::create_dir_all(root.join("wiki/sources")).expect("create wiki sources");
         std::fs::create_dir_all(root.join("wiki/concepts")).expect("create wiki concepts");
     }
@@ -1893,10 +1896,10 @@ mod tests {
         assert_eq!(report.stale_sources, 0);
 
         // Write a custom template override to simulate a template change
-        let prompts_dir = root.join("prompts");
-        std::fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        let overrides = prompts_dir(root);
+        std::fs::create_dir_all(&overrides).expect("create prompts dir");
         std::fs::write(
-            prompts_dir.join("summarize_document.md"),
+            overrides.join("summarize_document.md"),
             "Updated template: {{title}}\n{{body}}",
         )
         .expect("write template");
@@ -2516,7 +2519,7 @@ mod tests {
         );
 
         // Drop a fresh candidate file into the candidates dir.
-        let candidates_dir = root.join(crate::concept_extraction::CONCEPT_CANDIDATES_DIR);
+        let candidates_dir = crate::concept_extraction::concept_candidates_dir(root);
         std::fs::write(
             candidates_dir.join("injected.json"),
             r#"[{"name":"Novelty","aliases":[],"definition_hint":null,"source_anchors":[]}]"#,
@@ -2545,12 +2548,12 @@ mod tests {
         let options = CompileOptions::default();
         run_compile_with_llm(root, &options, Some(&adapter)).expect("first compile");
 
-        // Override the merge template under prompts/ (Template::load checks
-        // root-level overrides first).
-        let prompts_dir = root.join("prompts");
-        std::fs::create_dir_all(&prompts_dir).expect("create prompts");
+        // Override the merge template under .kb/prompts/ (Template::load
+        // checks the user override dir first).
+        let overrides = prompts_dir(root);
+        std::fs::create_dir_all(&overrides).expect("create prompts");
         std::fs::write(
-            prompts_dir.join("merge_concept_candidates.md"),
+            overrides.join("merge_concept_candidates.md"),
             "NEW MERGE TEMPLATE: {{candidates}}",
         )
         .expect("write template");

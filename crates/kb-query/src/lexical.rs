@@ -5,13 +5,13 @@ use anyhow::{Context, Result};
 use kb_core::fs::atomic_write;
 use kb_core::{
     extract_managed_regions, frontmatter::read_frontmatter, managed_region::slug_from_title,
-    read_normalized_document,
+    read_normalized_document, state_dir,
 };
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use tracing::warn;
 
-const INDEX_SUBPATH: &str = "state/indexes/lexical.json";
+const INDEX_REL: [&str; 2] = ["indexes", "lexical.json"];
 const WIKI_SOURCES: &str = "wiki/sources";
 const WIKI_CONCEPTS: &str = "wiki/concepts";
 
@@ -620,7 +620,7 @@ pub fn build_lexical_index(root: &Path) -> Result<LexicalIndex> {
 }
 
 fn index_path(root: &Path) -> PathBuf {
-    root.join(INDEX_SUBPATH)
+    state_dir(root).join(INDEX_REL[0]).join(INDEX_REL[1])
 }
 
 /// Returns the filesystem path for the lexical search index under `root`.

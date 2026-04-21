@@ -32,7 +32,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use kb_core::{
     EntityMetadata, ReviewItem, ReviewKind, ReviewStatus, Status, hash_many, list_review_items,
-    slug_from_title,
+    normalized_dir, slug_from_title,
 };
 use kb_llm::{
     CandidateSourceSnippet, ImputeGapKind, ImputeGapRequest, ImputeGapResponse, ImputedWebSource,
@@ -45,7 +45,6 @@ use crate::{
     detect_thin_concept_bodies,
 };
 
-const NORMALIZED_DIR: &str = "normalized";
 const MAX_SNIPPET_CHARS: usize = 280;
 const SNIPPET_LOOKBEHIND: usize = 80;
 const MAX_SNIPPETS_PER_REQUEST: usize = 6;
@@ -559,7 +558,7 @@ fn gather_source_snippets(
         if seen.contains(src_id) {
             continue;
         }
-        let path = root.join(NORMALIZED_DIR).join(src_id).join("source.md");
+        let path = normalized_dir(root).join(src_id).join("source.md");
         let Ok(body) = fs::read_to_string(&path) else {
             continue;
         };

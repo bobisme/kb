@@ -6,11 +6,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::fs::atomic_write;
+use crate::paths::state_dir;
 use crate::{BuildRecord, EntityId, ReviewItem, ReviewKind, ReviewStatus};
 
 #[must_use]
 pub fn build_records_dir(root: &Path) -> PathBuf {
-    root.join("state").join("build_records")
+    state_dir(root).join("build_records")
 }
 
 /// Persist a build record to `state/build_records/<id>.json`. Existing records with the
@@ -200,7 +201,7 @@ pub struct Manifest {
 
 #[must_use]
 pub fn manifest_path(root: &Path) -> PathBuf {
-    root.join("state").join("manifest.json")
+    state_dir(root).join("manifest.json")
 }
 
 impl Manifest {
@@ -345,7 +346,7 @@ mod tests {
         let err = Manifest::load(root).expect_err("corrupt manifest should fail");
         let message = err.to_string();
         assert!(message.contains("deserialize manifest"));
-        assert!(message.contains("state/manifest.json"));
+        assert!(message.contains(".kb/state/manifest.json") || message.contains(".kb\\state\\manifest.json"));
     }
 
     #[test]

@@ -61,7 +61,7 @@ fn fixture() -> TempDir {
         ]
     });
     write(
-        &root.join("state/indexes/lexical.json"),
+        &kb_core::state_dir(root).join("indexes/lexical.json"),
         &serde_json::to_string(&idx).expect("json"),
     );
 

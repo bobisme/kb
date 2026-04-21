@@ -27,7 +27,7 @@ use serde_yaml::{Mapping, Value};
 
 use kb_core::fs::atomic_write;
 use kb_core::frontmatter::read_frontmatter;
-use kb_core::{ReviewItem, ReviewKind, slug_from_title};
+use kb_core::{ReviewItem, ReviewKind, normalized_dir, slug_from_title};
 use kb_llm::{
     CandidateSourceSnippet, GenerateConceptBodyRequest, GenerateConceptFromCandidateRequest,
     LlmAdapter,
@@ -366,7 +366,7 @@ fn gather_source_snippets(
         if snippets.len() >= MAX_SNIPPETS {
             break;
         }
-        let source_path = root.join("normalized").join(src_id).join("source.md");
+        let source_path = normalized_dir(root).join(src_id).join("source.md");
         let body = match fs::read_to_string(&source_path) {
             Ok(b) => b,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -693,7 +693,7 @@ mod tests {
     }
 
     fn seed_source(root: &Path, id: &str, body: &str) {
-        let dir = root.join("normalized").join(id);
+        let dir = normalized_dir(root).join(id);
         std::fs::create_dir_all(&dir).expect("mkdir normalized");
         std::fs::write(dir.join("source.md"), body).expect("write source.md");
     }

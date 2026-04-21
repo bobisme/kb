@@ -2,7 +2,7 @@
 //!
 //! bn-3dkw: when a retrieval candidate's body references a local image
 //! (e.g. `![diagram](assets/foo.png)` in a normalized source, or
-//! `![fig](../../normalized/src-xyz/assets/bar.png)` in a compiled wiki
+//! `![fig](../../.kb/normalized/src-xyz/assets/bar.png)` in a compiled wiki
 //! page), we want to hand those image files to multimodal LLMs alongside
 //! the prompt — not just leave the text reference inert.
 //!
@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use kb_core::normalized_dir;
 use regex::Regex;
 
 use crate::lexical::RetrievalPlan;
@@ -79,9 +80,9 @@ pub fn resolve_candidate_image_paths(root: &Path, plan: &RetrievalPlan) -> Vec<P
         // scan the normalized source file. The wiki page is a summary that
         // usually drops the original image refs.
         if let Some(source_id) = wiki_source_id(&candidate.id) {
-            let normalized_dir = root.join("normalized").join(source_id);
-            let source_path = normalized_dir.join("source.md");
-            scan_file_for_images(&source_path, Some(&normalized_dir), &mut out, &mut seen);
+            let source_root = normalized_dir(root).join(source_id);
+            let source_path = source_root.join("source.md");
+            scan_file_for_images(&source_path, Some(&source_root), &mut out, &mut seen);
         }
     }
 
@@ -106,8 +107,7 @@ pub fn plan_mentions_images(root: &Path, plan: &RetrievalPlan) -> bool {
             return true;
         }
         if let Some(source_id) = wiki_source_id(&candidate.id) {
-            let source_path = root
-                .join("normalized")
+            let source_path = normalized_dir(root)
                 .join(source_id)
                 .join("source.md");
             if file_contains_image_ref(&source_path) {
@@ -232,7 +232,7 @@ mod tests {
         let root = tmp.path();
 
         // Lay down a fake KB with one normalized source + its wiki page.
-        let normalized_dir = root.join("normalized/src-xyz/assets");
+        let normalized_dir = normalized_dir(root).join("src-xyz/assets");
         fs::create_dir_all(&normalized_dir).expect("normalized assets");
         fs::write(normalized_dir.join("foo.png"), b"\x89PNG").expect("write png");
 
@@ -240,7 +240,7 @@ mod tests {
         fs::create_dir_all(&wiki_dir).expect("wiki dir");
         fs::write(
             wiki_dir.join("src-xyz.md"),
-            "---\ntype: source\n---\n![d](../../normalized/src-xyz/assets/foo.png)\n",
+            "---\ntype: source\n---\n![d](../../.kb/normalized/src-xyz/assets/foo.png)\n",
         )
         .expect("write wiki page");
 
@@ -307,7 +307,7 @@ mod tests {
     fn dedupes_same_image_across_candidates() {
         let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path();
-        let normalized_dir = root.join("normalized/src-a/assets");
+        let normalized_dir = normalized_dir(root).join("src-a/assets");
         fs::create_dir_all(&normalized_dir).expect("normalized dir");
         fs::write(normalized_dir.join("shared.png"), b"PNG").expect("png");
 
@@ -315,12 +315,12 @@ mod tests {
         fs::create_dir_all(&wiki_dir).expect("wiki dir");
         fs::write(
             wiki_dir.join("src-a.md"),
-            "![x](../../normalized/src-a/assets/shared.png)\n",
+            "![x](../../.kb/normalized/src-a/assets/shared.png)\n",
         )
         .expect("src-a");
         fs::write(
             wiki_dir.join("src-b.md"),
-            "![y](../../normalized/src-a/assets/shared.png)\n",
+            "![y](../../.kb/normalized/src-a/assets/shared.png)\n",
         )
         .expect("src-b");
 
@@ -349,7 +349,7 @@ mod tests {
     fn caps_at_max_images() {
         let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path();
-        let normalized_dir = root.join("normalized/src/assets");
+        let normalized_dir = normalized_dir(root).join("src/assets");
         fs::create_dir_all(&normalized_dir).expect("normalized dir");
 
         let wiki_dir = root.join("wiki/sources");
@@ -360,7 +360,7 @@ mod tests {
         for i in 0..10 {
             let name = format!("i{i}.png");
             fs::write(normalized_dir.join(&name), b"PNG").expect("png");
-            writeln!(body, "![](../../normalized/src/assets/{name})")
+            writeln!(body, "![](../../.kb/normalized/src/assets/{name})")
                 .expect("write to string never fails");
         }
         fs::write(wiki_dir.join("src.md"), body).expect("src page");
@@ -434,7 +434,7 @@ mod tests {
         let root = tmp.path();
 
         // Normalized source has the image ref; asset lives beside it.
-        let normalized_dir = root.join("normalized/src-xyz");
+        let normalized_dir = normalized_dir(root).join("src-xyz");
         fs::create_dir_all(normalized_dir.join("assets")).expect("assets");
         fs::write(normalized_dir.join("assets/foo.png"), b"\x89PNG").expect("png");
         fs::write(
@@ -480,19 +480,19 @@ mod tests {
         // 3 in the wiki page (unique), 3 in the normalized source where
         // one duplicates a wiki-page ref (so 5 distinct images total; cap
         // should still allow all 5 but would cut off any 6th).
-        let normalized_dir = root.join("normalized/src-many");
+        let normalized_dir = normalized_dir(root).join("src-many");
         let normalized_assets = normalized_dir.join("assets");
         fs::create_dir_all(&normalized_assets).expect("normalized assets");
         for i in 0..6 {
             fs::write(normalized_assets.join(format!("i{i}.png")), b"PNG").expect("png");
         }
 
-        // Wiki page refs: i0, i1, i2 via `../../normalized/src-many/assets/iN.png`.
+        // Wiki page refs: i0, i1, i2 via `../../.kb/normalized/src-many/assets/iN.png`.
         let mut wiki_body = String::from("---\ntype: source\n---\n");
         for i in 0..3 {
             writeln!(
                 wiki_body,
-                "![w{i}](../../normalized/src-many/assets/i{i}.png)"
+                "![w{i}](../../.kb/normalized/src-many/assets/i{i}.png)"
             )
             .expect("write");
         }
@@ -539,7 +539,7 @@ mod tests {
 
         // Lay down a normalized source dir that would match if the fallback
         // were mistakenly applied to a concept candidate — verify it doesn't.
-        let normalized_dir = root.join("normalized/src-hex");
+        let normalized_dir = normalized_dir(root).join("src-hex");
         fs::create_dir_all(normalized_dir.join("assets")).expect("assets");
         fs::write(normalized_dir.join("assets/bar.png"), b"PNG").expect("png");
         fs::write(
@@ -578,7 +578,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let root = tmp.path();
 
-        let normalized_assets = root.join("normalized/src-only-wiki/assets");
+        let normalized_assets = normalized_dir(root).join("src-only-wiki/assets");
         fs::create_dir_all(&normalized_assets).expect("assets");
         fs::write(normalized_assets.join("baz.png"), b"PNG").expect("png");
         // Note: no source.md file — the only ref lives in the wiki page.
@@ -587,7 +587,7 @@ mod tests {
         fs::create_dir_all(&wiki_dir).expect("wiki dir");
         fs::write(
             wiki_dir.join("src-only-wiki.md"),
-            "![d](../../normalized/src-only-wiki/assets/baz.png)\n",
+            "![d](../../.kb/normalized/src-only-wiki/assets/baz.png)\n",
         )
         .expect("wiki page");
 

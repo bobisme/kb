@@ -4,14 +4,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use kb_core::fs::atomic_write;
-use kb_core::{BuildRecord, EntityMetadata, NormalizedDocument, Status, hash_many, slug_from_title};
+use kb_core::{
+    BuildRecord, EntityMetadata, NormalizedDocument, Status, hash_many, slug_from_title, state_dir,
+};
 use kb_llm::{
     ConceptCandidate, ExtractConceptsRequest, LlmAdapter, LlmAdapterError, ProvenanceRecord,
 };
 use regex::Regex;
 
-/// Default directory used by the concept extraction pass.
-pub const CONCEPT_CANDIDATES_DIR: &str = "state/concept_candidates";
+/// Leaf name for the concept-candidates directory. Joined with `state_dir(root)`
+/// to produce `.kb/state/concept_candidates/` at runtime.
+pub const CONCEPT_CANDIDATES_SUBDIR: &str = "concept_candidates";
+
+/// Absolute path to the concept-candidates directory under `root`.
+#[must_use]
+pub fn concept_candidates_dir(root: &Path) -> PathBuf {
+    state_dir(root).join(CONCEPT_CANDIDATES_SUBDIR)
+}
 
 /// Regex patterns that identify meta-observation "concepts" the LLM still emits
 /// even after the prompt-level rules in `extract_concepts.md`. Any candidate whose
@@ -115,8 +124,7 @@ pub enum ConceptExtractionError {
 /// Compute the default artifact path for a source's concept candidates.
 #[must_use]
 pub fn concept_candidates_path(root: &Path, source_id: &str) -> PathBuf {
-    root.join(CONCEPT_CANDIDATES_DIR)
-        .join(format!("{source_id}.json"))
+    concept_candidates_dir(root).join(format!("{source_id}.json"))
 }
 
 /// Persist the JSON payload emitted by [`run_concept_extraction_pass`].
@@ -390,7 +398,7 @@ mod tests {
             expected_summary: Some("Rust ownership overview".to_string()),
             expected_max_concepts: Some(5),
         };
-        let output_path = PathBuf::from("state/concept_candidates/source-1.json");
+        let output_path = PathBuf::from(".kb/state/concept_candidates/source-1.json");
 
         let artifact = run_concept_extraction_pass(
             &adapter,
@@ -408,7 +416,7 @@ mod tests {
         assert_eq!(artifact.build_record.pass_name, "extract_concepts");
         assert_eq!(
             artifact.build_record.output_ids,
-            vec!["state/concept_candidates/source-1.json"]
+            vec![".kb/state/concept_candidates/source-1.json"]
         );
         let expected_prompt_hash = Hash::from([7u8; 32]).to_hex();
         assert_eq!(
@@ -539,7 +547,7 @@ mod tests {
             expected_summary: None,
             expected_max_concepts: None,
         };
-        let output_path = PathBuf::from("state/concept_candidates/dropout.json");
+        let output_path = PathBuf::from(".kb/state/concept_candidates/dropout.json");
 
         let artifact = run_concept_extraction_pass(
             &adapter,

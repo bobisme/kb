@@ -26,8 +26,8 @@ use ignore::overrides::OverrideBuilder;
 use kb_core::fs::atomic_write;
 use kb_core::{
     EntityMetadata, NormalizedDocument, SourceDocument, SourceKind, SourceRevision, Status,
-    mint_source_document_id, mint_source_revision_id, source_revision_content_hash,
-    write_normalized_document,
+    mint_source_document_id, mint_source_revision_id, normalized_dir, normalized_rel,
+    source_revision_content_hash, write_normalized_document,
 };
 use serde::{Deserialize, Serialize};
 
@@ -344,7 +344,7 @@ pub fn ingest_repo(
                 content_path: PathBuf::from("raw/repos")
                     .join(&repo_source_id)
                     .join(&rel_str),
-                metadata_path: PathBuf::from("normalized").join(&src_id).join("metadata.json"),
+                metadata_path: normalized_rel(&src_id).join("metadata.json"),
             });
             continue;
         }
@@ -584,9 +584,7 @@ fn ingest_repo_file(
         source_document_id: src_id,
         source_revision_id: rev_id,
         content_path: plan.rel_copied,
-        metadata_path: PathBuf::from("normalized")
-            .join(&plan.document.metadata.id)
-            .join("metadata.json"),
+        metadata_path: normalized_rel(&plan.document.metadata.id).join("metadata.json"),
     }))
 }
 
@@ -651,12 +649,8 @@ fn persist_repo_file(
         prompt_template_hash: None,
         dependencies: vec![plan.revision.metadata.id.clone()],
         output_paths: vec![
-            PathBuf::from("normalized")
-                .join(&plan.document.metadata.id)
-                .join("source.md"),
-            PathBuf::from("normalized")
-                .join(&plan.document.metadata.id)
-                .join("metadata.json"),
+            normalized_rel(&plan.document.metadata.id).join("source.md"),
+            normalized_rel(&plan.document.metadata.id).join("metadata.json"),
         ],
         status: Status::Fresh,
     };
@@ -683,7 +677,7 @@ fn persist_repo_file(
         fetched_at_millis: now,
     };
     atomic_write(
-        root.join("normalized")
+        normalized_dir(root)
             .join(&plan.document.metadata.id)
             .join("origin.json"),
         serde_json::to_vec_pretty(&origin)?.as_slice(),
@@ -757,7 +751,7 @@ fn existing_revision_id(root: &Path, src_id: &str) -> Option<String> {
     struct Probe {
         source_revision_id: String,
     }
-    let path = root.join("normalized").join(src_id).join("metadata.json");
+    let path = normalized_dir(root).join(src_id).join("metadata.json");
     let contents = fs::read_to_string(&path).ok()?;
     serde_json::from_str::<Probe>(&contents)
         .ok()

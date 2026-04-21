@@ -6,8 +6,8 @@ use anyhow::{Context, Result, bail};
 use kb_core::fs::atomic_write;
 use kb_core::{
     EntityMetadata, NormalizedDocument, Status, hash_bytes, mint_source_revision_id,
-    normalize_url_stable_location, source_document_id_for_url, source_revision_content_hash,
-    write_normalized_document,
+    normalize_url_stable_location, normalized_dir, normalized_rel, source_document_id_for_url,
+    source_revision_content_hash, write_normalized_document,
 };
 use regex::Regex;
 use reqwest::Client;
@@ -78,12 +78,8 @@ pub async fn ingest_url_with_options(
         .join("web")
         .join(&source_id)
         .join("page.html");
-    let normalized_path = PathBuf::from("normalized")
-        .join(&source_id)
-        .join("source.md");
-    let metadata_path = PathBuf::from("normalized")
-        .join(&source_id)
-        .join("metadata.json");
+    let normalized_path = normalized_rel(&source_id).join("source.md");
+    let metadata_path = normalized_rel(&source_id).join("metadata.json");
 
     let existing_revision_id = read_existing_revision_id(&root.join(&metadata_path))?;
     let outcome = match existing_revision_id {
@@ -120,7 +116,7 @@ pub async fn ingest_url_with_options(
             let product = readability::extractor::extract(&mut html_reader, &final_url)
                 .context("readability extraction failed")?;
 
-            let assets_dir = root.join("normalized").join(&source_id).join("assets");
+            let assets_dir = normalized_dir(root).join(&source_id).join("assets");
             let (processed_html, downloaded_assets) =
                 rewrite_images(&product.content, &final_url, &assets_dir, &client).await?;
             let markdown = html2md::parse_html(&processed_html);
@@ -152,7 +148,7 @@ pub async fn ingest_url_with_options(
         // the origin URL; the canonical metadata.json is owned by the
         // normalized-document writer.
         atomic_write(
-            root.join("normalized").join(&source_id).join("origin.json"),
+            normalized_dir(root).join(&source_id).join("origin.json"),
             serde_json::to_vec_pretty(&UrlOrigin {
                 title,
                 original_url: raw_url.to_string(),
@@ -515,7 +511,7 @@ fn count_url_sources(root: &Path) -> usize {
 /// inspect the origin sidecar at `normalized/<candidate>/origin.json`
 /// when present so that re-ingesting the same URL returns the same id.
 fn url_source_id_taken_by_other(root: &Path, candidate: &str, stable_location: &str) -> bool {
-    let origin = root.join("normalized").join(candidate).join("origin.json");
+    let origin = normalized_dir(root).join(candidate).join("origin.json");
     if let Ok(contents) = std::fs::read_to_string(&origin)
         && let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents)
         && let Some(stored_url) = value.get("original_url").and_then(|v| v.as_str())

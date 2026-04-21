@@ -129,7 +129,7 @@ fn init_creates_empty_state_files() {
     init_kb(&kb_root);
 
     let manifest =
-        fs::read_to_string(kb_root.join("state/manifest.json")).expect("read manifest state file");
+        fs::read_to_string(kb_root.join(".kb/state/manifest.json")).expect("read manifest state file");
     let manifest_json: Value = serde_json::from_str(&manifest).expect("parse manifest json");
     assert_eq!(manifest_json, serde_json::json!({ "artifacts": {} }));
 
@@ -137,12 +137,12 @@ fn init_creates_empty_state_files() {
     // successful `kb compile` in the canonical HashState schema
     // (see bn-1pw: removed the stale Hashes default-write from init).
     assert!(
-        !kb_root.join("state/hashes.json").exists(),
+        !kb_root.join(".kb/state/hashes.json").exists(),
         "hashes.json should not exist until first compile"
     );
     assert!(
-        kb_root.join("state/build_records").exists(),
-        "state/build_records must exist after init"
+        kb_root.join(".kb/state/build_records").exists(),
+        "`.kb/state/build_records` must exist after init"
     );
 }
 
@@ -187,7 +187,7 @@ fn init_force_preserves_existing_kb_toml() {
 
     // State scaffolding must still be regenerated under --force.
     assert!(
-        kb_root.join("state/manifest.json").exists(),
+        kb_root.join(".kb/state/manifest.json").exists(),
         "manifest.json must be (re)created under --force"
     );
 }
@@ -595,8 +595,8 @@ fn ingest_skips_empty_file_with_warning_and_exit_zero() {
         "expected emptiness warning on stderr, got: {stderr}"
     );
     assert!(
-        !kb_root.join("normalized").exists()
-            || fs::read_dir(kb_root.join("normalized"))
+        !kb_root.join(".kb/normalized").exists()
+            || fs::read_dir(kb_root.join(".kb/normalized"))
                 .expect("read normalized dir")
                 .next()
                 .is_none(),
@@ -1718,7 +1718,7 @@ fn search_without_matches_after_compile_omits_compile_tip() {
 
     // Confirm the lexical index was written.
     assert!(
-        kb_root.join("state/indexes/lexical.json").exists(),
+        kb_root.join(".kb/state/indexes/lexical.json").exists(),
         "compile should have produced a lexical index"
     );
 
@@ -1853,7 +1853,7 @@ fn inspect_resolves_bare_src_id_to_normalized_dir() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
 
-    let normalized_dir = kb_root.join("normalized/src-deadbeef");
+    let normalized_dir = kb_root.join(".kb/normalized/src-deadbeef");
     fs::create_dir_all(&normalized_dir).expect("create normalized dir");
     fs::write(normalized_dir.join("source.md"), "# Only normalized\n")
         .expect("write source.md");
@@ -1875,7 +1875,7 @@ fn inspect_resolves_bare_src_id_to_normalized_dir() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("resolved_id: normalized/src-deadbeef/source.md"),
+        stdout.contains("resolved_id: .kb/normalized/src-deadbeef/source.md"),
         "expected resolved_id to point at normalized source, got:\n{stdout}"
     );
 }
@@ -1919,7 +1919,7 @@ fn inspect_reports_fresh_when_source_revision_matches_normalized() {
     )
     .expect("write source page");
 
-    let normalized_dir = kb_root.join("normalized/src-abcd1234");
+    let normalized_dir = kb_root.join(".kb/normalized/src-abcd1234");
     fs::create_dir_all(&normalized_dir).expect("create normalized dir");
     fs::write(normalized_dir.join("source.md"), "# body\n").expect("write source");
     fs::write(
@@ -1957,7 +1957,7 @@ fn inspect_reports_stale_when_source_revision_diverges() {
     )
     .expect("write source page");
 
-    let normalized_dir = kb_root.join("normalized/src-aaaa1111");
+    let normalized_dir = kb_root.join(".kb/normalized/src-aaaa1111");
     fs::create_dir_all(&normalized_dir).expect("create normalized dir");
     fs::write(normalized_dir.join("source.md"), "# body\n").expect("write source");
     fs::write(
@@ -2349,7 +2349,7 @@ fn compile_builds_lexical_index() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let index_path = kb_root.join("state/indexes/lexical.json");
+    let index_path = kb_root.join(".kb/state/indexes/lexical.json");
     assert!(
         index_path.exists(),
         "lexical index should exist after compile"
@@ -2957,7 +2957,7 @@ fn lint_missing_concepts_flags_term_appearing_in_three_sources() {
     // Seed three normalized source documents that all mention the term
     // "FooBar System". The term appears 5+ times across the corpus and is
     // not a concept — it should produce a concept_candidate review item.
-    let normalized_root = kb_root.join("normalized");
+    let normalized_root = kb_root.join(".kb/normalized");
     for (doc_id, body) in [
         (
             "doc-a",
@@ -3062,7 +3062,7 @@ fn lint_contradictions_emits_review_item_when_llm_detects_conflict() {
 
     // Seed two normalized source documents — the heading-anchor on each
     // quote is how the lint attributes a quote to its source.
-    let normalized_root = kb_root.join("normalized");
+    let normalized_root = kb_root.join(".kb/normalized");
     for (doc_id, heading) in [("src-alpha", "claim-alpha"), ("src-beta", "claim-beta")] {
         let dir = normalized_root.join(doc_id);
         fs::create_dir_all(&dir).expect("create normalized doc dir");
@@ -3381,7 +3381,7 @@ fn doctor_returns_warning_when_interrupted_jobs_exist() {
     let fake_bin = install_fake_harnesses(&kb_root);
 
     fs::write(
-        kb_root.join("state/jobs/interrupted-test.json"),
+        kb_root.join(".kb/state/jobs/interrupted-test.json"),
         serde_json::json!({
             "metadata": {
                 "id": "interrupted-test",
@@ -3804,7 +3804,7 @@ fn approved_promotion_passes_orphan_lint_with_real_source_ids() {
     // Seed a normalized source that the retrieval plan pointed at. The lint
     // orphans check looks for `normalized/<doc_id>/metadata.json`.
     let doc_id = "wiki/sources/rust-overview.md";
-    let normalized_dir = kb_root.join("normalized").join(doc_id);
+    let normalized_dir = kb_root.join(".kb/normalized").join(doc_id);
     fs::create_dir_all(&normalized_dir).expect("create normalized dir");
     fs::write(
         normalized_dir.join("metadata.json"),
@@ -3977,7 +3977,7 @@ fn broken_kb_toml_fails_read_only_commands() {
 /// Fabricate `normalized/<src_id>/metadata.json` at the given revision,
 /// plus a minimal `source.md`. Used by the bn-2gn re-ingest status test.
 fn write_fake_normalized_source(kb_root: &Path, src_id: &str, revision: &str) {
-    let normalized_dir = kb_root.join("normalized").join(src_id);
+    let normalized_dir = kb_root.join(".kb/normalized").join(src_id);
     fs::create_dir_all(&normalized_dir).expect("create normalized dir");
     let metadata = serde_json::json!({
         "metadata": {
@@ -4015,7 +4015,7 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
 /// all compiled at some fingerprint. Values don't matter — `kb status` only
 /// checks for key presence to decide whether a source was ever compiled.
 fn write_fake_hash_state(kb_root: &Path, src_ids: &[&str]) {
-    let state_dir = kb_root.join("state");
+    let state_dir = kb_root.join(".kb/state");
     fs::create_dir_all(&state_dir).expect("create state dir");
     let mut hashes = serde_json::Map::new();
     for id in src_ids {
@@ -4113,8 +4113,8 @@ fn kb_status_flags_reingested_source_with_stale_wiki_page() {
 /// shape mirrors `jobs::load_job_run`'s serde expectations — if this drifts,
 /// update alongside the `JobRun`/`EntityMetadata` structs.
 fn seed_failed_job(root: &Path, id: &str, started_at_millis: u64) {
-    let jobs_dir = root.join("state/jobs");
-    fs::create_dir_all(&jobs_dir).expect("create state/jobs");
+    let jobs_dir = root.join(".kb/state/jobs");
+    fs::create_dir_all(&jobs_dir).expect("create .kb/state/jobs");
     let manifest = serde_json::json!({
         "metadata": {
             "id": id,
@@ -4356,8 +4356,8 @@ fn status_caps_failed_jobs_at_ten_with_more_hint() {
 /// command of `"compile"` (the most realistic source — user hits ^C
 /// during a long compile, leaves a manifest behind).
 fn seed_interrupted_job(root: &Path, id: &str, started_at_millis: u64) {
-    let jobs_dir = root.join("state/jobs");
-    fs::create_dir_all(&jobs_dir).expect("create state/jobs");
+    let jobs_dir = root.join(".kb/state/jobs");
+    fs::create_dir_all(&jobs_dir).expect("create .kb/state/jobs");
     let manifest = serde_json::json!({
         "metadata": {
             "id": id,
@@ -4495,7 +4495,7 @@ fn jobs_prune_interrupted_moves_to_trash_and_clears_status() {
         seed_interrupted_job(&kb_root, &format!("intr-{i:02}"), 1_000 + u64::from(i));
     }
     fs::write(
-        kb_root.join("state/jobs/intr-00.log"),
+        kb_root.join(".kb/state/jobs/intr-00.log"),
         "some log content\n",
     )
     .expect("write log sidecar");
@@ -4520,7 +4520,7 @@ fn jobs_prune_interrupted_moves_to_trash_and_clears_status() {
     );
 
     // Trash directory exists and contains all 20 manifests + the log.
-    let trash_root = kb_root.join("trash");
+    let trash_root = kb_root.join(".kb/trash");
     let trash_dirs: Vec<PathBuf> = fs::read_dir(&trash_root)
         .expect("read trash")
         .filter_map(Result::ok)
@@ -4554,7 +4554,7 @@ fn jobs_prune_interrupted_moves_to_trash_and_clears_status() {
     );
 
     // `state/jobs/` is now clean — no stray manifests.
-    let remaining: Vec<String> = fs::read_dir(kb_root.join("state/jobs"))
+    let remaining: Vec<String> = fs::read_dir(kb_root.join(".kb/state/jobs"))
         .expect("read jobs dir")
         .filter_map(Result::ok)
         .filter_map(|e| e.file_name().into_string().ok())
@@ -4614,7 +4614,7 @@ fn jobs_prune_respects_older_than_window() {
 
     // Manifest still on disk.
     assert!(
-        kb_root.join("state/jobs/fresh-intr.json").exists(),
+        kb_root.join(".kb/state/jobs/fresh-intr.json").exists(),
         "fresh manifest should still be on disk under default window"
     );
 }
@@ -4652,7 +4652,7 @@ fn jobs_list_interrupted_reports_ids_and_log_paths() {
         seed_interrupted_job(&kb_root, &format!("intr-{i}"), 1_000 + u64::from(i));
     }
     // Log sidecar for one; list must surface it for forensic jump-to.
-    fs::write(kb_root.join("state/jobs/intr-1.log"), "trace\n")
+    fs::write(kb_root.join(".kb/state/jobs/intr-1.log"), "trace\n")
         .expect("write log sidecar");
 
     // Text listing.
@@ -4958,7 +4958,7 @@ fn review_show_mentions_auto_apply_for_concept_merge() {
 /// a real holder; we do not flock it because the peek does not contest the
 /// advisory lock — it only reads the sidecar JSON.
 fn seed_fake_compile_lock(kb_root: &Path, command: &str) -> u32 {
-    let locks_dir = kb_root.join("state").join("locks");
+    let locks_dir = kb_root.join(".kb/state").join("locks");
     fs::create_dir_all(&locks_dir).expect("create locks dir");
     fs::write(locks_dir.join("root.lock"), b"").expect("touch root.lock");
     let pid = std::process::id();
@@ -5058,7 +5058,7 @@ fn lint_ignores_stale_compile_metadata_from_dead_pid() {
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
 
-    let locks_dir = kb_root.join("state").join("locks");
+    let locks_dir = kb_root.join(".kb/state").join("locks");
     fs::create_dir_all(&locks_dir).expect("create locks dir");
     fs::write(locks_dir.join("root.lock"), b"").expect("touch root.lock");
     // u32::MAX / 2 is virtually guaranteed to not correspond to a running pid.
@@ -5327,7 +5327,7 @@ fn forget_by_src_id_moves_entries_to_trash_and_succeeds() {
     let src_id = ingest_single_and_get_src_id(&kb_root, &source);
     stub_wiki_source_page(&kb_root, &src_id);
 
-    let normalized_dir = kb_root.join("normalized").join(&src_id);
+    let normalized_dir = kb_root.join(".kb/normalized").join(&src_id);
     let raw_dir = kb_root.join("raw/inbox").join(&src_id);
     let wiki_page = kb_root.join("wiki/sources").join(format!("{src_id}.md"));
     assert!(normalized_dir.exists());
@@ -5349,7 +5349,7 @@ fn forget_by_src_id_moves_entries_to_trash_and_succeeds() {
 
     // A `trash/<src_id>-*` dir should exist and contain the three entries
     // preserved under their original parent names.
-    let trash_root = kb_root.join("trash");
+    let trash_root = kb_root.join(".kb/trash");
     let trash_entries: Vec<_> = fs::read_dir(&trash_root)
         .expect("read trash dir")
         .filter_map(Result::ok)
@@ -5365,7 +5365,7 @@ fn forget_by_src_id_moves_entries_to_trash_and_succeeds() {
         .next()
         .expect("first trash bundle")
         .path();
-    assert!(bundle.join("normalized").join(&src_id).exists());
+    assert!(bundle.join(".kb/normalized").join(&src_id).exists());
     assert!(bundle.join("raw/inbox").join(&src_id).exists());
     assert!(
         bundle
@@ -5421,7 +5421,7 @@ fn forget_by_path_resolves_and_removes_source() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    assert!(!kb_root.join("normalized").join(&src_id).exists());
+    assert!(!kb_root.join(".kb/normalized").join(&src_id).exists());
     assert!(!kb_root.join("raw/inbox").join(&src_id).exists());
 }
 
@@ -5436,7 +5436,7 @@ fn forget_dry_run_prints_plan_and_keeps_disk_intact() {
     let src_id = ingest_single_and_get_src_id(&kb_root, &source);
     stub_wiki_source_page(&kb_root, &src_id);
 
-    let normalized_dir = kb_root.join("normalized").join(&src_id);
+    let normalized_dir = kb_root.join(".kb/normalized").join(&src_id);
     let raw_dir = kb_root.join("raw/inbox").join(&src_id);
     let wiki_page = kb_root.join("wiki/sources").join(format!("{src_id}.md"));
 
@@ -5468,7 +5468,7 @@ fn forget_dry_run_prints_plan_and_keeps_disk_intact() {
     assert!(wiki_page.exists(), "wiki page must still exist");
     // `kb init` seeds an empty trash/ dir, so we can't assert it's absent;
     // assert instead that no src-id-prefixed bundle got created under it.
-    let trash_dir = kb_root.join("trash");
+    let trash_dir = kb_root.join(".kb/trash");
     if trash_dir.exists() {
         let stray_bundles: Vec<_> = fs::read_dir(&trash_dir)
             .expect("read trash")
@@ -5621,7 +5621,7 @@ fn forget_declined_prompt_exits_zero_and_is_noop() {
     let src_id = ingest_single_and_get_src_id(&kb_root, &source);
     stub_wiki_source_page(&kb_root, &src_id);
 
-    let normalized_dir = kb_root.join("normalized").join(&src_id);
+    let normalized_dir = kb_root.join(".kb/normalized").join(&src_id);
     let raw_dir = kb_root.join("raw/inbox").join(&src_id);
     let wiki_page = kb_root.join("wiki/sources").join(format!("{src_id}.md"));
 
@@ -5677,7 +5677,7 @@ fn forget_empty_prompt_response_declines_and_exits_zero() {
     let src_id = ingest_single_and_get_src_id(&kb_root, &source);
     stub_wiki_source_page(&kb_root, &src_id);
 
-    let normalized_dir = kb_root.join("normalized").join(&src_id);
+    let normalized_dir = kb_root.join(".kb/normalized").join(&src_id);
 
     let mut cmd = kb_cmd(&kb_root);
     // Empty line: just press Enter.
@@ -5779,7 +5779,7 @@ fn stub_source_build_record(kb_root: &Path, src_id: &str) -> PathBuf {
     let mut metadata = test_metadata(&record_id);
     metadata
         .output_paths
-        .push(PathBuf::from(format!("normalized/{src_id}/summary.md")));
+        .push(PathBuf::from(format!(".kb/normalized/{src_id}/summary.md")));
     save_build_record(
         kb_root,
         &BuildRecord {
@@ -5792,7 +5792,7 @@ fn stub_source_build_record(kb_root: &Path, src_id: &str) -> PathBuf {
     )
     .expect("save build record");
     kb_root
-        .join("state/build_records")
+        .join(".kb/state/build_records")
         .join(format!("{record_id}.json"))
 }
 
@@ -5834,7 +5834,7 @@ fn forget_cascade_trashes_orphaned_concept_pages() {
     );
 
     // Orphans land under `trash/<src>-*/wiki/concepts/`.
-    let trash_root = kb_root.join("trash");
+    let trash_root = kb_root.join(".kb/trash");
     let bundle = fs::read_dir(&trash_root)
         .expect("read trash")
         .filter_map(Result::ok)
@@ -5910,7 +5910,7 @@ fn forget_cascade_trashes_stale_build_records() {
     );
 
     assert!(!record_path.exists(), "stale build record must be trashed");
-    let bundle = fs::read_dir(kb_root.join("trash"))
+    let bundle = fs::read_dir(kb_root.join(".kb/trash"))
         .expect("read trash")
         .filter_map(Result::ok)
         .find(|e| {
@@ -5921,7 +5921,7 @@ fn forget_cascade_trashes_stale_build_records() {
         .expect("trash bundle")
         .path();
     let trashed_record = bundle
-        .join("state/build_records")
+        .join(".kb/state/build_records")
         .join(format!("build:source-summary:{src_id}.json"));
     assert!(
         trashed_record.exists(),
@@ -5952,7 +5952,7 @@ fn forget_cascade_trashes_both_source_summary_and_extract_concepts_records() {
     extract_meta
         .output_paths
         .push(PathBuf::from(format!(
-            "state/concept_candidates/{src_id}.json"
+            ".kb/state/concept_candidates/{src_id}.json"
         )));
     save_build_record(
         &kb_root,
@@ -5966,7 +5966,7 @@ fn forget_cascade_trashes_both_source_summary_and_extract_concepts_records() {
     )
     .expect("save extract-concepts build record");
     let extract_record = kb_root
-        .join("state/build_records")
+        .join(".kb/state/build_records")
         .join(format!("{extract_record_id}.json"));
     assert!(summary_record.exists(), "sanity: summary record written");
     assert!(extract_record.exists(), "sanity: extract record written");
@@ -5990,7 +5990,7 @@ fn forget_cascade_trashes_both_source_summary_and_extract_concepts_records() {
     );
 
     // Acceptance: grep -rl <src> under state/ returns nothing.
-    for entry in walkdir_files(&kb_root.join("state")) {
+    for entry in walkdir_files(&kb_root.join(".kb/state")) {
         let contents = fs::read_to_string(&entry).unwrap_or_default();
         assert!(
             !contents.contains(&src_id),
@@ -6121,7 +6121,7 @@ fn forget_no_cascade_preserves_legacy_behavior() {
     );
 
     // Source itself was forgotten.
-    assert!(!kb_root.join("normalized").join(&src_id).exists());
+    assert!(!kb_root.join(".kb/normalized").join(&src_id).exists());
     // Cascade targets were NOT touched.
     assert!(orphan.exists(), "concept should survive --no-cascade");
     let q_body = fs::read_to_string(&question).expect("read question");
@@ -6230,7 +6230,7 @@ fn forget_cascade_fully_refreshes_index_pages_frontmatter_and_lexical() {
     kb_compile::index_page::persist_index_artifacts(&pre_artifacts)
         .expect("persist pre-index-pages");
     // Sanity: pre-state references everything we're about to forget.
-    let pre_lex = fs::read_to_string(kb_root.join("state/indexes/lexical.json"))
+    let pre_lex = fs::read_to_string(kb_root.join(".kb/state/indexes/lexical.json"))
         .expect("read pre-lex");
     assert!(
         pre_lex.contains(&format!("wiki/sources/{src_id}.md")),
@@ -6462,7 +6462,7 @@ fn lint_after_cascade_forget_has_no_orphan_errors() {
 /// bn-1jx acceptance tests to assert that validation rejections leave no
 /// trace in the jobs directory.
 fn count_job_manifests(root: &Path) -> usize {
-    let jobs_dir = root.join("state/jobs");
+    let jobs_dir = root.join(".kb/state/jobs");
     if !jobs_dir.exists() {
         return 0;
     }
@@ -6499,7 +6499,7 @@ fn ask_format_png_leaves_no_failed_job_manifest() {
         count_job_manifests(&kb_root),
         0,
         "validation rejection must not write a job manifest; manifests present: {:?}",
-        fs::read_dir(kb_root.join("state/jobs"))
+        fs::read_dir(kb_root.join(".kb/state/jobs"))
             .ok()
             .map(|iter| iter.filter_map(Result::ok).map(|e| e.file_name()).collect::<Vec<_>>())
     );
@@ -6754,7 +6754,7 @@ fn approve_refreshes_indexes_and_renders_question_title() {
 /// file-report code has something to read. Kept local to the bn-1525 tests to
 /// avoid cross-test coupling.
 fn seed_src(kb_root: &Path, src_id: &str) {
-    let normalized = kb_root.join("normalized").join(src_id);
+    let normalized = kb_root.join(".kb/normalized").join(src_id);
     fs::create_dir_all(&normalized).expect("create normalized dir");
     fs::write(normalized.join("source.md"), "# seed\n").expect("write source.md");
     fs::write(
@@ -7219,7 +7219,7 @@ fn review_approve_applies_concept_candidate_with_stub_llm() {
     // Seed three normalized source bodies that all mention "FooBar System"
     // (matches the existing lint test pattern so the snippet extractor has
     // real prose to work with, not just the candidate term in isolation).
-    let normalized_root = kb_root.join("normalized");
+    let normalized_root = kb_root.join(".kb/normalized");
     for (doc_id, body) in [
         (
             "doc-a",
@@ -7407,5 +7407,118 @@ fn review_approve_concept_candidate_rejects_already_approved() {
     assert!(
         stderr.contains("approved") || stderr.contains("only pending"),
         "error must mention status: {stderr}"
+    );
+}
+
+// ── bn-2xbq: kb migrate ────────────────────────────────────────────────────
+
+/// Build a legacy-shaped vault by hand: `kb.toml` at the root plus every
+/// subdir that bn-2xbq relocated (`cache/`, `logs/`, `state/`, `trash/`,
+/// `normalized/`, `prompts/`). A sentinel file in each directory lets us
+/// assert that the move preserved contents.
+fn write_legacy_layout(root: &Path) {
+    fs::write(root.join("kb.toml"), "\n").expect("write kb.toml");
+    for sub in ["cache", "logs", "state", "trash", "normalized", "prompts"] {
+        let dir = root.join(sub);
+        fs::create_dir_all(&dir).expect("mkdir legacy subdir");
+        fs::write(dir.join("marker.txt"), sub).expect("write marker");
+    }
+    // Browseable tree stays put — migrate must not touch these.
+    for sub in ["raw", "wiki", "outputs", "reviews"] {
+        fs::create_dir_all(root.join(sub)).expect("mkdir browseable");
+    }
+}
+
+/// bn-2xbq: running `kb migrate` on a pre-.kb/ layout relocates every
+/// internal plumbing directory into `.kb/`, preserves contents byte-for-byte,
+/// and leaves the browseable tree alone.
+#[test]
+fn migrate_relocates_every_legacy_dir_into_dot_kb() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    write_legacy_layout(&kb_root);
+
+    let output = kb_cmd(&kb_root)
+        .arg("migrate")
+        .output()
+        .expect("run kb migrate");
+    assert!(
+        output.status.success(),
+        "kb migrate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Each legacy directory is now gone from the root and present at .kb/<sub>
+    // with its marker file intact.
+    for sub in ["cache", "logs", "state", "trash", "normalized", "prompts"] {
+        assert!(
+            !kb_root.join(sub).exists(),
+            "{sub}/ should no longer exist at root"
+        );
+        let moved = kb_root.join(".kb").join(sub);
+        assert!(
+            moved.is_dir(),
+            "{sub}/ should live under .kb/ — got {}",
+            moved.display()
+        );
+        let marker = moved.join("marker.txt");
+        let contents = fs::read_to_string(&marker).expect("read marker after migrate");
+        assert_eq!(contents, sub, "marker bytes preserved");
+    }
+
+    // Browseable dirs untouched.
+    for sub in ["raw", "wiki", "outputs", "reviews"] {
+        assert!(
+            kb_root.join(sub).is_dir(),
+            "{sub}/ must stay at root after migrate"
+        );
+    }
+}
+
+/// bn-2xbq: a second `kb migrate` on an already-current layout is a no-op
+/// (exit 0, friendly message).
+#[test]
+fn migrate_is_idempotent_on_already_current_layout() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    write_legacy_layout(&kb_root);
+    // First migrate moves everything.
+    kb_cmd(&kb_root)
+        .arg("migrate")
+        .output()
+        .expect("first migrate");
+
+    // Second migrate must still succeed and print the "already migrated"
+    // message without touching the filesystem.
+    let output = kb_cmd(&kb_root)
+        .arg("migrate")
+        .output()
+        .expect("second migrate");
+    assert!(
+        output.status.success(),
+        "second kb migrate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Already migrated"),
+        "second migrate should print Already migrated; got: {stdout}"
+    );
+}
+
+/// bn-2xbq: mutating commands (`kb compile`, `kb ask`, …) refuse to run
+/// against a legacy layout and point the user at `kb migrate`.
+#[test]
+fn legacy_layout_sentinel_blocks_compile_with_helpful_error() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    write_legacy_layout(&kb_root);
+
+    let output = kb_cmd(&kb_root)
+        .arg("compile")
+        .output()
+        .expect("run kb compile");
+    assert!(!output.status.success(), "kb compile must fail on legacy layout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("kb migrate"),
+        "error must point users at `kb migrate`: {stderr}"
     );
 }
