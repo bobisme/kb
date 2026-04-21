@@ -1834,8 +1834,19 @@ fn run_ask(
                 // followed by a markdown image reference to the PNG. The PNG
                 // itself was already verified to exist above. All other
                 // formats render the raw post-processed body as-is.
+                //
+                // bn-31uk: chart runs drive the LLM through the write/bash
+                // tool cycle, so opencode streams the model's per-tool-call
+                // "what I'm about to do" commentary into stdout ahead of the
+                // real caption. Pass the post-processed body through
+                // `strip_tool_narration` to cut that preamble cleanly when
+                // the body has a markdown heading or a blank-line paragraph
+                // break. Markdown / JSON asks don't invoke tools and are
+                // intentionally untouched.
                 let body = if requested_format == "chart" {
-                    let caption = result.body.trim().to_string();
+                    let caption = kb_query::strip_tool_narration(&result.body)
+                        .trim()
+                        .to_string();
                     let image_line = "![chart](chart.png)";
                     if caption.is_empty() {
                         format!("{image_line}\n")

@@ -133,6 +133,126 @@ const fn should_show_uncertainty_banner(
     invalid_citations.len() > valid_citations.len()
 }
 
+/// Strip the LLM's inlined tool-call narration from the head of a chart-format
+/// answer body.
+///
+/// bn-31uk: when `kb ask --format=chart` runs, opencode drives the model
+/// through a bash/write tool cycle to produce the PNG, and streams the
+/// model's per-tool-call "what I'm about to do" commentary into stdout
+/// alongside the real final caption. The narration leaks into `answer.md`:
+///
+/// ```text
+/// Checking the output location, then I'll write and run a minimal script…
+/// Writing the chart script now, then I'll execute it and verify the PNG…
+///
+/// # Chart caption
+///
+/// The chart shows …
+/// ```
+///
+/// Strategy (deliberately conservative — no phrase-level regex):
+///
+/// 1. If the body contains a line-start markdown heading (`# ` through
+///    `######`), return the slice starting at the first such heading. The
+///    `ask_chart.md` prompt doesn't mandate a heading, but models often emit
+///    one, and when they do it is unambiguously the start of the caption.
+/// 2. Else, if the body has at least one blank-line-separated paragraph
+///    break, return the slice from the *last* paragraph. The narration
+///    opencode streams is organized into its own paragraphs separate from
+///    the final assistant message, so the final paragraph is the caption.
+/// 3. Else, return the full trimmed input unchanged. When the model emits
+///    one run-together block with no paragraph breaks at all, we have no
+///    robust structural cue to split on — dropping known "I'll"/"Checking"
+///    phrases by regex is too fragile (bone bn-31uk explicitly forbids it),
+///    so we keep the body intact rather than risk stripping real content.
+///
+/// Applied only on the chart / figure code path — markdown and JSON formats
+/// pass through unchanged.
+#[must_use]
+pub fn strip_tool_narration(text: &str) -> &str {
+    let trimmed = text.trim_start_matches(['\n', '\r']);
+
+    // Rule 1: first line-start markdown heading anchors the caption.
+    if let Some(idx) = find_first_heading(trimmed) {
+        return trimmed[idx..].trim_end();
+    }
+
+    // Rule 2: last blank-line-separated paragraph.
+    if let Some(idx) = find_last_paragraph_start(trimmed) {
+        return trimmed[idx..].trim_end();
+    }
+
+    // Rule 3: no structural signal — return input unchanged (still trimmed).
+    trimmed.trim_end()
+}
+
+/// Return the byte offset of the first line-start markdown heading
+/// (1–6 `#` chars followed by a space), or `None` if there is no heading.
+/// Only considers headings at the true start of a line (after a `\n` or at
+/// the beginning of the text), so inline `#` characters inside prose are
+/// ignored.
+fn find_first_heading(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let at_line_start = i == 0 || bytes[i - 1] == b'\n';
+        if at_line_start && bytes[i] == b'#' {
+            let mut j = i;
+            while j < bytes.len() && j - i < 6 && bytes[j] == b'#' {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b' ' {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Return the byte offset of the start of the last blank-line-separated
+/// paragraph. A "paragraph break" is two or more consecutive newlines
+/// (optionally with spaces/tabs on the blank lines). Returns `None` when
+/// the text has no paragraph break at all.
+fn find_last_paragraph_start(text: &str) -> Option<usize> {
+    // Walk the text to locate all paragraph breaks, then return the offset
+    // of the character just after the *last* one. We consider a run of
+    // "\n[ \t]*\n" (one or more times) a break.
+    let bytes = text.as_bytes();
+    let mut last_break_end: Option<usize> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            // Scan forward over any blank lines.
+            let mut j = i + 1;
+            let mut saw_blank_line = false;
+            loop {
+                // Consume leading spaces/tabs on this line.
+                let line_start = j;
+                while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                    j += 1;
+                }
+                if j < bytes.len() && bytes[j] == b'\n' {
+                    // Entire line was whitespace → counts as blank.
+                    saw_blank_line = true;
+                    j += 1;
+                } else {
+                    // Non-blank line reached. If we saw any blank line, this
+                    // is a paragraph break and the break ends at `line_start`.
+                    if saw_blank_line {
+                        last_break_end = Some(line_start);
+                    }
+                    break;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    last_break_end
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,5 +445,141 @@ mod tests {
         let raw = "Claim [1] and again [1] and [1].";
         let result = postprocess_answer(raw, &manifest, &ctx);
         assert_eq!(result.valid_citations, vec![1]);
+    }
+
+    // bn-31uk: strip_tool_narration tests. The helper is applied only on the
+    // chart code path; it must be surgical — no phrase-level regex — and
+    // preserve real caption content intact.
+
+    #[test]
+    fn strip_tool_narration_keeps_from_first_heading() {
+        let raw = "Checking the output location, then I'll write the script.\n\
+                   Writing the chart script now.\n\n\
+                   # Chart caption\n\n\
+                   Body text of the caption.\n";
+        assert_eq!(
+            strip_tool_narration(raw),
+            "# Chart caption\n\n\
+             Body text of the caption."
+        );
+    }
+
+    #[test]
+    fn strip_tool_narration_prefers_first_heading_over_last_paragraph() {
+        // When both rules could match, the heading wins — it's the stronger
+        // structural signal.
+        let raw = "narration line\n\n\
+                   # Caption header\n\n\
+                   Caption body paragraph.\n\n\
+                   Trailing paragraph.\n";
+        let stripped = strip_tool_narration(raw);
+        assert!(stripped.starts_with("# Caption header"), "got: {stripped:?}");
+        assert!(stripped.contains("Caption body paragraph."));
+        assert!(stripped.contains("Trailing paragraph."));
+    }
+
+    #[test]
+    fn strip_tool_narration_falls_back_to_last_paragraph() {
+        // No heading but narration and caption are separated by a blank line.
+        let raw = "Checking the output location.\n\
+                   Writing the chart script now.\n\n\
+                   The chart shows a horizontal comparison of two categories.\n";
+        assert_eq!(
+            strip_tool_narration(raw),
+            "The chart shows a horizontal comparison of two categories."
+        );
+    }
+
+    #[test]
+    fn strip_tool_narration_returns_input_when_no_paragraph_break_and_no_heading() {
+        // Pathological real-world case (bn-31uk example): narration and
+        // caption are all in one run-together block with no blank lines and
+        // no heading. The helper must NOT lossily drop real content by
+        // guessing; it returns the (trimmed) input so the caller still sees
+        // the full answer and downstream behavior is unchanged from pre-fix.
+        let raw = "Checking the output location.\n\
+                   Writing the chart script now.\n\
+                   The chart shows a horizontal comparison of two categories.\n";
+        assert_eq!(
+            strip_tool_narration(raw),
+            "Checking the output location.\n\
+             Writing the chart script now.\n\
+             The chart shows a horizontal comparison of two categories."
+        );
+    }
+
+    #[test]
+    fn strip_tool_narration_ignores_inline_hash_characters() {
+        // A `#` that is NOT at the start of a line is not a markdown heading.
+        // The helper must not mistake inline `#` or `#tag` for a section
+        // break.
+        let raw = "narration with #hashtag inline.\n\n\
+                   actual caption paragraph.\n";
+        // No line-start heading, so rule 2 (last paragraph) wins.
+        assert_eq!(
+            strip_tool_narration(raw),
+            "actual caption paragraph."
+        );
+    }
+
+    #[test]
+    fn strip_tool_narration_handles_heading_at_start_of_input() {
+        // If the heading is already at position 0, the helper returns the
+        // whole thing unchanged modulo trailing whitespace.
+        let raw = "# Caption\n\nBody.\n";
+        assert_eq!(strip_tool_narration(raw), "# Caption\n\nBody.");
+    }
+
+    #[test]
+    fn strip_tool_narration_preserves_trailing_paragraphs_after_heading() {
+        // After the heading the entire remainder is the caption content,
+        // including any subsequent paragraphs.
+        let raw = "intro narration.\n\n\
+                   # Title\n\n\
+                   Paragraph one.\n\n\
+                   Paragraph two with citation [1].\n";
+        let stripped = strip_tool_narration(raw);
+        assert!(stripped.starts_with("# Title"));
+        assert!(stripped.contains("Paragraph one."));
+        assert!(stripped.contains("Paragraph two with citation [1]."));
+    }
+
+    #[test]
+    fn strip_tool_narration_handles_blank_lines_with_whitespace() {
+        // Real LLM output sometimes emits paragraph breaks with a space or
+        // tab on the "blank" line. Treat those as paragraph breaks too.
+        let raw = "narration paragraph.\n   \n\
+                   caption paragraph.\n";
+        assert_eq!(
+            strip_tool_narration(raw),
+            "caption paragraph."
+        );
+    }
+
+    #[test]
+    fn strip_tool_narration_empty_input_returns_empty() {
+        assert_eq!(strip_tool_narration(""), "");
+        assert_eq!(strip_tool_narration("\n\n\n"), "");
+    }
+
+    #[test]
+    fn strip_tool_narration_single_line_no_heading_returns_input() {
+        // No narration at all — a one-line caption passes through.
+        assert_eq!(
+            strip_tool_narration("Just a single caption line."),
+            "Just a single caption line."
+        );
+    }
+
+    #[test]
+    fn strip_tool_narration_preserves_citation_keys_in_caption() {
+        // Integration with postprocess_answer's citation-key extraction: the
+        // helper must never eat `[N]` markers from the caption.
+        let raw = "narration.\n\n\
+                   The chart shows X versus Y [1][2].\n";
+        assert_eq!(
+            strip_tool_narration(raw),
+            "The chart shows X versus Y [1][2]."
+        );
     }
 }

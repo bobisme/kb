@@ -8,7 +8,7 @@ pub mod writer;
 
 pub use artifact::{
     ArtifactResult, CitationManifest, build_citation_manifest, postprocess_answer,
-    render_manifest_for_prompt,
+    render_manifest_for_prompt, strip_tool_narration,
 };
 pub use images::{MAX_IMAGES_PER_QUERY, plan_mentions_images, resolve_candidate_image_paths};
 pub use lexical::{

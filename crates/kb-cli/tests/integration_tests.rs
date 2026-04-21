@@ -1262,6 +1262,112 @@ fn ask_format_chart_produces_png_and_answer_with_image_ref() {
     assert_eq!(question["requested_format"], "chart");
 }
 
+// bn-31uk: chart runs invoke opencode with the write/bash tools enabled,
+// and opencode streams the model's per-tool-call commentary into stdout
+// ahead of the real caption. That preamble was leaking into answer.md's
+// body. A narrow `strip_tool_narration` helper runs on the chart code path
+// and cuts the preamble when the body has a markdown heading or a
+// blank-line paragraph break. This test wires a fake opencode that emits
+// exactly that shape (two narration lines, blank line, `# Chart caption`
+// header, blank line, body), produces a PNG, and asserts answer.md's body
+// begins at the heading — not at the narration.
+fn install_fake_narration_chart_harness(root: &Path) -> PathBuf {
+    let bin_dir = root.join("fake-narration-chart-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake narration chart bin");
+    // Same PNG-writing behavior as `install_fake_chart_harness`, but the
+    // printed caption intentionally begins with two narration lines that
+    // the LLM-driven tool loop would emit before settling on the final
+    // assistant message. strip_tool_narration should cut them.
+    let script = r#"#!/bin/sh
+set -e
+prompt=""
+for arg in "$@"; do
+    prompt="$arg"
+done
+png_path="$(printf '%s' "$prompt" | grep -oE '/[^ ]+chart\.png' | head -n1)"
+if [ -z "$png_path" ]; then
+    echo "fake-narration-chart-opencode: no chart.png path found in prompt" >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$png_path")"
+printf '\x89PNG\r\n\x1a\nFAKE-PNG-DATA' > "$png_path"
+printf 'narration line 1\nnarration line 2\n\n# Chart caption\n\nBody text of the caption.\n'
+"#;
+    write_executable(bin_dir.join("opencode").as_path(), script);
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+    bin_dir
+}
+
+#[test]
+fn ask_format_chart_strips_llm_tool_narration_preamble() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let fake_bin = install_fake_narration_chart_harness(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("chart")
+        .arg("Compare latencies across backends");
+    let output = cmd.output().expect("run kb ask --format=chart");
+    assert!(
+        output.status.success(),
+        "kb ask --format=chart failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let artifact_path = kb_root.join(
+        envelope["data"]["artifact_path"]
+            .as_str()
+            .expect("artifact_path"),
+    );
+    let answer_md = fs::read_to_string(&artifact_path).expect("read answer.md");
+
+    // Frontmatter must still be present (bn-35ap contract).
+    assert!(
+        answer_md.starts_with("---\n"),
+        "answer.md must begin with frontmatter, got:\n{answer_md}"
+    );
+
+    // Body starts after the second `---\n`. Extract it and verify the
+    // narration preamble was stripped: body begins at the '# Chart caption'
+    // heading, not at 'narration line 1'.
+    let body = answer_md
+        .splitn(3, "---\n")
+        .nth(2)
+        .expect("answer.md must have a body after frontmatter")
+        .trim_start_matches('\n');
+    assert!(
+        body.starts_with("# Chart caption"),
+        "answer.md body must begin at the '# Chart caption' heading after \
+         strip_tool_narration; narration lines must be dropped. Got body:\n{body}"
+    );
+    assert!(
+        !body.contains("narration line 1"),
+        "narration line 1 must be stripped, got body:\n{body}"
+    );
+    assert!(
+        !body.contains("narration line 2"),
+        "narration line 2 must be stripped, got body:\n{body}"
+    );
+    // Caption body content is preserved intact.
+    assert!(
+        body.contains("Body text of the caption."),
+        "caption body must be preserved, got body:\n{body}"
+    );
+    // The image reference is still emitted by the chart code path.
+    assert!(
+        body.contains("![chart](chart.png)"),
+        "answer.md must still embed the chart image reference, got body:\n{body}"
+    );
+}
+
 #[test]
 fn ask_format_chart_errors_when_llm_produces_no_png() {
     // When the LLM runs successfully but never writes the PNG to the exact
