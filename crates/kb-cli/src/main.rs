@@ -1661,6 +1661,57 @@ struct AskOutput<'a> {
     requested_format: &'a str,
 }
 
+/// Persist `answer.md` + `metadata.json` for a chart ask that failed to
+/// produce a PNG.
+///
+/// bn-1hqh: when `--format=chart` bails (LLM errored, printed an explicit
+/// `ERROR:`, or ran to completion without writing `chart.png`), we still want
+/// the outputs/questions/<q-id>/ directory to exist with the raw LLM output
+/// so the user has something to diagnose. The raw body is written verbatim
+/// — do **not** pass it through `strip_tool_narration`; narration is the
+/// interesting part on a failure path.
+///
+/// `raw_llm_output` is `None` when the LLM call itself errored before
+/// producing any text.
+fn write_chart_failure_artifacts(
+    dir_abs: &Path,
+    reason: &str,
+    raw_llm_output: Option<&str>,
+) -> Result<()> {
+    use kb_core::fs::atomic_write;
+
+    std::fs::create_dir_all(dir_abs)
+        .with_context(|| format!("create chart failure dir {}", dir_abs.display()))?;
+
+    let raw_section = match raw_llm_output {
+        Some(body) if !body.trim().is_empty() => body.to_string(),
+        Some(_) => "_(LLM produced no output.)_".to_string(),
+        None => "_(LLM call failed before producing any output.)_".to_string(),
+    };
+    let answer_body = format!(
+        "## Chart generation failed\n\n\
+         Reason: {reason}\n\n\
+         ## LLM output\n\n\
+         {raw_section}\n"
+    );
+    atomic_write(dir_abs.join("answer.md"), answer_body.as_bytes()).with_context(|| {
+        format!("write chart failure answer.md in {}", dir_abs.display())
+    })?;
+
+    let metadata = serde_json::json!({
+        "requested_format": "chart",
+        "success": false,
+        "error": reason,
+    });
+    let metadata_json = serde_json::to_string_pretty(&metadata)
+        .context("serialize chart failure metadata.json")?;
+    atomic_write(dir_abs.join("metadata.json"), metadata_json.as_bytes()).with_context(|| {
+        format!("write chart failure metadata.json in {}", dir_abs.display())
+    })?;
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn run_ask(
@@ -1799,28 +1850,63 @@ fn run_ask(
     );
 
     // Chart format rejects silent fallbacks. If the LLM call failed OR the
-    // expected PNG is missing, we bail with a clean error and do not write
-    // any question / artifact / metadata. The LLM's own reply is also checked
-    // for an explicit `ERROR:` prefix, which the prompt asks for when the
-    // sources don't support a chart.
+    // expected PNG is missing, we bail with a clean error pointing at the
+    // outputs dir.
+    //
+    // bn-1hqh: on any chart failure, persist `answer.md` (raw LLM output
+    // verbatim — no narration stripping) and `metadata.json` (`success:
+    // false`) under outputs/questions/<q-id>/ before bailing. The user asked
+    // for a chart; when they don't get one, leave enough artifacts behind
+    // that they can work out *why*. The output dir's parent was already
+    // created above so the LLM's bash tool could drop the PNG; here we just
+    // make sure the dir itself (and the failure artifacts) exist.
+    //
+    // The LLM's own reply is also checked for an explicit `ERROR:` prefix,
+    // which the prompt asks for when the sources don't support a chart.
     if requested_format == "chart" {
+        let chart_dir_abs = chart_abs
+            .as_ref()
+            .and_then(|p| p.parent())
+            .expect("chart_abs has a parent for chart format")
+            .to_path_buf();
+        let answer_md_rel_display = format!(
+            "outputs/questions/{question_id}/answer.md"
+        );
         match &llm_outcome {
             Err(err) => {
-                bail!("--format chart: LLM call failed: {err}");
+                let reason = format!("LLM call failed: {err}");
+                write_chart_failure_artifacts(&chart_dir_abs, &reason, None)?;
+                bail!(
+                    "--format chart failed: {reason}. See {answer_md_rel_display} for details."
+                );
             }
             Ok((result, _)) => {
                 let trimmed = result.body.trim_start();
                 if let Some(rest) = trimmed.strip_prefix("ERROR:") {
+                    let reason = format!("LLM declined to produce a chart: {}", rest.trim());
+                    write_chart_failure_artifacts(
+                        &chart_dir_abs,
+                        &reason,
+                        Some(&result.body),
+                    )?;
                     bail!(
-                        "--format chart: LLM declined to produce a chart: {}",
-                        rest.trim()
+                        "--format chart failed: {reason}. See {answer_md_rel_display} for LLM output."
                     );
                 }
                 let expected = chart_abs.as_ref().expect("chart_abs set for chart format");
                 if !expected.exists() {
-                    bail!(
-                        "--format chart: LLM did not produce chart at expected path {}",
+                    let reason = format!(
+                        "expected {} was not produced",
                         expected.display()
+                    );
+                    write_chart_failure_artifacts(
+                        &chart_dir_abs,
+                        &reason,
+                        Some(&result.body),
+                    )?;
+                    bail!(
+                        "--format chart failed: {reason}. \
+                         See {answer_md_rel_display} for LLM output."
                     );
                 }
             }

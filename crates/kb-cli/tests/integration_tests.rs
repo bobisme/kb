@@ -1373,15 +1373,23 @@ fn ask_format_chart_errors_when_llm_produces_no_png() {
     // When the LLM runs successfully but never writes the PNG to the exact
     // path, kb must refuse to write a stale answer.md. No silent fallback to
     // markdown.
+    //
+    // bn-1hqh: on failure the outputs/questions/<q-id>/ directory is still
+    // created with `answer.md` (raw LLM output, verbatim) and
+    // `metadata.json` (`success: false`) so users can diagnose why the
+    // chart wasn't produced.
     let (_temp_dir, kb_root) = make_temp_kb();
     init_kb(&kb_root);
 
-    // Fake opencode that prints a caption but never writes chart.png.
+    // Fake opencode that prints a caption (including tool-narration-like
+    // preamble) but never writes chart.png. The narration must survive
+    // verbatim on the failure path so the user sees what the LLM tried —
+    // strip_tool_narration is for the success path only.
     let bin_dir = kb_root.join("fake-no-png-bin");
     fs::create_dir_all(&bin_dir).expect("create fake bin");
     write_executable(
         bin_dir.join("opencode").as_path(),
-        "#!/bin/sh\nprintf 'A nice caption but no png.\\n'",
+        "#!/bin/sh\nprintf 'calling bash tool\\nran matplotlib import\\n\\nA nice caption but no png.\\n'",
     );
     write_executable(
         bin_dir.join("claude").as_path(),
@@ -1406,8 +1414,88 @@ fn ask_format_chart_errors_when_llm_produces_no_png() {
         "stderr should mention --format chart, got: {stderr}"
     );
     assert!(
-        stderr.contains("chart.png") || stderr.contains("did not produce"),
+        stderr.contains("chart.png") || stderr.contains("was not produced"),
         "stderr should explain the missing PNG, got: {stderr}"
+    );
+    // Error message points at the artifact dir so the user knows where to
+    // look.
+    assert!(
+        stderr.contains("answer.md"),
+        "stderr should reference answer.md for diagnosis, got: {stderr}"
+    );
+
+    // bn-1hqh: find the outputs/questions/q-*/ directory. Since we ran
+    // without --json, the question id isn't echoed to stdout — walk the
+    // questions dir.
+    let questions_dir = kb_root.join("outputs").join("questions");
+    assert!(
+        questions_dir.exists(),
+        "outputs/questions/ must be created on chart failure so users can diagnose"
+    );
+    let q_dirs: Vec<_> = fs::read_dir(&questions_dir)
+        .expect("read outputs/questions")
+        .filter_map(Result::ok)
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("q-")
+        })
+        .collect();
+    assert_eq!(
+        q_dirs.len(),
+        1,
+        "exactly one q-* dir must exist on chart failure, found {}",
+        q_dirs.len()
+    );
+    let q_dir = q_dirs[0].path();
+
+    // answer.md preserves the raw LLM output verbatim (narration + caption)
+    // inside the "Chart generation failed" envelope.
+    let answer_md =
+        fs::read_to_string(q_dir.join("answer.md")).expect("read failure answer.md");
+    assert!(
+        answer_md.contains("## Chart generation failed"),
+        "failure answer.md must have 'Chart generation failed' header, got:\n{answer_md}"
+    );
+    assert!(
+        answer_md.contains("Reason:"),
+        "failure answer.md must record a reason, got:\n{answer_md}"
+    );
+    assert!(
+        answer_md.contains("## LLM output"),
+        "failure answer.md must have LLM output section, got:\n{answer_md}"
+    );
+    // Narration survives verbatim — not stripped on the failure path.
+    assert!(
+        answer_md.contains("calling bash tool"),
+        "failure answer.md must preserve raw LLM output verbatim (narration included), got:\n{answer_md}"
+    );
+    assert!(
+        answer_md.contains("A nice caption but no png."),
+        "failure answer.md must preserve LLM caption, got:\n{answer_md}"
+    );
+
+    // metadata.json records success: false + the error string.
+    let metadata_str =
+        fs::read_to_string(q_dir.join("metadata.json")).expect("read failure metadata.json");
+    let metadata: Value =
+        serde_json::from_str(&metadata_str).expect("parse failure metadata.json");
+    assert_eq!(metadata["requested_format"], "chart");
+    assert_eq!(metadata["success"], false);
+    assert!(
+        metadata["error"].is_string(),
+        "metadata.json must include an error string, got: {metadata_str}"
+    );
+    let err_str = metadata["error"].as_str().expect("error is a string");
+    assert!(
+        !err_str.is_empty(),
+        "metadata.json error must be non-empty, got: {err_str}"
+    );
+
+    // chart.png must NOT exist (the whole point of this failure path).
+    assert!(
+        !q_dir.join("chart.png").exists(),
+        "chart.png must not exist when the LLM failed to produce it"
     );
 }
 
