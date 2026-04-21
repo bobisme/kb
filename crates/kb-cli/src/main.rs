@@ -1055,8 +1055,8 @@ fn check_root_writable(root: &Path) -> DoctorCheck {
     }
 }
 
-fn check_prompt_template_directory(root: &Path, cfg: &Config) -> DoctorCheck {
-    let prompt_dir = root.join(&cfg.data.prompt_templates);
+fn check_prompt_template_directory(root: &Path, _cfg: &Config) -> DoctorCheck {
+    let prompt_dir = kb_core::prompts_dir(root);
     if prompt_dir.is_dir() {
         DoctorCheck {
             name: "prompt_template_dir".to_string(),

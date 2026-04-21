@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    pub data: DataConfig,
     pub llm: LlmConfig,
     pub compile: CompileConfig,
     pub ask: AskConfig,
@@ -149,30 +148,6 @@ impl Config {
                 .model = Some(model.to_string());
         }
         self
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", default)]
-#[serde(deny_unknown_fields)]
-pub struct DataConfig {
-    /// Directory (relative to KB root) where prompt templates live. The
-    /// LLM adapter loads `<root>/<prompt_templates>/<name>.md`, falling
-    /// back to bundled defaults when the file is absent.
-    #[serde(rename = "prompt_templates_dir")]
-    pub prompt_templates: String,
-}
-
-impl Default for DataConfig {
-    fn default() -> Self {
-        // Stay in sync with `kb_core::paths::prompts_dir` — the LLM template
-        // loader always resolves against `.kb/prompts/`. This field is kept
-        // in the TOML mostly for discoverability (users see the path in
-        // `kb.toml` and know where to drop overrides); changing it does not
-        // relocate the loader's probe.
-        Self {
-            prompt_templates: format!("{}/prompts", kb_core::KB_DIR),
-        }
     }
 }
 
