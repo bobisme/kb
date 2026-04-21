@@ -273,6 +273,20 @@ pub struct AnswerQuestionRequest {
     /// no-op and not pay any attachment cost.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub image_paths: Vec<PathBuf>,
+    /// When `true`, adapters that speak a tool-use streaming protocol should
+    /// request a structured event stream from the runner and extract only the
+    /// final assistant message, skipping any intermediate tool-narration text.
+    ///
+    /// bn-1ikn: the `--format=chart` path drives the LLM through a
+    /// write/bash tool cycle, so opencode streams per-tool "what I'm about to
+    /// do" commentary ahead of the real caption. When this flag is set, the
+    /// opencode adapter invokes `opencode run --format json` and keeps only
+    /// the `text` event carrying `metadata.openai.phase = "final_answer"`.
+    /// Adapters that don't expose a structured stream (e.g. `claude` already
+    /// parses its JSON output) MAY ignore this flag — it's a hint, not a
+    /// contract. Defaults to `false` so existing callers are unaffected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub structured_output: bool,
 }
 
 /// Response containing the answer to a question.

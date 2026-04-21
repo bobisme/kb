@@ -134,7 +134,7 @@ impl OpencodeAdapter {
 
     /// Build the shell command string for `opencode run`.
     fn build_command(&self, config_path: &Path, prompt: &str) -> String {
-        self.build_command_with_attachments(config_path, prompt, &[])
+        self.build_command_with_attachments(config_path, prompt, &[], false)
     }
 
     /// Build the shell command string for `opencode run`, appending one `-f`
@@ -142,11 +142,17 @@ impl OpencodeAdapter {
     /// (declared as `[array]` in `opencode run --help`), and opencode is
     /// routed to openai/gpt-5.4 which accepts multimodal inputs natively —
     /// so each image path flows through as an attachment the model can see.
+    ///
+    /// bn-1ikn: when `json_events` is `true`, passes `--format json` so
+    /// opencode emits its NDJSON event stream instead of the rendered
+    /// plain-text transcript. Caller is responsible for parsing the stream
+    /// via [`extract_final_answer_from_json_events`].
     fn build_command_with_attachments(
         &self,
         config_path: &Path,
         prompt: &str,
         image_paths: &[PathBuf],
+        json_events: bool,
     ) -> String {
         // OPENCODE_CONFIG env var is set inline before the command (sh -c handles this)
         let mut parts = vec![
@@ -168,6 +174,11 @@ impl OpencodeAdapter {
         if let Some(ref session_id) = self.config.session_id {
             parts.push("--session".to_string());
             parts.push(shell_quote(session_id));
+        }
+
+        if json_events {
+            parts.push("--format".to_string());
+            parts.push("json".to_string());
         }
 
         for image in image_paths {
@@ -263,10 +274,24 @@ impl OpencodeAdapter {
         prompt: &str,
         image_paths: &[PathBuf],
     ) -> Result<String, LlmAdapterError> {
+        self.run_prompt_with_attachments_and_format(prompt, image_paths, false)
+    }
+
+    /// Core `opencode run` invocation. When `json_events` is `true`, passes
+    /// `--format json` and extracts the final assistant message from the
+    /// NDJSON event stream (bn-1ikn). Otherwise returns the ANSI-stripped
+    /// plain-text transcript as before.
+    fn run_prompt_with_attachments_and_format(
+        &self,
+        prompt: &str,
+        image_paths: &[PathBuf],
+        json_events: bool,
+    ) -> Result<String, LlmAdapterError> {
         // `_temp_dir` is held for the duration of the subprocess; its Drop removes
         // the config directory even if we panic or unwind here.
         let (_temp_dir, config_path) = self.write_config()?;
-        let command = self.build_command_with_attachments(&config_path, prompt, image_paths);
+        let command =
+            self.build_command_with_attachments(&config_path, prompt, image_paths, json_events);
         let result = run_shell_command(&command, self.config.timeout);
 
         let output = result.map_err(|e| match e {
@@ -290,7 +315,11 @@ impl OpencodeAdapter {
             )));
         }
 
-        Ok(strip_ansi_header(&output.stdout))
+        if json_events {
+            Ok(extract_final_answer_from_json_events(&output.stdout))
+        } else {
+            Ok(strip_ansi_header(&output.stdout))
+        }
     }
 }
 
@@ -599,7 +628,18 @@ impl LlmAdapter for OpencodeAdapter {
         // bn-3dkw: forward image attachments as `-f <path>` flags so the
         // multimodal model (gpt-5.4) can actually see them instead of just the
         // markdown reference in the prompt text.
-        let answer = self.run_prompt_with_attachments(&rendered.content, &request.image_paths)?;
+        //
+        // bn-1ikn: when the caller asks for structured output (chart path),
+        // invoke `opencode run --format json` and pull just the final
+        // assistant message out of the NDJSON event stream — the per-tool
+        // narration opencode streams ahead of the real answer is filtered at
+        // the source instead of hoping `strip_tool_narration` can recover it
+        // from a run-together plain-text blob.
+        let answer = self.run_prompt_with_attachments_and_format(
+            &rendered.content,
+            &request.image_paths,
+            request.structured_output,
+        )?;
         let ended_at = unix_time_ms()?;
 
         let provenance = ProvenanceRecord {
@@ -762,6 +802,93 @@ impl LlmAdapter for OpencodeAdapter {
             provenance,
         ))
     }
+}
+
+/// Parse opencode's `--format json` NDJSON event stream and return the
+/// concatenated text of the final assistant message.
+///
+/// # Event schema (opencode 1.4.3, observed on `openai/gpt-5.4`)
+///
+/// `opencode run --format json` emits one JSON object per line. Each has a
+/// top-level `type` field. The events we care about are `"text"` — these
+/// carry `part.text` (the streamed assistant text) and
+/// `part.metadata.openai.phase`, which takes values like
+/// `"response_reasoning"` for mid-stream tool narration and
+/// `"final_answer"` for the actual answer the user should see.
+///
+/// Intermediate events of other `type`s (`step_start`, `step_finish`,
+/// `tool`, …) are ignored. Text events without `phase == "final_answer"`
+/// (reasoning narration, tool pre-call chatter) are also skipped.
+///
+/// # Fallback behaviour
+///
+/// If the stream has *no* `final_answer` text event (e.g. the runner
+/// version is older / the model skipped the metadata, or the output isn't
+/// NDJSON at all), this returns the concatenation of every `text` event's
+/// `part.text` — or, failing that, the raw stdout with ANSI stripping — so
+/// we never silently discard the model's reply. The caller still runs
+/// `strip_tool_narration` on the result as a belt-and-suspenders fallback.
+fn extract_final_answer_from_json_events(stdout: &str) -> String {
+    let mut final_parts: Vec<String> = Vec::new();
+    let mut any_text_parts: Vec<String> = Vec::new();
+    let mut saw_json = false;
+
+    for raw_line in stdout.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || !line.starts_with('{') {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        saw_json = true;
+
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+            continue;
+        }
+        let Some(text) = value
+            .get("part")
+            .and_then(|p| p.get("text"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+
+        any_text_parts.push(text.to_string());
+
+        // Walk `part.metadata.*.phase` looking for "final_answer". The
+        // provider key ("openai", "anthropic", …) isn't fixed, so we scan
+        // all direct children of `metadata` rather than hardcoding a key.
+        let is_final = value
+            .get("part")
+            .and_then(|p| p.get("metadata"))
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|meta| {
+                meta.values().any(|provider| {
+                    provider
+                        .get("phase")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|phase| phase == "final_answer")
+                })
+            });
+
+        if is_final {
+            final_parts.push(text.to_string());
+        }
+    }
+
+    if !final_parts.is_empty() {
+        return final_parts.join("").trim().to_string();
+    }
+
+    // No `final_answer`-tagged events. If we saw *any* text events, return
+    // their concatenation — better than returning empty and losing the
+    // model's reply. If the stream wasn't JSON at all, fall back to plain
+    // ANSI-stripped stdout so existing error paths still surface output.
+    if saw_json && !any_text_parts.is_empty() {
+        return any_text_parts.join("").trim().to_string();
+    }
+    strip_ansi_header(stdout)
 }
 
 /// Strip ANSI escape codes and the opencode header from output.
@@ -1152,7 +1279,7 @@ mod tests {
             PathBuf::from("/abs/a.png"),
             PathBuf::from("/abs/b.jpg"),
         ];
-        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &images);
+        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &images, false);
 
         let f_flag_count = cmd.matches("-f ").count();
         assert_eq!(f_flag_count, 2, "expected two -f flags in: {cmd}");
@@ -1164,7 +1291,7 @@ mod tests {
     fn build_command_omits_f_flag_when_no_attachments() {
         let adapter = OpencodeAdapter::new(OpencodeConfig::default());
         let config_path = PathBuf::from("/tmp/opencode.json");
-        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &[]);
+        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &[], false);
         assert!(
             !cmd.contains(" -f "),
             "no -f flag expected when image_paths empty: {cmd}"
@@ -1215,6 +1342,7 @@ mod tests {
                 template_name: None,
                 output_path: None,
                 image_paths: vec![image_one.clone(), image_two.clone()],
+                structured_output: false,
             })
             .expect("answer");
 
@@ -1272,6 +1400,7 @@ mod tests {
                 template_name: None,
                 output_path: None,
                 image_paths: Vec::new(),
+                structured_output: false,
             })
             .expect("answer");
 
@@ -1384,5 +1513,267 @@ mod tests {
             }
             other => panic!("expected Transport error with PATH message, got {other:?}"),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // bn-1ikn: JSON event stream parsing for the chart call path.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn extract_final_answer_picks_only_final_answer_phase_events() {
+        // Two tool-narration events (phase: "response_reasoning") before a
+        // single final_answer event. The extractor must drop the narration
+        // and return only the final caption.
+        let stream = concat!(
+            r#"{"type":"step_start","timestamp":1,"part":{"type":"step-start"}}"#, "\n",
+            r#"{"type":"text","timestamp":2,"part":{"type":"text","text":"Checking the output location, then I'll write a matplotlib script.","metadata":{"openai":{"phase":"response_reasoning"}}}}"#, "\n",
+            r#"{"type":"text","timestamp":3,"part":{"type":"text","text":"Writing the chart script now, then executing it.","metadata":{"openai":{"phase":"response_reasoning"}}}}"#, "\n",
+            r#"{"type":"text","timestamp":4,"part":{"type":"text","text":"The chart shows a simple horizontal comparison.","metadata":{"openai":{"phase":"final_answer"}}}}"#, "\n",
+            r#"{"type":"step_finish","timestamp":5,"part":{"type":"step-finish"}}"#, "\n",
+        );
+
+        let got = extract_final_answer_from_json_events(stream);
+        assert_eq!(got, "The chart shows a simple horizontal comparison.");
+    }
+
+    #[test]
+    fn extract_final_answer_handles_q_db1_shape() {
+        // bn-1ikn: the pass-15 q-db1 real-world raw shape — two narration
+        // lines with no blank line separating them from the caption, which
+        // defeats `strip_tool_narration`. With `--format json`, each line
+        // arrives as its own event and we never see the run-together text.
+        let stream = concat!(
+            r#"{"type":"step_start","timestamp":1,"part":{"type":"step-start"}}"#, "\n",
+            r#"{"type":"text","timestamp":2,"part":{"type":"text","text":"Checking the output location, then I'll write and run a minimal matplotlib script to generate the PNG.","metadata":{"openai":{"phase":"response_reasoning"}}}}"#, "\n",
+            r#"{"type":"text","timestamp":3,"part":{"type":"text","text":"Writing the chart script now, then I'll execute it and verify the PNG was created.","metadata":{"openai":{"phase":"response_reasoning"}}}}"#, "\n",
+            r#"{"type":"text","timestamp":4,"part":{"type":"text","text":"The chart shows a simple horizontal comparison with two categories, `hexagonal` and `clean`, each assigned an equal value of 1.[1][2]","metadata":{"openai":{"phase":"final_answer"}}}}"#, "\n",
+            r#"{"type":"step_finish","timestamp":5,"part":{"type":"step-finish"}}"#, "\n",
+        );
+
+        let got = extract_final_answer_from_json_events(stream);
+        assert!(
+            !got.contains("Checking the output location"),
+            "narration leaked into output: {got}"
+        );
+        assert!(
+            !got.contains("Writing the chart script"),
+            "narration leaked into output: {got}"
+        );
+        assert!(got.starts_with("The chart shows"), "final caption lost: {got}");
+    }
+
+    #[test]
+    fn extract_final_answer_concatenates_multi_chunk_final_answer() {
+        // Some providers emit the final answer across multiple `text` events
+        // (streaming). The extractor must concatenate them in order.
+        let stream = concat!(
+            r#"{"type":"text","part":{"type":"text","text":"Part one. ","metadata":{"openai":{"phase":"final_answer"}}}}"#, "\n",
+            r#"{"type":"text","part":{"type":"text","text":"Part two.","metadata":{"openai":{"phase":"final_answer"}}}}"#, "\n",
+        );
+
+        assert_eq!(
+            extract_final_answer_from_json_events(stream),
+            "Part one. Part two."
+        );
+    }
+
+    #[test]
+    fn extract_final_answer_falls_back_to_any_text_when_no_phase_marker() {
+        // Older opencode / non-openai providers may not emit the
+        // `phase: "final_answer"` metadata. Rather than drop the model's
+        // reply on the floor, return the concatenation of all text events
+        // so `strip_tool_narration` (run after this in the CLI) can still
+        // have a go.
+        let stream = concat!(
+            r#"{"type":"step_start","part":{"type":"step-start"}}"#, "\n",
+            r#"{"type":"text","part":{"type":"text","text":"Hello world.","metadata":{}}}"#, "\n",
+        );
+
+        assert_eq!(extract_final_answer_from_json_events(stream), "Hello world.");
+    }
+
+    #[test]
+    fn extract_final_answer_falls_back_to_plain_text_for_non_json_stream() {
+        // If the runner didn't actually emit NDJSON (e.g. the --format flag
+        // was dropped), don't silently return empty — run the usual
+        // ANSI-header strip so callers still surface the model's reply.
+        let stream = "\x1b[0m\n> kb · openai/gpt-5.4\n\x1b[0m\nPlain text answer.";
+        assert_eq!(
+            extract_final_answer_from_json_events(stream),
+            "Plain text answer."
+        );
+    }
+
+    #[test]
+    fn extract_final_answer_ignores_unparseable_lines_between_events() {
+        // Tolerate stderr-ish lines or blank lines mixed into the stream.
+        let stream = concat!(
+            "\n",
+            "warning: some log line\n",
+            r#"{"type":"text","part":{"type":"text","text":"real answer","metadata":{"openai":{"phase":"final_answer"}}}}"#, "\n",
+        );
+
+        assert_eq!(extract_final_answer_from_json_events(stream), "real answer");
+    }
+
+    #[test]
+    fn extract_final_answer_works_with_anthropic_style_phase_key() {
+        // The `part.metadata` object is keyed by provider. Don't hard-code
+        // "openai" — any direct child whose `.phase == "final_answer"`
+        // counts.
+        let stream = concat!(
+            r#"{"type":"text","part":{"type":"text","text":"claude's answer","metadata":{"anthropic":{"phase":"final_answer"}}}}"#, "\n",
+        );
+
+        assert_eq!(
+            extract_final_answer_from_json_events(stream),
+            "claude's answer"
+        );
+    }
+
+    #[test]
+    fn build_command_adds_format_json_flag_when_requested() {
+        // bn-1ikn: `--format json` only appears in the argv when callers
+        // explicitly ask for the structured event stream. Other calls must
+        // NOT include the flag (it would disturb their plain-text parsing).
+        let adapter = OpencodeAdapter::new(OpencodeConfig::default());
+        let config_path = PathBuf::from("/tmp/opencode.json");
+
+        let plain = adapter.build_command_with_attachments(&config_path, "p", &[], false);
+        assert!(
+            !plain.contains("--format"),
+            "plain-text path must not include --format flag: {plain}"
+        );
+
+        let json = adapter.build_command_with_attachments(&config_path, "p", &[], true);
+        assert!(
+            json.contains("--format"),
+            "json path must include --format flag: {json}"
+        );
+        assert!(
+            json.contains("json"),
+            "json path must include 'json' argument: {json}"
+        );
+    }
+
+    #[test]
+    fn answer_question_chart_path_passes_format_json_flag_to_opencode() {
+        // When `structured_output: true` is set on the request, the opencode
+        // subprocess must be invoked with `--format json`. The fake-opencode
+        // script captures argv to disk and also emits a valid event stream
+        // so we can round-trip the final-answer extraction.
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-opencode.sh");
+        let args_path = tmp.path().join("args.txt");
+
+        // Emit two narration events followed by a final_answer event.
+        let event_stream = concat!(
+            r#"{"type":"text","part":{"type":"text","text":"I'll check the inputs.","metadata":{"openai":{"phase":"response_reasoning"}}}}"#, "\n",
+            r#"{"type":"text","part":{"type":"text","text":"Running now.","metadata":{"openai":{"phase":"response_reasoning"}}}}"#, "\n",
+            r#"{"type":"text","part":{"type":"text","text":"The caption is this.","metadata":{"openai":{"phase":"final_answer"}}}}"#, "\n",
+        );
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat <<'JSON_END'\n{}JSON_END\n",
+                args_path.display(),
+                event_stream,
+            ),
+        )
+        .expect("write fake opencode");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: script_path.display().to_string(),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+
+        let (response, _prov) = adapter
+            .answer_question(AnswerQuestionRequest {
+                question: "render a chart".to_string(),
+                context: vec!["source".to_string()],
+                format: Some(String::new()),
+                template_name: None,
+                output_path: None,
+                image_paths: Vec::new(),
+                structured_output: true,
+            })
+            .expect("answer");
+
+        assert_eq!(
+            response.answer, "The caption is this.",
+            "only the final_answer event text should reach the CLI"
+        );
+
+        let args = fs::read_to_string(&args_path).expect("captured args");
+        let arg_lines: Vec<&str> = args.lines().collect();
+        let format_idx = arg_lines
+            .iter()
+            .position(|l| *l == "--format")
+            .unwrap_or_else(|| panic!("--format flag missing in argv: {args}"));
+        assert_eq!(
+            arg_lines.get(format_idx + 1),
+            Some(&"json"),
+            "--format flag should be followed by 'json' in argv: {args}"
+        );
+    }
+
+    #[test]
+    fn answer_question_default_path_does_not_pass_format_json_flag() {
+        // structured_output: false (the default) must preserve the existing
+        // plain-text invocation. Chart is the only caller that flips this on.
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-opencode.sh");
+        let args_path = tmp.path().join("args.txt");
+        fs::write(
+            &script_path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'plain answer'\n",
+                args_path.display(),
+            ),
+        )
+        .expect("write fake opencode");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script_path, perms).expect("chmod");
+        }
+
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: script_path.display().to_string(),
+            timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+
+        let (response, _prov) = adapter
+            .answer_question(AnswerQuestionRequest {
+                question: "regular question".to_string(),
+                context: vec!["source".to_string()],
+                format: Some(String::new()),
+                template_name: None,
+                output_path: None,
+                image_paths: Vec::new(),
+                structured_output: false,
+            })
+            .expect("answer");
+
+        assert_eq!(response.answer, "plain answer");
+
+        let args = fs::read_to_string(&args_path).expect("captured args");
+        assert!(
+            !args.lines().any(|l| l == "--format"),
+            "--format flag must NOT appear when structured_output is false: {args}"
+        );
     }
 }

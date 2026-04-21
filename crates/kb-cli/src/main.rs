@@ -1838,6 +1838,12 @@ fn run_ask(
         (None, None)
     };
 
+    // bn-1ikn: chart runs ask the adapter for a structured event stream so we
+    // can pull just the final assistant message and skip the per-tool
+    // narration opencode emits ahead of it. Other formats keep plain-text
+    // output — their caller doesn't drive the LLM through tool calls.
+    let structured_output = requested_format == "chart";
+
     let llm_outcome = try_generate_answer(
         &cfg,
         root,
@@ -1847,6 +1853,7 @@ fn run_ask(
         template_override,
         output_path_override.as_deref(),
         &image_paths,
+        structured_output,
     );
 
     // Chart format rejects silent fallbacks. If the LLM call failed OR the
@@ -2201,6 +2208,9 @@ fn run_ask(
 // bn-3dkw: `image_paths` brings the arity to 8. The helper only has one caller
 // (`run_ask`) and each param is a distinct concern, so bundling them into a
 // struct is more ceremony than the site is worth.
+// bn-1ikn: `structured_output` is the ninth — set only for `--format=chart` so
+// the opencode adapter pulls the final assistant message out of the JSON event
+// stream instead of relying on post-hoc narration stripping.
 #[allow(clippy::too_many_arguments)]
 fn try_generate_answer(
     cfg: &Config,
@@ -2211,6 +2221,7 @@ fn try_generate_answer(
     template_name: Option<&str>,
     output_path: Option<&str>,
     image_paths: &[PathBuf],
+    structured_output: bool,
 ) -> Result<(kb_query::ArtifactResult, kb_llm::ProvenanceRecord)> {
     let adapter = create_ask_adapter(cfg, root)?;
 
@@ -2221,6 +2232,7 @@ fn try_generate_answer(
         template_name: template_name.map(str::to_string),
         output_path: output_path.map(str::to_string),
         image_paths: image_paths.to_vec(),
+        structured_output,
     };
 
     let (llm_response, provenance) = adapter

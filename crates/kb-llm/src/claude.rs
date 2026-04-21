@@ -1513,6 +1513,7 @@ mod tests {
                 template_name: None,
                 output_path: None,
                 image_paths: vec![img],
+                structured_output: false,
             })
             .expect("answer");
         assert_eq!(response.answer, "ok");
