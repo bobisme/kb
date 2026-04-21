@@ -266,6 +266,113 @@ async fn search_empty_query_returns_empty_results() {
 }
 
 #[tokio::test]
+async fn ask_strips_frontmatter_from_answer_field() {
+    // Regression test for bn-1hyu: the /ask handler reads the artifact file
+    // written by `kb ask` (which opens with a YAML frontmatter block) and
+    // returns its contents as the `answer` JSON field. Frontmatter metadata
+    // must be stripped before surfacing the body to the UI.
+    let tmp = fixture();
+    let root = tmp.path();
+
+    // Seed an artifact that looks exactly like what `kb ask` would produce.
+    let artifact_abs = root.join("outputs/questions/q-test/answer.md");
+    let body = "# Memo: What is ARIES?\n\n\
+         ARIES is a recovery algorithm for databases.\n";
+    let with_fm = format!(
+        "---\n\
+         id: art-1yc\n\
+         generated_at: 2026-04-20T00:00:00Z\n\
+         source_document_ids:\n  - doc:rust\n\
+         ---\n\n\
+         {body}"
+    );
+    write(&artifact_abs, &with_fm);
+
+    // Build a fake `kb` binary that ignores its args and prints the JSON
+    // envelope the real CLI would produce. We write it as a shell script
+    // and point `KB_BIN` at it for the duration of the test. The handler
+    // reads `artifact_path` directly, so we hand it the absolute path.
+    let fake_kb = tmp.path().join("fake-kb.sh");
+    let artifact_str = artifact_abs.to_str().expect("utf-8 path");
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "data": { "artifact_path": artifact_str },
+    });
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' '{}'\n",
+        serde_json::to_string(&envelope).expect("serialize envelope"),
+    );
+    fs::write(&fake_kb, script).expect("write fake kb");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&fake_kb).expect("meta").permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&fake_kb, perm).expect("chmod");
+    }
+
+    // SAFETY: Rust 2024 requires `unsafe` for env mutation. No other test
+    // in this crate reads or writes `KB_BIN`, so we accept the race risk
+    // here. If more /ask tests are added, serialize them behind a Mutex.
+    unsafe {
+        std::env::set_var("KB_BIN", &fake_kb);
+    }
+
+    let app = make_app(&tmp);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("q=what+is+aries"))
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    unsafe {
+        std::env::remove_var("KB_BIN");
+    }
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_str = body_string(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&body_str).expect("json");
+    let answer = json["answer"].as_str().expect("answer is a string");
+
+    // Frontmatter delimiters and keys must not leak through.
+    assert!(
+        !answer.starts_with("---"),
+        "answer starts with frontmatter delimiter: {answer:?}"
+    );
+    assert!(
+        !answer.contains("id: art-"),
+        "answer contains frontmatter id: {answer:?}"
+    );
+    assert!(
+        !answer.contains("generated_at:"),
+        "answer contains generated_at: {answer:?}"
+    );
+    assert!(
+        !answer.contains("source_document_ids:"),
+        "answer contains source_document_ids: {answer:?}"
+    );
+    // But the real body is still there, unchanged.
+    assert!(
+        answer.contains("# Memo: What is ARIES?"),
+        "answer missing heading: {answer:?}"
+    );
+    assert!(
+        answer.contains("ARIES is a recovery algorithm"),
+        "answer missing body text: {answer:?}"
+    );
+
+    // And the artifact_path is surfaced so the UI can link to the file.
+    assert_eq!(json["artifact_path"].as_str(), Some(artifact_str));
+    assert!(json["error"].is_null());
+}
+
+#[tokio::test]
 async fn ask_rejects_empty_question() {
     let tmp = fixture();
     let app = make_app(&tmp);

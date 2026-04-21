@@ -392,6 +392,12 @@ async fn run_ask_and_respond(root: &Path, question: &str) -> Response {
         .as_deref()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
+    // Artifact files written by `kb ask` open with a YAML frontmatter block
+    // (`---\nid: art-…\ngenerated_at: …\n---\n\n<body>`). The web UI surfaces
+    // the body only — the metadata belongs in `artifact_path`, not the
+    // rendered answer. Reuse the same stripper that the /wiki/* path uses
+    // so the two surfaces stay in sync.
+    let answer_body = markdown::strip_frontmatter(&answer_body).to_string();
 
     axum::Json(AskResponse {
         question: question_owned,
