@@ -49,6 +49,15 @@ static IMAGE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Callers that know no candidate can have images (empty plan, or a
 /// pre-check via [`plan_mentions_images`]) should skip this call entirely —
 /// it's a cheap walk but still touches disk.
+///
+/// For `wiki/sources/src-<id>.md` candidates, the wiki page is an LLM-
+/// generated summary that frequently drops the original `![](assets/…)`
+/// references from the raw source. So we additionally scan
+/// `normalized/<id>/source.md` (resolving refs relative to
+/// `normalized/<id>/`) — that's where the ingest-time image refs actually
+/// live. Concept pages (`wiki/concepts/*.md`) get no such fallback:
+/// concepts don't own sources, and any image a concept cites will be
+/// picked up when the source itself is also a candidate.
 #[must_use]
 pub fn resolve_candidate_image_paths(root: &Path, plan: &RetrievalPlan) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
@@ -59,28 +68,20 @@ pub fn resolve_candidate_image_paths(root: &Path, plan: &RetrievalPlan) -> Vec<P
             break;
         }
 
+        // Primary scan: the candidate's wiki page itself.
         let page_path = root.join(&candidate.id);
-        let Ok(body) = std::fs::read_to_string(&page_path) else {
-            continue;
-        };
+        scan_file_for_images(&page_path, None, &mut out, &mut seen);
+        if out.len() >= MAX_IMAGES_PER_QUERY {
+            break;
+        }
 
-        // The wiki page lives at e.g. `wiki/sources/src-xxx.md`; a relative
-        // path inside it resolves against its parent dir.
-        let page_parent = page_path.parent().unwrap_or(root);
-
-        for capture in IMAGE_REF_RE.captures_iter(&body) {
-            if out.len() >= MAX_IMAGES_PER_QUERY {
-                break;
-            }
-            let Some(raw_path) = capture.get(1).map(|m| m.as_str()) else {
-                continue;
-            };
-            let Some(resolved) = resolve_image_ref(raw_path, page_parent) else {
-                continue;
-            };
-            if seen.insert(resolved.clone()) {
-                out.push(resolved);
-            }
+        // Fallback scan: for `wiki/sources/src-<id>.md` candidates, also
+        // scan the normalized source file. The wiki page is a summary that
+        // usually drops the original image refs.
+        if let Some(source_id) = wiki_source_id(&candidate.id) {
+            let normalized_dir = root.join("normalized").join(source_id);
+            let source_path = normalized_dir.join("source.md");
+            scan_file_for_images(&source_path, Some(&normalized_dir), &mut out, &mut seen);
         }
     }
 
@@ -92,18 +93,85 @@ pub fn resolve_candidate_image_paths(root: &Path, plan: &RetrievalPlan) -> Vec<P
 /// Used as the zero-cost fast-path guard: if no candidate mentions any
 /// image, the ask pipeline can skip image resolution and adapter-side
 /// attachment plumbing entirely.
+///
+/// Matches [`resolve_candidate_image_paths`]'s scope: for
+/// `wiki/sources/src-<id>.md` candidates we also check
+/// `normalized/<id>/source.md`, since the wiki summary frequently drops
+/// the original refs.
 #[must_use]
 pub fn plan_mentions_images(root: &Path, plan: &RetrievalPlan) -> bool {
     for candidate in &plan.candidates {
         let page_path = root.join(&candidate.id);
-        let Ok(body) = std::fs::read_to_string(&page_path) else {
-            continue;
-        };
-        if IMAGE_REF_RE.is_match(&body) {
+        if file_contains_image_ref(&page_path) {
             return true;
+        }
+        if let Some(source_id) = wiki_source_id(&candidate.id) {
+            let source_path = root
+                .join("normalized")
+                .join(source_id)
+                .join("source.md");
+            if file_contains_image_ref(&source_path) {
+                return true;
+            }
         }
     }
     false
+}
+
+/// If `candidate_id` looks like `wiki/sources/src-<id>.md`, return the
+/// `<id>` portion (e.g. `src-xyz`). Otherwise `None`.
+///
+/// The candidate id uses forward slashes regardless of OS, since it comes
+/// from the KB's compiled index, not local filesystem traversal.
+fn wiki_source_id(candidate_id: &str) -> Option<&str> {
+    let rest = candidate_id.strip_prefix("wiki/sources/")?;
+    let stem = rest.strip_suffix(".md")?;
+    // Only `src-*` files are sources we ingest; ignore other wiki/sources
+    // files (e.g. an index) that don't have a matching normalized dir.
+    if stem.starts_with("src-") { Some(stem) } else { None }
+}
+
+/// Read `path` and append resolved image refs into `out`, respecting the
+/// global [`MAX_IMAGES_PER_QUERY`] cap and deduping against `seen`.
+///
+/// `anchor_override`, when set, is used as the base dir for relative refs;
+/// otherwise the file's parent is used. This lets the normalized-source
+/// fallback resolve refs against `normalized/<id>/` rather than the
+/// source.md file itself (which is equivalent in this case, but keeps the
+/// intent explicit).
+fn scan_file_for_images(
+    path: &Path,
+    anchor_override: Option<&Path>,
+    out: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+) {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let anchor = anchor_override
+        .or_else(|| path.parent())
+        .unwrap_or_else(|| Path::new("."));
+
+    for capture in IMAGE_REF_RE.captures_iter(&body) {
+        if out.len() >= MAX_IMAGES_PER_QUERY {
+            break;
+        }
+        let Some(raw_path) = capture.get(1).map(|m| m.as_str()) else {
+            continue;
+        };
+        let Some(resolved) = resolve_image_ref(raw_path, anchor) else {
+            continue;
+        };
+        if seen.insert(resolved.clone()) {
+            out.push(resolved);
+        }
+    }
+}
+
+/// True when the file at `path` exists and contains at least one markdown
+/// image ref. Missing/unreadable files are treated as empty.
+fn file_contains_image_ref(path: &Path) -> bool {
+    std::fs::read_to_string(path).is_ok_and(|body| IMAGE_REF_RE.is_match(&body))
 }
 
 /// Resolve a raw image reference to an absolute on-disk path, or return
@@ -355,5 +423,201 @@ mod tests {
         }]);
 
         assert!(!plan_mentions_images(root, &plan));
+    }
+
+    // bn-3nvm: wiki source summaries drop image refs. For `wiki/sources/src-X.md`
+    // candidates we must also scan `normalized/<X>/source.md`.
+
+    #[test]
+    fn resolves_image_from_normalized_source_when_wiki_summary_dropped_ref() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        // Normalized source has the image ref; asset lives beside it.
+        let normalized_dir = root.join("normalized/src-xyz");
+        fs::create_dir_all(normalized_dir.join("assets")).expect("assets");
+        fs::write(normalized_dir.join("assets/foo.png"), b"\x89PNG").expect("png");
+        fs::write(
+            normalized_dir.join("source.md"),
+            "# source\n\n![diagram](assets/foo.png)\n",
+        )
+        .expect("source.md");
+
+        // Wiki summary has NO image ref (this is the real-world bug).
+        let wiki_dir = root.join("wiki/sources");
+        fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        fs::write(
+            wiki_dir.join("src-xyz.md"),
+            "---\ntype: source\n---\n\nSummary text without image refs.\n",
+        )
+        .expect("wiki page");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            id: "wiki/sources/src-xyz.md".to_string(),
+            title: "src-xyz".to_string(),
+            score: 10,
+            estimated_tokens: 100,
+            reasons: Vec::new(),
+        }]);
+
+        assert!(
+            plan_mentions_images(root, &plan),
+            "plan_mentions_images must detect ref in normalized source.md",
+        );
+
+        let images = resolve_candidate_image_paths(root, &plan);
+        assert_eq!(images.len(), 1, "one image resolved: {images:?}");
+        assert!(images[0].ends_with("foo.png"));
+        assert!(images[0].is_absolute());
+    }
+
+    #[test]
+    fn normalized_source_and_wiki_page_both_scanned_dedup_and_cap() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        // Enough images across both files to exceed the cap (5).
+        // 3 in the wiki page (unique), 3 in the normalized source where
+        // one duplicates a wiki-page ref (so 5 distinct images total; cap
+        // should still allow all 5 but would cut off any 6th).
+        let normalized_dir = root.join("normalized/src-many");
+        let normalized_assets = normalized_dir.join("assets");
+        fs::create_dir_all(&normalized_assets).expect("normalized assets");
+        for i in 0..6 {
+            fs::write(normalized_assets.join(format!("i{i}.png")), b"PNG").expect("png");
+        }
+
+        // Wiki page refs: i0, i1, i2 via `../../normalized/src-many/assets/iN.png`.
+        let mut wiki_body = String::from("---\ntype: source\n---\n");
+        for i in 0..3 {
+            writeln!(
+                wiki_body,
+                "![w{i}](../../normalized/src-many/assets/i{i}.png)"
+            )
+            .expect("write");
+        }
+        let wiki_dir = root.join("wiki/sources");
+        fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        fs::write(wiki_dir.join("src-many.md"), wiki_body).expect("wiki page");
+
+        // Normalized source refs: i2 (duplicate), i3, i4, i5 — four refs,
+        // three unique (i3, i4, i5) after dedup. Total distinct: 6 (i0..i5)
+        // but cap is 5, so we get exactly MAX_IMAGES_PER_QUERY.
+        let mut source_body = String::from("# src\n");
+        for i in 2..6 {
+            writeln!(source_body, "![s{i}](assets/i{i}.png)").expect("write");
+        }
+        fs::write(normalized_dir.join("source.md"), source_body).expect("source.md");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            id: "wiki/sources/src-many.md".to_string(),
+            title: "src-many".to_string(),
+            score: 1,
+            estimated_tokens: 10,
+            reasons: Vec::new(),
+        }]);
+
+        let images = resolve_candidate_image_paths(root, &plan);
+        assert_eq!(
+            images.len(),
+            MAX_IMAGES_PER_QUERY,
+            "cap honored across both scan paths: {images:?}"
+        );
+        // First three must be from the wiki page (scanned first).
+        assert!(images[0].ends_with("i0.png"));
+        assert!(images[1].ends_with("i1.png"));
+        assert!(images[2].ends_with("i2.png"));
+        // i2 must not be duplicated.
+        let i2_count = images.iter().filter(|p| p.ends_with("i2.png")).count();
+        assert_eq!(i2_count, 1, "i2 deduplicated");
+    }
+
+    #[test]
+    fn concept_candidate_does_not_trigger_normalized_fallback() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        // Lay down a normalized source dir that would match if the fallback
+        // were mistakenly applied to a concept candidate — verify it doesn't.
+        let normalized_dir = root.join("normalized/src-hex");
+        fs::create_dir_all(normalized_dir.join("assets")).expect("assets");
+        fs::write(normalized_dir.join("assets/bar.png"), b"PNG").expect("png");
+        fs::write(
+            normalized_dir.join("source.md"),
+            "![x](assets/bar.png)\n",
+        )
+        .expect("source.md");
+
+        // Concept page with no image refs of its own.
+        let concept_dir = root.join("wiki/concepts");
+        fs::create_dir_all(&concept_dir).expect("concepts");
+        fs::write(concept_dir.join("src-hex.md"), "Just a concept.\n")
+            .expect("concept page");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            // Even if a concept's stem collides with a source id, the
+            // `wiki/concepts/` path must NOT trigger the normalized fallback.
+            id: "wiki/concepts/src-hex.md".to_string(),
+            title: "hex".to_string(),
+            score: 1,
+            estimated_tokens: 10,
+            reasons: Vec::new(),
+        }]);
+
+        assert!(
+            !plan_mentions_images(root, &plan),
+            "concept candidate must not fall through to normalized sources",
+        );
+        assert!(resolve_candidate_image_paths(root, &plan).is_empty());
+    }
+
+    #[test]
+    fn wiki_page_image_ref_still_resolves_without_normalized_source() {
+        // Regression guard: the existing primary-scan path keeps working
+        // even when there is no matching normalized/<id>/source.md on disk.
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        let normalized_assets = root.join("normalized/src-only-wiki/assets");
+        fs::create_dir_all(&normalized_assets).expect("assets");
+        fs::write(normalized_assets.join("baz.png"), b"PNG").expect("png");
+        // Note: no source.md file — the only ref lives in the wiki page.
+
+        let wiki_dir = root.join("wiki/sources");
+        fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        fs::write(
+            wiki_dir.join("src-only-wiki.md"),
+            "![d](../../normalized/src-only-wiki/assets/baz.png)\n",
+        )
+        .expect("wiki page");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            id: "wiki/sources/src-only-wiki.md".to_string(),
+            title: "s".to_string(),
+            score: 1,
+            estimated_tokens: 10,
+            reasons: Vec::new(),
+        }]);
+
+        assert!(plan_mentions_images(root, &plan));
+        let images = resolve_candidate_image_paths(root, &plan);
+        assert_eq!(images.len(), 1);
+        assert!(images[0].ends_with("baz.png"));
+    }
+
+    #[test]
+    fn wiki_source_id_parses_expected_forms() {
+        assert_eq!(
+            wiki_source_id("wiki/sources/src-xyz.md"),
+            Some("src-xyz"),
+        );
+        assert_eq!(
+            wiki_source_id("wiki/sources/src-1oz.md"),
+            Some("src-1oz"),
+        );
+        // Non-src files in wiki/sources (e.g. an index) should not map.
+        assert_eq!(wiki_source_id("wiki/sources/index.md"), None);
+        assert_eq!(wiki_source_id("wiki/concepts/c.md"), None);
+        assert_eq!(wiki_source_id("wiki/sources/src-xyz.txt"), None);
     }
 }
