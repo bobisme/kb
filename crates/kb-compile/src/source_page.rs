@@ -41,12 +41,27 @@ pub fn source_page_path_for_id(source_id: &str) -> PathBuf {
 ///
 /// Mirrors the scanner in `kb_ingest::image_refs` but is redeclared here to
 /// avoid pulling `kb-ingest` into kb-compile's dependency graph just for one
-/// regex. The pattern is intentionally conservative — `[^\]]*` for the alt
-/// text and `[^)\s]+` for the path — so it ignores reference-style links,
-/// titles, and footnotes.
+/// regex.
+///
+/// Capture groups:
+/// - group 1: alt text
+/// - group 2: angle-bracket-wrapped path (`<path with spaces.png>`)
+/// - group 3: plain path (no whitespace)
+///
+/// An optional `CommonMark` title after the path is tolerated and discarded.
+/// See bn-18qs: ingest now rewrites spaces-in-basename refs to the angle-
+/// bracket form, so this mirror has to match them to re-anchor refs when
+/// building the wiki source page.
 static IMAGE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"!\[([^\]]*)\]\(([^)\s]+)\)").expect("hard-coded image regex is valid")
+    Regex::new(r#"!\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^)\s"]+))(?:\s+"[^"]*")?\s*\)"#)
+        .expect("hard-coded image regex is valid")
 });
+
+/// True if `path` contains any ASCII whitespace — the signal for emitting
+/// the angle-bracket-wrapped form on rewrite.
+fn path_needs_angle_wrap(path: &str) -> bool {
+    path.chars().any(char::is_whitespace)
+}
 
 /// Rewrite `![alt](assets/<basename>)` references in `text` so they resolve
 /// from the wiki source page's location.
@@ -80,18 +95,35 @@ fn rewrite_asset_refs_with_prefix(text: &str, new_prefix: &str) -> String {
         cursor = whole.end();
 
         let alt = capture.get(1).map_or("", |m| m.as_str());
-        let path = capture.get(2).map_or("", |m| m.as_str());
+        // Path lives in either capture group 2 (angle-bracket form) or
+        // group 3 (plain form); callers should treat them uniformly.
+        let path = capture
+            .get(2)
+            .or_else(|| capture.get(3))
+            .map_or("", |m| m.as_str().trim());
 
         if let Some(rest) = path.strip_prefix("assets/") {
+            // Preserve the angle-bracket form on output when the basename
+            // contains whitespace so the rewritten ref stays valid
+            // CommonMark (bn-18qs).
+            let wrap = path_needs_angle_wrap(rest);
             out.push_str("![");
             out.push_str(alt);
-            out.push_str("](");
+            if wrap {
+                out.push_str("](<");
+            } else {
+                out.push_str("](");
+            }
             out.push_str(new_prefix);
             if !new_prefix.ends_with('/') {
                 out.push('/');
             }
             out.push_str(rest);
-            out.push(')');
+            if wrap {
+                out.push_str(">)");
+            } else {
+                out.push(')');
+            }
         } else {
             out.push_str(whole.as_str());
         }
@@ -398,5 +430,32 @@ mod tests {
         let summary = "![a](../../.kb/normalized/src-xyz/assets/already.png)\n![b](other/thing.png)\n";
         let out = rewrite_summary_image_refs(summary, "src-xyz");
         assert_eq!(out, summary);
+    }
+
+    /// bn-18qs: when ingest rewrites a spaces-in-basename ref to the
+    /// angle-bracket form (`![](<assets/foo bar.png>)`), the compile-time
+    /// re-anchor must match it AND preserve the angle-bracket form so the
+    /// wiki page's rewritten ref stays valid `CommonMark`.
+    #[test]
+    fn rewrite_summary_image_refs_handles_angle_bracket_form_for_paths_with_spaces() {
+        let summary = "![](<assets/Screenshot from 2026-04-07.png>)\n";
+        let out = rewrite_summary_image_refs(summary, "src-abc");
+        assert!(
+            out.contains("![](<../../.kb/normalized/src-abc/assets/Screenshot from 2026-04-07.png>)"),
+            "angle-bracket form must survive re-anchoring: {out}",
+        );
+    }
+
+    /// And titles after the path still work — discarded, but the ref
+    /// rewrites cleanly.
+    #[test]
+    fn rewrite_summary_image_refs_discards_title_attribute() {
+        let summary = r#"![x](assets/foo.png "caption")"#;
+        let out = rewrite_summary_image_refs(summary, "src-abc");
+        assert_eq!(
+            out,
+            "![x](../../.kb/normalized/src-abc/assets/foo.png)",
+            "title must be discarded on rewrite",
+        );
     }
 }

@@ -37,9 +37,30 @@ pub const MAX_IMAGES_PER_QUERY: usize = 5;
 /// Matches `![alt](path)` image references in markdown. Mirrors the scanners
 /// in `kb_ingest::image_refs` and `kb_compile::source_page` — kept local here
 /// so this crate doesn't have to depend on either.
+///
+/// Capture groups:
+/// - group 1: angle-bracket-wrapped path (`<path with spaces.png>`) when that
+///   form is used — spaces OK, no unescaped `>` inside.
+/// - group 2: plain path (`path.png`) — no whitespace, no angle brackets.
+///
+/// An optional `CommonMark` title (`"caption"`) after the path is tolerated
+/// and discarded. See bn-18qs: Obsidian emits the angle-bracket form when a
+/// filename contains spaces, and the old `[^)\s]+` pattern missed them
+/// entirely — so multimodal retrieval never saw those screenshots.
 static IMAGE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"!\[[^\]]*\]\(([^)\s]+)\)").expect("hard-coded image regex is valid")
+    Regex::new(r#"!\[[^\]]*\]\(\s*(?:<([^>]+)>|([^)\s"]+))(?:\s+"[^"]*")?\s*\)"#)
+        .expect("hard-coded image regex is valid")
 });
+
+/// Extract the raw path from an [`IMAGE_REF_RE`] capture, trimming any
+/// surrounding whitespace. Returns `None` if neither capture group is
+/// present.
+fn captured_raw_path<'a>(capture: &regex::Captures<'a>) -> Option<&'a str> {
+    capture
+        .get(1)
+        .or_else(|| capture.get(2))
+        .map(|m| m.as_str().trim())
+}
 
 /// Resolve image attachments referenced by the pages in `plan`, relative to
 /// the KB `root`.
@@ -156,7 +177,7 @@ fn scan_file_for_images(
         if out.len() >= MAX_IMAGES_PER_QUERY {
             break;
         }
-        let Some(raw_path) = capture.get(1).map(|m| m.as_str()) else {
+        let Some(raw_path) = captured_raw_path(&capture) else {
             continue;
         };
         let Some(resolved) = resolve_image_ref(raw_path, anchor) else {
@@ -619,5 +640,139 @@ mod tests {
         assert_eq!(wiki_source_id("wiki/sources/index.md"), None);
         assert_eq!(wiki_source_id("wiki/concepts/c.md"), None);
         assert_eq!(wiki_source_id("wiki/sources/src-xyz.txt"), None);
+    }
+
+    // ---- bn-18qs: angle-bracket form + paths with spaces + titles ----
+
+    /// Obsidian emits `![](<./Screenshot with spaces.png>)`; the ingest-time
+    /// rewrite preserves that form, so the normalized source.md we scan here
+    /// can contain `![](<assets/Screenshot with spaces.png>)`. We must
+    /// detect, extract, and resolve those refs.
+    #[test]
+    fn angle_bracket_ref_in_normalized_source_resolves() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        let normalized = normalized_dir(root).join("src-ab");
+        fs::create_dir_all(normalized.join("assets")).expect("assets");
+        fs::write(
+            normalized.join("assets/screenshot with spaces.png"),
+            b"\x89PNG",
+        )
+        .expect("png");
+        fs::write(
+            normalized.join("source.md"),
+            "# src\n\n![](<assets/screenshot with spaces.png>)\n",
+        )
+        .expect("source.md");
+
+        let wiki_dir = root.join("wiki/sources");
+        fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        fs::write(
+            wiki_dir.join("src-ab.md"),
+            "---\ntype: source\n---\nSummary text only.\n",
+        )
+        .expect("wiki page");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            id: "wiki/sources/src-ab.md".to_string(),
+            title: "src-ab".to_string(),
+            score: 1,
+            estimated_tokens: 10,
+            reasons: Vec::new(),
+        }]);
+
+        assert!(
+            plan_mentions_images(root, &plan),
+            "angle-bracket ref must count as an image mention",
+        );
+        let images = resolve_candidate_image_paths(root, &plan);
+        assert_eq!(images.len(), 1, "one image resolved: {images:?}");
+        assert!(images[0].ends_with("screenshot with spaces.png"));
+    }
+
+    /// `CommonMark` title attributes are tolerated — the title is discarded,
+    /// the path still resolves.
+    #[test]
+    fn title_attribute_tolerated_in_ref() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+
+        let wiki_dir = root.join("wiki/concepts");
+        fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        let img = wiki_dir.join("pic.png");
+        fs::write(&img, b"PNG").expect("png");
+        fs::write(
+            wiki_dir.join("c.md"),
+            r#"![x](pic.png "caption")"#,
+        )
+        .expect("c.md");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            id: "wiki/concepts/c.md".to_string(),
+            title: "c".to_string(),
+            score: 1,
+            estimated_tokens: 10,
+            reasons: Vec::new(),
+        }]);
+
+        let images = resolve_candidate_image_paths(root, &plan);
+        assert_eq!(images.len(), 1);
+        assert!(images[0].ends_with("pic.png"));
+    }
+
+    /// Angle-bracket URL refs stay skipped.
+    #[test]
+    fn angle_bracket_url_ref_still_skipped() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let wiki_dir = root.join("wiki/concepts");
+        fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        fs::write(
+            wiki_dir.join("c.md"),
+            "![](<https://example.com/foo bar.png>)\n",
+        )
+        .expect("c.md");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            id: "wiki/concepts/c.md".to_string(),
+            title: "c".to_string(),
+            score: 1,
+            estimated_tokens: 10,
+            reasons: Vec::new(),
+        }]);
+
+        let images = resolve_candidate_image_paths(root, &plan);
+        assert!(images.is_empty(), "URL in angle-brackets still skipped: {images:?}");
+    }
+
+    /// Angle-bracket ref to a missing file is silently dropped, matching
+    /// the plain-form behavior.
+    #[test]
+    fn angle_bracket_missing_ref_dropped() {
+        let tmp = TempDir::new().expect("tempdir");
+        let root = tmp.path();
+        let wiki_dir = root.join("wiki/concepts");
+        fs::create_dir_all(&wiki_dir).expect("wiki dir");
+        fs::write(
+            wiki_dir.join("c.md"),
+            "![](<does not exist.png>)\n",
+        )
+        .expect("c.md");
+
+        let plan = make_plan(vec![RetrievalCandidate {
+            id: "wiki/concepts/c.md".to_string(),
+            title: "c".to_string(),
+            score: 1,
+            estimated_tokens: 10,
+            reasons: Vec::new(),
+        }]);
+
+        assert!(
+            plan_mentions_images(root, &plan),
+            "regex must still match, even if the file is missing",
+        );
+        let images = resolve_candidate_image_paths(root, &plan);
+        assert!(images.is_empty());
     }
 }

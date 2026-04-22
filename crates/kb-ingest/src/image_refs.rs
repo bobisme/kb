@@ -48,17 +48,44 @@ const MAX_ASSET_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Matches `![alt](path)` images in markdown.
 ///
-/// - `alt` is captured non-greedily on `[^\]]*` so `](` inside alt text
+/// - `alt` is captured on `[^\]]*` (group 1) so `](` inside alt text
 ///   terminates the match early. This is intentional: `CommonMark`'s full
 ///   escape-aware parsing is out of scope here and the worst failure mode is
 ///   a reference we fail to rewrite, which degrades gracefully to "broken
 ///   link in the normalized source".
-/// - `path` is captured non-greedily on `[^)\s]+`, so the first whitespace or
-///   closing paren ends it. Markdown titles (`![alt](path "title")`) are not
-///   supported in v1.
+/// - The path is captured as either group 2 (angle-bracket-wrapped,
+///   `<path with spaces.png>`) or group 3 (plain, `path.png`). Callers take
+///   whichever group matched — see [`captured_raw_path`].
+/// - An optional `CommonMark` title (`"caption"`) after the path is tolerated
+///   and discarded — we don't carry titles through v1 (bn-18qs).
+///
+/// Angle-bracket form matters for paths with whitespace. Obsidian emits
+/// `![](<./Screenshot with spaces.png>)` when "Markdown links" is enabled on
+/// filenames containing spaces; the plain form can't represent such paths
+/// without producing ambiguous markdown.
 static IMAGE_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"!\[([^\]]*)\]\(([^)\s]+)\)").expect("hard-coded image regex is valid")
+    Regex::new(r#"!\[([^\]]*)\]\(\s*(?:<([^>]+)>|([^)\s"]+))(?:\s+"[^"]*")?\s*\)"#)
+        .expect("hard-coded image regex is valid")
 });
+
+/// Extract the raw path from an [`IMAGE_REF_RE`] capture, trimming any
+/// surrounding whitespace. Returns an empty string when neither form matched
+/// (shouldn't happen for a successful whole-pattern match, but we're
+/// defensive rather than panicking).
+fn captured_raw_path<'a>(capture: &regex::Captures<'a>) -> &'a str {
+    capture
+        .get(2)
+        .or_else(|| capture.get(3))
+        .map_or("", |m| m.as_str().trim())
+}
+
+/// True if `path` contains any ASCII whitespace. When rewriting a reference
+/// whose resolved basename contains whitespace we emit the angle-bracket
+/// form (`<assets/My Screenshot.png>`) so `CommonMark` parsers treat the
+/// URL as a single unambiguous token.
+fn basename_needs_angle_wrap(basename: &str) -> bool {
+    basename.chars().any(char::is_whitespace)
+}
 
 /// Result of scanning a markdown body and staging its image references.
 pub struct CopiedImages {
@@ -117,7 +144,7 @@ pub fn scan_and_stage(
         cursor = whole.end();
 
         let alt = capture.get(1).map_or("", |m| m.as_str());
-        let raw_path = capture.get(2).map_or("", |m| m.as_str());
+        let raw_path = captured_raw_path(&capture);
 
         match stage_reference(
             raw_path,
@@ -142,9 +169,19 @@ pub fn scan_and_stage(
                 }
                 rewritten.push_str("![");
                 rewritten.push_str(alt);
-                rewritten.push_str("](assets/");
-                rewritten.push_str(&basename);
-                rewritten.push(')');
+                // Emit the angle-bracket form when the basename contains
+                // whitespace so the rewritten markdown stays unambiguously
+                // parseable. Plain form otherwise preserves existing test
+                // output byte-for-byte (bn-18qs).
+                if basename_needs_angle_wrap(&basename) {
+                    rewritten.push_str("](<assets/");
+                    rewritten.push_str(&basename);
+                    rewritten.push_str(">)");
+                } else {
+                    rewritten.push_str("](assets/");
+                    rewritten.push_str(&basename);
+                    rewritten.push(')');
+                }
             }
             ReferenceOutcome::Leave => {
                 // Preserve the original matched substring unchanged.
@@ -372,18 +409,31 @@ pub fn rewrite_asset_refs(text: &str, new_prefix: &str) -> String {
         cursor = whole.end();
 
         let alt = capture.get(1).map_or("", |m| m.as_str());
-        let path = capture.get(2).map_or("", |m| m.as_str());
+        let path = captured_raw_path(&capture);
 
         if let Some(rest) = path.strip_prefix("assets/") {
+            // Preserve angle-bracket form when the path contains whitespace,
+            // both as an input signal (we wouldn't have matched otherwise
+            // under the plain branch) and on output so the new ref stays
+            // valid CommonMark (bn-18qs).
+            let wrap = basename_needs_angle_wrap(rest);
             out.push_str("![");
             out.push_str(alt);
-            out.push_str("](");
+            if wrap {
+                out.push_str("](<");
+            } else {
+                out.push_str("](");
+            }
             out.push_str(new_prefix);
             if !new_prefix.ends_with('/') {
                 out.push('/');
             }
             out.push_str(rest);
-            out.push(')');
+            if wrap {
+                out.push_str(">)");
+            } else {
+                out.push(')');
+            }
         } else {
             out.push_str(whole.as_str());
         }
@@ -550,5 +600,126 @@ mod tests {
     fn rewrite_asset_refs_handles_trailing_slash_prefix() {
         let out = rewrite_asset_refs("![a](assets/b.png)", "/abs/");
         assert_eq!(out, "![a](/abs/b.png)");
+    }
+
+    // ---- bn-18qs: angle-bracket form + paths with spaces + titles ----
+
+    /// Obsidian emits `![](<./Screenshot from YYYY-MM-DD.png>)` when a
+    /// filename contains spaces. The v1 regex excluded whitespace entirely,
+    /// so these refs never matched and the image was never staged.
+    #[test]
+    fn angle_bracket_path_with_spaces_is_staged_and_rewritten() {
+        let dir = TempDir::new().expect("tempdir");
+        let png = dir.path().join("screenshot with spaces.png");
+        fs::write(&png, b"\x89PNGfake").expect("write png");
+        let stage = staging(&dir);
+
+        let body = "![](<./screenshot with spaces.png>)\n";
+        let out = scan_and_stage(body, dir.path(), &stage).expect("stage");
+
+        assert_eq!(out.normalized_assets.len(), 1, "ref should match + stage");
+        assert!(
+            out.normalized_assets[0].ends_with("screenshot with spaces.png"),
+            "basename preserved: {:?}",
+            out.normalized_assets[0],
+        );
+        assert!(out.normalized_assets[0].is_file());
+        // Rewrite must preserve the angle-bracket form so the path-with-
+        // spaces stays a single URL token under CommonMark.
+        assert_eq!(
+            out.rewritten_markdown,
+            "![](<assets/screenshot with spaces.png>)\n",
+            "got: {}",
+            out.rewritten_markdown,
+        );
+    }
+
+    /// `CommonMark` titles (`"caption"`) are tolerated but discarded.
+    /// Without this the existing regex would fail to match
+    /// `![x](a.png "caption")` because the closing paren isn't the next
+    /// non-space char after the path.
+    #[test]
+    fn title_attribute_is_tolerated_and_discarded() {
+        let dir = TempDir::new().expect("tempdir");
+        let png = dir.path().join("a.png");
+        fs::write(&png, b"\x89PNGfake").expect("write png");
+        let stage = staging(&dir);
+
+        let body = r#"![x](a.png "caption")"#;
+        let out = scan_and_stage(body, dir.path(), &stage).expect("stage");
+
+        assert_eq!(out.normalized_assets.len(), 1);
+        assert!(out.normalized_assets[0].ends_with("a.png"));
+        // No title in the rewritten ref — titles aren't carried through v1.
+        assert_eq!(out.rewritten_markdown, "![x](assets/a.png)");
+    }
+
+    /// Title with the angle-bracket form too.
+    #[test]
+    fn angle_bracket_with_title_staged_title_discarded() {
+        let dir = TempDir::new().expect("tempdir");
+        let png = dir.path().join("a b.png");
+        fs::write(&png, b"\x89PNGfake").expect("write png");
+        let stage = staging(&dir);
+
+        let body = r#"![x](<./a b.png> "caption")"#;
+        let out = scan_and_stage(body, dir.path(), &stage).expect("stage");
+
+        assert_eq!(out.normalized_assets.len(), 1);
+        assert!(out.normalized_assets[0].ends_with("a b.png"));
+        assert_eq!(out.rewritten_markdown, "![x](<assets/a b.png>)");
+    }
+
+    /// Missing / URL / data URI refs in angle-bracket form still skip.
+    #[test]
+    fn angle_bracket_url_and_data_still_skipped() {
+        let dir = TempDir::new().expect("tempdir");
+        let stage = staging(&dir);
+        let body = "![](<https://example.com/x y.png>)\n![](<data:image/png;base64,AA>)\n";
+        let out = scan_and_stage(body, dir.path(), &stage).expect("stage");
+        assert!(out.normalized_assets.is_empty());
+        // Skipped refs are preserved byte-identical.
+        assert_eq!(out.rewritten_markdown, body);
+    }
+
+    #[test]
+    fn angle_bracket_missing_file_leaves_ref_untouched() {
+        let dir = TempDir::new().expect("tempdir");
+        let stage = staging(&dir);
+        let body = "![](<./does not exist.png>)\n";
+        let out = scan_and_stage(body, dir.path(), &stage).expect("stage");
+        assert!(out.normalized_assets.is_empty());
+        assert_eq!(out.rewritten_markdown, body);
+    }
+
+    /// Rewrite emits plain form when basename has no whitespace — preserves
+    /// existing callers' output byte-for-byte.
+    #[test]
+    fn plain_basename_still_rewrites_plain() {
+        let dir = TempDir::new().expect("tempdir");
+        let png = dir.path().join("pic.png");
+        fs::write(&png, b"\x89PNGfake").expect("write png");
+        let stage = staging(&dir);
+
+        let body = "![hi](./pic.png)";
+        let out = scan_and_stage(body, dir.path(), &stage).expect("stage");
+        assert_eq!(out.rewritten_markdown, "![hi](assets/pic.png)");
+    }
+
+    /// `rewrite_asset_refs` (used by the ingest's own tests + the wiki-page
+    /// prefix rewrite path) must preserve angle-bracket form on output when
+    /// the basename has spaces.
+    #[test]
+    fn rewrite_asset_refs_preserves_angle_wrap_for_spaces() {
+        let input = "![](<assets/My Screenshot.png>)\n![](assets/plain.png)\n";
+        let out = rewrite_asset_refs(input, "../../normalized/src-xyz/assets");
+        assert!(
+            out.contains("![](<../../normalized/src-xyz/assets/My Screenshot.png>)"),
+            "spaces path must stay angle-wrapped on rewrite: {out}",
+        );
+        assert!(
+            out.contains("![](../../normalized/src-xyz/assets/plain.png)"),
+            "plain path stays plain: {out}",
+        );
     }
 }

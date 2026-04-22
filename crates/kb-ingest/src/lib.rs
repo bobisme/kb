@@ -1386,6 +1386,57 @@ mod tests {
         );
     }
 
+    /// bn-18qs acceptance: a markdown file with an angle-bracket-wrapped
+    /// reference to a filename containing spaces (as Obsidian emits when
+    /// "Markdown links" is enabled) stages the image under its preserved
+    /// basename and rewrites the ref to the angle-bracket form.
+    #[test]
+    fn ingest_markdown_with_angle_bracket_path_and_spaces() {
+        let kb_root = init_kb_root();
+        let source_root = TempDir::new().expect("create source tempdir");
+
+        let png_bytes = b"\x89PNG\r\n\x1a\nfake";
+        let png_name = "Screenshot from 2026-04-07 10-37-54.png";
+        fs::write(source_root.path().join(png_name), png_bytes).expect("write png");
+        let md = source_root.path().join("notes.md");
+        fs::write(
+            &md,
+            format!("# Notes\n\n![](<./{png_name}>)\n"),
+        )
+        .expect("write md");
+
+        let ingested = ingest_paths(kb_root.path(), &[md]).expect("ingest succeeds");
+        assert_eq!(ingested.len(), 1);
+        let src_id = &ingested[0].document.metadata.id;
+
+        let asset_path = normalized_dir(kb_root.path()).join(src_id)
+            .join("assets")
+            .join(png_name);
+        assert!(
+            asset_path.is_file(),
+            "ingested asset should exist at {}",
+            asset_path.display(),
+        );
+        assert_eq!(
+            fs::read(&asset_path).expect("read asset"),
+            png_bytes,
+            "asset bytes must match original",
+        );
+
+        let normalized_source = normalized_dir(kb_root.path()).join(src_id)
+            .join("source.md");
+        let rewritten = fs::read_to_string(&normalized_source).expect("read normalized");
+        let expected = format!("![](<assets/{png_name}>)");
+        assert!(
+            rewritten.contains(&expected),
+            "source.md should have angle-bracket rewritten ref `{expected}`; got: {rewritten}",
+        );
+        assert!(
+            !rewritten.contains("./Screenshot"),
+            "original relative ref should not survive: {rewritten}",
+        );
+    }
+
     /// bn-1geb Part A acceptance: only allow-listed image extensions are
     /// copied. A markdown reference pointing at a CSV file is left alone
     /// — we don't want to pull random binary/data files into the KB tree.
