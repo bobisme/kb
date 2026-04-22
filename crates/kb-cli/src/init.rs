@@ -81,27 +81,20 @@ pub fn init(
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
 
-    // Browseable tree — lives at the vault root.
+    // Browseable tree — lives at the vault root. Only includes directories
+    // that ingest/compile/ask actively write into. On-demand review kinds
+    // (contradictions, concept_candidates, imputed_fixes) are created by
+    // their writers via `create_dir_all` when the first item lands, so
+    // they don't need pre-creation. Ditto `raw/repos` (created by the
+    // git-URL ingest path) and other future source buckets.
     let browseable_dirs = [
         "raw/inbox",
         "raw/web",
-        "raw/papers",
-        "raw/repos",
-        "raw/datasets",
-        "raw/images",
         "wiki/concepts",
         "wiki/sources",
-        "wiki/projects",
-        "wiki/timelines",
-        "wiki/people",
         "outputs/questions",
-        "outputs/reports",
-        "outputs/slides",
-        "outputs/figures",
         "reviews/promotions",
         "reviews/merges",
-        "reviews/aliases",
-        "reviews/canonicalization",
     ];
 
     // Internal plumbing — lives under `<root>/.kb/`.
