@@ -270,11 +270,16 @@ pub fn plan(
         .as_secs();
     let trash_bucket = trash_dir(root).join(format!("{src_id}-{timestamp}"));
 
-    let candidates = [
+    // bn-nlw9: the wiki source page lives at either `wiki/sources/<src>.md`
+    // (legacy) or `wiki/sources/<src>-<slug>.md` (current). Resolve the actual
+    // on-disk path so forget trashes whichever exists.
+    let mut candidates: Vec<PathBuf> = vec![
         normalized_dir(root).join(src_id),
         root.join("raw/inbox").join(src_id),
-        root.join(kb_compile::source_page::source_page_path_for_id(src_id)),
     ];
+    if let Some(page) = kb_compile::source_page::resolve_source_page_path(root, src_id) {
+        candidates.push(page);
+    }
     let moves: Vec<PathBuf> = candidates
         .into_iter()
         .filter(|p| p.exists())
@@ -444,7 +449,11 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     let normalized_prefix = normalized_rel(src_id);
-    let wiki_source_path = kb_compile::source_page::source_page_path_for_id(src_id);
+    // Legacy (id-only) wiki source page path plus the id-slug prefix. bn-nlw9
+    // introduced `wiki/sources/<src-id>-<slug>.md`, so we accept any
+    // `wiki/sources/<src-id>*.md`-shaped output here.
+    let wiki_source_id_only = kb_compile::source_page::source_page_path_for_id(src_id);
+    let wiki_source_prefix = format!("wiki/sources/{src_id}-");
     let concept_candidates_prefix = PathBuf::from(kb_core::KB_DIR)
         .join(kb_core::STATE_SUBDIR)
         .join("concept_candidates")
@@ -469,12 +478,14 @@ fn scan_stale_build_records(root: &Path, src_id: &str) -> Result<Vec<PathBuf>> {
             continue;
         };
         let references_src_via_paths = record.metadata.output_paths.iter().any(|out| {
+            let out_str = out.to_string_lossy();
             out.starts_with(&normalized_prefix)
-                || out == &wiki_source_path
+                || out == &wiki_source_id_only
+                || out_str.starts_with(&wiki_source_prefix)
                 // `starts_with` on `state/concept_candidates/<src>` catches both
                 // `<src>.json` (exact file) and any future subpath.
                 || out.starts_with(&concept_candidates_prefix)
-                || out.to_string_lossy().starts_with(
+                || out_str.starts_with(
                     &format!(
                         "{}/{}/concept_candidates/{src_id}.",
                         kb_core::KB_DIR,
@@ -829,9 +840,26 @@ pub fn prompt_text(plan: &ForgetPlan) -> String {
         .origin
         .as_deref()
         .map_or_else(|| plan.src_id.clone(), origin_label);
+    // Use the actual on-disk wiki source page filename when we can find one
+    // — bn-nlw9 may have slug-suffixed it. Fall back to the id-only form so
+    // the prompt still reads sensibly before the page has been compiled.
+    let page_label = plan
+        .moves
+        .iter()
+        .find_map(|p| {
+            let rel = p.file_name()?.to_str()?;
+            if rel.starts_with(&format!("{}.", plan.src_id))
+                || rel.starts_with(&format!("{}-", plan.src_id))
+            {
+                Some(format!("wiki/sources/{rel}"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| format!("wiki/sources/{}.md", plan.src_id));
     format!(
-        "remove source '{label}' ({})? This will delete wiki/sources/{}.md. [y/N] ",
-        plan.src_id, plan.src_id
+        "remove source '{label}' ({})? This will delete {page_label}. [y/N] ",
+        plan.src_id
     )
 }
 

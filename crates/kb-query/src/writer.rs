@@ -46,6 +46,12 @@ pub struct WriteArtifactInput<'a> {
     pub artifact_result: Option<&'a ArtifactResult>,
     pub provenance: Option<&'a ProvenanceRecord>,
     pub artifact_body: &'a str,
+    /// Directory name under `outputs/questions/` to write into. For bn-nlw9
+    /// this is `q-<id>-<slug>` (with a slug derived from the question text)
+    /// or simply `q-<id>` when the slug is empty. When `None`, the writer
+    /// falls back to `question.metadata.id` — preserving pre-bn-nlw9
+    /// behavior for callers that haven't been updated.
+    pub question_dir_name: Option<&'a str>,
     /// Wiki page paths (`wiki/sources/*.md` or `wiki/concepts/*.md`) that the
     /// model actually cited in the answer body. Used to narrow
     /// `source_document_ids` to sources that really ground the answer.
@@ -69,7 +75,10 @@ pub struct WriteArtifactOutput {
 #[allow(clippy::missing_errors_doc)]
 pub fn write_artifact(input: &WriteArtifactInput<'_>) -> std::io::Result<WriteArtifactOutput> {
     let question_id = &input.question.metadata.id;
-    let base_dir = PathBuf::from("outputs/questions").join(question_id);
+    let dir_name = input
+        .question_dir_name
+        .map_or_else(|| question_id.clone(), std::string::ToString::to_string);
+    let base_dir = PathBuf::from("outputs/questions").join(&dir_name);
 
     // The answer file name tracks the requested format so `--format=json` lands
     // on disk as `answer.json`, not `answer.md`. Marp still renders as
@@ -588,6 +597,7 @@ mod tests {
             artifact_body: &result.body,
             cited_source_paths: &[],
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -616,6 +626,7 @@ mod tests {
             artifact_body: body,
             cited_source_paths: &[],
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -672,6 +683,7 @@ mod tests {
             artifact_body: &result.body,
             cited_source_paths: &cited,
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -705,6 +717,7 @@ mod tests {
             artifact_body: "body",
             cited_source_paths: &[],
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -756,6 +769,7 @@ mod tests {
             artifact_body: "body",
             cited_source_paths: &[],
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -781,6 +795,7 @@ mod tests {
             artifact_body: "body",
             cited_source_paths: &[],
             build_record_id: Some("build:ask:q6"),
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -830,6 +845,7 @@ mod tests {
             artifact_body: &result.body,
             build_record_id: Some("build:ask:q-json"),
             cited_source_paths: &["wiki/sources/rust-overview.md".to_string()],
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -937,6 +953,7 @@ mod tests {
             artifact_body: "Body.",
             cited_source_paths: &cited,
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -1038,6 +1055,7 @@ mod tests {
             artifact_body: "Body.",
             cited_source_paths: &cited,
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -1161,6 +1179,7 @@ mod tests {
             artifact_body: "Body.",
             cited_source_paths: &cited,
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 
@@ -1246,6 +1265,7 @@ mod tests {
             artifact_body: "Body.",
             cited_source_paths: &cited,
             build_record_id: None,
+            question_dir_name: None,
         })
         .unwrap();
 

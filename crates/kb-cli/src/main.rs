@@ -1812,29 +1812,35 @@ fn run_ask(
     let timestamp = now_millis()?;
     let question_id = generate_question_id(root, timestamp, query);
 
+    // bn-nlw9: dir name is `q-<id>-<slug>` when the question text slugs to
+    // something non-empty, else `q-<id>`. `question_id` is still the stable
+    // id prefix used by lookups (`kb inspect q-<id>` resolves through
+    // `resolve_question_dir`). The slug is derived from the question text
+    // with the shared filename slugifier.
+    let question_slug =
+        kb_core::slug_for_filename(query, kb_core::DEFAULT_FILENAME_SLUG_MAX_CHARS);
+    let question_dir_name = if question_slug.is_empty() {
+        question_id.clone()
+    } else {
+        format!("{question_id}-{question_slug}")
+    };
+    let base_dir = PathBuf::from("outputs/questions").join(&question_dir_name);
+
     // Filename tracks the requested format. JSON gets `.json`; everything
     // else (md/marp/chart) stays as `.md`. Keep in sync with `kb_query::write_artifact`.
     let answer_file_name = match requested_format {
         "json" => "answer.json",
         _ => "answer.md",
     };
-    let answer_rel = PathBuf::from("outputs/questions")
-        .join(&question_id)
-        .join(answer_file_name);
-    let question_rel = PathBuf::from("outputs/questions")
-        .join(&question_id)
-        .join("question.json");
-    let plan_rel = PathBuf::from("outputs/questions")
-        .join(&question_id)
-        .join("retrieval_plan.json");
+    let answer_rel = base_dir.join(answer_file_name);
+    let question_rel = base_dir.join("question.json");
+    let plan_rel = base_dir.join("retrieval_plan.json");
 
     // Chart-format plumbing: resolve the PNG path the LLM will be told to
     // write to. The directory has to exist before the LLM runs so its bash
     // tool can drop the file without `mkdir -p`.
     let (chart_rel, chart_abs) = if requested_format == "chart" {
-        let rel = PathBuf::from("outputs/questions")
-            .join(&question_id)
-            .join("chart.png");
+        let rel = base_dir.join("chart.png");
         let abs = root.join(&rel);
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent).with_context(|| {
@@ -1911,9 +1917,7 @@ fn run_ask(
             .and_then(|p| p.parent())
             .expect("chart_abs has a parent for chart format")
             .to_path_buf();
-        let answer_md_rel_display = format!(
-            "outputs/questions/{question_id}/answer.md"
-        );
+        let answer_md_rel_display = base_dir.join("answer.md").to_string_lossy().into_owned();
         match &llm_outcome {
             Err(err) => {
                 let reason = format!("LLM call failed: {err}");
@@ -2029,9 +2033,10 @@ fn run_ask(
         raw_query: query.to_string(),
         requested_format: requested_format.to_string(),
         requesting_context: QuestionContext::ProjectKb,
-        retrieval_plan: format!(
-            "outputs/questions/{question_id}/retrieval_plan.json"
-        ),
+        retrieval_plan: base_dir
+            .join("retrieval_plan.json")
+            .to_string_lossy()
+            .into_owned(),
         token_budget: Some(cfg.ask.token_budget),
     };
 
@@ -2064,9 +2069,7 @@ fn run_ask(
             _ => ArtifactKind::AnswerNote,
         },
         format: requested_format.to_string(),
-        output_path: PathBuf::from(format!(
-            "outputs/questions/{question_id}/{answer_file_name}"
-        )),
+        output_path: base_dir.join(answer_file_name),
     };
 
     // Emit a BuildRecord for this ask, when the LLM actually produced something.
@@ -2138,6 +2141,7 @@ fn run_ask(
         artifact_body: &artifact_body,
         cited_source_paths: &cited_source_paths,
         build_record_id: build_record_id.as_deref(),
+        question_dir_name: Some(&question_dir_name),
     })?;
 
     if promote {
@@ -3050,16 +3054,12 @@ fn build_report_for_resolved(
         id_resolve::IdKind::Concept => root.join("wiki/concepts").join(format!("{}.md", resolved.id)),
         id_resolve::IdKind::Question => {
             // Prefer the answer artifact when it exists, otherwise point at
-            // the output dir. `build_file_report` copes with both.
-            let answer = root
-                .join("outputs/questions")
-                .join(&resolved.id)
-                .join("answer.md");
-            if answer.is_file() {
-                answer
-            } else {
-                root.join("outputs/questions").join(&resolved.id)
-            }
+            // the output dir. bn-nlw9: the dir may carry a `-<slug>` suffix
+            // so resolve via `resolve_question_dir` rather than join by id.
+            let q_dir = id_resolve::resolve_question_dir(root, &resolved.id)
+                .unwrap_or_else(|| root.join("outputs/questions").join(&resolved.id));
+            let answer = q_dir.join("answer.md");
+            if answer.is_file() { answer } else { q_dir }
         }
     };
     build_file_report(root, target, &path, jobs, graph, changed_inputs, hash_state)
@@ -3215,8 +3215,9 @@ fn resolve_source_id(root: &Path, target: &str) -> Option<PathBuf> {
     if !is_source_id(target) {
         return None;
     }
-    let wiki_page = root.join("wiki/sources").join(format!("{target}.md"));
-    if wiki_page.exists() {
+    // bn-nlw9: page may be at either `wiki/sources/<src>.md` (legacy) or
+    // `wiki/sources/<src>-<slug>.md` (current). Use the resolver.
+    if let Some(wiki_page) = kb_compile::source_page::resolve_source_page_path(root, target) {
         return Some(wiki_page);
     }
     let normalized = normalized_dir(root).join(target).join("source.md");
@@ -4524,13 +4525,15 @@ fn source_revision_mismatched(root: &Path, normalized_id: &str) -> Result<bool> 
         return Ok(false);
     };
 
-    let wiki_page = root.join(kb_compile::source_page::source_page_path_for_id(
-        normalized_id,
-    ));
-    let Ok(markdown) = std::fs::read_to_string(&wiki_page) else {
+    let Some(wiki_page) =
+        kb_compile::source_page::resolve_source_page_path(root, normalized_id)
+    else {
         // No wiki page yet — not a "mismatch"; already caught by hash state
         // in the common never-compiled case. If the wiki page was deleted
         // out from under us, the next compile will regenerate it.
+        return Ok(false);
+    };
+    let Ok(markdown) = std::fs::read_to_string(&wiki_page) else {
         return Ok(false);
     };
     let Some(frontmatter) = extract_frontmatter(&markdown) else {

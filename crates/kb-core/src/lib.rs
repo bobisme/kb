@@ -440,7 +440,8 @@ pub use paths::{
     normalized_rel, prompts_dir, state_dir, trash_dir,
 };
 pub use managed_region::{
-    ManagedRegion, extract_managed_regions, rewrite_managed_region, slug_from_title,
+    DEFAULT_FILENAME_SLUG_MAX_CHARS, ManagedRegion, extract_managed_regions,
+    rewrite_managed_region, slug_for_filename, slug_from_title,
 };
 pub use normalized::{read_normalized_document, write_normalized_document};
 pub use source_identity::{

@@ -139,8 +139,9 @@ pub fn plan_mentions_images(root: &Path, plan: &RetrievalPlan) -> bool {
     false
 }
 
-/// If `candidate_id` looks like `wiki/sources/src-<id>.md`, return the
-/// `<id>` portion (e.g. `src-xyz`). Otherwise `None`.
+/// If `candidate_id` looks like `wiki/sources/src-<id>.md` (legacy layout)
+/// or `wiki/sources/src-<id>-<slug>.md` (bn-nlw9 layout), return the
+/// `src-<id>` portion. Otherwise `None`.
 ///
 /// The candidate id uses forward slashes regardless of OS, since it comes
 /// from the KB's compiled index, not local filesystem traversal.
@@ -149,7 +150,19 @@ fn wiki_source_id(candidate_id: &str) -> Option<&str> {
     let stem = rest.strip_suffix(".md")?;
     // Only `src-*` files are sources we ingest; ignore other wiki/sources
     // files (e.g. an index) that don't have a matching normalized dir.
-    if stem.starts_with("src-") { Some(stem) } else { None }
+    if !stem.starts_with("src-") {
+        return None;
+    }
+    // The id portion is `src-<hash>`. Strip any trailing `-<slug>` by
+    // cutting at the second `-` from the start (`src` + `-` + `<hash>`).
+    // Example: `src-1wz-liveramp-intro` → `src-1wz`. Legacy `src-1wz`
+    // with no slug leaves `stem` unchanged.
+    let after_prefix = stem.strip_prefix("src-")?;
+    let hash_end = after_prefix
+        .find('-')
+        .unwrap_or(after_prefix.len());
+    // Return a slice into the original string covering `src-<hash>`.
+    Some(&stem[..("src-".len() + hash_end)])
 }
 
 /// Read `path` and append resolved image refs into `out`, respecting the

@@ -105,6 +105,88 @@ pub fn slug_from_title(title: &str) -> String {
     slug
 }
 
+/// Default max length for filename slugs.
+///
+/// Applies to both wiki source pages and question output directories.
+/// Chosen to keep browseable filenames under the ~255-char POSIX
+/// `NAME_MAX` even when combined with the id prefix and extension, while
+/// still leaving enough characters for a human-readable snippet of the
+/// title.
+pub const DEFAULT_FILENAME_SLUG_MAX_CHARS: usize = 60;
+
+/// Derive a filename-safe slug from a human-facing title.
+///
+/// Unlike [`slug_from_title`], this variant is purpose-built for browseable
+/// artifact filenames (e.g. `wiki/sources/src-1wz-<slug>.md` and
+/// `outputs/questions/q-1xk-<slug>/`). It:
+///
+/// - lowercases ASCII,
+/// - replaces any run of characters outside `[a-z0-9]` with a single `-`,
+/// - trims leading and trailing `-`,
+/// - truncates at `max_chars` on a word boundary (backing up to the last `-`
+///   if the cap lands mid-word), and
+/// - returns an empty string when the title collapses to nothing so callers
+///   can fall back to an id-only filename.
+///
+/// Non-ASCII letters are dropped (not transliterated) so the result is always
+/// ASCII-safe for the filesystem. Callers who want full Unicode support should
+/// reach for [`slug_from_title`] instead — which keeps Unicode alphanumerics —
+/// but that slug can break path handling on filesystems that normalize
+/// differently from the ingester.
+///
+/// When `max_chars == 0` the function treats it as "no truncation" so tests
+/// can exercise the unbounded form; production callers should pass
+/// [`DEFAULT_FILENAME_SLUG_MAX_CHARS`].
+#[must_use]
+pub fn slug_for_filename(title: &str, max_chars: usize) -> String {
+    let mut slug = String::new();
+    let mut last_was_hyphen = true;
+    for ch in title.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            slug.push(lower);
+            last_was_hyphen = false;
+        } else if !last_was_hyphen {
+            slug.push('-');
+            last_was_hyphen = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    while slug.starts_with('-') {
+        slug.remove(0);
+    }
+
+    if max_chars == 0 || slug.chars().count() <= max_chars {
+        return slug;
+    }
+
+    // Truncate at max_chars; if that lands mid-word, back up to the last `-`.
+    // Using `chars().count()` above guards against truncating multi-byte
+    // codepoints mid-sequence — but since our slug is ASCII-only by
+    // construction, byte offsets are equivalent to char offsets here.
+    let mut truncated = slug[..max_chars].to_string();
+    if let Some(next_char) = slug[max_chars..].chars().next() {
+        if next_char != '-' {
+            // Mid-word: back up to the last '-'.
+            if let Some(last_dash) = truncated.rfind('-') {
+                truncated.truncate(last_dash);
+            } else {
+                // No dash to fall back on — the whole truncated chunk is one
+                // word. Drop the slug entirely rather than produce a mangled
+                // prefix that misleads readers. The caller will fall back to
+                // the id-only filename.
+                return String::new();
+            }
+        }
+    }
+    while truncated.ends_with('-') {
+        truncated.pop();
+    }
+    truncated
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,5 +256,96 @@ Middle text."
         assert_eq!(slug_from_title("  Trimmed  "), "trimmed");
         assert_eq!(slug_from_title("Multi---Dash"), "multi-dash");
         assert_eq!(slug_from_title("v1.0 Release Notes"), "v1-0-release-notes");
+    }
+
+    #[test]
+    fn slug_for_filename_basic() {
+        assert_eq!(
+            slug_for_filename("2026-04-07 LiveRamp USB team intro", 60),
+            "2026-04-07-liveramp-usb-team-intro"
+        );
+        assert_eq!(
+            slug_for_filename("Produce a mermaid graph of USB team", 60),
+            "produce-a-mermaid-graph-of-usb-team"
+        );
+    }
+
+    #[test]
+    fn slug_for_filename_empty_and_nonalpha() {
+        assert_eq!(slug_for_filename("", 60), "");
+        assert_eq!(slug_for_filename("   ", 60), "");
+        assert_eq!(slug_for_filename("!!!@#$%", 60), "");
+        assert_eq!(slug_for_filename("-", 60), "");
+        assert_eq!(slug_for_filename("---", 60), "");
+    }
+
+    #[test]
+    fn slug_for_filename_strips_symbols() {
+        assert_eq!(
+            slug_for_filename("Background & Context / v2", 60),
+            "background-context-v2"
+        );
+        assert_eq!(slug_for_filename("Multi---Dash!!!", 60), "multi-dash");
+        assert_eq!(slug_for_filename("  Trimmed  ", 60), "trimmed");
+    }
+
+    #[test]
+    fn slug_for_filename_truncates_on_word_boundary() {
+        // 60-char cap on a long title: must not split mid-word.
+        let title = "how does the observability pipeline handle retries and backoffs in practice";
+        let slug = slug_for_filename(title, 60);
+        assert!(slug.len() <= 60, "slug too long: {slug}");
+        assert!(!slug.ends_with('-'), "trailing dash not stripped: {slug}");
+        // Must end on a full word. The 60-char mark lands inside "backoffs";
+        // truncation should back up to the previous `-`, dropping "backoffs".
+        assert_eq!(
+            slug,
+            "how-does-the-observability-pipeline-handle-retries-and"
+        );
+    }
+
+    #[test]
+    fn slug_for_filename_empty_when_single_word_exceeds_cap() {
+        // A title that's one enormous word has no dash to back up to; we'd
+        // rather return empty (caller falls back to id-only) than emit a
+        // misleading prefix.
+        let slug = slug_for_filename("supercalifragilisticexpialidocious", 10);
+        assert_eq!(slug, "");
+    }
+
+    #[test]
+    fn slug_for_filename_no_truncation_when_within_cap() {
+        assert_eq!(slug_for_filename("short title", 60), "short-title");
+    }
+
+    #[test]
+    fn slug_for_filename_unicode_is_dropped() {
+        // Non-ASCII chars are dropped, not transliterated — keep filesystem
+        // behavior portable. If every alphanumeric is non-ASCII, the slug
+        // collapses to empty.
+        assert_eq!(slug_for_filename("café", 60), "caf");
+        assert_eq!(slug_for_filename("日本語", 60), "");
+        assert_eq!(slug_for_filename("emoji 🎉 party", 60), "emoji-party");
+    }
+
+    #[test]
+    fn slug_for_filename_zero_max_disables_truncation() {
+        let title = "a ".to_string() + &"word ".repeat(50);
+        let slug = slug_for_filename(&title, 0);
+        assert!(
+            slug.len() > 60,
+            "max_chars=0 must skip truncation: got {} chars",
+            slug.len()
+        );
+    }
+
+    #[test]
+    fn slug_for_filename_handles_mid_boundary_at_dash() {
+        // If the char exactly at `max_chars` is a dash, we're on a boundary
+        // already — truncate without backing up.
+        let title = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii";
+        let slug = slug_for_filename(title, 9);
+        // Position 9 is the '-' after "aaaa-bbbb"; keep "aaaa-bbbb".
+        assert_eq!(slug, "aaaa-bbbb");
     }
 }

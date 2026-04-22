@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use kb_core::rewrite_managed_region;
+use kb_core::{DEFAULT_FILENAME_SLUG_MAX_CHARS, rewrite_managed_region, slug_for_filename};
 use regex::Regex;
 use serde_yaml::{Mapping, Number, Value};
 
@@ -32,9 +32,90 @@ pub struct SourcePageArtifact {
     pub markdown: String,
 }
 
+/// Compute the id-only source page path: `wiki/sources/<src-id>.md`.
+///
+/// Used when the caller does not have a title to derive a slug from — e.g.
+/// the build graph rebuilder matching wiki-page nodes back to their owning
+/// source document. For lookup of the on-disk file (which may carry a
+/// slug suffix), callers must use [`resolve_source_page_path`] instead.
+///
+/// For *writing* a source page, use [`source_page_path_for`] which includes
+/// the slugified title when one is available. Writes that use this function
+/// would overwrite the id-only form and orphan any existing slugged file;
+/// callers that produce files on disk should prefer the title-aware variant.
 #[must_use]
 pub fn source_page_path_for_id(source_id: &str) -> PathBuf {
     PathBuf::from("wiki/sources").join(format!("{}.md", slug_for_path(source_id)))
+}
+
+/// Compute the destination path for a source wiki page.
+///
+/// Either `wiki/sources/<src-id>-<slug>.md` (when the title slug is
+/// non-empty) or `wiki/sources/<src-id>.md` (when the title collapses to
+/// an empty slug).
+///
+/// `src_id` is used as the stable prefix (e.g. `src-1wz`); the slug is
+/// appended after `-` and derived from `title` via [`slug_for_filename`] with
+/// [`DEFAULT_FILENAME_SLUG_MAX_CHARS`]. Prefix-match lookups (`kb inspect
+/// src-1wz`) still resolve because the id is always the first segment.
+#[must_use]
+pub fn source_page_path_for(source_id: &str, title: &str) -> PathBuf {
+    let id_slug = slug_for_path(source_id);
+    let title_slug = slug_for_filename(title, DEFAULT_FILENAME_SLUG_MAX_CHARS);
+    let file_name = if title_slug.is_empty() {
+        format!("{id_slug}.md")
+    } else {
+        format!("{id_slug}-{title_slug}.md")
+    };
+    PathBuf::from("wiki/sources").join(file_name)
+}
+
+/// Resolve the on-disk source wiki page path for `src_id`, returning `None`
+/// when no file matches.
+///
+/// Accepts either the legacy `wiki/sources/<src-id>.md` form or the new
+/// `wiki/sources/<src-id>-<slug>.md` form (introduced in bn-nlw9). When both
+/// happen to coexist — a write-in-progress, for example — the id-slug form
+/// is preferred. All callers that previously used
+/// `format!("wiki/sources/{id}.md")` or [`source_page_path_for_id`] for
+/// *lookups* must call this helper instead to stay forward-compatible.
+///
+/// The returned path is relative to `_root`; callers `join` it with the root
+/// to get an absolute path. (The root argument is accepted for parity with
+/// other resolvers even though the lookup is already rooted.)
+#[must_use]
+pub fn resolve_source_page_path(root: &Path, src_id: &str) -> Option<PathBuf> {
+    let dir = root.join("wiki/sources");
+    if !dir.exists() {
+        return None;
+    }
+    let id_slug = slug_for_path(src_id);
+    let id_only = dir.join(format!("{id_slug}.md"));
+    let id_prefix = format!("{id_slug}-");
+
+    let mut id_slug_match: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem.starts_with(&id_prefix) {
+                id_slug_match = Some(path);
+                break;
+            }
+        }
+    }
+    if let Some(p) = id_slug_match {
+        return Some(p);
+    }
+    if id_only.exists() {
+        return Some(id_only);
+    }
+    None
 }
 
 /// Regex matching `![alt](path)` image references in markdown.
@@ -153,11 +234,62 @@ pub fn render_source_page(
     let markdown = serialize_frontmatter(&frontmatter, &body)?;
 
     Ok(SourcePageArtifact {
-        path: source_page_path_for_id(input.source_document_id),
+        path: source_page_path_for(input.source_document_id, input.title),
         frontmatter,
         body,
         markdown,
     })
+}
+
+/// Delete stale source wiki pages for `src_id` that don't match `keep_path`.
+///
+/// Used by the compile pipeline so that when a source's title changes,
+/// the old `wiki/sources/<src-id>-<old-slug>.md` (or the legacy id-only
+/// file) is cleaned up before writing the new page.
+///
+/// Matches both the id-only form (`<src-id>.md`) and any id-slug form
+/// (`<src-id>-*.md`) under `wiki/sources/`. `keep_path` is exempt even if it
+/// matches; everything else is removed.
+///
+/// # Errors
+///
+/// Returns an error when a matching stale file cannot be removed.
+pub fn clean_stale_source_pages(root: &Path, src_id: &str, keep_path: &Path) -> Result<Vec<PathBuf>> {
+    let dir = root.join("wiki/sources");
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let id_slug = slug_for_path(src_id);
+    let id_prefix = format!("{id_slug}-");
+    let id_only_stem = id_slug;
+
+    let keep_abs = if keep_path.is_absolute() {
+        keep_path.to_path_buf()
+    } else {
+        root.join(keep_path)
+    };
+
+    let mut removed = Vec::new();
+    for entry in std::fs::read_dir(&dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let matches_id = stem == id_only_stem || stem.starts_with(&id_prefix);
+        if !matches_id {
+            continue;
+        }
+        if path == keep_abs {
+            continue;
+        }
+        std::fs::remove_file(&path)?;
+        removed.push(path);
+    }
+    Ok(removed)
 }
 
 fn build_frontmatter(input: &SourcePageInput<'_>) -> Mapping {
@@ -341,9 +473,11 @@ mod tests {
         let citations = vec!["[[wiki/concepts/rust]]".to_string()];
         let artifact = render_source_page(&input(&key_topics, &citations), None).expect("render");
 
+        // Path includes the src-id (slugified) plus a slug derived from the
+        // title — the new browseable layout.
         assert_eq!(
             artifact.path,
-            PathBuf::from("wiki/sources/source-document-1.md")
+            PathBuf::from("wiki/sources/source-document-1-example-source.md")
         );
         assert_eq!(
             artifact.frontmatter.get("id"),
@@ -457,5 +591,101 @@ mod tests {
             "![x](../../.kb/normalized/src-abc/assets/foo.png)",
             "title must be discarded on rewrite",
         );
+    }
+
+    #[test]
+    fn source_page_path_for_includes_title_slug() {
+        let path = source_page_path_for("src-1wz", "2026-04-07 LiveRamp USB team intro");
+        assert_eq!(
+            path,
+            PathBuf::from("wiki/sources/src-1wz-2026-04-07-liveramp-usb-team-intro.md")
+        );
+    }
+
+    #[test]
+    fn source_page_path_for_falls_back_to_id_when_title_empty() {
+        let path = source_page_path_for("src-1wz", "");
+        assert_eq!(path, PathBuf::from("wiki/sources/src-1wz.md"));
+    }
+
+    #[test]
+    fn source_page_path_for_falls_back_to_id_when_title_all_symbols() {
+        let path = source_page_path_for("src-1wz", "!!!");
+        assert_eq!(path, PathBuf::from("wiki/sources/src-1wz.md"));
+    }
+
+    #[test]
+    fn resolve_source_page_path_prefers_id_slug_form() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("wiki/sources")).expect("mkdir");
+        std::fs::write(
+            root.join("wiki/sources/src-abc-hello-world.md"),
+            "slugged",
+        )
+        .expect("write slugged");
+
+        let resolved = resolve_source_page_path(root, "src-abc").expect("resolved");
+        assert_eq!(resolved, root.join("wiki/sources/src-abc-hello-world.md"));
+    }
+
+    #[test]
+    fn resolve_source_page_path_falls_back_to_id_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("wiki/sources")).expect("mkdir");
+        std::fs::write(root.join("wiki/sources/src-abc.md"), "plain").expect("write plain");
+
+        let resolved = resolve_source_page_path(root, "src-abc").expect("resolved");
+        assert_eq!(resolved, root.join("wiki/sources/src-abc.md"));
+    }
+
+    #[test]
+    fn resolve_source_page_path_returns_none_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        assert!(resolve_source_page_path(root, "src-missing").is_none());
+    }
+
+    #[test]
+    fn resolve_source_page_path_ignores_other_src_ids() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("wiki/sources")).expect("mkdir");
+        std::fs::write(root.join("wiki/sources/src-other-hello.md"), "other")
+            .expect("write other");
+        assert!(resolve_source_page_path(root, "src-abc").is_none());
+    }
+
+    #[test]
+    fn clean_stale_source_pages_removes_mismatched_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("wiki/sources")).expect("mkdir");
+        std::fs::write(root.join("wiki/sources/src-abc.md"), "id-only").expect("write");
+        std::fs::write(root.join("wiki/sources/src-abc-old-title.md"), "old").expect("write");
+        std::fs::write(root.join("wiki/sources/src-abc-new-title.md"), "new").expect("write");
+
+        let keep = PathBuf::from("wiki/sources/src-abc-new-title.md");
+        let removed = clean_stale_source_pages(root, "src-abc", &keep).expect("clean");
+        assert_eq!(removed.len(), 2);
+        assert!(root.join("wiki/sources/src-abc-new-title.md").exists());
+        assert!(!root.join("wiki/sources/src-abc.md").exists());
+        assert!(!root.join("wiki/sources/src-abc-old-title.md").exists());
+    }
+
+    #[test]
+    fn clean_stale_source_pages_keeps_unrelated_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("wiki/sources")).expect("mkdir");
+        std::fs::write(root.join("wiki/sources/src-other.md"), "other").expect("write");
+        std::fs::write(root.join("wiki/sources/index.md"), "index").expect("write");
+
+        let keep = PathBuf::from("wiki/sources/src-abc-new-title.md");
+        let removed = clean_stale_source_pages(root, "src-abc", &keep).expect("clean");
+        assert!(removed.is_empty());
+        assert!(root.join("wiki/sources/src-other.md").exists());
+        assert!(root.join("wiki/sources/index.md").exists());
     }
 }

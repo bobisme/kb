@@ -774,20 +774,26 @@ fn build_graph_from_state(root: &Path) -> Result<Graph> {
         }
     }
 
-    // Edges: source-document -> wiki-page. `source_page_path_for_id` uses the
-    // doc id verbatim to derive the filename, so matching the wiki page slug
-    // back to its owning doc id means finding the doc id whose
-    // `source_page_path_for_id` output has the same stem as the wiki page.
+    // Edges: source-document -> wiki-page. Source pages are now written at
+    // `wiki/sources/<src-id>-<title-slug>.md` (bn-nlw9), so match by id
+    // prefix: any on-disk wiki-page slug that is either the src id itself
+    // or starts with `<src-id>-` is owned by that doc.
     for doc_id in &doc_ids {
-        let page_path = crate::source_page::source_page_path_for_id(doc_id);
-        let Some(stem) = page_path.file_stem().and_then(|s| s.to_str()) else {
+        let page_stem_from_id = {
+            let p = crate::source_page::source_page_path_for_id(doc_id);
+            p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+        };
+        let Some(id_stem) = page_stem_from_id else {
             continue;
         };
-        if wiki_page_slugs.contains(stem) {
-            graph.add_edge(
-                format!("source-document-{doc_id}"),
-                format!("wiki-page-{stem}"),
-            );
+        let id_prefix = format!("{id_stem}-");
+        for page_slug in &wiki_page_slugs {
+            if page_slug == &id_stem || page_slug.starts_with(&id_prefix) {
+                graph.add_edge(
+                    format!("source-document-{doc_id}"),
+                    format!("wiki-page-{page_slug}"),
+                );
+            }
         }
     }
 
@@ -959,9 +965,14 @@ fn run_per_document_passes(
         let doc = read_normalized_document(root, doc_id)
             .with_context(|| format!("read normalized document {doc_id}"))?;
         let title = derive_title(&doc.canonical_text, doc_id);
-        let page_path = crate::source_page::source_page_path_for_id(doc_id);
+        // New page path includes the title slug (bn-nlw9). Read any existing
+        // page (id-only OR prior-slug form) so managed regions / frontmatter
+        // from the previous compile still propagate into the new file.
+        let page_path = crate::source_page::source_page_path_for(doc_id, &title);
         let page_abs_path = root.join(&page_path);
-        let existing_markdown = std::fs::read_to_string(&page_abs_path).ok();
+        let existing_page_abs = crate::source_page::resolve_source_page_path(root, doc_id)
+            .unwrap_or_else(|| page_abs_path.clone());
+        let existing_markdown = std::fs::read_to_string(&existing_page_abs).ok();
         let existing_body = existing_markdown
             .as_deref()
             .and_then(split_body_from_frontmatter);
@@ -1058,6 +1069,19 @@ fn run_per_document_passes(
         )?;
         kb_core::fs::atomic_write(&page_abs_path, page_artifact.markdown.as_bytes())
             .with_context(|| format!("write source page {}", page_abs_path.display()))?;
+        // Clean up any stale id-only or id-slug source pages left over from a
+        // previous compile (title changed → slug changed). bn-nlw9 keeps the
+        // new file on disk; every other match goes.
+        match crate::source_page::clean_stale_source_pages(root, doc_id, &page_path) {
+            Ok(removed) => {
+                for p in &removed {
+                    tracing::debug!("cleaned stale source page: {}", p.display());
+                }
+            }
+            Err(err) => {
+                tracing::warn!("could not clean stale source pages for {doc_id}: {err}");
+            }
+        }
         source_pages_written += 1;
 
         let candidates_path = crate::concept_extraction::concept_candidates_path(root, doc_id);
@@ -2084,9 +2108,14 @@ mod tests {
             "concept merge runs once globally"
         );
 
-        // Source pages should exist on disk.
-        let page_a = root.join("wiki/sources/doc-a.md");
-        assert!(page_a.exists(), "source page for doc-a missing");
+        // Source pages should exist on disk. bn-nlw9: the filename now
+        // includes a slug derived from the source title ("Alpha" → `alpha`).
+        let page_a = root.join("wiki/sources/doc-a-alpha.md");
+        assert!(
+            page_a.exists(),
+            "source page for doc-a missing at {}",
+            page_a.display()
+        );
         let body_a = std::fs::read_to_string(&page_a).expect("read page");
         assert!(body_a.contains("Fake summary."));
         assert!(body_a.contains("build_record_id:"));
@@ -2121,6 +2150,72 @@ mod tests {
             2,
             "second compile must not call summarize again"
         );
+    }
+
+    /// bn-nlw9: when a source's title changes between compiles, the wiki
+    /// source page is renamed to reflect the new slug and the old file is
+    /// cleaned up. Managed regions + frontmatter carry over because the
+    /// pipeline reads the prior file via the id-or-slug resolver.
+    #[test]
+    fn compile_renames_source_page_on_title_change() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        // First compile: title "Alpha" → doc-a-alpha.md.
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody"))
+            .expect("write doc-a");
+        let adapter = RecordingAdapter::default();
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+            },
+            Some(&adapter),
+        )
+        .expect("first compile");
+        assert!(
+            root.join("wiki/sources/doc-a-alpha.md").exists(),
+            "first compile must write slugged page"
+        );
+
+        // Edit the normalized text so the derived title changes. We also
+        // have to bump source_revision_id so hash-state sees the doc as
+        // stale and the per-doc passes re-run.
+        let mut doc = kb_core::read_normalized_document(root, "doc-a").expect("read");
+        doc.canonical_text = "# Beta\nBody".to_string();
+        doc.source_revision_id = "rev-beta".to_string();
+        kb_core::write_normalized_document(root, &doc).expect("rewrite");
+        // Force rebuild — we're using a recording adapter with a fixed
+        // provenance; the `content_hash` path alone wouldn't fire without
+        // the rebuild pass below touching it.
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: true,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+            },
+            Some(&adapter),
+        )
+        .expect("second compile");
+
+        assert!(
+            root.join("wiki/sources/doc-a-beta.md").exists(),
+            "second compile must write the new slug"
+        );
+        assert!(
+            !root.join("wiki/sources/doc-a-alpha.md").exists(),
+            "second compile must clean up the stale slug"
+        );
+        // Id-only form should not have appeared either.
+        assert!(!root.join("wiki/sources/doc-a.md").exists());
     }
 
     /// bn-3w0: after a successful compile, `state/graph.json` must exist and
@@ -2194,13 +2289,16 @@ mod tests {
 
         // Each source document should link to its rendered wiki page so
         // `kb inspect <wiki-page-slug>` can trace back to the source.
+        // bn-nlw9: the wiki-page node carries the id-slug stem
+        // (`doc-a-alpha` for the "Alpha" title) — edge matching is by
+        // `<src-id>-*` prefix.
         let src_a = graph
             .nodes
             .get("source-document-doc-a")
             .expect("source-document-doc-a node present");
         assert!(
-            src_a.outputs.iter().any(|o| o == "wiki-page-doc-a"),
-            "source-document-doc-a must connect to wiki-page-doc-a; outputs: {:?}",
+            src_a.outputs.iter().any(|o| o.starts_with("wiki-page-doc-a")),
+            "source-document-doc-a must connect to a wiki-page-doc-a* node; outputs: {:?}",
             src_a.outputs
         );
     }

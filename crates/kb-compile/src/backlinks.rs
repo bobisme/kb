@@ -8,7 +8,7 @@ use kb_core::{normalized_dir, rewrite_managed_region};
 use regex::Regex;
 use serde_yaml::Value;
 
-use crate::source_page::source_page_path_for_id;
+use crate::source_page::resolve_source_page_path;
 
 const WIKI_DIR: &str = "wiki";
 const CONCEPT_DIR: &str = "wiki/concepts";
@@ -490,11 +490,18 @@ fn collect_mention_backlinks(
             continue;
         }
 
-        // Map `normalized/<src_id>/` to the corresponding `wiki/sources/<slug>`
-        // page id by reusing the same slug rule the source-page generator uses.
-        // We only credit this src_id if it has a matching entry in `source_pages`;
-        // otherwise the source has no wiki page to link to.
-        let source_page_rel = source_page_path_for_id(&src_id);
+        // Map `normalized/<src_id>/` to the corresponding on-disk source page.
+        // After bn-nlw9, source pages are named `wiki/sources/<src-id>-<slug>.md`
+        // (or the legacy id-only form), so locate the actual file via
+        // `resolve_source_page_path` and derive the page_id from that path.
+        // We only credit this src_id if a matching file exists and lives in
+        // `source_pages`; otherwise the source has no wiki page to link to.
+        let Some(source_page_abs) = resolve_source_page_path(root, &src_id) else {
+            continue;
+        };
+        let Ok(source_page_rel) = source_page_abs.strip_prefix(root) else {
+            continue;
+        };
         let source_page_id = source_page_rel
             .to_string_lossy()
             .replace('\\', "/")

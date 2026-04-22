@@ -180,8 +180,43 @@ pub fn list_ids(root: &Path, kind: IdKind) -> Result<Vec<String>> {
     match kind {
         IdKind::Source => list_subdirs(&normalized_dir(root), |name| name.starts_with("src-")),
         IdKind::Concept => list_md_stems(&root.join("wiki/concepts")),
-        IdKind::Question => list_subdirs(&root.join("outputs/questions"), |_| true),
+        // Question directories may live at either `outputs/questions/q-<id>/`
+        // (legacy) or `outputs/questions/q-<id>-<slug>/` (bn-nlw9). For
+        // resolver purposes we want to match by the stable `q-<id>` portion
+        // — callers resolve the actual on-disk directory via
+        // [`resolve_question_dir`].
+        IdKind::Question => list_subdirs(&root.join("outputs/questions"), |_| true)
+            .map(|names| names.into_iter().map(question_id_from_dir_name).collect()),
     }
+}
+
+/// Extract the stable `q-<hash>` id prefix from a question directory name,
+/// stripping any `-<slug>` suffix introduced by bn-nlw9. Names that don't
+/// match the `q-...` shape pass through unchanged so resolver diagnostics
+/// still include them.
+fn question_id_from_dir_name(name: String) -> String {
+    let Some(rest) = name.strip_prefix("q-") else {
+        return name;
+    };
+    // Stable id runs up to the first `-`; anything after is the title slug.
+    let hash_end = rest.find('-').unwrap_or(rest.len());
+    format!("q-{}", &rest[..hash_end])
+}
+
+/// Resolve an on-disk question directory for `q_id`, returning `None` when
+/// no matching directory exists.
+///
+/// Accepts either the legacy `outputs/questions/q-<id>/` form or the
+/// bn-nlw9 `outputs/questions/q-<id>-<slug>/` form. When both happen to
+/// coexist, the id-slug form is preferred. All callers that previously
+/// built `outputs/questions/<q-id>/` by id alone for lookups must use
+/// this helper.
+///
+/// Thin re-export of the kb-query helper so callers that already depend
+/// on `id_resolve` can stay co-located.
+#[must_use]
+pub fn resolve_question_dir(root: &Path, q_id: &str) -> Option<std::path::PathBuf> {
+    kb_query::resolve_question_dir(root, q_id)
 }
 
 /// List immediate subdirectory names under `dir`, filtered by `keep`. Sorted
@@ -364,6 +399,58 @@ mod tests {
         assert!(list_ids(root, IdKind::Source).expect("src").is_empty());
         assert!(list_ids(root, IdKind::Concept).expect("concept").is_empty());
         assert!(list_ids(root, IdKind::Question).expect("q").is_empty());
+    }
+
+    #[test]
+    fn list_ids_strips_question_title_slug() {
+        // bn-nlw9 introduced `q-<id>-<slug>` directory names; resolver must
+        // still treat them as the plain `q-<id>` id.
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("outputs/questions/q-abc-the-question-title"))
+            .expect("mkdir slug");
+        fs::create_dir_all(root.join("outputs/questions/q-xyz")).expect("mkdir legacy");
+        let mut ids = list_ids(root, IdKind::Question).expect("q ids");
+        ids.sort();
+        assert_eq!(ids, vec!["q-abc".to_string(), "q-xyz".to_string()]);
+    }
+
+    #[test]
+    fn resolve_question_dir_prefers_slug_form() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("outputs/questions/q-abc-hello")).expect("mkdir");
+        let resolved = resolve_question_dir(root, "q-abc").expect("resolved");
+        assert_eq!(resolved, root.join("outputs/questions/q-abc-hello"));
+    }
+
+    #[test]
+    fn resolve_question_dir_falls_back_to_id_only() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("outputs/questions/q-plain")).expect("mkdir");
+        let resolved = resolve_question_dir(root, "q-plain").expect("resolved");
+        assert_eq!(resolved, root.join("outputs/questions/q-plain"));
+    }
+
+    #[test]
+    fn resolve_question_dir_returns_none_when_missing() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        assert!(resolve_question_dir(root, "q-missing").is_none());
+    }
+
+    #[test]
+    fn resolve_unique_q_prefix_across_slug_forms() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("outputs/questions/q-a7x3-produce-a-chart"))
+            .expect("mkdir q-a7x3 slug");
+        fs::create_dir_all(root.join("outputs/questions/q-b2k1")).expect("mkdir q-b2k1");
+
+        let resolved = resolve(root, "q-a7").expect("resolve prefix with slug");
+        assert_eq!(resolved.id, "q-a7x3");
+        assert_eq!(resolved.kind, IdKind::Question);
     }
 
     #[test]

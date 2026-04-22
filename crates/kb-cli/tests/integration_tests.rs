@@ -7522,3 +7522,309 @@ fn legacy_layout_sentinel_blocks_compile_with_helpful_error() {
         "error must point users at `kb migrate`: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// bn-nlw9: slugified titles in wiki/sources/ filenames and outputs/questions/
+// directory names.
+//
+// End-to-end checks that exercise the compile pipeline, ask flow, and the
+// migrate rename pass. The compile pipeline skips its LLM-driven per-doc
+// passes when no backend is configured, so these tests either drive the
+// pipeline through the CLI (which exercises the id-lookup resolvers) or
+// stub wiki pages directly on disk.
+// ---------------------------------------------------------------------------
+
+/// Seed the hash-state on-disk so kb's freshness tracker treats a
+/// hand-written `wiki/sources/<slug>.md` as a fully compiled fresh output.
+/// Test helper only — mirrors what the compile pipeline would have stored.
+fn stub_nlw9_source_page(kb_root: &Path, filename: &str, src_id: &str, title: &str) -> PathBuf {
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+    let path = sources_dir.join(filename);
+    let md = format!(
+        "---\nid: wiki-source-{src_id}\ntype: source\ntitle: {title}\n\
+source_document_id: {src_id}\nsource_revision_id: rev-1\ngenerated_at: 0\n\
+build_record_id: build-1\n---\n\n# Source\n\n<!-- kb:begin id=title -->\n\
+{title}\n<!-- kb:end id=title -->\n",
+    );
+    fs::write(&path, md).expect("write wiki source page");
+    path
+}
+
+/// bn-nlw9 P7.1: `kb inspect <src-id>` resolves both the legacy id-only
+/// and new id-slug source wiki-page filenames. The resolver is the piece
+/// that makes prefix-match lookups keep working after the rename.
+#[test]
+fn inspect_resolves_both_id_only_and_id_slug_source_pages() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    stub_nlw9_source_page(
+        &kb_root,
+        "src-slugged-hello-world-of-rust.md",
+        "src-slugged",
+        "Hello World of Rust",
+    );
+    stub_nlw9_source_page(&kb_root, "src-plain.md", "src-plain", "Plain");
+
+    for src_id in ["src-slugged", "src-plain"] {
+        let mut cmd = kb_cmd(&kb_root);
+        cmd.arg("inspect").arg(src_id);
+        let output = cmd.output().expect("run kb inspect");
+        assert!(
+            output.status.success(),
+            "kb inspect {src_id} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("wiki/sources/"),
+            "kb inspect {src_id} must resolve to a wiki source page; got: {stdout}"
+        );
+    }
+}
+
+/// bn-nlw9 P7.2: `kb forget <src-id>` moves the slug-augmented page to
+/// trash when no id-only form exists on disk.
+#[test]
+fn forget_trashes_id_slug_source_page() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Fabricate a normalized doc for this src so forget has something to
+    // act on besides the wiki page (forget cascades through all three
+    // buckets: normalized/, raw/inbox/, wiki/sources/).
+    let normalized_dir = kb_core::normalized_dir(&kb_root).join("src-abc");
+    fs::create_dir_all(&normalized_dir).expect("mkdir normalized");
+    fs::write(
+        normalized_dir.join("metadata.json"),
+        r#"{"metadata": {"id": "src-abc", "status": "fresh"}, "source_revision_id": "rev-1"}"#,
+    )
+    .expect("write normalized metadata");
+    fs::write(normalized_dir.join("source.md"), "# body\n").expect("write source.md");
+
+    let slugged = stub_nlw9_source_page(
+        &kb_root,
+        "src-abc-a-meaningful-title.md",
+        "src-abc",
+        "A meaningful title",
+    );
+    assert!(slugged.exists(), "precondition: slugged page exists");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg("src-abc");
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !slugged.exists(),
+        "slugged source page should have been trashed"
+    );
+}
+
+/// bn-nlw9 P7.3: `kb migrate` on a vault with legacy id-only sources +
+/// question dirs renames them to id-slug form and is idempotent on a
+/// second run. This is the migration test backing the migrate tests at
+/// the unit level with an end-to-end CLI invocation.
+#[test]
+fn migrate_renames_id_only_sources_and_questions_end_to_end() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Seed an id-only source page and an id-only question dir.
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("mkdir sources");
+    fs::write(
+        sources_dir.join("src-abc.md"),
+        "---\ntitle: Rust Concurrency Guide\n\
+source_document_id: src-abc\n\
+source_revision_id: rev-1\n---\n\n# Source\n",
+    )
+    .expect("write id-only source");
+
+    let q_dir = kb_root.join("outputs/questions/q-abc");
+    fs::create_dir_all(&q_dir).expect("mkdir q dir");
+    fs::write(
+        q_dir.join("question.json"),
+        r#"{"metadata":{"id":"q-abc"},"raw_query":"What is ownership in Rust?"}"#,
+    )
+    .expect("write question.json");
+
+    // First migrate: renames happen.
+    let output = kb_cmd(&kb_root)
+        .arg("migrate")
+        .output()
+        .expect("run kb migrate");
+    assert!(
+        output.status.success(),
+        "kb migrate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!sources_dir.join("src-abc.md").exists());
+    assert!(
+        sources_dir.join("src-abc-rust-concurrency-guide.md").exists(),
+        "source page should be slug-augmented"
+    );
+    let renamed_q = kb_root
+        .join("outputs/questions/q-abc-what-is-ownership-in-rust");
+    assert!(
+        renamed_q.is_dir(),
+        "question dir should be slug-augmented: {}",
+        renamed_q.display()
+    );
+
+    // Second migrate: idempotent.
+    let output2 = kb_cmd(&kb_root)
+        .arg("migrate")
+        .output()
+        .expect("run kb migrate again");
+    assert!(output2.status.success());
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    assert!(
+        stdout2.contains("Already migrated"),
+        "second migrate should print Already migrated; got: {stdout2}"
+    );
+    // Both renamed artifacts still there, in slug form.
+    assert!(
+        sources_dir.join("src-abc-rust-concurrency-guide.md").exists()
+    );
+    assert!(renamed_q.is_dir());
+}
+
+/// bn-nlw9 P7.5: `kb ask` produces a question dir whose name includes a
+/// slug derived from the question text, and the artifact path in the JSON
+/// envelope reflects the slugged dir. Runs without an LLM — the ask flow
+/// still creates the dir and writes a placeholder answer when no backend
+/// is available.
+#[test]
+fn ask_creates_slugged_question_output_dir() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("md")
+        .arg("Produce a mermaid graph of USB team");
+    let output = cmd.output().expect("run kb ask");
+    assert!(
+        output.status.success(),
+        "kb ask failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let artifact_rel = envelope["data"]["artifact_path"]
+        .as_str()
+        .expect("artifact_path");
+    assert!(
+        artifact_rel.starts_with("outputs/questions/q-"),
+        "artifact_path must live under outputs/questions/q-*: {artifact_rel}"
+    );
+    assert!(
+        artifact_rel.contains("-produce-a-mermaid-graph-of-usb-team"),
+        "artifact_path must include the question slug: {artifact_rel}"
+    );
+    let artifact_abs = kb_root.join(artifact_rel);
+    assert!(
+        artifact_abs.exists(),
+        "artifact file must exist on disk: {}",
+        artifact_abs.display()
+    );
+    let q_dir = artifact_abs
+        .parent()
+        .expect("artifact has parent dir");
+    let dir_name = q_dir
+        .file_name()
+        .expect("dir has name")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        dir_name.starts_with("q-"),
+        "question dir must start with q-: {dir_name}"
+    );
+    assert!(
+        dir_name.contains("-produce-a-mermaid-graph-of-usb-team"),
+        "question dir must include question slug: {dir_name}"
+    );
+}
+
+/// bn-nlw9 P7.6: `kb ask` with a query that collapses to an empty slug
+/// (e.g. only punctuation/symbols) falls back to the id-only dir name.
+#[test]
+fn ask_falls_back_to_id_only_dir_when_query_slugs_to_empty() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("md")
+        .arg("!!!@#$%");
+    let output = cmd.output().expect("run kb ask");
+    assert!(
+        output.status.success(),
+        "kb ask failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let artifact_rel = envelope["data"]["artifact_path"]
+        .as_str()
+        .expect("artifact_path");
+    // Empty slug → no trailing `-<slug>`, just `q-<id>/answer.md`.
+    let q_dir_name = Path::new(artifact_rel)
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .expect("parent dir name");
+    assert!(
+        q_dir_name.starts_with("q-") && !q_dir_name[2..].contains('-'),
+        "empty-slug query should produce id-only dir, got: {q_dir_name}"
+    );
+}
+
+/// bn-nlw9 P7.4: `kb migrate --json` surfaces the rename records under
+/// `data.renamed[]` so programmatic callers can tell what moved.
+#[test]
+fn migrate_json_emits_rename_records() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let sources_dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&sources_dir).expect("mkdir sources");
+    fs::write(
+        sources_dir.join("src-abc.md"),
+        "---\ntitle: Short Title\nsource_document_id: src-abc\nsource_revision_id: rev-1\n---\n",
+    )
+    .expect("write");
+
+    let output = kb_cmd(&kb_root)
+        .arg("--json")
+        .arg("migrate")
+        .output()
+        .expect("run kb --json migrate");
+    assert!(output.status.success());
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("parse migrate json envelope");
+    let renamed = envelope["data"]["renamed"]
+        .as_array()
+        .expect("data.renamed should be an array");
+    assert_eq!(renamed.len(), 1, "one rename; got: {renamed:?}");
+    assert_eq!(renamed[0]["kind"], "source");
+    assert!(
+        renamed[0]["from"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("src-abc.md")
+    );
+    assert!(
+        renamed[0]["to"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("src-abc-short-title.md")
+    );
+}

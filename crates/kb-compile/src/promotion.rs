@@ -200,16 +200,18 @@ fn load_artifact(root: &Path, item: &ReviewItem) -> Result<ArtifactLoad> {
         if dep.starts_with("art-") {
             // Artifact id `art-<suffix>` maps to the question directory
             // `outputs/questions/q-<suffix>/answer.md` (artifacts share the
-            // short suffix of their question).
+            // short suffix of their question). bn-nlw9 may have appended a
+            // title slug to the dir — resolve it explicitly rather than
+            // constructing the path from the id alone.
             let suffix = dep.strip_prefix("art-").unwrap_or(dep);
-            let answer_path = root
-                .join("outputs/questions")
-                .join(format!("q-{suffix}"))
-                .join("answer.md");
-            if answer_path.exists() {
-                let raw = std::fs::read_to_string(&answer_path)
-                    .with_context(|| format!("read artifact {}", answer_path.display()))?;
-                return Ok(parse_artifact(&raw));
+            let q_id = format!("q-{suffix}");
+            if let Some(q_dir) = kb_query::resolve_question_dir(root, &q_id) {
+                let answer_path = q_dir.join("answer.md");
+                if answer_path.exists() {
+                    let raw = std::fs::read_to_string(&answer_path)
+                        .with_context(|| format!("read artifact {}", answer_path.display()))?;
+                    return Ok(parse_artifact(&raw));
+                }
             }
         }
     }
