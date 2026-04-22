@@ -111,9 +111,23 @@ pub fn run_migrate(root: &Path, json: bool) -> Result<()> {
         }
     }
 
+    // Phase C (bn-6puc): fix stale double-id filenames that bn-nlw9 produced
+    // when the source's title slugified to the src id. Rename
+    // `wiki/sources/src-<id>-src-<id>...md` → `wiki/sources/src-<id>.md`
+    // and backfill the title frontmatter from the ingested file's stem.
+    //
+    // Runs BEFORE Phase B so a single `kb migrate` reaches the final
+    // resting place: Phase C collapses the stale double and sets the
+    // title; Phase B then re-slugs the cleaned id-only file to reflect
+    // the new title. Running the other order would require two `kb
+    // migrate` invocations to stabilize.
+    let mut renamed = fix_double_id_filenames(root)?;
+
     // Phase B: bn-nlw9 browseable-filename slugging. Runs every time so a
     // fresh-from-legacy vault picks up both rewrites in one `kb migrate`.
-    let renamed = rename_sources_and_questions(root)?;
+    let phase_b_renames = rename_sources_and_questions(root)?;
+    renamed.extend(phase_b_renames);
+
     let backlinks_refreshed = if renamed.is_empty() {
         true
     } else {
@@ -218,7 +232,11 @@ fn rename_sources_and_questions(root: &Path) -> Result<Vec<RenameRecord>> {
                 &title,
                 kb_core::DEFAULT_FILENAME_SLUG_MAX_CHARS,
             );
-            if slug.is_empty() {
+            // bn-6puc guard: a title like `src-1wz` would slugify to the id
+            // itself; appending it would produce an id-duplicating name. Leave
+            // the id-only file in place — compile's title fallback (Part 1)
+            // will assign a meaningful title on the next run.
+            if slug.is_empty() || kb_core::slug_redundant_with_id(&slug, stem) {
                 continue;
             }
             let new_name = format!("{stem}-{slug}.md");
@@ -264,7 +282,8 @@ fn rename_sources_and_questions(root: &Path) -> Result<Vec<RenameRecord>> {
                 &text,
                 kb_core::DEFAULT_FILENAME_SLUG_MAX_CHARS,
             );
-            if slug.is_empty() {
+            // bn-6puc guard: same as the sources loop — skip redundant slugs.
+            if slug.is_empty() || kb_core::slug_redundant_with_id(&slug, name) {
                 continue;
             }
             let new_name = format!("{name}-{slug}");
@@ -284,6 +303,225 @@ fn rename_sources_and_questions(root: &Path) -> Result<Vec<RenameRecord>> {
     }
 
     Ok(renamed)
+}
+
+/// bn-6puc Phase C: repair stale double-id filenames produced by bn-nlw9
+/// when the source's title slugified to the src id itself (or started with
+/// it).
+///
+/// For each `wiki/sources/src-<id>-<slug>.md` where `<slug>` equals
+/// `src-<id>` (or starts with `src-<id>-`), rename to
+/// `wiki/sources/src-<id>.md`. If a file at the target already exists we
+/// skip (bail-safe; user must resolve manually).
+///
+/// After renaming, backfill the wiki source page's title — both the YAML
+/// frontmatter `title:` field AND the managed `<!-- kb:begin id=title -->`
+/// block — from the ingested file's filename stem (looked up via
+/// `raw/inbox/<src>/source_document.json::stable_location`). This is a
+/// free, fast win: the user gets a meaningful title without re-running
+/// the (expensive) `source_summary` LLM pass. When the stem fallback is
+/// unavailable (URL ingest, missing `source_document.json`) the existing
+/// title is left in place — bn-6puc Part 1's compile-time fallback will
+/// correct it on the next `kb compile` run anyway.
+///
+/// Question dirs get the same mechanical rename. Question titles are
+/// raw user input (no frontmatter), so there's nothing else to backfill.
+///
+/// Idempotent: files that don't match the double-id pattern are skipped.
+fn fix_double_id_filenames(root: &Path) -> Result<Vec<RenameRecord>> {
+    let mut renamed = Vec::new();
+
+    let sources_dir = root.join("wiki/sources");
+    if sources_dir.exists() {
+        for entry in fs::read_dir(&sources_dir)
+            .with_context(|| format!("read {}", sources_dir.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("read entry in {}", sources_dir.display()))?;
+            let path = entry.path();
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some((src_id, slug_portion)) = split_src_id_and_slug(stem) else {
+                continue;
+            };
+            if !kb_core::slug_redundant_with_id(slug_portion, src_id) {
+                continue;
+            }
+            // Slug is redundant — collapse to the id-only filename.
+            let new_name = format!("{src_id}.md");
+            let new_path = sources_dir.join(&new_name);
+            if new_path.exists() {
+                // A clean id-only file already exists alongside the
+                // double-id stale. Don't clobber — the user must resolve.
+                continue;
+            }
+            fs::rename(&path, &new_path).with_context(|| {
+                format!("rename {} -> {}", path.display(), new_path.display())
+            })?;
+
+            // Best-effort: backfill the title from the ingested file's
+            // stem. Failure to backfill is non-fatal — compile will fix
+            // it up later.
+            if let Some(stem_title) = read_ingest_filename_stem(root, src_id) {
+                let _ = set_source_page_title(&new_path, &stem_title);
+            }
+
+            renamed.push(RenameRecord {
+                kind: "source".to_string(),
+                from: relative_for_display(root, &path),
+                to: relative_for_display(root, &new_path),
+            });
+        }
+    }
+
+    let questions_dir = root.join("outputs/questions");
+    if questions_dir.exists() {
+        for entry in fs::read_dir(&questions_dir)
+            .with_context(|| format!("read {}", questions_dir.display()))?
+        {
+            let entry =
+                entry.with_context(|| format!("read entry in {}", questions_dir.display()))?;
+            let path = entry.path();
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Some((q_id, slug_portion)) = split_q_id_and_slug(name) else {
+                continue;
+            };
+            if !kb_core::slug_redundant_with_id(slug_portion, q_id) {
+                continue;
+            }
+            let new_name = q_id.to_string();
+            let new_path = questions_dir.join(&new_name);
+            if new_path.exists() {
+                continue;
+            }
+            fs::rename(&path, &new_path).with_context(|| {
+                format!("rename {} -> {}", path.display(), new_path.display())
+            })?;
+            renamed.push(RenameRecord {
+                kind: "question".to_string(),
+                from: relative_for_display(root, &path),
+                to: relative_for_display(root, &new_path),
+            });
+        }
+    }
+
+    Ok(renamed)
+}
+
+/// Split `src-<hash>-<slug>` into `("src-<hash>", "<slug>")`. Returns
+/// `None` for id-only stems (`src-<hash>` with no trailing `-`) because
+/// there's no slug to examine.
+///
+/// The src id prefix is always `src-` followed by a token of
+/// `[a-z0-9]+` (terseid uses lowercase alnum). That makes the split
+/// deterministic: the boundary is the second `-` in the stem.
+fn split_src_id_and_slug(stem: &str) -> Option<(&str, &str)> {
+    let rest = stem.strip_prefix("src-")?;
+    // Walk the first segment after `src-` until we hit a `-`.
+    let (id_body, slug) = rest.split_once('-')?;
+    if id_body.is_empty() || slug.is_empty() {
+        return None;
+    }
+    let id_end = "src-".len() + id_body.len();
+    let slug_start = id_end + 1;
+    Some((&stem[..id_end], &stem[slug_start..]))
+}
+
+/// Split `q-<hash>-<slug>` into `("q-<hash>", "<slug>")`. Mirror of
+/// [`split_src_id_and_slug`] for question directory names.
+fn split_q_id_and_slug(name: &str) -> Option<(&str, &str)> {
+    let rest = name.strip_prefix("q-")?;
+    let (id_body, slug) = rest.split_once('-')?;
+    if id_body.is_empty() || slug.is_empty() {
+        return None;
+    }
+    let id_end = "q-".len() + id_body.len();
+    let slug_start = id_end + 1;
+    Some((&name[..id_end], &name[slug_start..]))
+}
+
+/// Read `raw/inbox/<src_id>/source_document.json::stable_location`,
+/// extract the file stem via [`kb_core::file_stem_from_stable_location`],
+/// and return the stem. `None` when the `source_document.json` is missing
+/// or the `stable_location` is URL-shaped.
+fn read_ingest_filename_stem(root: &Path, src_id: &str) -> Option<String> {
+    let path = root
+        .join("raw/inbox")
+        .join(src_id)
+        .join("source_document.json");
+    let bytes = fs::read(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let stable_location = value.get("stable_location")?.as_str()?;
+    kb_core::file_stem_from_stable_location(stable_location)
+}
+
+/// Update the `title:` frontmatter field AND the managed
+/// `<!-- kb:begin id=title -->` block in a wiki source page to
+/// `new_title`. Preserves the rest of the file (other frontmatter
+/// fields, body content, managed regions) verbatim.
+///
+/// Best-effort: returns `Ok(())` when the file could be updated,
+/// `Err(_)` with context when it couldn't (missing file, malformed
+/// frontmatter, etc.). Callers should swallow errors — a failed
+/// title backfill is cosmetic, not a migration blocker.
+fn set_source_page_title(path: &Path, new_title: &str) -> Result<()> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read {}", path.display()))?;
+
+    let rest = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))
+        .ok_or_else(|| anyhow::anyhow!("no frontmatter block in {}", path.display()))?;
+
+    let mut yaml = String::new();
+    let mut body_start = 0usize;
+    let mut found_close = false;
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "---" {
+            body_start = (raw.len() - rest.len()) + yaml.len() + line.len();
+            found_close = true;
+            break;
+        }
+        yaml.push_str(line);
+    }
+    if !found_close {
+        anyhow::bail!("unterminated frontmatter in {}", path.display());
+    }
+
+    let mut parsed: serde_yaml::Value = serde_yaml::from_str(&yaml)
+        .with_context(|| format!("parse frontmatter in {}", path.display()))?;
+    if let Some(map) = parsed.as_mapping_mut() {
+        map.insert(
+            serde_yaml::Value::String("title".to_string()),
+            serde_yaml::Value::String(new_title.to_string()),
+        );
+    } else {
+        anyhow::bail!("frontmatter is not a mapping in {}", path.display());
+    }
+    let new_yaml = serde_yaml::to_string(&parsed)
+        .with_context(|| format!("serialize frontmatter for {}", path.display()))?;
+
+    let body = &raw[body_start..];
+    let new_body = kb_core::rewrite_managed_region(body, "title", &format!("\n{new_title}\n"))
+        .unwrap_or_else(|| body.to_string());
+
+    let new_markdown = format!("---\n{new_yaml}---\n{new_body}");
+    fs::write(path, new_markdown)
+        .with_context(|| format!("write {}", path.display()))?;
+    Ok(())
 }
 
 /// Regenerate backlinks after bn-nlw9 renames so concept pages' managed
@@ -617,6 +855,214 @@ build_record_id: build-1\n---\n\n# Source\n",
 
         assert!(src_dir.join("src-abc-existing-slug.md").exists());
         assert!(!src_dir.join("src-abc-something-else.md").exists());
+    }
+
+    // bn-6puc Phase C: repair stale double-id filenames produced by a
+    // previous bn-nlw9 run and backfill titles from the ingested stem.
+
+    fn write_source_document_record(
+        root: &Path,
+        src_id: &str,
+        stable_location: &str,
+    ) {
+        let dir = root.join("raw/inbox").join(src_id);
+        fs::create_dir_all(&dir).unwrap();
+        let payload = serde_json::json!({
+            "stable_location": stable_location,
+        });
+        fs::write(dir.join("source_document.json"), payload.to_string()).unwrap();
+    }
+
+    #[test]
+    fn migrate_phase_c_renames_double_id_source_to_id_only() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        // Simulate the bug: a source wiki page whose `title: src-1wz`
+        // produced `src-1wz-src-1wz.md` under bn-nlw9.
+        let src_dir = root.join("wiki/sources");
+        fs::create_dir_all(&src_dir).unwrap();
+        let stale_md =
+            "---\nid: wiki-source-src-1wz\ntype: source\ntitle: src-1wz\n\
+source_document_id: src-1wz\nsource_revision_id: rev-1\ngenerated_at: 0\n\
+build_record_id: build-1\n---\n\n# Source\n\
+<!-- kb:begin id=title -->\nsrc-1wz\n<!-- kb:end id=title -->\n";
+        fs::write(src_dir.join("src-1wz-src-1wz.md"), stale_md).unwrap();
+        // Corresponding ingest record so the title can be backfilled.
+        write_source_document_record(
+            root,
+            "src-1wz",
+            "/home/bob/kb/2026-04-07-LiveRamp-USB-team-intro.md",
+        );
+
+        run_migrate(root, false).unwrap();
+
+        assert!(
+            !src_dir.join("src-1wz-src-1wz.md").exists(),
+            "double-id source page must be renamed away"
+        );
+        // Phase C collapses to `src-1wz.md` and backfills the title;
+        // Phase B (same run) re-slugs to the final name.
+        let final_path =
+            src_dir.join("src-1wz-2026-04-07-liveramp-usb-team-intro.md");
+        assert!(
+            final_path.is_file(),
+            "expected final slugged source page at {}",
+            final_path.display(),
+        );
+        let body = fs::read_to_string(&final_path).unwrap();
+        assert!(
+            body.contains("title: 2026-04-07-LiveRamp-USB-team-intro"),
+            "frontmatter title must be backfilled from stem, got: {body}",
+        );
+        assert!(
+            body.contains("# Source"),
+            "body heading must be preserved, got: {body}",
+        );
+        // Managed title block must reflect the new title too.
+        assert!(
+            body.contains("<!-- kb:begin id=title -->"),
+            "managed title block preserved",
+        );
+        assert!(
+            body.contains("2026-04-07-LiveRamp-USB-team-intro\n<!-- kb:end id=title -->"),
+            "managed title block must be updated from stem, got: {body}",
+        );
+        assert!(!body.contains("\nsrc-1wz\n<!-- kb:end id=title -->"));
+    }
+
+    #[test]
+    fn migrate_phase_c_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let src_dir = root.join("wiki/sources");
+        fs::create_dir_all(&src_dir).unwrap();
+        let stale_md = "---\ntitle: src-abc\n---\n# Source\n";
+        fs::write(src_dir.join("src-abc-src-abc.md"), stale_md).unwrap();
+        write_source_document_record(root, "src-abc", "/tmp/hello.md");
+
+        run_migrate(root, false).unwrap();
+
+        // After the first run, Phase C collapsed the double into
+        // `src-abc.md` with the title backfilled to `hello` (from the
+        // stable_location `/tmp/hello.md`). Phase B then (in the same
+        // run, since C precedes B) saw the id-only file with a real
+        // title and re-slugged to `src-abc-hello.md` — the final form.
+        let final_path = src_dir.join("src-abc-hello.md");
+        assert!(
+            final_path.exists(),
+            "expected phase B to re-slug the backfilled file after phase C cleanup"
+        );
+        assert!(!src_dir.join("src-abc-src-abc.md").exists());
+        assert!(!src_dir.join("src-abc.md").exists());
+
+        // Second run: idempotent no-op — the artifact is already at its
+        // final slugged path.
+        run_migrate(root, false).unwrap();
+        assert!(final_path.exists());
+        assert!(!src_dir.join("src-abc-src-abc.md").exists());
+        assert!(!src_dir.join("src-abc.md").exists());
+    }
+
+    #[test]
+    fn migrate_phase_c_leaves_title_unchanged_when_no_stem_available() {
+        // URL-ingested or missing source_document.json — the rename still
+        // happens, but the title isn't backfilled.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let src_dir = root.join("wiki/sources");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("src-url-src-url.md"),
+            "---\ntitle: src-url\n---\n# Source\n",
+        )
+        .unwrap();
+        // URL stable_location: stem extraction returns None.
+        write_source_document_record(root, "src-url", "https://example.com/post");
+
+        run_migrate(root, false).unwrap();
+
+        assert!(src_dir.join("src-url.md").exists());
+        let body = fs::read_to_string(src_dir.join("src-url.md")).unwrap();
+        assert!(
+            body.contains("title: src-url"),
+            "title must fall through to the id when no stem is available: {body}",
+        );
+    }
+
+    #[test]
+    fn migrate_phase_c_renames_double_id_question_dirs() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let q_dir = root.join("outputs/questions/q-1xk-q-1xk");
+        fs::create_dir_all(&q_dir).unwrap();
+        fs::write(
+            q_dir.join("question.json"),
+            serde_json::json!({"raw_query": "q-1xk"}).to_string(),
+        )
+        .unwrap();
+
+        run_migrate(root, false).unwrap();
+
+        assert!(!root.join("outputs/questions/q-1xk-q-1xk").exists());
+        assert!(root.join("outputs/questions/q-1xk").is_dir());
+        // Second run is a no-op.
+        run_migrate(root, false).unwrap();
+        assert!(root.join("outputs/questions/q-1xk").is_dir());
+    }
+
+    #[test]
+    fn migrate_phase_c_skips_when_clean_already_exists() {
+        // Weird edge case: both forms are on disk. Phase C must refuse
+        // to clobber the clean id-only file — leave the stale one in
+        // place and let the user resolve manually.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let src_dir = root.join("wiki/sources");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("src-abc.md"), "---\ntitle: Real\n---\n").unwrap();
+        fs::write(
+            src_dir.join("src-abc-src-abc.md"),
+            "---\ntitle: src-abc\n---\n",
+        )
+        .unwrap();
+
+        run_migrate(root, false).unwrap();
+
+        // The stale double-id file must remain untouched — Phase C did
+        // not clobber. Phase B, seeing the clean `src-abc.md` id-only
+        // file with title `Real`, re-slugs it to `src-abc-real.md` in
+        // the same run.
+        assert!(
+            src_dir.join("src-abc-src-abc.md").exists(),
+            "Phase C must not clobber when the clean target already exists"
+        );
+        assert!(
+            src_dir.join("src-abc-real.md").exists(),
+            "Phase B must re-slug the clean id-only file"
+        );
+        // Only the original id-only form is gone.
+        assert!(!src_dir.join("src-abc.md").exists());
+    }
+
+    #[test]
+    fn migrate_phase_b_with_slug_equal_to_id_produces_id_only_not_double() {
+        // bn-6puc regression: if Phase B runs on a legacy id-only file whose
+        // title is `src-1wz`, the slug guard must skip the rename rather
+        // than produce `src-1wz-src-1wz.md`.
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        write_source_page(root, "src-1wz", "src-1wz");
+
+        run_migrate(root, false).unwrap();
+
+        assert!(
+            root.join("wiki/sources/src-1wz.md").exists(),
+            "id-only file must stay put when the slug would dup the id",
+        );
+        assert!(
+            !root.join("wiki/sources/src-1wz-src-1wz.md").exists(),
+            "phase B must never create a double-id filename",
+        );
     }
 
     #[test]

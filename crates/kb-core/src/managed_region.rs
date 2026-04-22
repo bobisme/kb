@@ -187,6 +187,71 @@ pub fn slug_for_filename(title: &str, max_chars: usize) -> String {
     truncated
 }
 
+/// Extract the filename stem from a `stable_location` string produced by
+/// the ingest pipeline.
+///
+/// Returns `None` when:
+///
+/// - `stable_location` is URL-shaped (`scheme://host/...`) — URL sources
+///   have no meaningful filesystem stem,
+/// - the path has no final component, or
+/// - the stem is empty after trimming.
+///
+/// Handles the repo-source form `git+<url>#<path>` by extracting the path
+/// after the fragment. Leaves the stem verbatim (no slug normalization)
+/// since callers pass it through [`slug_for_filename`] themselves.
+///
+/// bn-6puc: used as the "filename stem" fallback rung in the title
+/// extractor and by `kb migrate` to backfill titles on sources that only
+/// had the src id as title.
+#[must_use]
+pub fn file_stem_from_stable_location(stable_location: &str) -> Option<String> {
+    let path_segment: &str = if let Some(rest) = stable_location.strip_prefix("git+") {
+        rest.rsplit_once('#').map_or(rest, |(_, p)| p)
+    } else if stable_location.contains("://") {
+        return None;
+    } else {
+        stable_location
+    };
+
+    let stem = std::path::Path::new(path_segment)
+        .file_stem()
+        .and_then(|s| s.to_str())?
+        .trim();
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
+}
+
+/// `true` when `slug` either equals `id` or begins with `<id>-` — i.e.
+/// using `slug` as a suffix to `id` would produce an ugly id-duplicating
+/// filename such as `src-1wz-src-1wz-intro.md`.
+///
+/// bn-6puc: both the wiki source page writer and the question output dir
+/// writer hit this bug when the title/question-text slugifies to the id
+/// itself (e.g. a frontmatter `title: src-1wz` or a user asking a question
+/// that literally names the id). Callers should treat a `true` result as
+/// "drop the slug and keep the id-only filename".
+///
+/// Comparison is case-insensitive; both inputs are normally already
+/// ASCII-lowercased by [`slug_for_filename`], but normalizing here is
+/// cheap and protects against callers who skip the slugifier.
+#[must_use]
+pub fn slug_redundant_with_id(slug: &str, id: &str) -> bool {
+    if id.is_empty() {
+        return false;
+    }
+    let s = slug.to_ascii_lowercase();
+    let i = id.to_ascii_lowercase();
+    if s == i {
+        return true;
+    }
+    let prefix = format!("{i}-");
+    s.starts_with(&prefix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

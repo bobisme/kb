@@ -964,7 +964,13 @@ fn run_per_document_passes(
     for doc_id in stale_doc_ids {
         let doc = read_normalized_document(root, doc_id)
             .with_context(|| format!("read normalized document {doc_id}"))?;
-        let title = derive_title(&doc.canonical_text, doc_id);
+        // bn-6puc: before falling through to the src-id, prefer the ingested
+        // file's filename stem as a title when the body has no H1 and no
+        // frontmatter title. URL-ingested sources have no filesystem stem, so
+        // the stem helper returns `None` and we fall through to `doc_id` as
+        // before.
+        let stem_fallback = stable_location_file_stem(root, doc_id);
+        let title = derive_title(&doc.canonical_text, stem_fallback.as_deref(), doc_id);
         // New page path includes the title slug (bn-nlw9). Read any existing
         // page (id-only OR prior-slug form) so managed regions / frontmatter
         // from the previous compile still propagate into the new file.
@@ -1284,8 +1290,22 @@ fn run_concept_merge_from_state(
     })
 }
 
-/// Extract a human-readable title: first `# ` heading in canonical text, else `fallback_id`.
-fn derive_title(canonical_text: &str, fallback_id: &str) -> String {
+/// Extract a human-readable title with the following fallback order:
+///
+/// 1. The first `title:` line in a leading YAML frontmatter block (if any).
+/// 2. The first `# ` heading in the canonical text.
+/// 3. `stem_fallback` — the ingested file's filename stem (bn-6puc). URL
+///    ingests pass `None` here so step 4 applies instead.
+/// 4. `fallback_id` — the src id (last resort).
+///
+/// Note: the ingest pipeline strips YAML frontmatter from `canonical_text`
+/// before persisting, so step 1 is rarely hit in practice — it's there as
+/// defense against future paths that might preserve frontmatter and to make
+/// the fallback order explicit.
+fn derive_title(canonical_text: &str, stem_fallback: Option<&str>, fallback_id: &str) -> String {
+    if let Some(title) = frontmatter_title(canonical_text) {
+        return title;
+    }
     for line in canonical_text.lines() {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("# ") {
@@ -1295,7 +1315,54 @@ fn derive_title(canonical_text: &str, fallback_id: &str) -> String {
             }
         }
     }
+    if let Some(stem) = stem_fallback {
+        let trimmed = stem.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
     fallback_id.to_string()
+}
+
+/// Parse a leading YAML frontmatter block out of `text` and return the
+/// `title:` field, trimmed. Returns `None` when the text has no frontmatter,
+/// no `title:` key, or the title is empty after trimming.
+fn frontmatter_title(text: &str) -> Option<String> {
+    let rest = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))?;
+    let mut yaml = String::new();
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "---" {
+            break;
+        }
+        yaml.push_str(line);
+    }
+    let parsed: serde_yaml::Value = serde_yaml::from_str(&yaml).ok()?;
+    let title = parsed.get("title")?.as_str()?.trim().to_string();
+    if title.is_empty() { None } else { Some(title) }
+}
+
+/// Read the filename stem from `raw/inbox/<src_id>/source_document.json`'s
+/// `stable_location` field. Returns `None` when:
+///
+/// - the `source_document.json` is missing or malformed,
+/// - the `stable_location` is URL-shaped (`scheme://...`) — URL sources don't
+///   carry a meaningful filesystem stem, and
+/// - the stem is empty.
+///
+/// The stem is returned verbatim (preserving hyphens, case, and extension-
+/// less basename). Slug normalization happens later in the write path.
+fn stable_location_file_stem(root: &Path, src_id: &str) -> Option<String> {
+    let path = root
+        .join("raw/inbox")
+        .join(src_id)
+        .join("source_document.json");
+    let bytes = std::fs::read(&path).ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let stable_location = value.get("stable_location")?.as_str()?;
+    kb_core::file_stem_from_stable_location(stable_location)
 }
 
 /// Split body text out of a frontmatter-prefixed markdown document, returning None if
@@ -2678,5 +2745,144 @@ mod tests {
         let out = stderr_tail(&s);
         assert!(out.starts_with("..."));
         assert!(out.len() <= ERR_TAIL_BYTES + 3);
+    }
+
+    // bn-6puc Part 1: derive_title's four-rung fallback.
+
+    #[test]
+    fn derive_title_prefers_h1_heading() {
+        let title = derive_title("# Real Title\n\nBody.", Some("file-stem"), "src-abc");
+        assert_eq!(title, "Real Title");
+    }
+
+    #[test]
+    fn derive_title_prefers_frontmatter_title_over_h1() {
+        let text = "---\ntitle: Explicit Title\n---\n# H1 heading\n";
+        let title = derive_title(text, Some("file-stem"), "src-abc");
+        assert_eq!(title, "Explicit Title");
+    }
+
+    #[test]
+    fn derive_title_falls_back_to_file_stem_when_no_h1() {
+        // bn-6puc: body has no H1 (starts with H2/H3), no frontmatter — the
+        // filename stem is preferred over the src id.
+        let text = "## Sub heading\n\nBody starts here with a sub head.";
+        let title = derive_title(
+            text,
+            Some("2026-04-07-LiveRamp-USB-team-intro"),
+            "src-1wz",
+        );
+        assert_eq!(title, "2026-04-07-LiveRamp-USB-team-intro");
+    }
+
+    #[test]
+    fn derive_title_falls_back_to_id_when_no_stem() {
+        // URL-ingested source: `stem_fallback` is `None`, so step 4 applies.
+        let title = derive_title("## Just sub heads.", None, "src-1wz");
+        assert_eq!(title, "src-1wz");
+    }
+
+    #[test]
+    fn derive_title_skips_empty_stem() {
+        let title = derive_title("## Just sub heads.", Some("   "), "src-1wz");
+        assert_eq!(title, "src-1wz");
+    }
+
+    #[test]
+    fn derive_title_ignores_empty_h1_lines() {
+        // An empty `# ` line must not be returned as the title.
+        let text = "# \n\n# Actual\n";
+        let title = derive_title(text, Some("stem"), "src-abc");
+        assert_eq!(title, "Actual");
+    }
+
+    // bn-6puc: file_stem_from_stable_location coverage.
+
+    #[test]
+    fn file_stem_returns_basename_for_local_path() {
+        let stem = kb_core::file_stem_from_stable_location(
+            "/home/bob/notes/2026-04-07-LiveRamp-USB-team-intro.md",
+        );
+        assert_eq!(stem.as_deref(), Some("2026-04-07-LiveRamp-USB-team-intro"));
+    }
+
+    #[test]
+    fn file_stem_returns_none_for_url() {
+        let stem = kb_core::file_stem_from_stable_location("https://example.com/a/b");
+        assert_eq!(stem, None);
+    }
+
+    #[test]
+    fn file_stem_handles_repo_source_fragment() {
+        let stem = kb_core::file_stem_from_stable_location(
+            "git+https://github.com/foo/bar.git#notes/intro.md",
+        );
+        assert_eq!(stem.as_deref(), Some("intro"));
+    }
+
+    // bn-6puc Part 4 integration: end-to-end title fallback and filename.
+    // Ingest a note with no frontmatter title and no H1 → compile's source
+    // page must carry `title: <stem>` and land at `src-<id>-<slug-of-stem>.md`.
+    #[test]
+    fn compile_uses_file_stem_title_and_slugged_path_when_body_has_no_h1() {
+        use std::fs;
+
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        let src_id = "src-stem";
+        let stem = "2026-04-07-LiveRamp-USB-team-intro";
+        // Write a fake ingest record so derive_title can pick up the stem.
+        let inbox = root.join("raw/inbox").join(src_id);
+        fs::create_dir_all(&inbox).expect("mkdir inbox");
+        let sd = serde_json::json!({
+            "stable_location": format!("/tmp/{stem}.md"),
+        });
+        fs::write(inbox.join("source_document.json"), sd.to_string())
+            .expect("write source_document.json");
+
+        // Body has no H1 (starts with H2) — forces the stem fallback.
+        write_normalized_document(
+            root,
+            &test_doc(src_id, "## Sub heading\n\nBody text.\n"),
+        )
+        .expect("write normalized");
+
+        // Per-document passes (including source-page emission) require an
+        // adapter — use the in-test RecordingAdapter.
+        let adapter = RecordingAdapter::default();
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+            },
+            Some(&adapter),
+        )
+        .expect("compile");
+
+        // The written source page lives under the slugged form of the stem —
+        // NOT under `src-stem-src-stem.md`.
+        let expected =
+            root.join("wiki/sources/src-stem-2026-04-07-liveramp-usb-team-intro.md");
+        assert!(
+            expected.is_file(),
+            "expected slugged stem path at {}",
+            expected.display(),
+        );
+        let body = fs::read_to_string(&expected).expect("read page");
+        assert!(
+            body.contains(&format!("title: {stem}")),
+            "frontmatter title must be the stem, got: {body}",
+        );
+        // No double-id ugliness.
+        assert!(
+            !root.join("wiki/sources/src-stem-src-stem.md").exists(),
+            "compile must never emit a double-id source page filename",
+        );
     }
 }

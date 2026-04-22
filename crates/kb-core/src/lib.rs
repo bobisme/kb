@@ -441,7 +441,8 @@ pub use paths::{
 };
 pub use managed_region::{
     DEFAULT_FILENAME_SLUG_MAX_CHARS, ManagedRegion, extract_managed_regions,
-    rewrite_managed_region, slug_for_filename, slug_from_title,
+    file_stem_from_stable_location, rewrite_managed_region, slug_for_filename, slug_from_title,
+    slug_redundant_with_id,
 };
 pub use normalized::{read_normalized_document, write_normalized_document};
 pub use source_identity::{

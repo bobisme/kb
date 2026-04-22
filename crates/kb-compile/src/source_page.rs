@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::Result;
-use kb_core::{DEFAULT_FILENAME_SLUG_MAX_CHARS, rewrite_managed_region, slug_for_filename};
+use kb_core::{
+    DEFAULT_FILENAME_SLUG_MAX_CHARS, rewrite_managed_region, slug_for_filename,
+    slug_redundant_with_id,
+};
 use regex::Regex;
 use serde_yaml::{Mapping, Number, Value};
 
@@ -51,18 +54,25 @@ pub fn source_page_path_for_id(source_id: &str) -> PathBuf {
 /// Compute the destination path for a source wiki page.
 ///
 /// Either `wiki/sources/<src-id>-<slug>.md` (when the title slug is
-/// non-empty) or `wiki/sources/<src-id>.md` (when the title collapses to
-/// an empty slug).
+/// non-empty and doesn't already begin with the id) or
+/// `wiki/sources/<src-id>.md` (when the title collapses to an empty slug
+/// OR the slug is itself the id / starts with `<id>-`).
 ///
 /// `src_id` is used as the stable prefix (e.g. `src-1wz`); the slug is
 /// appended after `-` and derived from `title` via [`slug_for_filename`] with
 /// [`DEFAULT_FILENAME_SLUG_MAX_CHARS`]. Prefix-match lookups (`kb inspect
 /// src-1wz`) still resolve because the id is always the first segment.
+///
+/// bn-6puc guard: a title that slugifies to `src-<id>` (or `src-<id>-...`)
+/// would produce an ugly `wiki/sources/src-<id>-src-<id>.md` double.
+/// Detect that case and emit just `<src-id>.md` instead — the user can
+/// always write in a real title later, and a slug-equals-id outcome carries
+/// no additional human-readable information beyond the id itself.
 #[must_use]
 pub fn source_page_path_for(source_id: &str, title: &str) -> PathBuf {
     let id_slug = slug_for_path(source_id);
     let title_slug = slug_for_filename(title, DEFAULT_FILENAME_SLUG_MAX_CHARS);
-    let file_name = if title_slug.is_empty() {
+    let file_name = if title_slug.is_empty() || slug_redundant_with_id(&title_slug, &id_slug) {
         format!("{id_slug}.md")
     } else {
         format!("{id_slug}-{title_slug}.md")
@@ -611,6 +621,42 @@ mod tests {
     #[test]
     fn source_page_path_for_falls_back_to_id_when_title_all_symbols() {
         let path = source_page_path_for("src-1wz", "!!!");
+        assert_eq!(path, PathBuf::from("wiki/sources/src-1wz.md"));
+    }
+
+    // bn-6puc Part 2 / Part 4: the slug writer must guard against titles
+    // that slugify to the src id itself (or start with it). Emit the
+    // id-only form instead of a double like `src-1wz-src-1wz.md`.
+
+    #[test]
+    fn source_page_path_for_guards_against_title_equal_to_src_id() {
+        let path = source_page_path_for("src-1wz", "src-1wz");
+        assert_eq!(path, PathBuf::from("wiki/sources/src-1wz.md"));
+    }
+
+    #[test]
+    fn source_page_path_for_guards_against_title_starting_with_src_id() {
+        let path = source_page_path_for("src-1wz", "src-1wz extra notes");
+        assert_eq!(path, PathBuf::from("wiki/sources/src-1wz.md"));
+    }
+
+    #[test]
+    fn source_page_path_for_uses_stem_slug_when_title_is_real_filename() {
+        let path =
+            source_page_path_for("src-1wz", "2026-04-07-LiveRamp-USB-team-intro");
+        assert_eq!(
+            path,
+            PathBuf::from(
+                "wiki/sources/src-1wz-2026-04-07-liveramp-usb-team-intro.md",
+            )
+        );
+    }
+
+    /// Case-insensitivity: a title with mixed-case `SRC-1WZ` must also
+    /// collapse, because the slugifier lowercases before comparison.
+    #[test]
+    fn source_page_path_for_guards_against_uppercase_id_title() {
+        let path = source_page_path_for("src-1wz", "SRC-1WZ");
         assert_eq!(path, PathBuf::from("wiki/sources/src-1wz.md"));
     }
 

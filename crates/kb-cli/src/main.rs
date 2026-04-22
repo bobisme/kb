@@ -1819,7 +1819,12 @@ fn run_ask(
     // with the shared filename slugifier.
     let question_slug =
         kb_core::slug_for_filename(query, kb_core::DEFAULT_FILENAME_SLUG_MAX_CHARS);
-    let question_dir_name = if question_slug.is_empty() {
+    // bn-6puc guard: when the question text slugifies to `q-<id>` (or
+    // `q-<id>-...`) the suffix would just duplicate the id in the dir name.
+    // Fall back to the id-only form rather than emit `q-1xk-q-1xk-intro`.
+    let question_dir_name = if question_slug.is_empty()
+        || kb_core::slug_redundant_with_id(&question_slug, &question_id)
+    {
         question_id.clone()
     } else {
         format!("{question_id}-{question_slug}")
