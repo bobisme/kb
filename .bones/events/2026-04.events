@@ -1321,3 +1321,4 @@
 1777078128229446	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEt9wY		item.move	bn-146i	{"state":"doing"}	blake3:q8gHTdjiV-OFiOV1JvdfaWSyKRnJ10mSZVUPJbCpZBc
 1777078128237264	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEt-AY		item.assign	bn-146i	{"action":"assign","agent":"kb-dev"}	blake3:fovf-z_7iwwz5Ag7BETCEziC5sKpt2ZGkjfPeA8LvEo
 1777078942705091	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEt-QY		item.comment	bn-146i	{"body":"Implemented chief-facing kb JSON contract support in maw workspace bn-146i. Commit 8d3464a adds kb resolve --json, status freshness aliases, contract docs/schema policy, and integration snapshot coverage for resolve/status/ask dry-run/doctor. Validation: just check; cargo test -p kb-cli --test integration_tests."}	blake3:HpFC1u2Ql0uXIhdr8Z2BcqRyVsNiN7bR1eGUNoI8snU
+1777079108659849	kb-dev	itc:v3:AWLJ58k-Zk8zEAAAAAAAQde-r7a9sAAAAAEt-gY		item.move	bn-146i	{"state":"done"}	blake3:9ztQRddemfJSQUA1nT-Hg_0oPhrRvR5j7M2u1wtiT1k
