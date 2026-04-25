@@ -334,6 +334,15 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    // Best-effort: register sqlite-vec as a process-wide auto-extension
+    // before any DB connection is opened so semantic search can use the
+    // indexed KNN fast path. A failure here (extension disabled via
+    // KB_SQLITE_VEC_AUTO=0, or auto-extension registration rejected) is
+    // not fatal — semantic search falls back to a pure-Rust cosine path.
+    if let Err(err) = kb_sqlite_vec::register_auto_extension() {
+        tracing::debug!("sqlite-vec auto-extension unavailable: {err}");
+    }
+
     let cli = Cli::parse();
 
     if let Err(err) = run(cli) {
@@ -640,7 +649,7 @@ fn run(cli: Cli) -> Result<()> {
             let search_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            let index = kb_query::LexicalIndex::load(search_root)?;
+            let cfg = config::Config::load_from_root(search_root, None)?;
             let limit = limit.unwrap_or(10);
 
             // Detect the "query reduced entirely to stopwords" case before
@@ -649,7 +658,7 @@ fn run(cli: Cli) -> Result<()> {
             // error.
             if kb_query::query_reduced_to_stopwords(&query) {
                 if cli.json {
-                    let empty: Vec<kb_query::SearchResult> = Vec::new();
+                    let empty: Vec<kb_query::HybridResult> = Vec::new();
                     emit_json("search", &empty)?;
                 } else {
                     println!(
@@ -659,7 +668,12 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            let results = index.search(&query, limit);
+            let results = kb_query::hybrid_search_with_options(
+                search_root,
+                &query,
+                limit,
+                cfg.retrieval.to_hybrid_options(),
+            )?;
             if cli.json {
                 emit_json("search", &results)?;
             } else if results.is_empty() {
@@ -673,8 +687,11 @@ fn run(cli: Cli) -> Result<()> {
                 }
             } else {
                 for result in &results {
-                    println!("{} [score: {}]", result.title, result.score);
-                    println!("  {}", result.id);
+                    println!(
+                        "{} [score: {:.4}]",
+                        result.title, result.score
+                    );
+                    println!("  {}", result.item_id);
                     for reason in &result.reasons {
                         println!("    reason: {reason}");
                     }
@@ -1783,8 +1800,12 @@ fn run_ask(
         .into());
     }
 
-    let retrieval_plan =
-        kb_query::LexicalIndex::load(root)?.plan_retrieval(query, cfg.ask.token_budget, root);
+    let retrieval_plan = kb_query::plan_retrieval_hybrid(
+        root,
+        query,
+        cfg.ask.token_budget,
+        cfg.retrieval.to_hybrid_options(),
+    )?;
 
     if dry_run {
         if json {
@@ -4028,6 +4049,10 @@ struct StatusPayload {
     wiki_pages: usize,
     concepts: usize,
     stale_count: usize,
+    /// Snapshot of the semantic embedding store, populated when
+    /// `.kb/state/embeddings.db` exists. Both fields are 0 on a fresh kb
+    /// that has not been compiled.
+    semantic_index: SemanticIndexStatus,
     recent_jobs: Vec<JobRun>,
     /// Failed job runs, capped at `FAILED_JOBS_DISPLAY_LIMIT` most recent.
     failed_jobs: Vec<JobRun>,
@@ -4219,12 +4244,25 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     let changed_inputs_not_compiled = changed_scan.entries;
     let sources_with_missing_origin = find_missing_origins(root)?;
 
+    // Best-effort: a missing/locked embedding DB doesn't fail status.
+    let semantic_index = match kb_query::semantic_index_stats(root) {
+        Ok(stats) => SemanticIndexStatus {
+            embeddings: stats.embeddings,
+            stale: stats.stale,
+        },
+        Err(err) => {
+            tracing::debug!("semantic index status unavailable: {err}");
+            SemanticIndexStatus::default()
+        }
+    };
+
     Ok(StatusPayload {
         normalized_source_count,
         sources: source_counts,
         wiki_pages,
         concepts,
         stale_count,
+        semantic_index,
         recent_jobs,
         failed_jobs,
         failed_jobs_total,
@@ -4233,6 +4271,13 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
         changed_inputs_not_compiled,
         sources_with_missing_origin,
     })
+}
+
+/// Semantic index summary surfaced by `kb status`.
+#[derive(Debug, Default, Serialize)]
+struct SemanticIndexStatus {
+    embeddings: usize,
+    stale: usize,
 }
 
 /// Walk `normalized/*/` and flag every source whose recorded
@@ -4625,6 +4670,10 @@ fn print_status(status: &StatusPayload) {
     }
     println!("wiki concept pages: {}", status.concepts);
     println!("stale artifacts: {}", status.stale_count);
+    println!(
+        "semantic index: {} embeddings, {} stale",
+        status.semantic_index.embeddings, status.semantic_index.stale
+    );
     println!();
 
     if !status.changed_inputs_not_compiled.is_empty() {

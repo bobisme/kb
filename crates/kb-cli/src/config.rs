@@ -6,7 +6,11 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
 /// Top-level CLI configuration parsed from `kb.toml`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// `Eq` is intentionally not derived: the `[retrieval]` section carries
+/// `f32` thresholds which have no total ordering. `PartialEq` is preserved
+/// for tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -17,6 +21,7 @@ pub struct Config {
     pub publish: PublishConfig,
     pub lock: LockConfig,
     pub ingest: IngestConfig,
+    pub retrieval: RetrievalConfig,
 }
 
 impl Config {
@@ -133,6 +138,10 @@ impl Config {
 
         if let Ok(timeout_ms) = env::var("KB_LOCK_TIMEOUT_MS") {
             self.lock.timeout_ms = parse_u64_var("KB_LOCK_TIMEOUT_MS", &timeout_ms)?;
+        }
+
+        if let Ok(raw) = env::var("KB_SEMANTIC") {
+            self.retrieval.semantic = parse_bool_var("KB_SEMANTIC", &raw)?;
         }
 
         Ok(self)
@@ -364,6 +373,46 @@ impl Default for LockConfig {
         // workloads without hanging forever on a truly stuck holder.
         Self {
             timeout_ms: 600_000,
+        }
+    }
+}
+
+/// `[retrieval]` section of `kb.toml`. Tunes the hybrid retrieval pipeline
+/// added in bn-3qsj.
+///
+/// `semantic = false` short-circuits the semantic tier, producing
+/// lexical-only results indistinguishable from the pre-hybrid behavior.
+/// The `KB_SEMANTIC=0` env var overrides this at runtime — useful when
+/// debugging fusion regressions without touching the file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct RetrievalConfig {
+    pub semantic: bool,
+    pub rrf_k: usize,
+    pub min_semantic_score: f32,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        Self {
+            semantic: true,
+            rrf_k: kb_query::RRF_K,
+            min_semantic_score: kb_query::MIN_SEMANTIC_SCORE,
+        }
+    }
+}
+
+impl RetrievalConfig {
+    /// Translate the parsed config into the runtime [`HybridOptions`] the
+    /// `kb-query` crate consumes. The two types are kept separate so
+    /// `kb-query` doesn't depend on `toml` / `serde` config plumbing.
+    #[must_use]
+    pub const fn to_hybrid_options(&self) -> kb_query::HybridOptions {
+        kb_query::HybridOptions {
+            semantic_enabled: self.semantic,
+            rrf_k: self.rrf_k,
+            min_semantic_score: self.min_semantic_score,
         }
     }
 }

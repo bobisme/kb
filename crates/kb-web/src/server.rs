@@ -10,7 +10,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use kb_query::{LexicalIndex, SearchResult};
+use kb_query::{HybridOptions, HybridResult, LexicalIndex};
 use serde::Deserialize;
 
 use crate::markdown;
@@ -198,13 +198,25 @@ async fn search_handler(
         return axum::Json(SearchResponse { results: Vec::new() }).into_response();
     }
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
-    let results = state.index().search(&query, limit);
+    let results = match kb_query::hybrid_search_with_index(
+        state.root(),
+        state.index(),
+        &query,
+        limit,
+        HybridOptions::default(),
+    ) {
+        Ok(hits) => hits,
+        Err(err) => {
+            tracing::warn!("hybrid search failed, falling back to empty: {err:#}");
+            Vec::new()
+        }
+    };
     axum::Json(SearchResponse { results }).into_response()
 }
 
 #[derive(serde::Serialize)]
 struct SearchResponse {
-    results: Vec<SearchResult>,
+    results: Vec<HybridResult>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -20,6 +20,12 @@ const WEIGHT_ALIAS: usize = 3;
 const WEIGHT_HEADING: usize = 2;
 const WEIGHT_SUMMARY: usize = 1;
 const DEFAULT_RETRIEVAL_TOP_K: usize = 25;
+
+/// Soft cap on semantic-only tail candidates in hybrid retrieval.
+///
+/// Kept as a separate constant so a future change to the lexical default
+/// doesn't silently change hybrid behavior.
+pub const DEFAULT_RETRIEVAL_TOP_K_FOR_HYBRID: usize = DEFAULT_RETRIEVAL_TOP_K;
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const MIN_ENTRY_TOKEN_ESTIMATE: u32 = 32;
 
@@ -102,7 +108,12 @@ pub struct SearchResult {
 }
 
 /// A persisted retrieval plan for a question.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is intentionally not derived: candidates may carry an
+/// `Option<f32>` semantic score which has no total ordering. Direct
+/// equality comparison was never used on `RetrievalPlan` outside tests
+/// asserting individual fields.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalPlan {
     pub query: String,
     pub token_budget: u32,
@@ -116,13 +127,31 @@ pub struct RetrievalPlan {
 }
 
 /// A ranked candidate selected for retrieval.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The legacy `score` field is the lexical score used by `LexicalIndex`'s
+/// scoring loop. Hybrid retrieval populates the additional optional
+/// `semantic_score` / `semantic_rank` / `lexical_rank` fields and surfaces
+/// the per-tier reasons through `reasons`. JSON consumers that pre-date
+/// the hybrid layer continue to round-trip cleanly thanks to
+/// `skip_serializing_if = "Option::is_none"`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RetrievalCandidate {
     pub id: String,
     pub title: String,
     pub score: usize,
     pub estimated_tokens: u32,
     pub reasons: Vec<String>,
+    /// Semantic similarity score in `[0, 1]`. Set by the hybrid layer when
+    /// a candidate participated in the semantic ranked list. `None` for
+    /// lexical-only or fallback-added candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_score: Option<f32>,
+    /// 1-indexed rank in the semantic ranked list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_rank: Option<usize>,
+    /// 1-indexed rank in the lexical ranked list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexical_rank: Option<usize>,
 }
 
 /// A budgeted context payload assembled from retrieval candidates.
@@ -305,6 +334,9 @@ impl LexicalIndex {
                 score: analysis.score,
                 estimated_tokens: entry_tokens,
                 reasons: analysis.reasons,
+                semantic_score: None,
+                semantic_rank: None,
+                lexical_rank: None,
             });
         }
 
@@ -386,6 +418,9 @@ fn append_low_coverage_fallback(
             score: 0,
             estimated_tokens: tokens,
             reasons: vec![FALLBACK_CANDIDATE_REASON.to_string()],
+            semantic_score: None,
+            semantic_rank: None,
+            lexical_rank: None,
         });
     };
 
@@ -438,6 +473,20 @@ fn collect_fallback_source_summaries(root: &Path) -> Vec<String> {
     entries.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     entries.truncate(FALLBACK_SOURCE_SUMMARY_LIMIT);
     entries.into_iter().map(|(_, _, rel)| rel).collect()
+}
+
+/// Public token estimator for the hybrid layer. Mirrors the
+/// `estimate_path_tokens` heuristic so semantic-only tail candidates
+/// budget identically to fallback candidates.
+#[must_use]
+pub fn estimate_path_tokens_for_hybrid(path: &Path) -> u32 {
+    estimate_path_tokens(path)
+}
+
+/// Public fallback-title resolver for the hybrid layer.
+#[must_use]
+pub fn fallback_title_for_hybrid(path: &Path, rel_id: &str) -> String {
+    fallback_title_for(path, rel_id)
 }
 
 /// Estimate token usage for a file on disk using the same ~4-chars-per-token
@@ -1333,6 +1382,9 @@ mod tests {
                 score: 10,
                 estimated_tokens: 20,
                 reasons: vec!["title matched 'ownership' 1x (+4)".to_string()],
+                semantic_score: None,
+                semantic_rank: None,
+                lexical_rank: None,
             }],
             fallback_reason: None,
         };
@@ -1396,6 +1448,9 @@ mod tests {
                 score: 10,
                 estimated_tokens: 20,
                 reasons: vec!["summary matched 'borrowing' 1x (+1)".to_string()],
+                semantic_score: None,
+                semantic_rank: None,
+                lexical_rank: None,
             }],
             fallback_reason: None,
         };

@@ -556,7 +556,8 @@ mod tests {
                 score: 10,
                 estimated_tokens: 500,
                 reasons: vec!["title match".into()],
-            }],
+            ..Default::default()
+                }],
             fallback_reason: None,
         }
     }
@@ -924,6 +925,7 @@ mod tests {
                     score: 10,
                     estimated_tokens: 128,
                     reasons: vec![],
+                ..Default::default()
                 },
                 crate::RetrievalCandidate {
                     id: "wiki/concepts/ownership.md".into(),
@@ -931,6 +933,7 @@ mod tests {
                     score: 8,
                     estimated_tokens: 128,
                     reasons: vec![],
+                ..Default::default()
                 },
             ],
             fallback_reason: None,
@@ -990,6 +993,7 @@ mod tests {
     /// sources the model actually cited, not the entire retrieval scope. The
     /// full scope remains available under `retrieval_candidates` for audit.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn source_document_ids_narrows_to_cited_sources_only() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
@@ -1013,6 +1017,7 @@ mod tests {
                     score: 10,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
                 crate::RetrievalCandidate {
                     id: "wiki/sources/beta.md".into(),
@@ -1020,6 +1025,7 @@ mod tests {
                     score: 9,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
                 crate::RetrievalCandidate {
                     id: "wiki/sources/gamma.md".into(),
@@ -1027,6 +1033,7 @@ mod tests {
                     score: 8,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
                 crate::RetrievalCandidate {
                     id: "wiki/sources/delta.md".into(),
@@ -1034,6 +1041,7 @@ mod tests {
                     score: 7,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
             ],
             fallback_reason: None,
@@ -1164,7 +1172,8 @@ mod tests {
                 score: 10,
                 estimated_tokens: 100,
                 reasons: vec![],
-            }],
+            ..Default::default()
+                }],
             fallback_reason: None,
         };
 
@@ -1222,6 +1231,7 @@ mod tests {
                     score: 10,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
                 crate::RetrievalCandidate {
                     id: "wiki/sources/two.md".into(),
@@ -1229,6 +1239,7 @@ mod tests {
                     score: 9,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
                 crate::RetrievalCandidate {
                     id: "wiki/sources/three.md".into(),
@@ -1236,6 +1247,7 @@ mod tests {
                     score: 8,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
                 crate::RetrievalCandidate {
                     id: "wiki/sources/four.md".into(),
@@ -1243,6 +1255,7 @@ mod tests {
                     score: 7,
                     estimated_tokens: 100,
                     reasons: vec![],
+                ..Default::default()
                 },
             ],
             fallback_reason: None,

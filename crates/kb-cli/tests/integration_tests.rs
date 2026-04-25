@@ -399,7 +399,16 @@ fn ask_persists_ranked_retrieval_plan_after_compile() {
         retrieval_plan.get("fallback_reason").is_none(),
         "fallback_reason should be absent on strong-match plan, got: {retrieval_plan:?}",
     );
-    assert_eq!(candidates.len(), 4);
+    // Hybrid retrieval can append semantic-only tail candidates beyond the
+    // four lexical hits. The first four positions still belong to the
+    // lexical scoring (because lexical-tier hits sort in front of zero-
+    // scored semantic-only entries), so we assert presence of all four
+    // expected lexical candidates rather than an exact count.
+    assert!(
+        candidates.len() >= 4,
+        "expected >=4 candidates, got {}",
+        candidates.len()
+    );
     assert_eq!(candidates[0]["id"], "wiki/concepts/borrow-checker.md");
     let first_score = candidates[0]["score"].as_u64().expect("first score");
     let second_score = candidates[1]["score"].as_u64().expect("second score");
@@ -2686,13 +2695,25 @@ fn search_with_json_output() {
     assert!(!results.is_empty(), "should have search results");
 
     let first = &results[0];
+    // bn-3qsj: search now returns HybridResult, which carries `item_id`
+    // (matching the lexical+semantic store) instead of the legacy `id`
+    // SearchResult field. `score` is now an f32 RRF score, not a bare
+    // lexical count, but the field is still present.
     assert!(
-        first.get("id").is_some() && first.get("title").is_some() && first.get("score").is_some(),
-        "JSON results should have id, title, and score fields: {first}"
+        first.get("item_id").is_some()
+            && first.get("title").is_some()
+            && first.get("score").is_some(),
+        "JSON results should have item_id, title, and score fields: {first}"
     );
     assert!(
         first.get("reasons").is_some(),
         "JSON results should include reasons field: {first}"
+    );
+    // Hybrid result also exposes per-tier ranks so the user can see
+    // which tier matched.
+    assert!(
+        first.get("lexical_rank").is_some() || first.get("semantic_rank").is_some(),
+        "JSON results should expose at least one of lexical_rank/semantic_rank: {first}"
     );
 }
 
@@ -7827,4 +7848,275 @@ fn migrate_json_emits_rename_records() {
             .unwrap_or("")
             .ends_with("src-abc-short-title.md")
     );
+}
+
+// ---------------------------------------------------------------------------
+// bn-3qsj: hybrid retrieval coverage
+// ---------------------------------------------------------------------------
+
+/// Build a small fixture corpus where the relevant source uses **different
+/// vocabulary** from the query. Lexical search alone would miss the right
+/// page because the query word ("login") never appears in the body; the
+/// page is about "credential-exchange protocol stuff" instead. A working
+/// hybrid retrieval surfaces it via the semantic tier.
+fn write_paraphrase_fixture(root: &Path) {
+    // src-cred is the relevant page. Its body uses the morphological
+    // sibling "authn" (and its variants "authenticate", "authenticated")
+    // throughout — the query word "authentication" tokenizes apart from
+    // "authn", so the lexical tier alone misses it. The hash-embed
+    // backend is morphology-aware (its 3..=5-char n-grams overlap on
+    // "auth"), so the semantic tier is what surfaces this page.
+    write_source_page(
+        root,
+        "src-cred",
+        "Authn token flow",
+        "Service issues a signed authn token on a successful authenticate \
+         call. The caller presents the authn token on each request; the \
+         server runs an authenticate verify before accepting. Authn token \
+         rotation happens once per hour. Authn pack contents include \
+         issuer, subject, expiry. Authenticated callers stay authenticated \
+         for the token lifetime.",
+    );
+    // Decoys: completely unrelated subject matter. Avoid the literal
+    // "auth" prefix entirely so the n-gram overlap with the query is
+    // negligible.
+    write_source_page(
+        root,
+        "src-frontend",
+        "Frontend rendering pipeline",
+        "Pixel buffer composition, vertex transforms, and rasterization \
+         routines. Shaders compile to a vendor-specific bytecode then run \
+         on the GPU.",
+    );
+    write_source_page(
+        root,
+        "src-billing",
+        "Billing pipeline overview",
+        "Invoice generation, ledger reconciliation, and tax engine \
+         integration. Currency conversion happens at the edge.",
+    );
+}
+
+#[test]
+fn compile_populates_embedding_db_and_second_compile_is_no_op() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_paraphrase_fixture(&kb_root);
+
+    // First compile should populate .kb/state/embeddings.db.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("compile");
+    let output = cmd.output().expect("compile 1");
+    assert!(
+        output.status.success(),
+        "first compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let db_path = kb_root.join(".kb/state/embeddings.db");
+    assert!(
+        db_path.exists(),
+        "kb compile must populate {}",
+        db_path.display()
+    );
+
+    let initial_size = fs::metadata(&db_path).expect("stat db").len();
+    assert!(initial_size > 0, "embedding db should not be empty");
+
+    // Second compile with no changes is essentially free for embeddings —
+    // every page hash matches and no row is rewritten.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("compile");
+    let output = cmd.output().expect("compile 2");
+    assert!(
+        output.status.success(),
+        "second compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after_size = fs::metadata(&db_path).expect("stat db 2").len();
+    assert_eq!(
+        initial_size, after_size,
+        "second compile changed embedding db size: {initial_size} -> {after_size}"
+    );
+}
+
+#[test]
+fn search_paraphrased_query_beats_lexical_only_via_semantic_tier() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_paraphrase_fixture(&kb_root);
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    let output = compile_cmd.output().expect("compile");
+    assert!(output.status.success(), "compile failed");
+
+    // The fixture's relevant page uses "authn" / "authenticate" — the
+    // query word "authentication" never appears verbatim. Pure-lexical
+    // retrieval misses it (different tokens); hybrid catches it via the
+    // hash-embed backend's character-n-gram overlap on "auth".
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("search").arg("authentication").arg("--json");
+    let output = cmd.output().expect("hybrid search");
+    assert!(
+        output.status.success(),
+        "search failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value =
+        serde_json::from_slice(&output.stdout).expect("hybrid search returns json");
+    let results = envelope["data"]
+        .as_array()
+        .expect("data array")
+        .clone();
+    assert!(
+        !results.is_empty(),
+        "hybrid search should find the credential-exchange page despite vocab mismatch"
+    );
+    let top = &results[0];
+    assert!(
+        top["item_id"]
+            .as_str()
+            .is_some_and(|id| id.contains("src-cred")),
+        "expected the credential-exchange source on top, got: {top}"
+    );
+    // Reasons list should explicitly cite the semantic tier.
+    let reasons = top["reasons"].as_array().expect("reasons array");
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.as_str().is_some_and(|t| t.contains("semantic match"))),
+        "top hit should have a semantic-tier reason: {top}"
+    );
+}
+
+#[test]
+fn search_with_kb_semantic_disabled_falls_back_to_lexical_only() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_paraphrase_fixture(&kb_root);
+    write_source_page(
+        &kb_root,
+        "src-creds-keyword",
+        "Authentication overview",
+        "This page contains the literal word authentication so the \
+         lexical tier finds it on its own without help from the \
+         semantic tier.",
+    );
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    assert!(compile_cmd.output().expect("compile").status.success());
+
+    // With KB_SEMANTIC=0, hybrid reduces to lexical-only — no semantic
+    // reasons should appear on any result.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("KB_SEMANTIC", "0");
+    cmd.arg("search").arg("authentication").arg("--json");
+    let output = cmd.output().expect("disabled search");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("json envelope");
+    let results = envelope["data"]
+        .as_array()
+        .expect("data array")
+        .clone();
+    assert!(
+        !results.is_empty(),
+        "lexical-only should still surface the keyword page"
+    );
+    for r in &results {
+        let reasons = r["reasons"].as_array().expect("reasons");
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| !reason.as_str().is_some_and(|t| t.contains("semantic match"))),
+            "semantic match should not appear when KB_SEMANTIC=0; got: {r}"
+        );
+    }
+}
+
+#[test]
+fn search_with_sqlite_vec_disabled_uses_rust_cosine_fallback_with_same_top_k() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_paraphrase_fixture(&kb_root);
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    assert!(compile_cmd.output().expect("compile").status.success());
+
+    let run_search = |env: Option<(&str, &str)>| -> Vec<String> {
+        let mut cmd = kb_cmd(&kb_root);
+        if let Some((k, v)) = env {
+            cmd.env(k, v);
+        }
+        cmd.arg("search").arg("authentication").arg("--json");
+        let output = cmd.output().expect("search");
+        assert!(output.status.success());
+        let envelope: Value = serde_json::from_slice(&output.stdout).expect("json");
+        envelope["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .filter_map(|r| r["item_id"].as_str().map(str::to_owned))
+            .collect()
+    };
+
+    let with_extension = run_search(None);
+    let without_extension = run_search(Some(("KB_SQLITE_VEC_AUTO", "0")));
+    assert_eq!(
+        with_extension, without_extension,
+        "KB_SQLITE_VEC_AUTO=0 should produce identical top-K via Rust cosine fallback"
+    );
+}
+
+#[test]
+fn forget_eagerly_drops_embedding_row_for_source() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Ingest + stub a wiki source page so we have something forget can act
+    // on, then sync the embedding pipeline directly. This avoids a full
+    // `kb compile` (which would need an LLM to do per-doc passes); the
+    // embedding sync only needs the wiki page on disk.
+    let source = kb_root.join("seed.md");
+    fs::write(&source, "# hi\n\nbody\n").expect("write source");
+    let src_id = ingest_single_and_get_src_id(&kb_root, &source);
+    stub_wiki_source_page(&kb_root, &src_id);
+
+    let backend = kb_query::HashEmbedBackend::new();
+    kb_query::sync_embeddings(&kb_root, &backend).expect("sync embeddings");
+
+    let db_path = kb_root.join(".kb/state/embeddings.db");
+    assert!(db_path.exists(), "embedding store should exist after sync");
+    let conn = rusqlite::Connection::open(&db_path).expect("open db");
+    let pre_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM item_embeddings WHERE item_id = ?1",
+            rusqlite::params![format!("wiki/sources/{src_id}.md")],
+            |row| row.get(0),
+        )
+        .expect("pre count");
+    assert_eq!(pre_count, 1, "embedding row should exist for {src_id}");
+    drop(conn);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--force").arg("forget").arg(&src_id);
+    let output = cmd.output().expect("run kb forget");
+    assert!(
+        output.status.success(),
+        "kb forget failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Eager: row gone before any subsequent compile runs.
+    let conn = rusqlite::Connection::open(&db_path).expect("reopen db");
+    let post_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM item_embeddings WHERE item_id = ?1",
+            rusqlite::params![format!("wiki/sources/{src_id}.md")],
+            |row| row.get(0),
+        )
+        .expect("post count");
+    assert_eq!(post_count, 0, "kb forget must eagerly drop the embedding row");
 }

@@ -242,7 +242,9 @@ async fn search_returns_json_results() {
         .and_then(|v| v.as_array())
         .expect("results array");
     assert!(!results.is_empty(), "expected at least one hit");
-    assert_eq!(results[0]["id"], "wiki/concepts/rust.md");
+    // bn-3qsj: `/search` now returns HybridResult, which uses `item_id`
+    // (matching the lexical+semantic store) instead of the legacy `id`.
+    assert_eq!(results[0]["item_id"], "wiki/concepts/rust.md");
 }
 
 #[tokio::test]

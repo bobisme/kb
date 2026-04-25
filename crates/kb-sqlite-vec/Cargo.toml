@@ -1,0 +1,14 @@
+[package]
+name = "kb-sqlite-vec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SQLite vector extension loader for semantic search in kb"
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }

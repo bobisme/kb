@@ -689,6 +689,18 @@ pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<ExecuteOutcome> {
         }
     };
 
+    // bn-3qsj step 5: eagerly drop the forgotten source's embedding row
+    // (per design-doc open question 1, "eager forget"). The next compile
+    // would prune it lazily anyway, but eager is cheaper to reason about
+    // and avoids a forget→search window where stale semantic hits would
+    // still surface. Missing embedding DB is fine — fresh kbs that never
+    // ran compile have nothing to drop.
+    if let Err(err) = drop_embedding_for_src(root, &plan.src_id) {
+        eprintln!(
+            "warning: embedding row drop failed after forget: {err:#}"
+        );
+    }
+
     Ok(ExecuteOutcome {
         backlinks_refreshed,
         cascade_refresh: CascadeRefresh {
@@ -698,6 +710,37 @@ pub fn execute(root: &Path, plan: &ForgetPlan) -> Result<ExecuteOutcome> {
             graph_nodes_pruned,
         },
     })
+}
+
+/// Open the embedding store and delete the wiki source's row.
+///
+/// The embedding row is keyed by `wiki/sources/<filename>.md`, where
+/// `<filename>` is the on-disk filename for the source (which may include
+/// a slug suffix). We discover it by listing surviving wiki source pages
+/// that begin with `<src_id>` — there should be at most one. After the
+/// trash move ran above, the source's wiki page is already gone, so we
+/// look for it via the trash bucket too as a fallback.
+fn drop_embedding_for_src(root: &Path, src_id: &str) -> Result<()> {
+    use rusqlite::params;
+    let db_path = kb_query::embedding_db_path(root);
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let conn = rusqlite::Connection::open(&db_path)
+        .with_context(|| format!("open embedding db {}", db_path.display()))?;
+    // Match either the bare `wiki/sources/<src_id>.md` form or the
+    // slugged `wiki/sources/<src_id>-<slug>.md` form. SQLite GLOB makes
+    // the prefix match readable.
+    let pattern_bare = format!("wiki/sources/{src_id}.md");
+    let pattern_slug = format!("wiki/sources/{src_id}-*.md");
+    conn.execute(
+        "DELETE FROM item_embeddings
+         WHERE item_id = ?1
+            OR item_id GLOB ?2",
+        params![pattern_bare, pattern_slug],
+    )
+    .with_context(|| format!("delete embedding for {src_id}"))?;
+    Ok(())
 }
 
 /// Load `state/graph.json`, remove every node referencing `src_id`, and

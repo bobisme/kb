@@ -7,6 +7,7 @@ members = [
     "crates/kb-lint",
     "crates/kb-llm",
     "crates/kb-query",
+    "crates/kb-sqlite-vec",
     "crates/kb-web",
 ]
 resolver = "2"
@@ -29,9 +30,11 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 ignore = "0.4"
 regex = "1"
+rusqlite = { version = "0.30", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+sqlite-vec = "0.1.7-alpha.10"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 toml = "0.8"
@@ -47,4 +50,5 @@ kb-ingest = { path = "crates/kb-ingest" }
 kb-compile = { path = "crates/kb-compile" }
 kb-query = { path = "crates/kb-query" }
 kb-lint = { path = "crates/kb-lint" }
+kb-sqlite-vec = { path = "crates/kb-sqlite-vec" }
 kb-web = { path = "crates/kb-web" }

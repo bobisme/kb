@@ -459,6 +459,12 @@ pub fn run_compile_with_llm(
                 ],
             },
         ));
+        passes.push((
+            "embedding_sync".to_string(),
+            PassStatus::DryRun {
+                would_process: vec!["wiki/**/*.md".to_string()],
+            },
+        ));
 
         return Ok(CompileReport {
             total_sources,
@@ -659,6 +665,32 @@ pub fn run_compile_with_llm(
             affected: index_count,
         },
     ));
+
+    // Pass: embedding sync. Walks wiki pages, hashes the embed input, and
+    // re-embeds anything stale into .kb/state/embeddings.db. Idempotent —
+    // unchanged pages skip the embed call entirely. A failure here is
+    // logged but does not fail the compile: the lexical index is the
+    // primary signal and hybrid retrieval degrades cleanly when the
+    // embedding store is missing or partial.
+    match kb_query::sync_embeddings(root, &kb_query::HashEmbedBackend::new()) {
+        Ok(stats) => {
+            passes.push((
+                "embedding_sync".to_string(),
+                PassStatus::Executed {
+                    affected: stats.embedded.saturating_add(stats.removed),
+                },
+            ));
+        }
+        Err(err) => {
+            tracing::warn!("embedding sync pass failed: {err:#}");
+            passes.push((
+                "embedding_sync".to_string(),
+                PassStatus::Skipped {
+                    reason: format!("error: {err}"),
+                },
+            ));
+        }
+    }
 
     // Persist updated hash state (only when we computed one)
     if let Some(state) = &hash_state {

@@ -284,7 +284,8 @@ mod tests {
             score: 10,
             estimated_tokens: 100,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         let images = resolve_candidate_image_paths(root, &plan);
         assert_eq!(images.len(), 1, "one image resolved: {images:?}");
@@ -310,7 +311,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         let images = resolve_candidate_image_paths(root, &plan);
         assert!(images.is_empty(), "no images from URLs: {images:?}");
@@ -331,7 +333,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         let images = resolve_candidate_image_paths(root, &plan);
         assert!(images.is_empty());
@@ -365,6 +368,7 @@ mod tests {
                 score: 3,
                 estimated_tokens: 10,
                 reasons: Vec::new(),
+            ..Default::default()
             },
             RetrievalCandidate {
                 id: "wiki/sources/src-b.md".to_string(),
@@ -372,6 +376,7 @@ mod tests {
                 score: 2,
                 estimated_tokens: 10,
                 reasons: Vec::new(),
+            ..Default::default()
             },
         ]);
 
@@ -405,7 +410,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         let images = resolve_candidate_image_paths(root, &plan);
         assert_eq!(images.len(), MAX_IMAGES_PER_QUERY);
@@ -427,6 +433,7 @@ mod tests {
                 score: 1,
                 estimated_tokens: 10,
                 reasons: Vec::new(),
+            ..Default::default()
             },
             RetrievalCandidate {
                 id: "wiki/concepts/b.md".to_string(),
@@ -434,6 +441,7 @@ mod tests {
                 score: 1,
                 estimated_tokens: 10,
                 reasons: Vec::new(),
+            ..Default::default()
             },
         ]);
 
@@ -454,7 +462,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         assert!(!plan_mentions_images(root, &plan));
     }
@@ -492,7 +501,8 @@ mod tests {
             score: 10,
             estimated_tokens: 100,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         assert!(
             plan_mentions_images(root, &plan),
@@ -549,7 +559,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         let images = resolve_candidate_image_paths(root, &plan);
         assert_eq!(
@@ -596,6 +607,7 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
+            ..Default::default()
         }]);
 
         assert!(
@@ -631,7 +643,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         assert!(plan_mentions_images(root, &plan));
         let images = resolve_candidate_image_paths(root, &plan);
@@ -693,7 +706,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         assert!(
             plan_mentions_images(root, &plan),
@@ -727,7 +741,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         let images = resolve_candidate_image_paths(root, &plan);
         assert_eq!(images.len(), 1);
@@ -753,7 +768,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         let images = resolve_candidate_image_paths(root, &plan);
         assert!(images.is_empty(), "URL in angle-brackets still skipped: {images:?}");
@@ -779,7 +795,8 @@ mod tests {
             score: 1,
             estimated_tokens: 10,
             reasons: Vec::new(),
-        }]);
+        ..Default::default()
+            }]);
 
         assert!(
             plan_mentions_images(root, &plan),
