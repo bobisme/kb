@@ -3370,7 +3370,9 @@ fn doctor_returns_zero_when_all_checks_pass() {
     let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse doctor json");
     assert_eq!(envelope["schema_version"], 1);
     assert_eq!(envelope["command"], "doctor");
+    insta::assert_snapshot!("doctor_envelope_keys", sorted_object_keys(&envelope));
     let payload = &envelope["data"];
+    insta::assert_snapshot!("doctor_data_keys", sorted_object_keys(payload));
     assert_eq!(payload["status"], "ok");
     assert_eq!(payload["exit_code"], 0);
     assert_eq!(payload["error_count"], 0);
@@ -3483,6 +3485,7 @@ fn ask_dry_run_prints_retrieval_plan_without_calling_llm() {
     assert!(plan["query"].is_string());
     assert!(plan["token_budget"].is_number());
     assert!(plan["candidates"].is_array());
+    insta::assert_snapshot!("ask_dry_run_data_keys", sorted_object_keys(plan));
 
     let outputs_dir = kb_root.join("outputs/questions");
     if outputs_dir.exists() {
@@ -3501,6 +3504,110 @@ fn ask_dry_run_prints_retrieval_plan_without_calling_llm() {
             entries.len()
         );
     }
+}
+
+#[test]
+fn status_json_exposes_chief_freshness_contract_fields() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    let source = kb_root.join("chief-contract.md");
+    fs::write(&source, "# Chief Contract\n\nProvider fields.\n").expect("write source");
+
+    let mut ingest_cmd = kb_cmd(&kb_root);
+    ingest_cmd.arg("ingest").arg(&source);
+    let ingest_output = ingest_cmd.output().expect("run kb ingest");
+    assert!(
+        ingest_output.status.success(),
+        "ingest failed: {}",
+        String::from_utf8_lossy(&ingest_output.stderr)
+    );
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    let compile_output = compile_cmd.output().expect("run kb compile");
+    assert!(
+        compile_output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    let mut status_cmd = kb_cmd(&kb_root);
+    status_cmd.arg("--json").arg("status");
+    let output = status_cmd.output().expect("run kb status");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse status json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "status");
+    let data = &envelope["data"];
+    assert_eq!(data["total_sources"], data["normalized_source_count"]);
+    assert_eq!(data["stale_sources"], data["stale_count"]);
+    assert!(
+        data["wiki_page_count"].as_u64().expect("wiki_page_count") >= data["wiki_pages"]
+            .as_u64()
+            .expect("wiki_pages")
+    );
+    assert!(
+        data["last_compile_at_millis"].is_number(),
+        "last compile timestamp should be present after compile: {data}"
+    );
+}
+
+#[test]
+fn resolve_json_resolves_kb_uri_with_metadata() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_concept_page(&kb_root, "borrow-checker", "Borrow checker", &["borrowck"]);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("resolve")
+        .arg("kb://wiki/concepts/borrow-checker.md");
+    let output = cmd.output().expect("run kb resolve");
+    assert!(
+        output.status.success(),
+        "resolve failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse resolve json");
+    assert_eq!(envelope["schema_version"], 1);
+    assert_eq!(envelope["command"], "resolve");
+    insta::assert_snapshot!("resolve_envelope_keys", sorted_object_keys(&envelope));
+    insta::assert_snapshot!("resolve_data_keys", sorted_object_keys(&envelope["data"]));
+
+    let data = &envelope["data"];
+    assert_eq!(data["target"], "wiki/concepts/borrow-checker.md");
+    assert_eq!(data["stable_id"], "concept:borrow-checker");
+    assert_eq!(data["current_path"], "wiki/concepts/borrow-checker.md");
+    assert_eq!(data["title"], "Borrow checker");
+    assert!(data["content_hash"].is_string());
+    assert_eq!(data["broken"], false);
+    assert_eq!(data["kind"], "wiki_page");
+}
+
+#[test]
+fn resolve_json_reports_broken_kb_uri_without_failing() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json")
+        .arg("resolve")
+        .arg("kb://wiki/concepts/missing.md");
+    let output = cmd.output().expect("run kb resolve missing");
+    assert!(
+        output.status.success(),
+        "broken references should be represented in JSON rather than command failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse resolve json");
+    assert_eq!(envelope["command"], "resolve");
+    let data = &envelope["data"];
+    assert_eq!(data["target"], "wiki/concepts/missing.md");
+    assert_eq!(data["broken"], true);
+    assert_eq!(data["freshness"], "missing");
+    assert!(data["broken_reason"].is_string());
 }
 
 #[test]

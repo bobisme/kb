@@ -24,7 +24,7 @@ use config::{Config, LlmRunnerConfig};
 use kb_compile::Graph;
 use kb_core::{
     Artifact, ArtifactKind, EntityMetadata, JobRun, JobRunStatus, Question, QuestionContext,
-    ReviewItem, ReviewKind, ReviewStatus, Status, hash_many, normalized_dir, normalized_rel,
+    ReviewItem, ReviewKind, ReviewStatus, Status, hash_file, hash_many, normalized_dir, normalized_rel,
     slug_from_title, state_dir,
 };
 use kb_llm::{
@@ -205,6 +205,12 @@ enum Command {
         /// Document or entity to inspect
         #[arg(required = true)]
         target: String,
+    },
+    /// Resolve a kb:// artifact reference to its current KB location
+    Resolve {
+        /// Artifact reference, e.g. <kb://wiki/concepts/runway.md>
+        #[arg(required = true)]
+        uri: String,
     },
     /// Remove an ingested source (moves files into `trash/` for safety)
     Forget {
@@ -704,6 +710,12 @@ fn run(cli: Cli) -> Result<()> {
                 .as_deref()
                 .expect("root resolved for non-init commands");
             run_inspect(root, &target, cli.json, trace)
+        }
+        Some(Command::Resolve { uri }) => {
+            let root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            run_resolve(root, &uri, cli.json)
         }
         Some(Command::Forget { target, no_cascade }) => {
             let forget_root = root
@@ -2788,7 +2800,202 @@ struct InspectTraceNode {
     inputs: Vec<Self>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[derive(Debug, Serialize)]
+struct ResolveReport {
+    uri: String,
+    target: String,
+    stable_id: Option<String>,
+    current_path: Option<String>,
+    title: Option<String>,
+    content_hash: Option<String>,
+    freshness: String,
+    broken: bool,
+    broken_reason: Option<String>,
+    kind: Option<String>,
+}
+
+fn run_resolve(root: &Path, uri: &str, json: bool) -> Result<()> {
+    let target = kb_uri_target(uri)?;
+    let report = if let Some(reason) = path_outside_root(root, &target) {
+        ResolveReport {
+            uri: uri.to_string(),
+            target,
+            stable_id: None,
+            current_path: None,
+            title: None,
+            content_hash: None,
+            freshness: "missing".to_string(),
+            broken: true,
+            broken_reason: Some(format!(
+                "target is outside the KB root ({reason}); resolve only accepts kb:// references under {}",
+                root.display()
+            )),
+            kind: None,
+        }
+    } else {
+        match build_inspect_report_for_target(root, &target) {
+            Ok(report) => resolve_report_from_inspect(root, uri, &target, &report),
+            Err(err) => ResolveReport {
+                uri: uri.to_string(),
+                target,
+                stable_id: None,
+                current_path: None,
+                title: None,
+                content_hash: None,
+                freshness: "missing".to_string(),
+                broken: true,
+                broken_reason: Some(err.to_string()),
+                kind: None,
+            },
+        }
+    };
+
+    if json {
+        emit_json("resolve", &report)?;
+    } else {
+        println!("{}", render_resolve_report(&report));
+    }
+    Ok(())
+}
+
+fn kb_uri_target(uri: &str) -> Result<String> {
+    let Some(rest) = uri.strip_prefix("kb://") else {
+        bail!("resolve: URI must start with kb://");
+    };
+    let no_fragment = rest.split_once('#').map_or(rest, |(head, _)| head);
+    let no_query = no_fragment
+        .split_once('?')
+        .map_or(no_fragment, |(head, _)| head);
+    let target = no_query.trim_start_matches('/').trim();
+    if target.is_empty() {
+        bail!("resolve: kb:// URI target cannot be empty");
+    }
+    Ok(target.to_string())
+}
+
+fn resolve_report_from_inspect(
+    root: &Path,
+    uri: &str,
+    target: &str,
+    report: &InspectReport,
+) -> ResolveReport {
+    let current_path = report.metadata.file_path.clone();
+    let file_path = current_path.as_deref().map(|path| root.join(path));
+    let (frontmatter, body) = file_path
+        .as_ref()
+        .and_then(|path| path.is_file().then_some(path))
+        .and_then(|path| kb_core::frontmatter::read_frontmatter(path).ok())
+        .map_or_else(
+            || (serde_yaml::Mapping::new(), String::new()),
+            |(frontmatter, body)| (frontmatter, body),
+        );
+    let stable_id = frontmatter_string(&frontmatter, "id")
+        .or_else(|| frontmatter_string(&frontmatter, "source_document_id"))
+        .or_else(|| current_path.as_deref().and_then(stable_id_from_path))
+        .or_else(|| stable_id_from_resolved_id(&report.resolved_id));
+    let title = frontmatter_string(&frontmatter, "title")
+        .or_else(|| frontmatter_string(&frontmatter, "name"))
+        .or_else(|| first_markdown_heading(&body))
+        .or_else(|| current_path.as_deref().and_then(title_from_path));
+    let content_hash = file_path
+        .as_ref()
+        .and_then(|path| path.is_file().then_some(path))
+        .and_then(|path| hash_file(path).ok())
+        .map(|hash| hash.to_hex());
+
+    ResolveReport {
+        uri: uri.to_string(),
+        target: target.to_string(),
+        stable_id,
+        current_path,
+        title,
+        content_hash,
+        freshness: report.freshness.clone(),
+        broken: !report.metadata.exists_on_disk || report.freshness == "missing",
+        broken_reason: if report.metadata.exists_on_disk {
+            None
+        } else {
+            Some("resolved target does not exist on disk".to_string())
+        },
+        kind: Some(report.kind.clone()),
+    }
+}
+
+fn frontmatter_string(frontmatter: &serde_yaml::Mapping, key: &str) -> Option<String> {
+    frontmatter
+        .get(serde_yaml::Value::String(key.to_string()))
+        .and_then(serde_yaml::Value::as_str)
+        .map(str::to_string)
+}
+
+fn stable_id_from_path(path: &str) -> Option<String> {
+    let stem = Path::new(path).file_stem()?.to_str()?;
+    if let Some(rest) = stem.strip_prefix("src-") {
+        let suffix = rest.split_once('-').map_or(rest, |(id, _)| id);
+        return Some(format!("src-{suffix}"));
+    }
+    if let Some(rest) = stem.strip_prefix("q-") {
+        let suffix = rest.split_once('-').map_or(rest, |(id, _)| id);
+        return Some(format!("q-{suffix}"));
+    }
+    if path.starts_with("wiki/concepts/") && !stem.is_empty() {
+        return Some(stem.to_string());
+    }
+    None
+}
+
+fn stable_id_from_resolved_id(id: &str) -> Option<String> {
+    if is_source_id(id) || id.starts_with("q-") || id.starts_with("build:") {
+        Some(id.to_string())
+    } else {
+        None
+    }
+}
+
+fn first_markdown_heading(body: &str) -> Option<String> {
+    body.lines()
+        .find_map(|line| line.trim_start().strip_prefix("# "))
+        .map(str::trim)
+        .filter(|heading| !heading.is_empty())
+        .map(str::to_string)
+}
+
+fn title_from_path(path: &str) -> Option<String> {
+    Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(str::to_string)
+}
+
+fn render_resolve_report(report: &ResolveReport) -> String {
+    [
+        format!("uri: {}", report.uri),
+        format!("target: {}", report.target),
+        format!(
+            "stable_id: {}",
+            report.stable_id.as_deref().unwrap_or("(none)")
+        ),
+        format!(
+            "current_path: {}",
+            report.current_path.as_deref().unwrap_or("(none)")
+        ),
+        format!("title: {}", report.title.as_deref().unwrap_or("(none)")),
+        format!(
+            "content_hash: {}",
+            report.content_hash.as_deref().unwrap_or("(none)")
+        ),
+        format!("freshness: {}", report.freshness),
+        format!("broken: {}", report.broken),
+        format!(
+            "broken_reason: {}",
+            report.broken_reason.as_deref().unwrap_or("(none)")
+        ),
+        format!("kind: {}", report.kind.as_deref().unwrap_or("(none)")),
+    ]
+    .join("\n")
+}
+
 fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()> {
     if target.trim().is_empty() {
         bail!("inspect: target cannot be empty");
@@ -2802,116 +3009,12 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
         bail!("'{target}' is outside the KB root ({reason}); inspect only accepts ids or paths under {}", root.display());
     }
 
-    let graph = Graph::load_from(root)?;
-    let hash_state = kb_compile::HashState::load_from_root(root)?;
-    let changed_inputs = find_changed_inputs(root, &hash_state)?;
-    let jobs = jobs::recent_jobs(root, 1_000)?;
-
-    let mut report = if let Some(path) = resolve_source_id(root, target) {
-        // I1: bare `src-<hex>` identifiers resolve to their wiki/sources page
-        // (preferred) or their normalized/<id>/source.md.
-        build_file_report(
-            root,
-            target,
-            &path,
-            &jobs,
-            &graph,
-            &changed_inputs,
-            &hash_state,
-        )?
-    } else if let Some(id) = graph.resolve_node_id(target) {
-        build_graph_inspect_report(root, &graph, target, &id, &changed_inputs, &jobs)?
-    } else if let Some(record) = kb_core::load_build_record(root, target)? {
-        build_build_record_report(root, target, &record, &jobs)?
-    } else if let Some(job) = jobs.iter().find(|job| job.metadata.id == target) {
-        build_job_report(target, job)
-    } else {
-        let candidate = root.join(target);
-        let resolved = if candidate.exists() {
-            Some(candidate)
-        } else {
-            resolve_wiki_missing_md(root, target)
-        };
-        if let Some(path) = resolved {
-            build_file_report(
-                root,
-                target,
-                &path,
-                &jobs,
-                &graph,
-                &changed_inputs,
-                &hash_state,
-            )?
-        } else {
-            let frontmatter_matches = find_by_frontmatter_id(root, target);
-            match frontmatter_matches.len() {
-                1 => {
-                    let path = &frontmatter_matches[0];
-                    build_file_report(
-                        root,
-                        target,
-                        path,
-                        &jobs,
-                        &graph,
-                        &changed_inputs,
-                        &hash_state,
-                    )?
-                }
-                0 => {
-                    // bn-1525: last-resort short-prefix resolution. If `target`
-                    // is a partial id (e.g. `src-a7` for `src-a7x3q9`), delegate
-                    // to `id_resolve`, which tries src → concept → question and
-                    // propagates an ambiguity error verbatim when two full ids
-                    // share the prefix. Ambiguity here ALWAYS wins over "not
-                    // found" even if a later kind would uniquely match — users
-                    // who typed a prefix expect "longer prefix, please", not a
-                    // silent fall-through.
-                    match id_resolve::resolve(root, target) {
-                        Ok(resolved) => build_report_for_resolved(
-                            root,
-                            target,
-                            &resolved,
-                            &jobs,
-                            &graph,
-                            &changed_inputs,
-                            &hash_state,
-                        )?,
-                        Err(err) => {
-                            let msg = err.to_string();
-                            if msg.contains("ambiguous") {
-                                // Short-circuit: re-raise the candidate list
-                                // instead of the generic "was not found"
-                                // message.
-                                return Err(err);
-                            }
-                            bail!(
-                                "'{target}' was not found. Try an exact ID, a unique prefix (e.g. 'src-a7' for 'src-a7x3q9'), a unique graph suffix, a build record ID, a job ID, a frontmatter id, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
-                            );
-                        }
-                    }
-                }
-                _ => {
-                    let paths: Vec<String> = frontmatter_matches
-                        .iter()
-                        .map(|path| {
-                            path.strip_prefix(root)
-                                .unwrap_or(path)
-                                .to_string_lossy()
-                                .into_owned()
-                        })
-                        .collect();
-                    bail!(
-                        "'{target}' is ambiguous - matches multiple files: [{}]. Pass the full path to disambiguate.",
-                        paths.join(", ")
-                    );
-                }
-            }
-        }
-    };
+    let mut report = build_inspect_report_for_target(root, target)?;
 
     if trace {
         if let Some(graph_data) = &report.graph {
             let _ = graph_data;
+            let graph = Graph::load_from(root)?;
             report.trace = Some(build_trace(&graph, &report.resolved_id, &mut std::collections::BTreeSet::new()));
         } else {
             report.trace = Some(Vec::new());
@@ -2925,6 +3028,119 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_inspect_report_for_target(root: &Path, target: &str) -> Result<InspectReport> {
+    let graph = Graph::load_from(root)?;
+    let hash_state = kb_compile::HashState::load_from_root(root)?;
+    let changed_inputs = find_changed_inputs(root, &hash_state)?;
+    let jobs = jobs::recent_jobs(root, 1_000)?;
+
+    if let Some(path) = resolve_source_id(root, target) {
+        // I1: bare `src-<hex>` identifiers resolve to their wiki/sources page
+        // (preferred) or their normalized/<id>/source.md.
+        return build_file_report(
+            root,
+            target,
+            &path,
+            &jobs,
+            &graph,
+            &changed_inputs,
+            &hash_state,
+        );
+    }
+    if let Some(id) = graph.resolve_node_id(target) {
+        return build_graph_inspect_report(root, &graph, target, &id, &changed_inputs, &jobs);
+    }
+    if let Some(record) = kb_core::load_build_record(root, target)? {
+        return build_build_record_report(root, target, &record, &jobs);
+    }
+    if let Some(job) = jobs.iter().find(|job| job.metadata.id == target) {
+        return Ok(build_job_report(target, job));
+    }
+
+    let candidate = root.join(target);
+    let resolved = if candidate.exists() {
+        Some(candidate)
+    } else {
+        resolve_wiki_missing_md(root, target)
+    };
+    if let Some(path) = resolved {
+        return build_file_report(
+            root,
+            target,
+            &path,
+            &jobs,
+            &graph,
+            &changed_inputs,
+            &hash_state,
+        );
+    }
+
+    let frontmatter_matches = find_by_frontmatter_id(root, target);
+    match frontmatter_matches.len() {
+        1 => {
+            let path = &frontmatter_matches[0];
+            build_file_report(
+                root,
+                target,
+                path,
+                &jobs,
+                &graph,
+                &changed_inputs,
+                &hash_state,
+            )
+        }
+        0 => {
+            // bn-1525: last-resort short-prefix resolution. If `target`
+            // is a partial id (e.g. `src-a7` for `src-a7x3q9`), delegate
+            // to `id_resolve`, which tries src → concept → question and
+            // propagates an ambiguity error verbatim when two full ids
+            // share the prefix. Ambiguity here ALWAYS wins over "not
+            // found" even if a later kind would uniquely match — users
+            // who typed a prefix expect "longer prefix, please", not a
+            // silent fall-through.
+            match id_resolve::resolve(root, target) {
+                Ok(resolved) => build_report_for_resolved(
+                    root,
+                    target,
+                    &resolved,
+                    &jobs,
+                    &graph,
+                    &changed_inputs,
+                    &hash_state,
+                ),
+                Err(err) => {
+                    let msg = err.to_string();
+                    if msg.contains("ambiguous") {
+                        // Short-circuit: re-raise the candidate list
+                        // instead of the generic "was not found"
+                        // message.
+                        return Err(err);
+                    }
+                    bail!(
+                        "'{target}' was not found. Try an exact ID, a unique prefix (e.g. 'src-a7' for 'src-a7x3q9'), a unique graph suffix, a build record ID, a job ID, a frontmatter id, or a path under the KB root. Run 'kb compile' first if the dependency graph has not been created yet."
+                    );
+                }
+            }
+        }
+        _ => {
+            let paths: Vec<String> = frontmatter_matches
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(root)
+                        .unwrap_or(path)
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            bail!(
+                "'{target}' is ambiguous - matches multiple files: [{}]. Pass the full path to disambiguate.",
+                paths.join(", ")
+            );
+        }
+    }
 }
 
 fn build_graph_inspect_report(
@@ -4041,6 +4257,14 @@ struct LintCheckReport {
 }
 #[derive(Debug, Serialize)]
 struct StatusPayload {
+    /// Chief-facing alias for the total number of ingested source roots.
+    total_sources: usize,
+    /// Chief-facing alias for sources whose compiled wiki artifacts are stale.
+    stale_sources: usize,
+    /// Chief-facing count of generated wiki pages known from disk.
+    wiki_page_count: usize,
+    /// Most recent successful compile completion/start time, if recorded.
+    last_compile_at_millis: Option<u64>,
     /// Count of ingested sources discovered under `normalized/<id>/`.
     normalized_source_count: usize,
     /// Wiki source pages (`wiki-page-*` nodes referencing a source document),
@@ -4154,6 +4378,7 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     // source — so we keep it in lockstep with the disk-walked total.
     let wiki_pages = source_counts.total;
     let concepts = count_wiki_concept_pages(root)?;
+    let wiki_page_count = wiki_pages + concepts;
 
     // bn-2m2: `stale_count` now reflects the primary user-visible staleness
     // signal — ingested sources whose wiki page is out of date relative to
@@ -4243,6 +4468,10 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
 
     let changed_inputs_not_compiled = changed_scan.entries;
     let sources_with_missing_origin = find_missing_origins(root)?;
+    let last_compile_at_millis = all_jobs
+        .iter()
+        .filter(|job| job.command == "compile" && job.status == JobRunStatus::Succeeded)
+        .find_map(|job| job.ended_at_millis.or(Some(job.started_at_millis)));
 
     // Best-effort: a missing/locked embedding DB doesn't fail status.
     let semantic_index = match kb_query::semantic_index_stats(root) {
@@ -4257,6 +4486,10 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     };
 
     Ok(StatusPayload {
+        total_sources: normalized_source_count,
+        stale_sources: stale_count,
+        wiki_page_count,
+        last_compile_at_millis,
         normalized_source_count,
         sources: source_counts,
         wiki_pages,

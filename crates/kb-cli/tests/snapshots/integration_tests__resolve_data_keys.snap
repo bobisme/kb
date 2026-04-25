@@ -1,0 +1,5 @@
+---
+source: crates/kb-cli/tests/integration_tests.rs
+expression: "sorted_object_keys(&envelope[\"data\"])"
+---
+broken, broken_reason, content_hash, current_path, freshness, kind, stable_id, target, title, uri

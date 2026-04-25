@@ -1,0 +1,5 @@
+---
+source: crates/kb-cli/tests/integration_tests.rs
+expression: sorted_object_keys(payload)
+---
+checks, error_count, exit_code, status, warning_count

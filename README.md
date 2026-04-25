@@ -102,6 +102,7 @@ kb ask --promote             queue the answer for wiki/questions/
 kb chat                      interactive opencode session with read-only KB agent
 kb search <term>             lexical search with explainable scoring
 kb inspect <id|path>         show metadata, citations, build records
+kb resolve <kb-uri>          resolve kb:// artifact references for tools
 kb lint [--strict]           broken-links, orphans, stale-revision, missing-citations, duplicate-concepts
 kb review list|show|approve|reject
 kb forget <src-id>           remove a source (cascade: concepts, indexes, graph, lexical)

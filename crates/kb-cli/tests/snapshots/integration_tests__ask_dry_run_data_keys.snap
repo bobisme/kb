@@ -1,0 +1,5 @@
+---
+source: crates/kb-cli/tests/integration_tests.rs
+expression: sorted_object_keys(plan)
+---
+candidates, estimated_tokens, fallback_reason, query, token_budget

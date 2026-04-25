@@ -101,6 +101,43 @@ Normal run:
 }
 ```
 
+### `kb status --json`
+
+```json
+{
+  "total_sources": 24,
+  "stale_sources": 2,
+  "wiki_page_count": 90,
+  "last_compile_at_millis": 1777000000000,
+  "normalized_source_count": 24,
+  "sources": {
+    "total": 24,
+    "by_kind": {
+      "file": 24
+    }
+  },
+  "wiki_pages": 24,
+  "concepts": 66,
+  "stale_count": 2,
+  "semantic_index": {
+    "embeddings": 90,
+    "stale": 0
+  },
+  "recent_jobs": [],
+  "failed_jobs": [],
+  "failed_jobs_total": 0,
+  "interrupted_jobs": [],
+  "interrupted_jobs_total": 0,
+  "changed_inputs_not_compiled": [],
+  "sources_with_missing_origin": []
+}
+```
+
+Chief-facing freshness aliases are intentionally redundant with older fields:
+`total_sources == normalized_source_count`, `stale_sources == stale_count`, and
+`wiki_page_count == wiki_pages + concepts`. `last_compile_at_millis` is `null`
+when no successful compile job has been recorded.
+
 ### `kb search --json`
 
 `data` is an array of result objects (empty array when no results or no index):
@@ -147,6 +184,32 @@ Normal run:
 `"artifact"`, `"question"`, `"build_record"`, `"job_run"`, `"entity"`.
 
 `freshness` values: `"fresh"`, `"stale"`, `"missing"`, `"unknown"`.
+
+### `kb resolve <kb-uri> --json`
+
+`resolve` accepts `kb://` artifact references and returns the current target
+metadata without requiring callers to read KB internals. Broken references are
+represented in the payload with `broken: true` and still use exit code 0 so
+doctor-style consumers can report every broken citation in one pass.
+
+```json
+{
+  "uri": "kb://wiki/concepts/example.md",
+  "target": "wiki/concepts/example.md",
+  "stable_id": "concept:example",
+  "current_path": "wiki/concepts/example.md",
+  "title": "Example",
+  "content_hash": "b3...",
+  "freshness": "fresh",
+  "broken": false,
+  "broken_reason": null,
+  "kind": "wiki_page"
+}
+```
+
+`stable_id`, `current_path`, `title`, `content_hash`, and `kind` are nullable
+when the reference is broken or the KB has no stable identity for the artifact.
+`content_hash` is the current BLAKE3 hash of the resolved on-disk file.
 
 ### `kb lint --json`
 
@@ -202,8 +265,14 @@ Normal run:
 
 `exit_code` values: `0` (ok), `1` (warnings), `2` (errors).
 
-## Breaking-change policy
+## Schema version policy
 
-Breaking changes to any `data` field (rename, type change, field removal) bump
-`schema_version`. Adding new optional fields is **not** a breaking change.
-Consumers should treat unknown fields as ignorable.
+`schema_version` is the compatibility contract for chief-facing JSON. Breaking
+changes to the envelope or any documented `data` field (rename, type change,
+required field removal, or semantic change that invalidates old parsers) bump
+`schema_version`.
+
+Adding new optional fields is **not** a breaking change. Consumers should treat
+unknown fields as ignorable and accept the current schema version plus N-1 where
+they have an adapter. New fields that duplicate older fields as aliases must stay
+consistent with the older field for the lifetime of the schema version.
