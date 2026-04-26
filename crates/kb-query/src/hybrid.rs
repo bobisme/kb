@@ -438,8 +438,32 @@ pub fn plan_retrieval_hybrid(
             semantic_score: Some(hit.score),
             semantic_rank: Some(i + 1),
             lexical_rank: None,
+            fused_score: None,
         });
     }
+
+    // Step 4: compute fused RRF score per candidate from its (lexical_rank,
+    // semantic_rank) pair, then sort by it. Without this the plan would
+    // keep the lexical-only order even though the candidate set has been
+    // augmented with semantic-only tail hits — confusing for users who
+    // see `semantic match (rank 1, score 0.59)` on a candidate sitting
+    // below several lower-ranked lexical-only entries.
+    for candidate in &mut plan.candidates {
+        let lex = candidate
+            .lexical_rank
+            .map_or(0.0, |r| rank_to_score(r, RRF_K));
+        let sem = candidate
+            .semantic_rank
+            .map_or(0.0, |r| rank_to_score(r, RRF_K));
+        candidate.fused_score = Some(lex + sem);
+    }
+    plan.candidates.sort_by(|a, b| {
+        b.fused_score
+            .unwrap_or(0.0)
+            .partial_cmp(&a.fused_score.unwrap_or(0.0))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.id.cmp(&b.id))
+    });
 
     Ok(plan)
 }

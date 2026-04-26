@@ -1830,10 +1830,17 @@ fn run_ask(
             );
             println!("Candidates ({}):", retrieval_plan.candidates.len());
             for candidate in &retrieval_plan.candidates {
-                println!(
-                    "  {} [score: {}, ~{} tokens]",
-                    candidate.id, candidate.score, candidate.estimated_tokens
-                );
+                if let Some(fused) = candidate.fused_score {
+                    println!(
+                        "  {} [score: {fused:.4} (fused), ~{} tokens]",
+                        candidate.id, candidate.estimated_tokens
+                    );
+                } else {
+                    println!(
+                        "  {} [score: {}, ~{} tokens]",
+                        candidate.id, candidate.score, candidate.estimated_tokens
+                    );
+                }
                 for reason in &candidate.reasons {
                     println!("    reason: {reason}");
                 }

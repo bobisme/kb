@@ -152,6 +152,13 @@ pub struct RetrievalCandidate {
     /// 1-indexed rank in the lexical ranked list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lexical_rank: Option<usize>,
+    /// Reciprocal Rank Fusion score combining lexical and semantic ranks.
+    /// Populated by `plan_retrieval_hybrid` after both tiers run; this is
+    /// the value the candidate list is sorted by. `None` for lexical-only
+    /// runs (`KB_SEMANTIC=0` or no semantic hits) where `score` already
+    /// drives the order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fused_score: Option<f32>,
 }
 
 /// A budgeted context payload assembled from retrieval candidates.
@@ -337,6 +344,8 @@ impl LexicalIndex {
                 semantic_score: None,
                 semantic_rank: None,
                 lexical_rank: None,
+
+                fused_score: None,
             });
         }
 
@@ -421,6 +430,8 @@ fn append_low_coverage_fallback(
             semantic_score: None,
             semantic_rank: None,
             lexical_rank: None,
+
+            fused_score: None,
         });
     };
 
@@ -1385,6 +1396,8 @@ mod tests {
                 semantic_score: None,
                 semantic_rank: None,
                 lexical_rank: None,
+
+                fused_score: None,
             }],
             fallback_reason: None,
         };
@@ -1451,6 +1464,8 @@ mod tests {
                 semantic_score: None,
                 semantic_rank: None,
                 lexical_rank: None,
+
+                fused_score: None,
             }],
             fallback_reason: None,
         };
