@@ -10,6 +10,7 @@ from typing import Optional
 
 import click
 
+from .kbtx import render as render_kbtx
 from .pipeline import (
     PipelineConfig,
     TranscriptArtifact,
@@ -53,6 +54,8 @@ def _load_aliases(path: Optional[Path]) -> dict[str, str]:
 @click.option("--min-speakers", type=int, default=None, help="Hint: minimum speakers.")
 @click.option("--max-speakers", type=int, default=None, help="Hint: maximum speakers.")
 @click.option("--no-cache", is_flag=True, help="Bypass transcript cache.")
+@click.option("--pause-threshold-seconds", type=float, default=5.0, show_default=True,
+              help="Emit a `> [pause: Ns]` action line when a between-turn gap meets or exceeds this. Set to 0 to disable.")
 @click.option("--hf-token", envvar="HF_TOKEN", default=None,
               help="HuggingFace token (or use HF_TOKEN env / huggingface-cli login).")
 def main(
@@ -67,6 +70,7 @@ def main(
     min_speakers: Optional[int],
     max_speakers: Optional[int],
     no_cache: bool,
+    pause_threshold_seconds: float,
     hf_token: Optional[str],
 ) -> None:
     """Transcribe + diarize audio into kb-ready markdown."""
@@ -100,12 +104,13 @@ def main(
         _save_artifact(artifact, artifact_cache)
         click.echo(f"[cached] {artifact_cache}", err=True)
 
-    markdown = render_markdown(
+    markdown = render_kbtx(
         artifact,
         title=title,
         recording_date=recording_date,
         audio_filename=audio_path.name,
         aliases=_load_aliases(aliases),
+        pause_threshold_seconds=pause_threshold_seconds,
     )
 
     if out_path is None:
@@ -114,59 +119,6 @@ def main(
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(markdown)
         click.echo(f"[wrote] {out_path}", err=True)
-
-
-def render_markdown(
-    artifact: TranscriptArtifact,
-    *,
-    title: str,
-    recording_date: str,
-    audio_filename: str,
-    aliases: dict[str, str],
-) -> str:
-    """Render the locked markdown source format."""
-    speakers_seen: list[str] = []
-    for turn in artifact.turns:
-        if turn.speaker not in speakers_seen:
-            speakers_seen.append(turn.speaker)
-
-    def label(s: str) -> str:
-        return aliases.get(s, s)
-
-    fm = [
-        "---",
-        "type: source",
-        f"title: {title}",
-        f"recording_date: {recording_date}",
-        f"audio_file: {audio_filename}",
-        f"duration_seconds: {artifact.duration_seconds:.1f}",
-        f"speakers_detected: {len(speakers_seen)}",
-        f"asr_model: {artifact.asr_model}",
-        f"diarization_model: {artifact.diarization_model}",
-        f"language: {artifact.language}",
-        "---",
-        "",
-        "# Transcript",
-        "",
-    ]
-
-    body = []
-    for turn in artifact.turns:
-        body.append(
-            f"[{_format_ts(turn.start)} → {_format_ts(turn.end)}] "
-            f"**{label(turn.speaker)}:** {turn.text.strip()}"
-        )
-        body.append("")
-
-    return "\n".join(fm) + "\n" + "\n".join(body)
-
-
-def _format_ts(seconds: float) -> str:
-    """Format seconds as HH:MM:SS."""
-    s = int(seconds)
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{sec:02d}"
 
 
 def _save_artifact(artifact: TranscriptArtifact, path: Path) -> None:

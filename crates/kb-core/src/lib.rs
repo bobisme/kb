@@ -432,6 +432,7 @@ pub mod normalized;
 pub mod paths;
 pub mod source_identity;
 pub mod state;
+pub mod transcript;
 
 pub use hashing::{Hash, hash_bytes, hash_file, hash_many};
 pub use paths::{
