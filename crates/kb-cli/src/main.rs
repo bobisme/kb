@@ -7,6 +7,7 @@ mod id_resolve;
 mod init;
 mod jobs;
 mod jobs_cmd;
+mod ls;
 mod migrate;
 mod publish;
 mod review;
@@ -202,6 +203,14 @@ enum Command {
     Doctor,
     /// Show status of the knowledge base
     Status,
+    /// Tree-list non-hidden files known to this KB.
+    ///
+    /// Walks the discovered KB root (the same one resolved by every other
+    /// command) and prints a `tree`-style view of every entry whose name
+    /// does not start with `.`. The `.kb/` internals dir, `.git/`, and any
+    /// other dotfiles are skipped at every level. Symlinks and special
+    /// files are skipped too — the KB tree is plain files and directories.
+    Ls,
     /// Publish selected artifacts to a project notes folder
     Publish {
         /// Named target from [publish.targets] in kb.toml
@@ -688,6 +697,12 @@ fn run(cli: Cli) -> Result<()> {
             }
             print_status(&status);
             Ok(())
+        }
+        Some(Command::Ls) => {
+            let ls_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            ls::run_ls(ls_root, cli.json)
         }
         Some(Command::Init { path, reset_config }) => {
             init::init(root, path, cli.force, reset_config, cli.quiet)
