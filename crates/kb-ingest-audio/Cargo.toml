@@ -1,0 +1,47 @@
+[package]
+name = "kb-ingest-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+kb-core.workspace = true
+# Pinned to match pyannote-rs 0.3.4. rc.12 has a Send-trait regression
+# (OperatorDomain not Send) that breaks pyannote-rs's SessionBuilder.
+# Kept as a direct dep (rather than transitive via pyannote-rs) so the
+# pin is visible at the workspace boundary.
+ndarray = "0.16"
+ort = "=2.0.0-rc.10"
+pyannote-rs = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "blocking"] }
+serde.workspace = true
+serde_json.workspace = true
+symphonia = { version = "0.5", features = ["aac", "isomp4", "mp3", "wav", "flac"] }
+thiserror.workspace = true
+tracing.workspace = true
+whisper-rs = "0.13"
+
+[features]
+default = []
+# Enable NVIDIA CUDA acceleration for whisper.cpp ASR. We deliberately
+# do NOT enable `ort/cuda`: empirically the rc.10 CUDA EP returns
+# garbage segmentation logits on long audio. Diarization stays on CPU
+# (the model is ~6 MB and it processes a 75-min recording in seconds).
+# Requires a CUDA toolkit on the build host; resolve `nvcc` via
+# $CUDA_PATH or PATH and set `CMAKE_CUDA_ARCHITECTURES` to your card's
+# compute capability (e.g. `86` for the 3090).
+cuda = ["whisper-rs/cuda"]
+
+[dev-dependencies]
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[[example]]
+name = "capture_model_hashes"
+path = "examples/capture_model_hashes.rs"

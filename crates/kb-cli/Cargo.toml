@@ -12,6 +12,13 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Enable NVIDIA CUDA acceleration for `kb ingest --audio`. Requires a
+# CUDA toolkit on the build host. Builds a non-portable binary; default
+# CPU build remains the supported distribution.
+cuda = ["kb-ingest-audio/cuda"]
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
@@ -22,6 +29,7 @@ fs2.workspace = true
 kb-compile.workspace = true
 kb-core.workspace = true
 kb-ingest.workspace = true
+kb-ingest-audio.workspace = true
 kb-lint.workspace = true
 kb-llm.workspace = true
 kb-query.workspace = true

@@ -1,8 +1,10 @@
 //! Round-trip kbtx parsing against real LiveRamp transcripts.
 //!
-//! The fixtures are the rendered outputs from the bn-3hfw Python tool,
+//! The fixtures are the rendered outputs from the `bn-3hfw` Python tool,
 //! checked into the repo so the Rust parser/renderer is validated against
 //! real content (not just the synthetic unit-test sample).
+
+#![allow(clippy::unwrap_used, clippy::doc_markdown)]
 
 use kb_core::transcript;
 

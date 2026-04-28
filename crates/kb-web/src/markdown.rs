@@ -56,11 +56,8 @@ fn inject_turn_anchors(mut events: Vec<Event<'_>>) -> Vec<Event<'_>> {
         let mut text = String::new();
         while j < len {
             match &events[j] {
-                Event::End(end) if matches!(end, pulldown_cmark::TagEnd::Heading(HeadingLevel::H2)) => {
-                    break;
-                }
-                Event::Text(t) => text.push_str(t),
-                Event::Code(t) => text.push_str(t),
+                Event::End(pulldown_cmark::TagEnd::Heading(HeadingLevel::H2)) => break,
+                Event::Text(t) | Event::Code(t) => text.push_str(t),
                 _ => {}
             }
             j += 1;

@@ -4,6 +4,7 @@ members = [
     "crates/kb-compile",
     "crates/kb-core",
     "crates/kb-ingest",
+    "crates/kb-ingest-audio",
     "crates/kb-lint",
     "crates/kb-llm",
     "crates/kb-query",
@@ -47,6 +48,7 @@ url = "2"
 kb-core = { path = "crates/kb-core" }
 kb-llm = { path = "crates/kb-llm" }
 kb-ingest = { path = "crates/kb-ingest" }
+kb-ingest-audio = { path = "crates/kb-ingest-audio" }
 kb-compile = { path = "crates/kb-compile" }
 kb-query = { path = "crates/kb-query" }
 kb-lint = { path = "crates/kb-lint" }

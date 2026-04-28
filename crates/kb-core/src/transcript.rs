@@ -40,7 +40,7 @@ const ARROW_CANONICAL: &str = "→";
 const ARROW_FALLBACK: &str = "->";
 
 /// AST root.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TranscriptDoc {
     /// YAML frontmatter, kept as raw text so we don't need a YAML lib here.
     pub frontmatter: String,
@@ -55,14 +55,14 @@ pub struct RosterEntry {
     pub role: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BodyNode {
     Turn(Turn),
     ActionLine(ActionLine),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
     pub speaker_id: String,
     pub start_seconds: u32,
@@ -94,6 +94,12 @@ pub enum ParseError {
 // Parser
 // ---------------------------------------------------------------------------
 
+/// Parse a kbtx-format transcript into a structured `TranscriptDoc`.
+///
+/// # Errors
+///
+/// Returns a `ParseError` for malformed frontmatter, malformed roster
+/// entries, malformed turn headings, or invalid timestamps.
 pub fn parse(input: &str) -> Result<TranscriptDoc, ParseError> {
     let mut doc = TranscriptDoc::default();
     let mut lines = input.lines().enumerate().peekable();
@@ -200,21 +206,26 @@ fn parse_roster_entry(line_no: usize, line: &str) -> Result<RosterEntry, ParseEr
     let rest = after_at[colon + 1..].trim();
 
     // Split off optional `(role)` at the end.
-    let (display_name, role) = if let Some(open) = rest.rfind('(') {
-        if rest.ends_with(')') {
-            let display = rest[..open].trim().to_string();
-            let role = rest[open + 1..rest.len() - 1].trim().to_string();
-            let display = if display.is_empty() { None } else { Some(display) };
-            let role = if role.is_empty() { None } else { Some(role) };
-            (display, role)
-        } else {
-            (Some(rest.to_string()), None)
-        }
-    } else if rest.is_empty() {
-        (None, None)
-    } else {
-        (Some(rest.to_string()), None)
-    };
+    let (display_name, role) = rest.rfind('(').map_or_else(
+        || {
+            if rest.is_empty() {
+                (None, None)
+            } else {
+                (Some(rest.to_string()), None)
+            }
+        },
+        |open| {
+            if rest.ends_with(')') {
+                let display = rest[..open].trim().to_string();
+                let role = rest[open + 1..rest.len() - 1].trim().to_string();
+                let display = if display.is_empty() { None } else { Some(display) };
+                let role = if role.is_empty() { None } else { Some(role) };
+                (display, role)
+            } else {
+                (Some(rest.to_string()), None)
+            }
+        },
+    );
 
     let display_name = match display_name.as_deref() {
         Some("unknown") => None, // canonicalize "unknown" to no display name
@@ -295,11 +306,11 @@ fn parse_turn(line_no: usize, heading: &str, lines: &mut Iter) -> Result<Turn, P
         lines.next();
     }
     // Trim trailing blank lines.
-    while body_lines.last().map(|s| s.trim().is_empty()).unwrap_or(false) {
+    while body_lines.last().is_some_and(|s| s.trim().is_empty()) {
         body_lines.pop();
     }
     // Trim leading blank lines.
-    while body_lines.first().map(|s| s.trim().is_empty()).unwrap_or(false) {
+    while body_lines.first().is_some_and(|s| s.trim().is_empty()) {
         body_lines.remove(0);
     }
 
@@ -341,6 +352,7 @@ fn parse_timestamp(ts: &str) -> Result<u32, ParseError> {
 // Renderer
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub fn render(doc: &TranscriptDoc) -> String {
     let mut out = String::new();
 
@@ -408,6 +420,7 @@ pub fn render(doc: &TranscriptDoc) -> String {
     out
 }
 
+#[must_use]
 pub fn format_timestamp(seconds: u32) -> String {
     let h = seconds / 3600;
     let m = (seconds % 3600) / 60;
@@ -417,6 +430,7 @@ pub fn format_timestamp(seconds: u32) -> String {
 
 /// Anchor slug for a turn — used by renderers (kb-web etc.) to give each turn
 /// a stable HTML anchor: `<id>-<HH>-<MM>-<SS>`.
+#[must_use]
 pub fn turn_anchor(speaker_id: &str, start_seconds: u32) -> String {
     let h = start_seconds / 3600;
     let m = (start_seconds % 3600) / 60;
@@ -453,17 +467,17 @@ mod tests {
                 assert_eq!(t.end_seconds, 25);
                 assert_eq!(t.text, "First turn body. Goes here.");
             }
-            other => panic!("expected Turn, got {other:?}"),
+            BodyNode::ActionLine(a) => panic!("expected Turn, got ActionLine {a:?}"),
         }
         match &doc.body[1] {
             BodyNode::ActionLine(a) => assert_eq!(a.text, "pause: 6s"),
-            other => panic!("expected ActionLine, got {other:?}"),
+            BodyNode::Turn(t) => panic!("expected ActionLine, got Turn {t:?}"),
         }
     }
 
     #[test]
     fn round_trip_byte_identical() {
-        let doc = parse(SAMPLE).unwrap();
+        let doc = parse(SAMPLE).expect("sample parses");
         let rendered = render(&doc);
         assert_eq!(rendered, SAMPLE);
     }
@@ -471,11 +485,11 @@ mod tests {
     #[test]
     fn ascii_arrow_accepted() {
         let with_ascii = SAMPLE.replace(" → ", " -> ");
-        let doc = parse(&with_ascii).unwrap();
+        let doc = parse(&with_ascii).expect("ascii arrow variant parses");
         // First turn parses fine.
         match &doc.body[0] {
             BodyNode::Turn(t) => assert_eq!(t.start_seconds, 1),
-            _ => panic!(),
+            BodyNode::ActionLine(_) => panic!("expected Turn at body[0]"),
         }
         // Renderer always uses canonical arrow, so round-trip is to canonical form.
         let rendered = render(&doc);
@@ -499,7 +513,7 @@ mod tests {
     #[test]
     fn parses_minimal_doc() {
         let s = "# Transcript\n\n## @speaker_00 [00:00:00 → 00:00:25]\n\nBody.\n";
-        let doc = parse(s).unwrap();
+        let doc = parse(s).expect("minimal doc parses");
         assert!(doc.frontmatter.is_empty());
         assert!(doc.roster.is_empty());
         assert_eq!(doc.body.len(), 1);

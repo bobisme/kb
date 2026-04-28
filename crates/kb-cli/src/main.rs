@@ -115,8 +115,8 @@ enum Command {
     },
     /// Ingest documents into the knowledge base
     Ingest {
-        /// Files, directories, URLs, or git repo URLs to ingest
-        #[arg(required = true)]
+        /// Files, directories, URLs, or git repo URLs to ingest. Required
+        /// unless `--audio` is given (which produces a transcript and ingests it).
         sources: Vec<String>,
         /// Ingest files even if they are empty or contain only YAML frontmatter
         #[arg(long)]
@@ -136,6 +136,23 @@ enum Command {
         /// Git repo only: pin to this commit SHA after cloning.
         #[arg(long = "commit", value_name = "SHA")]
         commit: Option<String>,
+        /// Audio file (m4a/mp3/mp4/wav/flac) to transcribe + diarize, then
+        /// ingest the resulting `.kbtx.md` transcript. First run downloads
+        /// ~1.2 GB of models into `~/.kb/models/`.
+        #[arg(long = "audio", value_name = "PATH")]
+        audio: Option<PathBuf>,
+        /// Title for the transcript's kbtx frontmatter. Defaults to the
+        /// audio filename stem.
+        #[arg(long = "audio-title", value_name = "TITLE", requires = "audio")]
+        audio_title: Option<String>,
+        /// Recording date (YYYY-MM-DD) for the transcript's kbtx
+        /// frontmatter. Defaults to today.
+        #[arg(long = "audio-recording-date", value_name = "YYYY-MM-DD", requires = "audio")]
+        audio_recording_date: Option<String>,
+        /// Override path for the rendered `.kbtx.md`. Default:
+        /// `<audio-stem>.kbtx.md` adjacent to the audio file.
+        #[arg(long = "audio-out", value_name = "PATH", requires = "audio")]
+        audio_out: Option<PathBuf>,
     },
     /// Compile the knowledge base
     Compile,
@@ -543,7 +560,27 @@ fn run(cli: Cli) -> Result<()> {
             exclude,
             branch,
             commit,
+            audio,
+            audio_title,
+            audio_recording_date,
+            audio_out,
         }) => {
+            if sources.is_empty() && audio.is_none() {
+                return Err(ValidationError::new(
+                    "kb ingest requires at least one source path/URL, or --audio <PATH>",
+                )
+                .into());
+            }
+            if let Some(audio_path) = &audio {
+                if !audio_path.exists() {
+                    return Err(ValidationError::new(format!(
+                        "audio file does not exist: {}",
+                        audio_path.display()
+                    ))
+                    .into());
+                }
+            }
+
             // bn-1jx: validate local source paths exist before we acquire
             // the root lock and start a job manifest. `kb_ingest::collect_files`
             // bails with the same message, but doing it here means a bad
@@ -592,6 +629,10 @@ fn run(cli: Cli) -> Result<()> {
                     &exclude,
                     branch.as_deref(),
                     commit.as_deref(),
+                    audio.as_deref(),
+                    audio_title.as_deref(),
+                    audio_recording_date.as_deref(),
+                    audio_out.as_deref(),
                 )
             };
 
@@ -1551,10 +1592,22 @@ fn run_ingest(
     exclude: &[String],
     branch: Option<&str>,
     commit: Option<&str>,
+    audio: Option<&Path>,
+    audio_title: Option<&str>,
+    audio_recording_date: Option<&str>,
+    audio_out: Option<&Path>,
 ) -> Result<()> {
     let mut git_urls = Vec::new();
     let mut urls = Vec::new();
     let mut local_paths = Vec::new();
+
+    if let Some(audio_path) = audio {
+        let kbtx_path =
+            transcribe_audio_to_kbtx(audio_path, audio_title, audio_recording_date, audio_out)?;
+        eprintln!("[transcribed] {}", kbtx_path.display());
+        local_paths.push(kbtx_path);
+    }
+
     for source in sources {
         if kb_ingest::is_git_url(source) {
             // Test git URLs ahead of plain URLs: `https://github.com/foo/bar`
@@ -1680,6 +1733,85 @@ fn run_ingest(
     );
 
     Ok(())
+}
+
+/// Transcribe `audio_path` via kb-ingest-audio (whisper + pyannote), write
+/// the rendered kbtx to `audio_out` (or `<stem>.kbtx.md` next to the audio
+/// when not given), and return the kbtx path so it can be ingested as a
+/// regular markdown source.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn transcribe_audio_to_kbtx(
+    audio_path: &Path,
+    audio_title: Option<&str>,
+    audio_recording_date: Option<&str>,
+    audio_out: Option<&Path>,
+) -> Result<PathBuf> {
+    let stem = audio_path
+        .file_stem()
+        .map_or_else(|| "transcript".to_string(), |s| s.to_string_lossy().to_string());
+    let title = audio_title.map_or_else(|| stem.clone(), str::to_string);
+    let recording_date =
+        audio_recording_date.map_or_else(today_yyyy_mm_dd, str::to_string);
+    let out_path = audio_out.map_or_else(
+        || {
+            let mut p = audio_path.to_path_buf();
+            // Replace the extension with `.kbtx.md` next to the audio file.
+            p.set_extension("kbtx.md");
+            p
+        },
+        Path::to_path_buf,
+    );
+
+    let cfg = kb_ingest_audio::TranscribeConfig::new(audio_path, &title, &recording_date);
+    eprintln!(
+        "[transcribing] {} -> {} (title={title:?}, date={recording_date})",
+        audio_path.display(),
+        out_path.display()
+    );
+    let kbtx = kb_ingest_audio::transcribe(&cfg)
+        .map_err(|e| anyhow::anyhow!("audio transcription failed: {e}"))?;
+
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("creating parent dir for {}", out_path.display())
+            })?;
+        }
+    }
+    std::fs::write(&out_path, kbtx)
+        .with_context(|| format!("writing kbtx to {}", out_path.display()))?;
+    Ok(out_path)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+fn today_yyyy_mm_dd() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Avoid pulling in chrono just for today's date — derive from epoch.
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Days since epoch.
+    let days = secs.div_euclid(86_400);
+    let (y, m, d) = days_to_ymd(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Convert days since 1970-01-01 to (year, month, day). Adapted from
+/// Howard Hinnant's `civil_from_days`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+const fn days_to_ymd(z: i64) -> (i32, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u32, d as u32)
 }
 
 fn normalized_dir_for(item: &IngestResult) -> PathBuf {
@@ -5100,6 +5232,16 @@ mod tests {
     fn write_kb_config(root: &Path) {
         fs::create_dir_all(root).expect("create kb root");
         fs::write(root.join(Config::FILE_NAME), "\n").expect("write kb config");
+    }
+
+    #[test]
+    fn days_to_ymd_known_dates() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+        // 2026-04-27 is 20_570 days past the epoch (date used as default
+        // recording_date in `kb ingest --audio`).
+        assert_eq!(days_to_ymd(20_570), (2026, 4, 27));
+        // Pre-epoch sanity check: 1969-12-31.
+        assert_eq!(days_to_ymd(-1), (1969, 12, 31));
     }
 
     #[test]
