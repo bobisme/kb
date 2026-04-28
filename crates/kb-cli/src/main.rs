@@ -115,8 +115,10 @@ enum Command {
     },
     /// Ingest documents into the knowledge base
     Ingest {
-        /// Files, directories, URLs, or git repo URLs to ingest. Required
-        /// unless `--audio` is given (which produces a transcript and ingests it).
+        /// Files, directories, URLs, or git repo URLs to ingest.
+        /// Audio files (.m4a/.mp3/.mp4/.wav/.flac) are auto-detected
+        /// and routed through whisper + pyannote transcription. At
+        /// least one source is required unless `--audio` is given.
         sources: Vec<String>,
         /// Ingest files even if they are empty or contain only YAML frontmatter
         #[arg(long)]
@@ -136,22 +138,23 @@ enum Command {
         /// Git repo only: pin to this commit SHA after cloning.
         #[arg(long = "commit", value_name = "SHA")]
         commit: Option<String>,
-        /// Audio file (m4a/mp3/mp4/wav/flac) to transcribe + diarize, then
-        /// ingest the resulting `.kbtx.md` transcript. First run downloads
-        /// ~1.2 GB of models into `~/.kb/models/`.
+        /// Audio file to transcribe + diarize. Usually unnecessary —
+        /// any positional source ending in .m4a/.mp3/.mp4/.wav/.flac
+        /// is auto-detected as audio. First run downloads ~1.2 GB of
+        /// models into `~/.kb/models/`.
         #[arg(long = "audio", value_name = "PATH")]
         audio: Option<PathBuf>,
-        /// Title for the transcript's kbtx frontmatter. Defaults to the
-        /// audio filename stem.
-        #[arg(long = "audio-title", value_name = "TITLE", requires = "audio")]
+        /// Title for the transcript's kbtx frontmatter. Defaults to
+        /// the audio filename stem.
+        #[arg(long = "audio-title", value_name = "TITLE")]
         audio_title: Option<String>,
         /// Recording date (YYYY-MM-DD) for the transcript's kbtx
         /// frontmatter. Defaults to today.
-        #[arg(long = "audio-recording-date", value_name = "YYYY-MM-DD", requires = "audio")]
+        #[arg(long = "audio-recording-date", value_name = "YYYY-MM-DD")]
         audio_recording_date: Option<String>,
         /// Override path for the rendered `.kbtx.md`. Default:
         /// `<audio-stem>.kbtx.md` adjacent to the audio file.
-        #[arg(long = "audio-out", value_name = "PATH", requires = "audio")]
+        #[arg(long = "audio-out", value_name = "PATH")]
         audio_out: Option<PathBuf>,
     },
     /// Compile the knowledge base
@@ -1615,6 +1618,20 @@ fn run_ingest(
             git_urls.push(source.as_str());
         } else if kb_ingest::is_url(source) {
             urls.push(source.as_str());
+        } else if is_audio_path(source) {
+            // Auto-route audio files through the transcription pipeline.
+            // Saves the user from having to remember `--audio` for the
+            // common case; explicit `--audio` is still supported above
+            // for scripted use.
+            let audio_path = PathBuf::from(source);
+            let kbtx_path = transcribe_audio_to_kbtx(
+                &audio_path,
+                audio_title,
+                audio_recording_date,
+                audio_out,
+            )?;
+            eprintln!("[transcribed] {}", kbtx_path.display());
+            local_paths.push(kbtx_path);
         } else {
             local_paths.push(PathBuf::from(source));
         }
@@ -1733,6 +1750,18 @@ fn run_ingest(
     );
 
     Ok(())
+}
+
+/// Recognize audio source paths by extension. Used to auto-route
+/// audio files through the transcription pipeline without requiring
+/// the user to pass `--audio` explicitly. Matches the container
+/// formats we can decode via symphonia + the pyannote/whisper stack.
+fn is_audio_path(source: &str) -> bool {
+    const AUDIO_EXTENSIONS: &[&str] = &[
+        ".m4a", ".mp3", ".mp4", ".wav", ".flac", ".ogg", ".opus",
+    ];
+    let lower = source.to_lowercase();
+    AUDIO_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
 
 /// Transcribe `audio_path` via kb-ingest-audio (whisper + pyannote), write
