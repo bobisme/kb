@@ -8230,3 +8230,97 @@ fn forget_eagerly_drops_embedding_row_for_source() {
         .expect("post count");
     assert_eq!(post_count, 0, "kb forget must eagerly drop the embedding row");
 }
+
+// bn-166d: a fake opencode that emits a deterministic answer body
+// containing one verifiable and one fabricated quote, both citing
+// `src-rust-quote`. Used to exercise the `verified: N/M quotes...`
+// footer the post-process appends to ask answers.
+fn install_fake_quote_harness(root: &Path) -> PathBuf {
+    let bin_dir = root.join("fake-quote-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake quote bin dir");
+    let script = r#"#!/bin/sh
+# Drain stdin (prompt) and ignore — the answer is fully canned. The
+# answer must be markdown that lands as `artifact_body` so the post-
+# process verifier sees the quoted spans.
+cat >/dev/null
+cat <<'ANSWER'
+Per the docs: "memory safety without garbage collection" [src-rust-quote].
+
+Some agents claim "rust runs natively on quantum hardware" [src-rust-quote],
+which would be neat.
+ANSWER
+"#;
+    write_executable(bin_dir.join("opencode").as_path(), script);
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+    bin_dir
+}
+
+#[test]
+fn ask_answer_footer_counts_verified_and_unverified_quotes() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Source page must contain the *real* quote so it verifies and the
+    // *fake* quote stays missing. The slug must include the `src-`
+    // prefix so the verifier resolves `[src-rust-quote]` to this file
+    // (production src-ids always start with `src-`; the
+    // `write_source_page` helper takes the bare slug).
+    write_source_page(
+        &kb_root,
+        "src-rust-quote",
+        "Rust language",
+        "Rust offers memory safety without garbage collection — and zero-cost abstractions.",
+    );
+
+    let fake_bin = install_fake_quote_harness(&kb_root);
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--format")
+        .arg("md")
+        .arg("Tell me about Rust safety.");
+    let output = cmd.output().expect("run kb ask --format=md");
+    assert!(
+        output.status.success(),
+        "kb ask failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse ask json");
+    let artifact_path = kb_root.join(
+        envelope["data"]["artifact_path"]
+            .as_str()
+            .expect("artifact_path"),
+    );
+    let content = fs::read_to_string(&artifact_path).expect("read answer");
+
+    // Footer must report 1/2 verified — the real quote hits the source
+    // page, the quantum-hardware quote does not.
+    assert!(
+        content.contains("**verified: 1/2 quotes found in sources**"),
+        "expected verified footer, got:\n{content}"
+    );
+    assert!(
+        content.contains("Unverified quotes:"),
+        "expected unverified-quote section in footer:\n{content}"
+    );
+    assert!(
+        content.contains("rust runs natively on quantum hardware"),
+        "expected the fabricated quote to be listed in the footer:\n{content}"
+    );
+    // The verified quote must NOT appear under the unverified section,
+    // even though it shares the src-id. We assert the order: footer is
+    // appended after the body, so check the substring positions.
+    let footer_start = content
+        .find("**verified:")
+        .expect("footer marker present");
+    let unverified_section = &content[footer_start..];
+    assert!(
+        !unverified_section.contains("memory safety without garbage collection"),
+        "verified quote should not be re-listed under Unverified quotes:\n{unverified_section}"
+    );
+}

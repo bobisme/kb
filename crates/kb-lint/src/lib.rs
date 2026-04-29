@@ -39,6 +39,9 @@ pub enum LintRule {
     /// LLM-powered and expensive — never runs as part of `LintRule::All`.
     /// Callers must select it explicitly via `--check contradictions`.
     Contradictions,
+    /// Verifies that quoted spans adjacent to a citation actually appear
+    /// in the cited source (bn-166d). Pure on-disk lookup — no LLM.
+    UnverifiedQuote,
     All,
 }
 
@@ -67,6 +70,11 @@ impl LintRule {
                 "contradictions" | "contradiction" | "cross-source-contradictions"
                 | "cross_source_contradictions",
             ) => Ok(Self::Contradictions),
+            Some(
+                "unverified-quote" | "unverified_quote" | "unverifiedquote"
+                | "citation-verification" | "citation_verification" | "verify-citations"
+                | "verify_citations",
+            ) => Ok(Self::UnverifiedQuote),
             Some(other) => Err(anyhow!("unsupported lint rule: {other}")),
         }
     }
@@ -81,6 +89,7 @@ impl LintRule {
             Self::MissingCitations => "missing-citations",
             Self::MissingConcepts => "missing-concepts",
             Self::Contradictions => "contradictions",
+            Self::UnverifiedQuote => "unverified-quote",
             Self::All => "all",
         }
     }
@@ -148,6 +157,10 @@ pub enum IssueKind {
     /// useful. Surfaced by the `thin_concepts` discovery pass used by
     /// `kb lint --impute` (bn-xt4o).
     ThinConceptBody,
+    /// A quoted span next to a citation does not appear in the cited
+    /// source (bn-166d). Either the model fabricated the quote or the
+    /// source was rewritten between extraction and verification.
+    UnverifiedQuote,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -171,6 +184,7 @@ pub struct LintOptions {
     pub require_citations: bool,
     pub missing_citations_level: MissingCitationsLevel,
     pub missing_concepts: MissingConceptsConfig,
+    pub citation_verification: CitationVerificationConfig,
 }
 
 impl Default for LintOptions {
@@ -179,6 +193,34 @@ impl Default for LintOptions {
             require_citations: true,
             missing_citations_level: MissingCitationsLevel::Warn,
             missing_concepts: MissingConceptsConfig::default(),
+            citation_verification: CitationVerificationConfig::default(),
+        }
+    }
+}
+
+/// `[lint.citation_verification]` runtime config (bn-166d).
+///
+/// Controls the `unverified-quote` lint that checks whether quoted
+/// spans next to citations exist in their cited source. Default is
+/// `enabled = true, level = warn` so existing builds don't suddenly
+/// fail; users can flip to `error` when the quote-verification rate
+/// is good enough to gate compiles on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CitationVerificationConfig {
+    pub enabled: bool,
+    pub level: MissingCitationsLevel,
+    /// Allowed Levenshtein edits per 100 normalized quote characters.
+    /// Default `1` ≈ 1% slack; raise if your sources frequently get
+    /// post-extraction rewrites.
+    pub fuzz_per_100_chars: u32,
+}
+
+impl Default for CitationVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: MissingCitationsLevel::Warn,
+            fuzz_per_100_chars: kb_core::DEFAULT_FUZZ_PER_100_CHARS,
         }
     }
 }
@@ -221,6 +263,11 @@ pub fn run_lint_with_options(
         && matches!(rule, LintRule::MissingConcepts | LintRule::All)
     {
         issues.extend(detect_missing_concepts_issues(root, &options.missing_concepts)?);
+    }
+    if options.citation_verification.enabled
+        && matches!(rule, LintRule::UnverifiedQuote | LintRule::All)
+    {
+        issues.extend(detect_unverified_quotes(root, &options.citation_verification)?);
     }
 
     Ok(LintReport {
@@ -1306,6 +1353,163 @@ fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
 }
 
+// ---------------------------------------------------------------------------
+// Unverified-quote check (bn-166d)
+// ---------------------------------------------------------------------------
+
+/// Walk every compiled concept page, extract `(quote, src-id)` pairs from
+/// the body, and emit one [`IssueKind::UnverifiedQuote`] per pair whose
+/// quote can't be located in the cited source within the configured
+/// fuzz budget.
+///
+/// We only sweep `wiki/concepts/` — source pages and question pages are
+/// either the source themselves (would be circular) or carry citations
+/// in a different shape (frontmatter-only). Concept pages are where
+/// fabricated quotes do real harm because they're the long-lived,
+/// promoted-to-vault writeups.
+fn detect_unverified_quotes(
+    root: &Path,
+    config: &CitationVerificationConfig,
+) -> Result<Vec<LintIssue>> {
+    let concepts_dir = root.join(WIKI_DIR).join("concepts");
+    if !concepts_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut source_cache: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut issues = Vec::new();
+
+    for page in markdown_files_under(&concepts_dir)? {
+        let raw = fs::read_to_string(&page)
+            .with_context(|| format!("read concept page {}", page.display()))?;
+        // Frontmatter problems are reported by the missing-citations pass;
+        // we just skip the page here so the same file doesn't raise
+        // duplicate noise.
+        let Ok((_, body)) = read_frontmatter(&page) else {
+            continue;
+        };
+        let body_offset = raw.len().saturating_sub(body.len());
+        let folded_body = kb_core::fold_smart_quotes(&body);
+        let pairs = kb_core::extract_quote_citations(&body);
+
+        for pair in pairs {
+            let normalized_quote = kb_core::normalize_for_match(&pair.quote);
+            let source_body = source_cache
+                .entry(pair.src_id.clone())
+                .or_insert_with(|| load_source_body_for_id(root, &pair.src_id));
+
+            let outcome_kind = source_body.as_ref().map_or(
+                kb_core::VerificationKind::SourceNotFound,
+                |content| {
+                    let normalized_source = kb_core::normalize_for_match(content);
+                    match kb_core::is_quote_present(
+                        &normalized_quote,
+                        &normalized_source,
+                        config.fuzz_per_100_chars,
+                    ) {
+                        kb_core::QuoteMatch::Exact => kb_core::VerificationKind::Verified,
+                        kb_core::QuoteMatch::Fuzzy { distance, budget } => {
+                            kb_core::VerificationKind::VerifiedFuzzy { distance, budget }
+                        }
+                        kb_core::QuoteMatch::NotFound => {
+                            kb_core::VerificationKind::QuoteNotInSource
+                        }
+                    }
+                },
+            );
+
+            if matches!(
+                outcome_kind,
+                kb_core::VerificationKind::Verified
+                    | kb_core::VerificationKind::VerifiedFuzzy { .. }
+            ) {
+                continue;
+            }
+
+            let rel_page = relative_to_root(root, &page).to_string_lossy().into_owned();
+            let line = line_number_at(&folded_body, pair.offset) + count_lines_before(&raw, body_offset);
+            let message = match outcome_kind {
+                kb_core::VerificationKind::SourceNotFound => format!(
+                    "quote cites `{}` but no wiki/sources/{}*.md page was found",
+                    pair.src_id, pair.src_id,
+                ),
+                kb_core::VerificationKind::QuoteNotInSource => format!(
+                    "quote `\"{}\"` not found in cited source `{}` (after whitespace + emphasis normalization, fuzz {}/100 chars)",
+                    truncate_for_message(&pair.quote, 80),
+                    pair.src_id,
+                    config.fuzz_per_100_chars,
+                ),
+                _ => unreachable!("verified outcomes filtered above"),
+            };
+            issues.push(LintIssue {
+                severity: config.level.severity(),
+                kind: IssueKind::UnverifiedQuote,
+                referring_page: rel_page,
+                line,
+                target: pair.src_id.clone(),
+                message,
+                suggested_fix: Some(
+                    "verify the quote against the source page; either correct the quote, drop it, or update the citation"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    Ok(issues)
+}
+
+/// Locate the wiki source page on disk for a given src-id and return its
+/// raw body. Mirrors `kb_compile::source_page::resolve_source_page_path`
+/// without taking on a dependency cycle (kb-lint is consumed by
+/// kb-compile, not the other way around).
+fn load_source_body_for_id(root: &Path, src_id: &str) -> Option<String> {
+    let dir = root.join("wiki/sources");
+    if !dir.exists() {
+        return None;
+    }
+    let id_only = dir.join(format!("{src_id}.md"));
+    let id_prefix = format!("{src_id}-");
+
+    let mut id_slug_match: Option<PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            if stem == src_id || stem.starts_with(&id_prefix) {
+                id_slug_match = Some(path);
+                break;
+            }
+        }
+    }
+    let path = id_slug_match.or_else(|| id_only.exists().then_some(id_only))?;
+    fs::read_to_string(&path).ok()
+}
+
+fn count_lines_before(text: &str, offset: usize) -> usize {
+    text[..offset.min(text.len())]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+}
+
+fn truncate_for_message(s: &str, max_chars: usize) -> String {
+    let mut out = String::with_capacity(max_chars + 1);
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2098,6 +2302,7 @@ mod tests {
                 require_citations: true,
                 missing_citations_level: MissingCitationsLevel::Error,
                 missing_concepts: MissingConceptsConfig::default(),
+                citation_verification: CitationVerificationConfig::default(),
             },
         )
         .expect("lint report");
@@ -4046,6 +4251,199 @@ mod missing_concepts_tests {
                 .iter()
                 .any(|i| i.kind == IssueKind::ConceptCandidate),
             "expected ConceptCandidate kind: {report:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // bn-166d: unverified-quote lint
+    // -----------------------------------------------------------------
+
+    fn write_concept_with_quotes(root: &Path, page_name: &str, body: &str) {
+        fs::create_dir_all(root.join("wiki/concepts")).expect("create concepts dir");
+        fs::write(
+            root.join(format!("wiki/concepts/{page_name}.md")),
+            format!("---\nsource_document_ids:\n  - doc-1\n---\n{body}\n"),
+        )
+        .expect("write concept page");
+    }
+
+    fn write_source_page(root: &Path, src_id: &str, body: &str) {
+        fs::create_dir_all(root.join("wiki/sources")).expect("create sources dir");
+        fs::write(
+            root.join(format!("wiki/sources/{src_id}.md")),
+            format!("---\nsource_document_id: doc-1\n---\n# Source\n\n{body}\n"),
+        )
+        .expect("write source page");
+    }
+
+    #[test]
+    fn unverified_quote_lint_flags_fabricated_quote() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_source_page(
+            root,
+            "src-real",
+            "Rust is a systems programming language focused on safety and performance.",
+        );
+        write_concept_with_quotes(
+            root,
+            "rust",
+            r#"# Rust
+
+The docs say "Rust is a systems programming language" [src-real].
+But also "Rust runs on quantum computers" [src-real]."#,
+        );
+
+        let report =
+            run_lint(root, LintRule::UnverifiedQuote).expect("unverified-quote lint runs");
+        let unverified: Vec<&LintIssue> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == IssueKind::UnverifiedQuote)
+            .collect();
+        assert_eq!(
+            unverified.len(),
+            1,
+            "expected exactly one unverified-quote, got: {:?}",
+            report.issues
+        );
+        assert_eq!(unverified[0].target, "src-real");
+        assert!(
+            unverified[0].message.contains("quantum"),
+            "message should reference fabricated quote: {}",
+            unverified[0].message
+        );
+        assert_eq!(unverified[0].severity, IssueSeverity::Warning);
+    }
+
+    #[test]
+    fn unverified_quote_lint_passes_when_quotes_match() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_source_page(
+            root,
+            "src-real",
+            "The Raft algorithm achieves consensus through a single elected leader.",
+        );
+        write_concept_with_quotes(
+            root,
+            "raft",
+            r#"# Raft
+
+[src-real] "The Raft algorithm achieves consensus through a single elected leader"."#,
+        );
+
+        let report = run_lint(root, LintRule::UnverifiedQuote).expect("lint runs");
+        let unverified: Vec<&LintIssue> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == IssueKind::UnverifiedQuote)
+            .collect();
+        assert!(
+            unverified.is_empty(),
+            "verified quote should produce no issues, got: {unverified:?}"
+        );
+    }
+
+    #[test]
+    fn unverified_quote_lint_flags_missing_source() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        // Note: no wiki/sources/ entry for src-ghost.
+        write_concept_with_quotes(
+            root,
+            "ghost",
+            r#"# Ghost
+
+It is written that "all consensus protocols are equivalent" [src-ghost]."#,
+        );
+
+        let report = run_lint(root, LintRule::UnverifiedQuote).expect("lint runs");
+        let unverified: Vec<&LintIssue> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == IssueKind::UnverifiedQuote)
+            .collect();
+        assert_eq!(unverified.len(), 1);
+        assert!(
+            unverified[0].message.contains("no wiki/sources"),
+            "expected 'no wiki/sources' message, got: {}",
+            unverified[0].message
+        );
+    }
+
+    #[test]
+    fn unverified_quote_lint_respects_config_disabled() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_concept_with_quotes(
+            root,
+            "ghost",
+            r#"# Ghost
+
+"fabricated" [src-missing]."#,
+        );
+
+        let mut options = LintOptions::default();
+        options.citation_verification.enabled = false;
+        // require-citations off too so the page passes.
+        options.require_citations = false;
+
+        let report = run_lint_with_options(root, LintRule::UnverifiedQuote, &options)
+            .expect("lint runs");
+        assert!(
+            report.is_clean(),
+            "disabled config should suppress lint: {report:?}"
+        );
+    }
+
+    #[test]
+    fn unverified_quote_lint_honors_error_level() {
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_concept_with_quotes(
+            root,
+            "ghost",
+            r#"# Ghost
+
+"fabricated" [src-missing]."#,
+        );
+
+        let mut options = LintOptions::default();
+        options.citation_verification.level = MissingCitationsLevel::Error;
+
+        let report = run_lint_with_options(root, LintRule::UnverifiedQuote, &options)
+            .expect("lint runs");
+        assert!(report.has_errors(), "level=error should escalate severity");
+    }
+
+    #[test]
+    fn unverified_quote_lint_handles_paragraph_break_normalization() {
+        // Quote spans whitespace boundaries between concept and source.
+        let dir = TempDir::new().expect("tempdir");
+        let root = dir.path();
+        write_source_page(
+            root,
+            "src-x",
+            "Lorem ipsum.\n\nThe answer is forty-two\n   and we should be confident.",
+        );
+        write_concept_with_quotes(
+            root,
+            "answer",
+            r#"# Answer
+
+They wrote "the answer is forty-two and we should be confident" [src-x]."#,
+        );
+
+        let report = run_lint(root, LintRule::UnverifiedQuote).expect("lint runs");
+        let unverified: Vec<&LintIssue> = report
+            .issues
+            .iter()
+            .filter(|i| i.kind == IssueKind::UnverifiedQuote)
+            .collect();
+        assert!(
+            unverified.is_empty(),
+            "quote spanning whitespace should still verify after normalization: {unverified:?}"
         );
     }
 }

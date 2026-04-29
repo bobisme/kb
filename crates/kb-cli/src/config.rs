@@ -282,6 +282,7 @@ pub struct LintConfig {
     pub missing_citations_level: String,
     pub missing_concepts: LintMissingConceptsConfig,
     pub contradictions: LintContradictionsConfig,
+    pub citation_verification: LintCitationVerificationConfig,
 }
 
 impl Default for LintConfig {
@@ -291,6 +292,7 @@ impl Default for LintConfig {
             missing_citations_level: "warn".to_string(),
             missing_concepts: LintMissingConceptsConfig::default(),
             contradictions: LintContradictionsConfig::default(),
+            citation_verification: LintCitationVerificationConfig::default(),
         }
     }
 }
@@ -339,6 +341,33 @@ impl Default for LintContradictionsConfig {
         Self {
             enabled: false,
             min_sources: 2,
+        }
+    }
+}
+
+/// `[lint.citation_verification]` section of `kb.toml`. Controls the
+/// `unverified-quote` check added in bn-166d which inspects quoted
+/// spans in compiled concept pages and verifies they appear in the
+/// cited source.
+///
+/// Default: `enabled = true, level = "warn", fuzz_per_100_chars = 1`
+/// — lined up with the bone spec so existing builds pick up the
+/// check automatically without their compile pass turning red.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct LintCitationVerificationConfig {
+    pub enabled: bool,
+    pub level: String,
+    pub fuzz_per_100_chars: u32,
+}
+
+impl Default for LintCitationVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: "warn".to_string(),
+            fuzz_per_100_chars: kb_core::DEFAULT_FUZZ_PER_100_CHARS,
         }
     }
 }

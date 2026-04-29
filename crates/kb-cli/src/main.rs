@@ -2477,7 +2477,7 @@ fn run_ask(
         AutoPromoted::default()
     };
 
-    let (model_version, template_hash, artifact_status, artifact_body, llm_info) =
+    let (model_version, template_hash, artifact_status, mut artifact_body, llm_info) =
         match llm_outcome {
             Ok((result, provenance)) => {
                 // For chart format, the artifact body is the LLM's caption
@@ -2753,6 +2753,30 @@ fn run_ask(
         })
         .unwrap_or_default();
 
+    // bn-166d: verify quoted spans actually appear in their cited sources
+    // and append a footer summarizing the result. Only runs when the LLM
+    // produced a real body; placeholder artifacts are skipped because
+    // there's nothing to verify. The footer is appended to `artifact_body`
+    // *before* write_artifact so it lands inside answer.md and the
+    // structured answer.json `body` field alike.
+    let quote_verifications: Vec<kb_core::QuoteVerification> = if llm_info.is_some()
+        && cfg.lint.citation_verification.enabled
+    {
+        kb_core::verify_body_quotes(
+            &artifact_body,
+            cfg.lint.citation_verification.fuzz_per_100_chars,
+            |src_id| {
+                kb_compile::source_page::resolve_source_page_path(root, src_id)
+                    .and_then(|rel| std::fs::read_to_string(root.join(rel)).ok())
+            },
+        )
+    } else {
+        Vec::new()
+    };
+    if !quote_verifications.is_empty() {
+        artifact_body.push_str(&render_quote_verification_footer(&quote_verifications));
+    }
+
     let write_output = kb_query::write_artifact(&kb_query::WriteArtifactInput {
         root,
         question: &question,
@@ -2905,6 +2929,50 @@ fn try_generate_answer(
         kb_query::postprocess_answer(&llm_response.answer, &citation_manifest, assembled);
 
     Ok((result, provenance))
+}
+
+/// Render the `verified: N/M quotes found in sources` footer (bn-166d).
+///
+/// Always emits the count so readers can see the verifier ran, even
+/// when every quote checked out. When some quotes failed verification
+/// it lists each failure with its src-id and a truncated copy of the
+/// quote for at-a-glance audit.
+fn render_quote_verification_footer(verifications: &[kb_core::QuoteVerification]) -> String {
+    let total = verifications.len();
+    let verified = verifications.iter().filter(|v| v.is_verified()).count();
+    let failures: Vec<&kb_core::QuoteVerification> = verifications
+        .iter()
+        .filter(|v| !v.is_verified())
+        .collect();
+
+    let mut out = String::new();
+    out.push_str("\n\n---\n\n");
+    let _ = std::fmt::Write::write_fmt(
+        &mut out,
+        format_args!("**verified: {verified}/{total} quotes found in sources**\n"),
+    );
+    if !failures.is_empty() {
+        out.push_str("\nUnverified quotes:\n");
+        for v in failures {
+            let reason = match v.outcome {
+                kb_core::VerificationKind::SourceNotFound => "source not found",
+                kb_core::VerificationKind::QuoteNotInSource => "not in source",
+                _ => "unverified",
+            };
+            let preview = if v.quote.chars().count() > 80 {
+                let mut s: String = v.quote.chars().take(80).collect();
+                s.push('…');
+                s
+            } else {
+                v.quote.clone()
+            };
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!("- `{}` — \"{preview}\" ({reason})\n", v.src_id),
+            );
+        }
+    }
+    out
 }
 
 /// Execute one `kb compile` invocation (dry-run or real) against `root`.
@@ -4469,14 +4537,20 @@ fn run_lint(
         enabled: cfg.lint.contradictions.enabled,
         min_sources: cfg.lint.contradictions.min_sources,
     };
+    let citation_verification_cfg = build_citation_verification_cfg(&cfg)?;
     let options = kb_lint::LintOptions {
         require_citations: cfg.lint.require_citations,
         missing_citations_level,
         missing_concepts: missing_concepts_cfg.clone(),
+        citation_verification: citation_verification_cfg.clone(),
     };
 
     let rules = if matches!(check, kb_lint::LintRule::All) {
-        lint_rules_for_root(cfg.lint.require_citations, missing_concepts_cfg.enabled)
+        lint_rules_for_root(
+            cfg.lint.require_citations,
+            missing_concepts_cfg.enabled,
+            citation_verification_cfg.enabled,
+        )
     } else {
         vec![check]
     };
@@ -4594,9 +4668,29 @@ fn accumulate_lint_report(
     });
 }
 
+/// Translate the parsed `[lint.citation_verification]` TOML section
+/// into the runtime [`kb_lint::CitationVerificationConfig`]. Lifted out
+/// of `run_lint` so the dispatch function stays under clippy's
+/// 100-line cap. Returns an error when `level` is misspelled.
+fn build_citation_verification_cfg(cfg: &Config) -> Result<kb_lint::CitationVerificationConfig> {
+    let level = match cfg.lint.citation_verification.level.as_str() {
+        "warn" | "warning" => kb_lint::MissingCitationsLevel::Warn,
+        "error" => kb_lint::MissingCitationsLevel::Error,
+        other => bail!(
+            "invalid lint.citation_verification.level in kb.toml: {other} (expected warn or error)"
+        ),
+    };
+    Ok(kb_lint::CitationVerificationConfig {
+        enabled: cfg.lint.citation_verification.enabled,
+        level,
+        fuzz_per_100_chars: cfg.lint.citation_verification.fuzz_per_100_chars,
+    })
+}
+
 fn lint_rules_for_root(
     require_citations: bool,
     missing_concepts_enabled: bool,
+    citation_verification_enabled: bool,
 ) -> Vec<kb_lint::LintRule> {
     let mut rules = vec![
         kb_lint::LintRule::BrokenLinks,
@@ -4609,6 +4703,9 @@ fn lint_rules_for_root(
     }
     if missing_concepts_enabled {
         rules.push(kb_lint::LintRule::MissingConcepts);
+    }
+    if citation_verification_enabled {
+        rules.push(kb_lint::LintRule::UnverifiedQuote);
     }
     // Deliberately exclude LintRule::Contradictions: it's LLM-powered and
     // expensive, so it's opt-in per-command via `kb lint --check contradictions`,
