@@ -1658,15 +1658,16 @@ fn run_ingest(
     }
 
     // Load kb.toml so the ingest pipeline picks up `[ingest.markitdown]`
-    // settings. The config loader tolerates a missing section by falling
-    // back to defaults (markitdown on, default extension set), which means
-    // `kb ingest` keeps working on KBs that predate bn-23am without any
-    // config edits.
+    // and `[ingest.ocr]` settings. The config loader tolerates missing
+    // sections by falling back to defaults (markitdown on, OCR on for
+    // scan-only PDFs), which means `kb ingest` keeps working on KBs that
+    // predate bn-23am / bn-2hyr without any config edits.
     let cfg = Config::load_from_root(root, None).unwrap_or_default();
     let ingest_options = kb_ingest::IngestOptions {
         dry_run,
         allow_empty,
         markitdown: cfg.ingest.markitdown.to_options(),
+        ocr: cfg.ingest.ocr.to_options(),
     };
 
     let mut results = Vec::new();

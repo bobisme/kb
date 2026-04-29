@@ -422,14 +422,15 @@ impl RetrievalConfig {
     }
 }
 
-/// `[ingest]` section of `kb.toml`. Currently only gates the optional
-/// markitdown preprocessing step; split out as its own struct so future
-/// ingest-wide knobs (e.g. per-source timeouts) get a home.
+/// `[ingest]` section of `kb.toml`. Bundles per-stage knobs: the markitdown
+/// preprocessor and the OCR fallback that fires when markitdown's extraction
+/// is empty/short for a scanned PDF.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct IngestConfig {
     pub markitdown: MarkitdownConfig,
+    pub ocr: OcrConfig,
 }
 
 /// `[ingest.markitdown]` section of `kb.toml`. Controls whether `kb ingest`
@@ -487,6 +488,61 @@ impl MarkitdownConfig {
                 .iter()
                 .map(|e| e.to_ascii_lowercase())
                 .collect(),
+        }
+    }
+}
+
+/// `[ingest.ocr]` section of `kb.toml`. Controls the OCR fallback that
+/// kicks in when markitdown returns empty/short text for a PDF (typically
+/// scan-only PDFs: photographed pages, image-only legal docs). See
+/// `kb_ingest::OcrOptions` for the runtime counterpart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct OcrConfig {
+    /// Master switch. Defaults on — the conversion is a no-op (warn + skip)
+    /// if either `pdftoppm` or `tesseract` is missing on PATH, so leaving
+    /// it on is safe even on machines without OCR installed.
+    pub enabled: bool,
+    /// Tesseract executable. Whitespace-split into program + leading argv
+    /// (so `"docker run --rm tesseract"` works as a wrapper).
+    pub command: String,
+    /// Pdftoppm executable. Whitespace-split, same convention as `command`.
+    /// Exposed mainly so containerized / wrapped poppler installs can be
+    /// pointed at without code changes.
+    pub pdftoppm_command: String,
+    /// Tesseract language code(s). Pass-through; tesseract accepts
+    /// `+`-joined language codes (`eng+fra`) so we don't validate here.
+    pub language: String,
+    /// Trigger threshold (in chars). When markitdown's output trims to less
+    /// than this many chars, we attempt OCR. `0` disables the threshold —
+    /// only literally empty text triggers OCR.
+    pub min_chars_threshold: usize,
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            command: "tesseract".to_string(),
+            pdftoppm_command: "pdftoppm".to_string(),
+            language: "eng".to_string(),
+            min_chars_threshold: kb_ingest::OCR_DEFAULT_MIN_CHARS_THRESHOLD,
+        }
+    }
+}
+
+impl OcrConfig {
+    /// Translate the parsed config into the runtime `OcrOptions` the
+    /// `kb-ingest` crate consumes.
+    #[must_use]
+    pub fn to_options(&self) -> kb_ingest::OcrOptions {
+        kb_ingest::OcrOptions {
+            enabled: self.enabled,
+            command: self.command.clone(),
+            pdftoppm_command: self.pdftoppm_command.clone(),
+            language: self.language.clone(),
+            min_chars_threshold: self.min_chars_threshold,
         }
     }
 }

@@ -218,6 +218,10 @@ pub struct IngestOptions {
     /// Settings for the markitdown preprocessing step. Default = disabled so
     /// callers that don't care about PDFs keep the v1 behavior.
     pub markitdown: preprocess::MarkitdownOptions,
+    /// Settings for the OCR fallback applied to PDFs whose markitdown
+    /// extraction is empty/short. Default = disabled so legacy callers
+    /// keep their existing behavior.
+    pub ocr: ocr::OcrOptions,
 }
 
 impl IngestOptions {
@@ -228,6 +232,7 @@ impl IngestOptions {
             dry_run: false,
             allow_empty: false,
             markitdown: preprocess::MarkitdownOptions::disabled(),
+            ocr: ocr::OcrOptions::disabled(),
         }
     }
 }
@@ -269,6 +274,7 @@ pub fn ingest_paths_with_flags(
             dry_run,
             allow_empty,
             markitdown: preprocess::MarkitdownOptions::disabled(),
+            ocr: ocr::OcrOptions::disabled(),
         },
     )
 }
@@ -333,6 +339,17 @@ fn collect_files(path: &Path, files: &mut Vec<(PathBuf, FileOrigin)>) -> Result<
     )
 }
 
+/// True if this path's extension is `.pdf` (case-insensitive). The OCR
+/// fallback is PDF-only — other markitdown-supported formats (`.docx`,
+/// `.pptx`, …) are word-processor formats where "empty extraction" really
+/// means "the document was empty", not "the document is a stack of
+/// scanned pages".
+fn is_pdf_source(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
 /// Returns `Ok(true)` if the file should be ingested, `Ok(false)` if it was a
 /// binary file from a directory walk that should be silently skipped, and
 /// `Err` if it was an explicit binary file that should abort the run.
@@ -382,14 +399,49 @@ fn ingest_file(
     // conversion, `normalized_bytes` is the markdown captured from
     // markitdown's stdout and `original_bytes` is still the raw file we
     // archive under `raw/inbox/<src>/<rev>/original.<ext>`. On an applicable
-    // but failed conversion (SkipFile) we drop the file entirely so we
-    // don't re-feed an unsupported binary through the text/binary gate.
-    let (normalized_bytes, was_preprocessed): (Vec<u8>, bool) =
-        match preprocess::maybe_preprocess(&canonical_source, &options.markitdown)? {
-            preprocess::Preprocessed::Converted(c) => (c.markdown, true),
-            preprocess::Preprocessed::NotApplicable => (original_bytes.clone(), false),
-            preprocess::Preprocessed::SkipFile => return Ok(None),
-        };
+    // but failed conversion (SkipFile) we usually drop the file — except for
+    // PDFs, where bn-2hyr's OCR fallback may still rescue the document.
+    let preprocessed = preprocess::maybe_preprocess(&canonical_source, &options.markitdown)?;
+    let source_is_pdf = is_pdf_source(&canonical_source);
+    let (mut normalized_bytes, was_preprocessed): (Vec<u8>, bool) = match preprocessed {
+        preprocess::Preprocessed::Converted(c) => (c.markdown, true),
+        preprocess::Preprocessed::NotApplicable => (original_bytes.clone(), false),
+        preprocess::Preprocessed::SkipFile => {
+            // bn-2hyr: a markitdown skip for a PDF usually means "extracted
+            // nothing useful" (scan-only). Treat that as an empty-but-
+            // preprocessed conversion so the OCR fallback below gets a
+            // chance to recover the text. Non-PDFs keep the legacy skip
+            // behavior; if a .docx skips it's a real failure, not a scan.
+            if source_is_pdf && options.ocr.enabled {
+                (Vec::new(), true)
+            } else {
+                return Ok(None);
+            }
+        }
+    };
+    // bn-2hyr: scan-only PDFs make markitdown emit empty/near-empty markdown
+    // because the content is pixels, not text. Fall back to pdftoppm +
+    // tesseract OCR so those PDFs still produce searchable markdown. We
+    // only bother for actual PDFs that just went through preprocessing —
+    // .docx and friends are word-processor formats where empty extraction
+    // means "actually empty", not "image-only".
+    if was_preprocessed && source_is_pdf {
+        let extracted_text = String::from_utf8_lossy(&normalized_bytes);
+        if ocr::should_ocr_fallback(&extracted_text, options.ocr.min_chars_threshold).is_some()
+        {
+            match ocr::ocr_pdf(&canonical_source, root, &options.ocr)? {
+                ocr::OcrOutcome::Recovered { markdown, .. } => {
+                    normalized_bytes = markdown.into_bytes();
+                }
+                ocr::OcrOutcome::Empty | ocr::OcrOutcome::Skipped => {
+                    // Leave `normalized_bytes` as the original short/empty
+                    // extraction. The downstream `is_semantically_empty`
+                    // gate will skip the file with a warning, matching the
+                    // behavior on machines without tesseract installed.
+                }
+            }
+        }
+    }
 
     if !check_text_or_skip(&canonical_source, &normalized_bytes, origin)? {
         return Ok(None);
@@ -1523,6 +1575,10 @@ mod tests {
                     extensions: vec!["pdf".to_string()],
                     optional_extensions: Vec::new(),
                 },
+                // OCR off so the markitdown-only acceptance tests aren't
+                // perturbed by PATH state (whether tesseract is installed
+                // on the host shouldn't change ingest behavior here).
+                ocr: crate::OcrOptions::disabled(),
             }
         }
 
@@ -1696,6 +1752,7 @@ mod tests {
                     extensions: vec!["pdf".to_string()],
                     optional_extensions: Vec::new(),
                 },
+                ocr: crate::OcrOptions::disabled(),
             };
             let err = ingest_paths_with_config(kb_root.path(), &[pdf], &options)
                 .expect_err("binary file should still be rejected");
@@ -1759,12 +1816,17 @@ mod tests {
 
 mod headings;
 mod image_refs;
+mod ocr;
 mod preprocess;
 mod repo;
 mod url;
 
 pub use headings::extract_heading_ids;
 pub use image_refs::{CopiedImages, rewrite_asset_refs, scan_and_stage};
+pub use ocr::{
+    DEFAULT_MIN_CHARS_THRESHOLD as OCR_DEFAULT_MIN_CHARS_THRESHOLD, FallbackReason as OcrFallbackReason,
+    OcrCache, OcrOptions, OcrOutcome, ocr_pdf, should_ocr_fallback,
+};
 pub use preprocess::{
     Converted, MarkitdownOptions, Preprocessed,
     default_extensions as markitdown_default_extensions,
