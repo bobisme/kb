@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,14 @@ pub trait LogSink: Send + Sync {
     /// Append a single message as a log line. Implementations should not
     /// panic on IO errors — a failed log write must never abort a compile.
     fn append_log(&self, message: &str);
+
+    /// Optional filesystem path of the log file backing this sink. Returned
+    /// so error formatters can point users at the full diagnostic
+    /// (`(see <path>)`) without bringing the CLI's `JobLogSink` into scope.
+    /// In-memory or no-op sinks return `None`.
+    fn log_path(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// Max bytes of subprocess stderr to embed in a single log line when an
@@ -61,6 +69,116 @@ fn stderr_tail(text: &str) -> String {
         start += 1;
     }
     format!("...{}", &text[start..])
+}
+
+/// Hard cap on the terminal-friendly `[err]` line length. The full diagnostic
+/// goes to the log file; on stderr we want a single readable line so the user
+/// can scroll a failed compile without losing the actual reason behind a wall
+/// of prompt-echo. 200 bytes fits a typical 132-column terminal twice over.
+const ERR_TERMINAL_MAX: usize = 200;
+
+/// Compress an error message into a single line, replacing newlines and
+/// excess whitespace with spaces. Multi-line LLM error payloads (rendered
+/// prompts, multi-line transport errors) thus become readable one-liners on
+/// stderr. The full message — newlines and all — still ends up in the log.
+fn flatten_err_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut prev_space = false;
+    for ch in text.chars() {
+        let is_space = ch == '\n' || ch == '\r' || ch == '\t' || ch == ' ';
+        if is_space {
+            if !prev_space && !out.is_empty() {
+                out.push(' ');
+            }
+            prev_space = true;
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    while out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Truncate a single-line string to at most `max` bytes on a char boundary,
+/// appending an ellipsis marker when bytes were dropped. Used to bound the
+/// terminal `[err]` line at `ERR_TERMINAL_MAX`.
+fn truncate_to(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let marker = "...";
+    let cap = max.saturating_sub(marker.len());
+    let mut end = cap;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &text[..end], marker)
+}
+
+/// Build the two views of an `[err]` line for a failed LLM pass.
+///
+/// Returns `(terminal_line, log_line)`:
+/// * `terminal_line` is a single-line, ≤[`ERR_TERMINAL_MAX`]-byte summary
+///   suitable for `reporter.error` — newlines flattened, ending with
+///   `(see <log_path>)` when a log path is available so the user can find
+///   the full diagnostic.
+/// * `log_line` keeps the existing 2 KB tail (`stderr_tail`) and embedded
+///   newlines — log files are searchable and benefit from the full context.
+///
+/// `pass_label` is the rendered identifier appearing after `[err]`, e.g.
+/// `source_summary: doc-fail` or `concept_merge`. The pipeline already builds
+/// these labels per-call-site, so this helper just stitches them together.
+fn format_pass_err(
+    pass_label: &str,
+    elapsed_secs: f64,
+    err: &dyn std::fmt::Display,
+    log_path: Option<&Path>,
+) -> (String, String) {
+    let raw = err.to_string();
+    let log_body = stderr_tail(&raw);
+    let log_line = format!("  [err] {pass_label} ({elapsed_secs:.1}s) — {log_body}");
+
+    let pointer = log_path.map_or_else(
+        || " (full diagnostic in .kb/state/jobs/*.log)".to_string(),
+        |p| format!(" (see {})", p.display()),
+    );
+    let summary = flatten_err_line(&raw);
+    // Reserve room for the trailing pointer so it always survives truncation.
+    let prefix = format!("  [err] {pass_label} ({elapsed_secs:.1}s) — ");
+    // The minimum line we must produce is `prefix + pointer`; the body is
+    // whatever fits in between (with at least one byte to avoid an empty
+    // dash). If the prefix already overflows, we still emit it — at that
+    // point the pass label is the whole story.
+    let budget = ERR_TERMINAL_MAX
+        .saturating_sub(prefix.len())
+        .saturating_sub(pointer.len());
+    let body = if budget == 0 {
+        String::new()
+    } else {
+        truncate_to(&summary, budget)
+    };
+    let mut terminal_line = if body.is_empty() {
+        format!("{}{}", prefix.trim_end_matches(" — "), pointer)
+    } else {
+        format!("{prefix}{body}{pointer}")
+    };
+    // Guard against a pathologically long pass_label producing an over-long
+    // line — clamp the whole thing to the cap as a final safety net.
+    if terminal_line.len() > ERR_TERMINAL_MAX {
+        terminal_line = truncate_to(&terminal_line, ERR_TERMINAL_MAX);
+    }
+    (terminal_line, log_line)
+}
+
+/// Resolve the optional log path threaded through to error formatters.
+fn log_path_from_options(options: &CompileOptions) -> Option<PathBuf> {
+    options
+        .log_sink
+        .as_ref()
+        .and_then(|sink| sink.log_path().map(Path::to_path_buf))
 }
 
 #[derive(Clone, Default)]
@@ -1032,15 +1150,18 @@ fn run_per_document_passes(
             Err(err) => {
                 tracing::warn!("source_summary failed for {doc_id}: {err}");
                 // Adapter errors already embed subprocess stderr (opencode/claude
-                // both format `stderr` into their LlmAdapterError message) — trim
-                // to ERR_TAIL_BYTES so a single failed pass can't flood the log.
-                let err_str = stderr_tail(&err.to_string());
-                let err_line = format!(
-                    "  [err] source_summary: {doc_id} ({:.1}s) — {err_str}",
+                // both format `stderr` into their LlmAdapterError message). Two
+                // views: terminal gets a one-line summary with a `(see …)`
+                // pointer; the log keeps a 2 KB tail of the full diagnostic.
+                let log_path = log_path_from_options(options);
+                let (terminal_line, log_line) = format_pass_err(
+                    &format!("source_summary: {doc_id}"),
                     summary_started.elapsed().as_secs_f64(),
+                    &err,
+                    log_path.as_deref(),
                 );
-                reporter.error(&err_line);
-                log_message(options, &err_line);
+                reporter.error(&terminal_line);
+                log_message(options, &log_line);
                 // Advance the progress bar past this item even on error so the
                 // counter still reaches total once every doc has been tried.
                 reporter.pass_item_done(
@@ -1157,13 +1278,15 @@ fn run_per_document_passes(
             }
             Err(err) => {
                 tracing::warn!("concept_extraction failed for {doc_id}: {err}");
-                let err_str = stderr_tail(&err.to_string());
-                let err_line = format!(
-                    "  [err] concept_extraction: {doc_id} ({:.1}s) — {err_str}",
+                let log_path = log_path_from_options(options);
+                let (terminal_line, log_line) = format_pass_err(
+                    &format!("concept_extraction: {doc_id}"),
                     extract_started.elapsed().as_secs_f64(),
+                    &err,
+                    log_path.as_deref(),
                 );
-                reporter.error(&err_line);
-                log_message(options, &err_line);
+                reporter.error(&terminal_line);
+                log_message(options, &log_line);
                 reporter.pass_item_done(
                     "concept_extraction",
                     doc_id,
@@ -1280,13 +1403,15 @@ fn run_concept_merge_from_state(
     ) {
         Ok(a) => a,
         Err(err) => {
-            let err_str = stderr_tail(&err.to_string());
-            let err_line = format!(
-                "  [err] concept_merge ({:.1}s) — {err_str}",
+            let log_path = log_path_from_options(options);
+            let (terminal_line, log_line) = format_pass_err(
+                "concept_merge",
                 merge_started.elapsed().as_secs_f64(),
+                &err,
+                log_path.as_deref(),
             );
-            reporter.error(&err_line);
-            log_message(options, &err_line);
+            reporter.error(&terminal_line);
+            log_message(options, &log_line);
             reporter.pass_item_done(
                 "concept_merge",
                 &candidate_label,
@@ -2572,9 +2697,12 @@ mod tests {
         );
     }
 
-    /// When the LLM adapter fails, the log must capture an `[err]` line and
-    /// include (a tail of) the subprocess stderr so the operator can debug
-    /// without re-running a long compile.
+    /// When the LLM adapter fails, the **log** must capture an `[err]` line
+    /// containing a tail of the subprocess stderr (full diagnostic, with
+    /// embedded newlines preserved) so the operator can debug without
+    /// re-running a long compile. Companion test
+    /// `compile_terminal_err_line_is_short_and_single_line` asserts the
+    /// terminal-side counterpart (one-line summary, ≤200 bytes).
     #[test]
     fn compile_captures_stderr_tail_on_llm_failure() {
         let dir = tempdir().expect("tempdir");
@@ -2605,15 +2733,19 @@ mod tests {
             .find(|l| l.contains("[err] source_summary: doc-fail"))
             .unwrap_or_else(|| panic!("missing [err] line; got {lines:?}"));
 
-        // Tail marker at the *end* of stderr must survive truncation.
+        // Tail marker at the *end* of stderr must survive truncation in the
+        // log line. The terminal line — captured by reporter.error, NOT this
+        // sink — uses the truncated single-line variant and is asserted in
+        // the companion test.
         assert!(
             err_line.contains("TAIL_MARKER"),
-            "stderr tail must preserve the last bytes; got {err_line:?}"
+            "log [err] must preserve the last bytes of stderr; got {err_line:?}"
         );
-        // Truncation must have dropped bytes — line length is bounded.
+        // Truncation must have dropped bytes — line length is bounded by
+        // ERR_TAIL_BYTES + a small fixed overhead for the prefix and marker.
         assert!(
             err_line.len() < big_stderr.len(),
-            "err line should be shorter than the full stderr; got {} bytes",
+            "log [err] should be shorter than the full stderr; got {} bytes",
             err_line.len()
         );
         // Sentinel confirming the tail helper ran (prefix).
@@ -2621,6 +2753,253 @@ mod tests {
             err_line.contains("..."),
             "truncated tail should be prefixed with '...'; got {err_line:?}"
         );
+    }
+
+    /// Captures every `error()` call on a stub reporter so tests can inspect
+    /// what landed on the terminal vs. what landed in the log sink. Used
+    /// together with `MemorySink` to assert the terminal/log split for the
+    /// `[err]` lines emitted on LLM failures (bn-12zh).
+    #[derive(Default, Clone)]
+    struct CapturingReporter {
+        errors: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl CapturingReporter {
+        fn errors(&self) -> Vec<String> {
+            self.errors.lock().expect("lock").clone()
+        }
+    }
+
+    impl ProgressReporter for CapturingReporter {
+        fn pass_start(&self, _pass: &str, _total: usize) {}
+        fn pass_item_start(&self, _pass: &str, _item: &str) {}
+        fn pass_item_done(&self, _pass: &str, _item: &str, _elapsed: Duration) {}
+        fn pass_done(&self, _pass: &str, _affected: usize, _elapsed: Duration) {}
+        fn info(&self, _message: &str) {}
+        fn error(&self, message: &str) {
+            self.errors.lock().expect("lock").push(message.to_string());
+        }
+    }
+
+    /// bn-12zh: the **terminal** `[err]` line emitted on an LLM failure must
+    /// be a single line ≤ `ERR_TERMINAL_MAX` bytes, with no embedded newlines,
+    /// even when the underlying error contains a multi-KB rendered prompt
+    /// with newlines. Drowning the terminal in prompt echo was the symptom
+    /// that motivated this bone.
+    #[test]
+    fn compile_terminal_err_line_is_short_and_single_line() {
+        use std::fmt::Write as _;
+
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-fail", "# T\nB.")).expect("write");
+
+        // Multi-line, multi-KB blob — same shape as a real opencode prompt
+        // echo (rendered template + document body interleaved with newlines).
+        let mut blob = String::new();
+        for i in 0..200 {
+            writeln!(blob, "prompt-line-{i}: filler text to reach > 2 KB total")
+                .expect("write to String");
+        }
+        blob.push_str("FINAL_MARKER");
+        let adapter = FailingAdapter { stderr_blob: blob };
+
+        let sink = MemorySink::default();
+        let reporter = CapturingReporter::default();
+        let options = CompileOptions {
+            force: false,
+            dry_run: false,
+            progress: false,
+            log_sink: Some(Arc::new(sink.clone())),
+            reporter: Some(Arc::new(reporter.clone())),
+        };
+        run_compile_with_llm(root, &options, Some(&adapter))
+            .expect("compile succeeds (failures logged, not bubbled)");
+
+        let term_errors = reporter.errors();
+        let term_err = term_errors
+            .iter()
+            .find(|l| l.contains("[err] source_summary: doc-fail"))
+            .unwrap_or_else(|| panic!("missing terminal [err] line; got {term_errors:?}"));
+
+        // No embedded newlines on the terminal — the whole point of the fix.
+        assert!(
+            !term_err.contains('\n'),
+            "terminal [err] must be a single line; got {term_err:?}"
+        );
+        // Hard cap: ≤ ERR_TERMINAL_MAX bytes, even for a multi-KB error.
+        assert!(
+            term_err.len() <= ERR_TERMINAL_MAX,
+            "terminal [err] must be ≤{} bytes; got {} bytes: {:?}",
+            ERR_TERMINAL_MAX,
+            term_err.len(),
+            term_err
+        );
+        // Pointer to the log file (or generic fallback) must be present so
+        // the user can find the full diagnostic offline.
+        assert!(
+            term_err.contains("(see ") || term_err.contains("(full diagnostic in"),
+            "terminal [err] must end with a pointer to the log; got {term_err:?}"
+        );
+
+        // The log sink keeps the full tail — verify both views diverge.
+        let log_lines = sink.snapshot();
+        let log_err = log_lines
+            .iter()
+            .find(|l| l.contains("[err] source_summary: doc-fail"))
+            .unwrap_or_else(|| panic!("missing log [err] line; got {log_lines:?}"));
+        assert!(
+            log_err.contains("FINAL_MARKER"),
+            "log [err] should still contain the tail of the diagnostic; got {log_err:?}"
+        );
+        assert!(
+            log_err.len() > term_err.len(),
+            "log line ({} bytes) must be richer than terminal line ({} bytes)",
+            log_err.len(),
+            term_err.len()
+        );
+    }
+
+    /// Sink that advertises a fake log path so tests can assert that the
+    /// `[err]` formatter threads it into `(see …)`. Used by
+    /// `compile_terminal_err_line_points_to_log_path`.
+    #[derive(Clone)]
+    struct PathedSink {
+        path: PathBuf,
+    }
+
+    impl LogSink for PathedSink {
+        fn append_log(&self, _message: &str) {}
+        fn log_path(&self) -> Option<&Path> {
+            Some(&self.path)
+        }
+    }
+
+    /// bn-12zh: the terminal `[err]` line must end with `(see <log path>)`
+    /// when a `LogSink` exposes a real path (the production CLI path via
+    /// `JobLogSink`). Stub the path on a custom sink.
+    #[test]
+    fn compile_terminal_err_line_points_to_log_path() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-fail", "# T\nB.")).expect("write");
+
+        let adapter = FailingAdapter {
+            stderr_blob: "boom\nwith\nnewlines".to_string(),
+        };
+
+        let fake_path = root.join("state/jobs/job-12zh.log");
+        let reporter = CapturingReporter::default();
+        let options = CompileOptions {
+            force: false,
+            dry_run: false,
+            progress: false,
+            log_sink: Some(Arc::new(PathedSink {
+                path: fake_path.clone(),
+            })),
+            reporter: Some(Arc::new(reporter.clone())),
+        };
+        run_compile_with_llm(root, &options, Some(&adapter))
+            .expect("compile succeeds (failures logged, not bubbled)");
+
+        let errors = reporter.errors();
+        let term_err = errors
+            .iter()
+            .find(|l| l.contains("[err] source_summary: doc-fail"))
+            .unwrap_or_else(|| panic!("missing terminal [err] line; got {errors:?}"));
+
+        assert!(
+            term_err.contains(&format!("(see {})", fake_path.display())),
+            "terminal [err] must reference the log path; got {term_err:?}"
+        );
+    }
+
+    /// bn-12zh: with no `log_sink` configured, the terminal `[err]` line
+    /// still includes a generic pointer so the user knows where to look.
+    #[test]
+    fn compile_terminal_err_line_falls_back_to_generic_log_pointer() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-fail", "# T\nB.")).expect("write");
+
+        let adapter = FailingAdapter {
+            stderr_blob: "boom".to_string(),
+        };
+        let reporter = CapturingReporter::default();
+        let options = CompileOptions {
+            force: false,
+            dry_run: false,
+            progress: false,
+            log_sink: None,
+            reporter: Some(Arc::new(reporter.clone())),
+        };
+        run_compile_with_llm(root, &options, Some(&adapter))
+            .expect("compile succeeds (failures logged, not bubbled)");
+
+        let errors = reporter.errors();
+        let term_err = errors
+            .iter()
+            .find(|l| l.contains("[err] source_summary: doc-fail"))
+            .unwrap_or_else(|| panic!("missing terminal [err] line; got {errors:?}"));
+
+        assert!(
+            term_err.contains("full diagnostic in .kb/state/jobs/*.log"),
+            "expected generic pointer fallback; got {term_err:?}"
+        );
+    }
+
+    /// Unit test for the formatter: a multi-line input is collapsed into a
+    /// single line and capped at `ERR_TERMINAL_MAX`. Exercised directly so we
+    /// don't need a full pipeline run to validate edge cases.
+    #[test]
+    fn format_pass_err_strips_newlines_and_truncates() {
+        let big_input = format!(
+            "line1\nline2\nline3\n{}",
+            "x".repeat(ERR_TERMINAL_MAX * 4),
+        );
+        let (terminal, log) = format_pass_err(
+            "source_summary: doc-x",
+            1.5,
+            &big_input,
+            Some(Path::new("/tmp/jobs/abc.log")),
+        );
+        assert!(!terminal.contains('\n'), "terminal line had newline: {terminal:?}");
+        assert!(
+            terminal.len() <= ERR_TERMINAL_MAX,
+            "terminal line over cap ({} bytes): {:?}",
+            terminal.len(),
+            terminal,
+        );
+        assert!(
+            terminal.ends_with("(see /tmp/jobs/abc.log)"),
+            "missing log pointer; got {terminal:?}",
+        );
+        // Log line preserves newlines from the input.
+        assert!(log.contains("line1"));
+        assert!(log.contains('\n'), "log line should keep newlines; got {log:?}");
+    }
+
+    #[test]
+    fn flatten_err_line_collapses_whitespace_runs() {
+        assert_eq!(flatten_err_line("a\nb"), "a b");
+        assert_eq!(flatten_err_line("a\n\n  b"), "a b");
+        assert_eq!(flatten_err_line("trailing  \n"), "trailing");
+        assert_eq!(flatten_err_line(""), "");
+    }
+
+    #[test]
+    fn truncate_to_appends_ellipsis_marker() {
+        let s = "abcdefghij";
+        assert_eq!(truncate_to(s, 100), "abcdefghij");
+        let out = truncate_to(s, 6);
+        assert!(out.ends_with("..."), "got {out:?}");
+        assert!(out.len() <= 6, "got {} bytes: {out:?}", out.len());
     }
 
     /// Guards the behavior driving the Debug impl: the `log_sink` field must

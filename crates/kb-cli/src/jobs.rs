@@ -37,6 +37,10 @@ impl LogSink for JobLogSink {
         // couldn't run.
         let _ = append_log_line(&self.log_path, message);
     }
+
+    fn log_path(&self) -> Option<&Path> {
+        Some(&self.log_path)
+    }
 }
 
 impl JobHandle {
