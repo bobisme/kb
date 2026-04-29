@@ -4,11 +4,120 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use kb_core::{
     BuildRecord, Citation, EntityMetadata, NormalizedDocument, Status, hash_many,
-    rewrite_managed_region,
+    rewrite_managed_region, slug_from_title,
 };
 use kb_llm::{LlmAdapter, LlmAdapterError, ProvenanceRecord, SummarizeDocumentRequest};
 
 const SUMMARY_REGION_ID: &str = "summary";
+
+/// Detect whether a `stable_location` points at a kbtx transcript source.
+///
+/// kbtx files use the double-extension `.kbtx.md` so we can recognize them
+/// without re-parsing frontmatter or the body. URL-shaped stable locations
+/// never carry a meaningful filename so they are never transcripts.
+///
+/// The check is case-insensitive on the suffix to tolerate any future
+/// pathway that uppercases parts of the location string.
+#[must_use]
+pub fn is_transcript_stable_location(stable_location: &str) -> bool {
+    if stable_location.contains("://") && !stable_location.starts_with("git+") {
+        return false;
+    }
+    let path_segment: &str = stable_location
+        .strip_prefix("git+")
+        .map_or(stable_location, |rest| {
+            rest.rsplit_once('#').map_or(rest, |(_, p)| p)
+        });
+    path_segment.to_ascii_lowercase().ends_with(".kbtx.md")
+}
+
+/// Re-extract heading IDs from a kbtx transcript source's canonical text,
+/// skipping per-speaker turn H2s (`## @<id> [HH:MM:SS → HH:MM:SS]`) and
+/// the structural `## Speakers` heading.
+///
+/// The default heading extractor (`kb_ingest::extract_heading_ids`) treats
+/// every H2 as a candidate "key topic", which adds 100-200 noisy
+/// speaker-turn slugs to a transcript's source-page Key topics list and
+/// dilutes lexical signal for retrieval. Transcripts have one turn H2 per
+/// speaker change; none of them are meaningful topic anchors.
+///
+/// This walks `markdown` line-by-line (mirroring the simple ATX-heading
+/// scan in `kb_ingest::headings::extract_heading_ids`) and emits slugs only
+/// for headings that are not transcript-shaped. Duplicates are
+/// disambiguated with a numeric suffix the same way the upstream extractor
+/// does, so the resulting slugs stay stable as anchor targets.
+#[must_use]
+pub fn extract_transcript_heading_ids(markdown: &str) -> Vec<String> {
+    use std::collections::HashMap;
+
+    let mut ids = Vec::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    let mut in_fence = false;
+
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            continue;
+        };
+        let (level, rest) = parse_heading_prefix(rest);
+        if level == 0 {
+            continue;
+        }
+        let title = rest.trim().trim_end_matches('#').trim();
+        if title.is_empty() {
+            continue;
+        }
+
+        // Skip kbtx-specific H2s entirely:
+        //   `## @speaker_03 [00:00:01 → 00:00:53]` — per-turn heading
+        //   `## Speakers`                          — roster section
+        if level == 2 && (title.starts_with('@') || title == "Speakers") {
+            continue;
+        }
+
+        let slug = slug_from_title(title);
+        if slug.is_empty() {
+            continue;
+        }
+
+        let key = slug.to_lowercase();
+        let count = counts.entry(key).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            ids.push(slug);
+        } else {
+            ids.push(format!("{slug}-{count}"));
+        }
+    }
+
+    ids
+}
+
+/// Returns the heading level (1, 2, or 3) and the remainder after the
+/// hash prefix, or `(0, rest)` for non-headings. Mirrors the parser in
+/// `kb_ingest::headings`.
+fn parse_heading_prefix(rest: &str) -> (u8, &str) {
+    let (extra, tail) = rest.strip_prefix("##").map_or_else(
+        || rest.strip_prefix('#').map_or((0u8, rest), |t| (1u8, t)),
+        |t| (2u8, t),
+    );
+
+    if tail.starts_with('#') {
+        return (0, rest);
+    }
+    match tail.chars().next() {
+        Some(c) if c.is_whitespace() => (extra + 1, tail),
+        _ => (0, rest),
+    }
+}
 
 /// Output emitted by the source summary pass for one normalized document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,5 +522,102 @@ mod tests {
         assert!(updated.contains("New summary."));
         assert!(updated.contains("## Notes\nKeep me."));
         assert!(!updated.contains("Old summary."));
+    }
+
+    // bn-3syy: kbtx transcript heading filtering.
+
+    #[test]
+    fn is_transcript_stable_location_recognizes_kbtx_extension() {
+        assert!(is_transcript_stable_location(
+            "/home/bob/notes/usb-team-intro.kbtx.md",
+        ));
+        assert!(is_transcript_stable_location(
+            "/home/bob/notes/USB-Team-Intro.KBTX.MD",
+        ));
+        assert!(is_transcript_stable_location(
+            "git+https://github.com/foo/bar.git#transcripts/intro.kbtx.md",
+        ));
+    }
+
+    #[test]
+    fn is_transcript_stable_location_rejects_plain_markdown() {
+        assert!(!is_transcript_stable_location(
+            "/home/bob/notes/usb-team-intro.md",
+        ));
+        assert!(!is_transcript_stable_location("/home/bob/notes/intro.txt"));
+        // URL sources never carry a meaningful filename for our purposes.
+        assert!(!is_transcript_stable_location("https://example.com/a/b"));
+    }
+
+    #[test]
+    fn extract_transcript_heading_ids_skips_speaker_turns_and_speakers_heading() {
+        let md = "---\ntype: source\n---\n\n## Speakers\n\n- @alice: Alice\n\n# Transcript\n\n## @alice [00:00:01 → 00:00:10]\n\nHello world.\n\n## @bob [00:00:11 → 00:00:20]\n\nHi back.\n\n## Action items\n\n- Follow up.\n";
+        let ids = extract_transcript_heading_ids(md);
+        // The only retained slugs are the H1 `Transcript` and the H2
+        // `Action items` — every speaker turn and the structural
+        // `Speakers` heading is dropped.
+        assert_eq!(
+            ids,
+            vec!["transcript".to_string(), "action-items".to_string()],
+        );
+    }
+
+    #[test]
+    fn extract_transcript_heading_ids_dramatically_shrinks_usb_fixture() {
+        // The USB transcript fixture has 188 speaker-turn H2s plus
+        // structural headings. The kbtx-aware extractor should drop the
+        // turns and Speakers heading, leaving only the `# Transcript` H1
+        // (a handful of topics, not 188).
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../kb-core/tests/fixtures/usb-team-intro.kbtx.md");
+        let md = std::fs::read_to_string(&path).expect("read usb fixture");
+
+        // Sanity-check the fixture still has ~188 speaker-turn H2s; if
+        // someone trims it later this test still meaningfully asserts a
+        // big reduction.
+        let speaker_h2_count = md.lines().filter(|l| l.starts_with("## @")).count();
+        assert!(
+            speaker_h2_count >= 50,
+            "fixture should retain its speaker-heavy shape; got {speaker_h2_count} speaker H2s",
+        );
+
+        let ids = extract_transcript_heading_ids(&md);
+        assert!(
+            ids.len() < 10,
+            "expected a handful of topics for transcript source, got {} ({:?})",
+            ids.len(),
+            ids,
+        );
+        assert!(
+            !ids.iter().any(|id| id.starts_with("speaker")),
+            "transcript-aware extractor must not emit speaker-turn slugs; got {ids:?}",
+        );
+        assert!(
+            !ids.iter().any(|id| id == "speakers"),
+            "transcript-aware extractor must drop the structural `Speakers` heading; got {ids:?}",
+        );
+    }
+
+    #[test]
+    fn extract_transcript_heading_ids_preserves_non_transcript_h2s() {
+        // Action items and similar real H2s should survive even in a
+        // transcript document.
+        let md = "# Transcript\n\n## @alice [00:00:01 → 00:00:10]\n\nbody\n\n## Decisions\n\n- decided.\n\n## @bob [00:00:11 → 00:00:20]\n\nbody\n\n## Follow-ups\n\n- ping.\n";
+        let ids = extract_transcript_heading_ids(md);
+        assert_eq!(
+            ids,
+            vec![
+                "transcript".to_string(),
+                "decisions".to_string(),
+                "follow-ups".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn extract_transcript_heading_ids_dedupes_repeated_headings() {
+        let md = "## Notes\n\nfirst\n\n## Notes\n\nsecond\n";
+        let ids = extract_transcript_heading_ids(md);
+        assert_eq!(ids, vec!["notes".to_string(), "notes-2".to_string()]);
     }
 }

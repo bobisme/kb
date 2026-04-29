@@ -1112,14 +1112,32 @@ fn run_per_document_passes(
     let mut concept_extraction_affected = 0usize;
 
     for doc_id in stale_doc_ids {
-        let doc = read_normalized_document(root, doc_id)
+        let mut doc = read_normalized_document(root, doc_id)
             .with_context(|| format!("read normalized document {doc_id}"))?;
+        // bn-3syy: kbtx transcripts emit one H2 per speaker turn (`## @<id>
+        // [HH:MM:SS → HH:MM:SS]`); the upstream `extract_heading_ids` walks
+        // them as if they were topic anchors, polluting the source page's
+        // Key topics with 100-200 noisy speaker-turn slugs and diluting
+        // lexical signal. Detect transcripts via the `.kbtx.md` extension on
+        // the source's `stable_location` and re-extract heading IDs with a
+        // kbtx-aware variant that drops per-turn H2s and the structural
+        // `## Speakers` heading.
+        let stable_location = read_stable_location(root, doc_id);
+        if stable_location
+            .as_deref()
+            .is_some_and(crate::source_summary::is_transcript_stable_location)
+        {
+            doc.heading_ids =
+                crate::source_summary::extract_transcript_heading_ids(&doc.canonical_text);
+        }
         // bn-6puc: before falling through to the src-id, prefer the ingested
         // file's filename stem as a title when the body has no H1 and no
         // frontmatter title. URL-ingested sources have no filesystem stem, so
         // the stem helper returns `None` and we fall through to `doc_id` as
         // before.
-        let stem_fallback = stable_location_file_stem(root, doc_id);
+        let stem_fallback = stable_location
+            .as_deref()
+            .and_then(kb_core::file_stem_from_stable_location);
         let title = derive_title(&doc.canonical_text, stem_fallback.as_deref(), doc_id);
         // New page path includes the title slug (bn-nlw9). Read any existing
         // page (id-only OR prior-slug form) so managed regions / frontmatter
@@ -1518,25 +1536,24 @@ fn frontmatter_title(text: &str) -> Option<String> {
     if title.is_empty() { None } else { Some(title) }
 }
 
-/// Read the filename stem from `raw/inbox/<src_id>/source_document.json`'s
-/// `stable_location` field. Returns `None` when:
+/// Read the `stable_location` string from
+/// `raw/inbox/<src_id>/source_document.json`. Returns `None` when the file
+/// is missing or malformed.
 ///
-/// - the `source_document.json` is missing or malformed,
-/// - the `stable_location` is URL-shaped (`scheme://...`) — URL sources don't
-///   carry a meaningful filesystem stem, and
-/// - the stem is empty.
-///
-/// The stem is returned verbatim (preserving hyphens, case, and extension-
-/// less basename). Slug normalization happens later in the write path.
-fn stable_location_file_stem(root: &Path, src_id: &str) -> Option<String> {
+/// Used as the single source of truth for the source's original filesystem
+/// path / URL. Callers extract whatever subview they need (filename stem
+/// for title fallback, file extension for transcript detection, etc.).
+fn read_stable_location(root: &Path, src_id: &str) -> Option<String> {
     let path = root
         .join("raw/inbox")
         .join(src_id)
         .join("source_document.json");
     let bytes = std::fs::read(&path).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let stable_location = value.get("stable_location")?.as_str()?;
-    kb_core::file_stem_from_stable_location(stable_location)
+    value
+        .get("stable_location")?
+        .as_str()
+        .map(ToOwned::to_owned)
 }
 
 /// Split body text out of a frontmatter-prefixed markdown document, returning None if
