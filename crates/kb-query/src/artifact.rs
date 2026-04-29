@@ -87,6 +87,18 @@ pub fn postprocess_answer(
 
     let needs_banner = should_show_uncertainty_banner(&valid, &invalid);
 
+    // bn-1319: rewrite valid `[N]` markers to Obsidian wikilinks so they're
+    // clickable inside the vault. Invalid `[N]` are left as plain text so the
+    // unresolved-citations footer below still labels them.
+    let rewritten = CITATION_RE.replace_all(raw_answer, |caps: &regex::Captures<'_>| {
+        let raw = caps.get(0).map_or("", |m| m.as_str()).to_string();
+        let n: u32 = caps[1].parse().unwrap_or(0);
+        manifest
+            .entries
+            .get(&n)
+            .map_or(raw, |entry| citation_wikilink(entry, n))
+    });
+
     let mut body = String::new();
 
     if needs_banner {
@@ -94,7 +106,7 @@ pub fn postprocess_answer(
         body.push_str("The answer below may be incomplete. Consider ingesting additional sources.\n\n");
     }
 
-    body.push_str(raw_answer);
+    body.push_str(&rewritten);
 
     if !invalid.is_empty() {
         body.push_str("\n\n---\n\n");
@@ -109,6 +121,24 @@ pub fn postprocess_answer(
         valid_citations: valid,
         invalid_citations: invalid,
         has_uncertainty_banner: needs_banner,
+    }
+}
+
+/// Render an Obsidian wikilink for a citation manifest entry, displayed as the
+/// numeric key the model emitted (`[[wiki/path|N]]`). Real heading anchors are
+/// preserved as `#anchor`; the assembler's pseudo-anchors (`summary`,
+/// `section`) are skipped because they don't correspond to anything in the
+/// underlying page.
+fn citation_wikilink(entry: &ManifestEntry, n: u32) -> String {
+    let target = entry
+        .source_id
+        .strip_suffix(".md")
+        .unwrap_or(&entry.source_id);
+    match entry.anchor.as_deref() {
+        Some(anchor) if !anchor.is_empty() && anchor != "summary" && anchor != "section" => {
+            format!("[[{target}#{anchor}|{n}]]")
+        }
+        _ => format!("[[{target}|{n}]]"),
     }
 }
 
@@ -313,6 +343,10 @@ mod tests {
         let result = postprocess_answer(raw, &manifest, &ctx);
         assert_eq!(result.valid_citations, vec![1, 2]);
         assert_eq!(result.invalid_citations, vec![99]);
+        // Valid citations are rewritten to clickable Obsidian wikilinks; invalid
+        // ones stay as plain text so the unresolved-citations footer reads cleanly.
+        assert!(result.body.contains("[[wiki/sources/doc-a|1]]"));
+        assert!(result.body.contains("[[wiki/sources/doc-b#intro|2]]"));
         assert!(result.body.contains("[99]"));
         assert!(result.body.contains("Unresolved citations"));
     }
@@ -326,6 +360,95 @@ mod tests {
         assert_eq!(result.valid_citations, vec![1, 2]);
         assert!(result.invalid_citations.is_empty());
         assert!(!result.body.contains("Unresolved citations"));
+    }
+
+    /// bn-1319 regression: valid `[N]` markers must turn into Obsidian
+    /// wikilinks so they're clickable in the vault, with `.md` stripped from
+    /// the target and pseudo-anchors (`summary`, `section`) omitted because
+    /// they don't correspond to a real heading on the destination page.
+    #[test]
+    fn postprocess_rewrites_valid_citations_to_obsidian_wikilinks() {
+        let ctx = AssembledContext {
+            text: String::new(),
+            token_budget: 1000,
+            estimated_tokens: 0,
+            manifest: vec![
+                ContextManifestEntry {
+                    start_offset: 0,
+                    end_offset: 1,
+                    source_id: "wiki/sources/full-doc.md".to_string(),
+                    anchor: None,
+                    chunk_kind: ContextChunkKind::FullDocument,
+                },
+                ContextManifestEntry {
+                    start_offset: 1,
+                    end_offset: 2,
+                    source_id: "wiki/sources/with-summary.md".to_string(),
+                    anchor: Some("summary".to_string()),
+                    chunk_kind: ContextChunkKind::Summary,
+                },
+                ContextManifestEntry {
+                    start_offset: 2,
+                    end_offset: 3,
+                    source_id: "wiki/sources/with-section.md".to_string(),
+                    anchor: Some("section".to_string()),
+                    chunk_kind: ContextChunkKind::Section,
+                },
+                ContextManifestEntry {
+                    start_offset: 3,
+                    end_offset: 4,
+                    source_id: "wiki/concepts/topic.md".to_string(),
+                    anchor: Some("ownership-rules".to_string()),
+                    chunk_kind: ContextChunkKind::Section,
+                },
+            ],
+        };
+        let manifest = build_citation_manifest(&ctx);
+        let raw = "Claim a [1]; claim b [2]; claim c [3]; claim d [4].";
+        let result = postprocess_answer(raw, &manifest, &ctx);
+
+        // No-anchor source: link to the page itself.
+        assert!(
+            result.body.contains("[[wiki/sources/full-doc|1]]"),
+            "got body: {}",
+            result.body
+        );
+        // Pseudo "summary" anchor must be stripped.
+        assert!(result.body.contains("[[wiki/sources/with-summary|2]]"));
+        assert!(!result.body.contains("with-summary#summary"));
+        // Pseudo "section" anchor must be stripped.
+        assert!(result.body.contains("[[wiki/sources/with-section|3]]"));
+        assert!(!result.body.contains("with-section#section"));
+        // Real heading anchors survive on concept pages too.
+        assert!(result.body.contains("[[wiki/concepts/topic#ownership-rules|4]]"));
+
+        // No bare `[N]` markers should remain in the body for valid citations.
+        for n in 1..=4 {
+            let bare = format!("[{n}]");
+            assert!(
+                !result.body.contains(&bare),
+                "bare {bare} should have been rewritten to a wikilink, body: {}",
+                result.body
+            );
+        }
+    }
+
+    /// bn-1319 regression: adjacent citations like `[1][2]` must each be
+    /// rewritten independently and produce well-formed back-to-back wikilinks
+    /// without corrupting the surrounding text.
+    #[test]
+    fn postprocess_rewrites_adjacent_citations() {
+        let ctx = sample_context();
+        let manifest = build_citation_manifest(&ctx);
+        let raw = "Stacked claim [1][2] still resolves.";
+        let result = postprocess_answer(raw, &manifest, &ctx);
+        assert!(
+            result
+                .body
+                .contains("[[wiki/sources/doc-a|1]][[wiki/sources/doc-b#intro|2]]"),
+            "got: {}",
+            result.body
+        );
     }
 
     #[test]
