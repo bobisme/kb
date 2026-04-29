@@ -49,6 +49,7 @@ impl Template {
     fn bundled(name: &str) -> Result<String> {
         match name {
             "ask.md" => Ok(include_str!("../prompts/ask.md").to_string()),
+            "ask_auto.md" => Ok(include_str!("../prompts/ask_auto.md").to_string()),
             "ask_chart.md" => Ok(include_str!("../prompts/ask_chart.md").to_string()),
             "ask_excalidraw.md" => {
                 Ok(include_str!("../prompts/ask_excalidraw.md").to_string())

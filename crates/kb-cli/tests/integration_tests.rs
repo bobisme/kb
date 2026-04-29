@@ -291,7 +291,11 @@ fn ask_creates_question_record_and_placeholder_artifact() {
         serde_json::from_str(&fs::read_to_string(&question_path).expect("read question record"))
             .expect("parse question record");
     assert_eq!(question_record["raw_query"], "How does the pipeline work?");
-    assert_eq!(question_record["requested_format"], "md");
+    // bn-2cs2: default format is now `auto`; the model picks supporting
+    // artifacts per question. The placeholder path is exercised here
+    // because no LLM backend is configured, but the recorded format still
+    // reflects the requested mode.
+    assert_eq!(question_record["requested_format"], "auto");
     assert_eq!(question_record["requesting_context"], "project_kb");
 
     let retrieval_plan_path = kb_root.join(
@@ -310,7 +314,7 @@ fn ask_creates_question_record_and_placeholder_artifact() {
 
     let artifact = fs::read_to_string(&artifact_path).expect("read artifact placeholder");
     assert!(artifact.contains("question_id:"));
-    assert!(artifact.contains("requested_format: md"));
+    assert!(artifact.contains("requested_format: auto"));
     assert!(
         artifact.contains("LLM unavailable") || artifact.contains("type: question_answer"),
         "artifact should contain LLM unavailable message or valid artifact header"

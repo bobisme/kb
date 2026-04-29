@@ -165,9 +165,12 @@ enum Command {
         /// Question to ask (reads from stdin if omitted or "-")
         query: Option<String>,
 
-        /// Artifact format for the answer (md, marp, json, chart, figure, excalidraw, diagram, png)
+        /// Artifact format for the answer.
+        /// Default `auto` lets the model pick supporting artifacts (Excalidraw,
+        /// chart) per question. Pass an explicit format to pin the output.
         #[arg(long, value_parser = [
-            "md", "marp", "json", "chart", "figure", "excalidraw", "diagram", "png",
+            "auto", "md", "marp", "json", "chart", "figure",
+            "excalidraw", "diagram", "png",
         ])]
         format: Option<String>,
 
@@ -1997,6 +2000,68 @@ fn write_excalidraw_failure_artifacts(
     Ok(())
 }
 
+/// bn-2cs2: classification of files promoted out of the auto-format
+/// sandbox. The two buckets line up with the artifact kinds the auto prompt
+/// teaches the model to produce: Excalidraw diagrams (`.excalidraw[.md]`)
+/// and chart PNGs (`.png`). Anything outside these extensions is left in
+/// the sandbox so the post-cleanup `remove_dir_all` sweeps it away.
+#[derive(Default)]
+struct AutoPromoted {
+    diagrams: Vec<PathBuf>,
+    charts: Vec<PathBuf>,
+}
+
+/// bn-2cs2: counterpart to [`promote_excalidraw_files`] for the auto-format
+/// sandbox. Walks the sandbox once, classifies each file by extension, and
+/// moves accepted ones up alongside `answer.md`. Returns both lists so the
+/// caller can record them in `output_paths` and embed them in the body.
+fn promote_auto_files(sandbox: &Path, dest_dir: &Path) -> Result<AutoPromoted> {
+    let mut out = AutoPromoted::default();
+    let entries = std::fs::read_dir(sandbox)
+        .with_context(|| format!("read auto sandbox {}", sandbox.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let kind = if name_str.ends_with(".excalidraw")
+            || name_str.ends_with(".excalidraw.md")
+        {
+            Some("diagram")
+        } else if name_str.ends_with(".png") {
+            Some("chart")
+        } else {
+            None
+        };
+        let Some(kind) = kind else {
+            continue;
+        };
+        let src = entry.path();
+        let dest = dest_dir.join(&name);
+        if let Err(rename_err) = std::fs::rename(&src, &dest) {
+            std::fs::copy(&src, &dest).with_context(|| {
+                format!(
+                    "copy {} to {} (rename failed: {rename_err})",
+                    src.display(),
+                    dest.display(),
+                )
+            })?;
+            std::fs::remove_file(&src).with_context(|| {
+                format!("remove sandbox file {} after copy", src.display())
+            })?;
+        }
+        match kind {
+            "diagram" => out.diagrams.push(dest),
+            "chart" => out.charts.push(dest),
+            _ => unreachable!("kind is one of diagram|chart"),
+        }
+    }
+    Ok(out)
+}
+
 /// bn-28ob: move accepted Excalidraw files out of the per-question sandbox
 /// dir (`<q-dir>/.diagrams/`) into the q-dir itself, alongside `answer.md`.
 ///
@@ -2072,7 +2137,7 @@ fn run_ask(
     // as validation so `kb status` doesn't count it as a failed run.
     if requested_format == "png" {
         return Err(ValidationError::new(
-            "--format png is not yet supported; supported formats: md, marp, json, chart, excalidraw",
+            "--format png is not yet supported; supported formats: auto, md, marp, json, chart, excalidraw",
         )
         .into());
     }
@@ -2177,6 +2242,21 @@ fn run_ask(
         None
     };
 
+    // bn-2cs2: auto-format plumbing. The LLM gets a single scratch dir and
+    // can drop a mix of supporting artifacts (Excalidraw diagrams, chart
+    // PNGs) — or none at all if plain text answers the question. After the
+    // run, accepted files are classified by extension and promoted to the
+    // q-dir alongside `answer.md`; the scratch dir is removed.
+    let auto_sandbox_abs = if requested_format == "auto" {
+        let abs = root.join(&base_dir).join(".scratch");
+        fs::create_dir_all(&abs).with_context(|| {
+            format!("create auto-format sandbox dir {}", abs.display())
+        })?;
+        Some(abs)
+    } else {
+        None
+    };
+
     let assembled = kb_query::assemble_context(root, &retrieval_plan)?;
     let citation_manifest = kb_query::build_citation_manifest(&assembled);
     let manifest_text = kb_query::render_manifest_for_prompt(&citation_manifest);
@@ -2206,15 +2286,22 @@ fn run_ask(
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
         ),
+        "auto" => (
+            Some("ask_auto.md"),
+            auto_sandbox_abs
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        ),
         _ => (None, None),
     };
 
-    // bn-1ikn: chart and excalidraw runs ask the adapter for a structured
-    // event stream so we can pull just the final assistant message and skip
-    // the per-tool narration opencode emits ahead of it. Other formats keep
-    // plain-text output — their caller doesn't drive the LLM through tools.
+    // bn-1ikn: tool-driving formats (chart, excalidraw, auto) ask the
+    // adapter for a structured event stream so we can pull just the final
+    // assistant message and skip the per-tool narration opencode emits
+    // ahead of it. Other formats keep plain-text output — their caller
+    // doesn't drive the LLM through tools.
     let structured_output =
-        matches!(requested_format, "chart" | "excalidraw");
+        matches!(requested_format, "chart" | "excalidraw" | "auto");
 
     let llm_outcome = try_generate_answer(
         &cfg,
@@ -2355,6 +2442,40 @@ fn run_ask(
         Vec::new()
     };
 
+    // bn-2cs2: auto format processes its sandbox after the LLM run. Unlike
+    // chart and excalidraw, auto has *no* required artifacts — a plain
+    // markdown answer is a valid outcome. So no `bail!` on empty sandbox;
+    // the run is treated as successful regardless. Files are classified by
+    // extension and promoted into the q-dir; anything unrecognized stays in
+    // the sandbox so the post-cleanup `remove_dir_all` sweeps it away. The
+    // sandbox is removed on both success and failure paths so partial state
+    // never leaks into the q-dir.
+    let auto_promoted: AutoPromoted = if requested_format == "auto" {
+        let sandbox = auto_sandbox_abs
+            .as_ref()
+            .expect("sandbox set for auto format")
+            .clone();
+        let q_dir_abs = root.join(&base_dir);
+        let promoted = if llm_outcome.is_ok() {
+            promote_auto_files(&sandbox, &q_dir_abs).with_context(|| {
+                format!(
+                    "promote auto artifacts from {} into {}",
+                    sandbox.display(),
+                    q_dir_abs.display(),
+                )
+            })?
+        } else {
+            // LLM failed entirely. Drop the sandbox and fall through to the
+            // placeholder body — auto doesn't need its own failure artifact
+            // path because the placeholder already says "LLM unavailable".
+            AutoPromoted::default()
+        };
+        let _ = std::fs::remove_dir_all(&sandbox);
+        promoted
+    } else {
+        AutoPromoted::default()
+    };
+
     let (model_version, template_hash, artifact_status, artifact_body, llm_info) =
         match llm_outcome {
             Ok((result, provenance)) => {
@@ -2411,6 +2532,47 @@ fn run_ask(
                         }
                         body
                     }
+                    "auto" => {
+                        // bn-2cs2: strip tool narration, then append safety-net
+                        // embeds for any promoted artifact the model forgot to
+                        // reference. Unlike chart/excalidraw the model may
+                        // produce zero artifacts; in that case the body is
+                        // just the cleaned text.
+                        let caption = kb_query::strip_tool_narration(&result.body)
+                            .trim()
+                            .to_string();
+                        let mut body = String::new();
+                        if !caption.is_empty() {
+                            body.push_str(&caption);
+                            body.push('\n');
+                        }
+                        for path in &auto_promoted.diagrams {
+                            if let Some(name) =
+                                path.file_name().and_then(|s| s.to_str())
+                            {
+                                let embed = format!("![[{name}]]");
+                                if !body.contains(&embed) {
+                                    body.push('\n');
+                                    body.push_str(&embed);
+                                    body.push('\n');
+                                }
+                            }
+                        }
+                        for path in &auto_promoted.charts {
+                            if let Some(name) =
+                                path.file_name().and_then(|s| s.to_str())
+                            {
+                                let embed = format!("![chart]({name})");
+                                if !body.contains(&embed) && !body.contains(&format!("({name})"))
+                                {
+                                    body.push('\n');
+                                    body.push_str(&embed);
+                                    body.push('\n');
+                                }
+                            }
+                        }
+                        body
+                    }
                     _ => result.body.clone(),
                 };
                 (
@@ -2455,6 +2617,21 @@ fn run_ask(
         question_output_paths.push(rel.clone());
     }
 
+    // bn-2cs2: same for auto-promoted artifacts (diagrams + chart PNGs).
+    let auto_rels: Vec<PathBuf> = auto_promoted
+        .diagrams
+        .iter()
+        .chain(auto_promoted.charts.iter())
+        .filter_map(|abs| {
+            abs.strip_prefix(root)
+                .ok()
+                .map(std::path::Path::to_path_buf)
+        })
+        .collect();
+    for rel in &auto_rels {
+        question_output_paths.push(rel.clone());
+    }
+
     let question = Question {
         metadata: EntityMetadata {
             id: question_id.clone(),
@@ -2483,6 +2660,9 @@ fn run_ask(
         artifact_output_paths.push(rel.clone());
     }
     for rel in &excalidraw_rels {
+        artifact_output_paths.push(rel.clone());
+    }
+    for rel in &auto_rels {
         artifact_output_paths.push(rel.clone());
     }
 
@@ -3104,7 +3284,7 @@ fn normalize_ask_format(format: &str) -> Result<&str> {
         // `diagram` is an alias for `excalidraw`; both produce one or more
         // `.excalidraw` JSON files alongside `answer.md`.
         "diagram" => Ok("excalidraw"),
-        "md" | "marp" | "json" | "chart" | "excalidraw" | "png" => Ok(format),
+        "auto" | "md" | "marp" | "json" | "chart" | "excalidraw" | "png" => Ok(format),
         other => bail!("unsupported ask format: {other}"),
     }
 }
@@ -5883,6 +6063,90 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
             "chart",
         );
         assert!(normalize_ask_format("not-a-format").is_err());
+    }
+
+    /// bn-2cs2: `auto` is now both the default config value and an accepted
+    /// `--format` argument so users can pass `--format=auto` explicitly to
+    /// document the choice in scripts.
+    #[test]
+    fn normalize_ask_format_accepts_auto() {
+        assert_eq!(normalize_ask_format("auto").expect("auto"), "auto");
+        assert_eq!(
+            Config::default().ask.artifact_default_format,
+            "auto",
+            "default format should be auto so the model can multiplex outputs",
+        );
+    }
+
+    /// bn-2cs2: the auto promoter classifies sandbox files into diagrams
+    /// (`.excalidraw[.md]`) and charts (`.png`) and leaves anything else
+    /// behind so the post-cleanup `remove_dir_all` discards it.
+    #[test]
+    fn promote_auto_files_classifies_diagrams_and_charts() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let sandbox = root.join("sandbox");
+        let dest = root.join("dest");
+        fs::create_dir_all(&sandbox).expect("create sandbox");
+        fs::create_dir_all(&dest).expect("create dest");
+
+        fs::write(sandbox.join("system.excalidraw"), b"{\"type\":\"excalidraw\"}")
+            .expect("write system.excalidraw");
+        fs::write(
+            sandbox.join("flow.excalidraw.md"),
+            b"---\nexcalidraw-plugin: true\n---\n",
+        )
+        .expect("write flow.excalidraw.md");
+        // PNG bytes (the magic number is enough — we don't validate content).
+        fs::write(sandbox.join("trend.png"), b"\x89PNG\r\n\x1a\n").expect("write trend.png");
+        // Stray junk that must NOT promote.
+        fs::write(sandbox.join("notes.txt"), b"ignored").expect("write notes.txt");
+        fs::write(sandbox.join("script.py"), b"# helper").expect("write script.py");
+        fs::create_dir_all(sandbox.join("scratch")).expect("scratch sub-dir");
+
+        let promoted = promote_auto_files(&sandbox, &dest).expect("promote");
+
+        let mut diagram_names: Vec<String> = promoted
+            .diagrams
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
+            .collect();
+        diagram_names.sort();
+        assert_eq!(
+            diagram_names,
+            vec!["flow.excalidraw.md".to_string(), "system.excalidraw".to_string()],
+        );
+        let chart_names: Vec<String> = promoted
+            .charts
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
+            .collect();
+        assert_eq!(chart_names, vec!["trend.png".to_string()]);
+
+        assert!(dest.join("system.excalidraw").exists());
+        assert!(dest.join("flow.excalidraw.md").exists());
+        assert!(dest.join("trend.png").exists());
+        // Junk stays in the sandbox so the caller can sweep it.
+        assert!(sandbox.join("notes.txt").exists());
+        assert!(sandbox.join("script.py").exists());
+        assert!(!dest.join("notes.txt").exists());
+        assert!(!dest.join("script.py").exists());
+    }
+
+    /// bn-2cs2: empty sandbox is success, not failure — auto can produce
+    /// zero artifacts when plain text answers the question.
+    #[test]
+    fn promote_auto_files_returns_empty_when_sandbox_is_empty() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let sandbox = root.join("sandbox");
+        let dest = root.join("dest");
+        fs::create_dir_all(&sandbox).expect("create sandbox");
+        fs::create_dir_all(&dest).expect("create dest");
+
+        let promoted = promote_auto_files(&sandbox, &dest).expect("promote");
+        assert!(promoted.diagrams.is_empty());
+        assert!(promoted.charts.is_empty());
     }
 
     /// bn-28ob: `promote_excalidraw_files` should move accepted Excalidraw

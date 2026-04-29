@@ -264,7 +264,12 @@ impl Default for AskConfig {
     fn default() -> Self {
         Self {
             token_budget: 20_000,
-            artifact_default_format: "markdown".to_string(),
+            // bn-2cs2: default to `auto` so the model can produce supporting
+            // artifacts (Excalidraw, charts) when the question warrants
+            // them, without requiring the caller to pre-guess the right
+            // `--format`. Users who need the cheap text-only path pass
+            // `--format=md` explicitly.
+            artifact_default_format: "auto".to_string(),
         }
     }
 }
