@@ -18,7 +18,7 @@ use crate::adapter::{
     parse_merge_concept_candidates_json,
 };
 use crate::provenance::{ProvenanceRecord, TokenUsage};
-use crate::subprocess::{SubprocessError, run_shell_command};
+use crate::subprocess::{SubprocessError, run_command_with_stdin};
 use crate::templates::Template;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,10 +117,14 @@ impl ClaudeCliAdapter {
         rendered: RenderedPrompt,
     ) -> Result<(SummarizeDocumentResponse, ProvenanceRecord), LlmAdapterError> {
         let started_at = unix_time_ms()?;
-        let command = self.build_command(&rendered.content);
-
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            rendered.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -161,42 +165,48 @@ impl ClaudeCliAdapter {
         ))
     }
 
-    fn build_command(&self, prompt: &str) -> String {
-        self.build_command_with_extra_tools(prompt, &[])
+    fn build_argv(&self) -> Vec<String> {
+        self.build_argv_with_extra_tools(&[])
     }
 
-    /// Build a `claude -p` command with an explicit set of additional tools
+    /// Build a `claude -p` argv with an explicit set of additional tools
     /// appended via `--allowedTools`. bn-xt4o: the `impute_gap` call uses
     /// this to turn on `WebSearch` + `WebFetch` so the agent can browse.
     /// Claude's default `--tools` set is left alone when `extra_tools` is
     /// empty so other calls continue to work with whatever the user
     /// configured.
-    fn build_command_with_extra_tools(&self, prompt: &str, extra_tools: &[&str]) -> String {
-        let mut parts = vec![self.config.command.clone(), "-p".to_string()];
+    ///
+    /// bn-18xw: the prompt is no longer included in argv — it's piped to
+    /// the child's stdin. `claude -p` reads stdin when no positional prompt
+    /// is provided, so we sidestep the `ARG_MAX` hazard and the shell-quoting
+    /// tax for large prompts. This also means a failed `claude` invocation
+    /// no longer echoes the rendered prompt back through stderr (sh -c
+    /// used to log the entire failed command line).
+    fn build_argv_with_extra_tools(&self, extra_tools: &[&str]) -> Vec<String> {
+        let mut argv = vec![self.config.command.clone(), "-p".to_string()];
 
         if let Some(model) = &self.config.model {
-            parts.push("--model".to_string());
-            parts.push(shell_quote(model));
+            argv.push("--model".to_string());
+            argv.push(model.clone());
         }
 
         if let Some(permission_mode) = &self.config.permission_mode {
-            parts.push("--permission-mode".to_string());
-            parts.push(shell_quote(permission_mode));
+            argv.push("--permission-mode".to_string());
+            argv.push(permission_mode.clone());
         }
 
         if !extra_tools.is_empty() {
-            parts.push("--allowedTools".to_string());
+            argv.push("--allowedTools".to_string());
             // Claude's `--allowedTools` takes a comma-or-space separated
-            // list. Use a comma-joined form so a single shell-quoted arg
-            // carries all of them.
-            parts.push(shell_quote(&extra_tools.join(",")));
+            // list. Pass a single comma-joined arg via Command::args —
+            // no shell quoting needed.
+            argv.push(extra_tools.join(","));
         }
 
-        parts.push("--output-format".to_string());
-        parts.push("json".to_string());
-        parts.push(shell_quote(prompt));
+        argv.push("--output-format".to_string());
+        argv.push("json".to_string());
 
-        parts.join(" ")
+        argv
     }
 }
 
@@ -215,10 +225,14 @@ impl LlmAdapter for ClaudeCliAdapter {
     ) -> Result<(ExtractConceptsResponse, ProvenanceRecord), LlmAdapterError> {
         let rendered = self.render_extract_concepts_prompt(&request)?;
         let started_at = unix_time_ms()?;
-        let command = self.build_command(&rendered.content);
-
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            rendered.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -278,9 +292,14 @@ impl LlmAdapter for ClaudeCliAdapter {
         })?;
 
         let started_at = unix_time_ms()?;
-        let command = self.build_command(&rendered.content);
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            rendered.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -344,9 +363,14 @@ impl LlmAdapter for ClaudeCliAdapter {
         })?;
 
         let started_at = unix_time_ms()?;
-        let command = self.build_command(&rendered.content);
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            rendered.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -419,9 +443,14 @@ impl LlmAdapter for ClaudeCliAdapter {
         })?;
 
         let started_at = unix_time_ms()?;
-        let command = self.build_command(&rendered.content);
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            rendered.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -499,10 +528,14 @@ impl LlmAdapter for ClaudeCliAdapter {
         };
 
         let started_at = unix_time_ms()?;
-        let command = self.build_command(&prompt.content);
-
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            prompt.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -568,9 +601,14 @@ impl LlmAdapter for ClaudeCliAdapter {
         })?;
 
         let started_at = unix_time_ms()?;
-        let command = self.build_command(&rendered.content);
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            rendered.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -641,10 +679,14 @@ impl LlmAdapter for ClaudeCliAdapter {
         // bn-xt4o: enable claude's `WebSearch` + `WebFetch` tools for this
         // call so the agent can browse external sources. Other calls leave
         // the allowed-tools set at the user's default.
-        let command =
-            self.build_command_with_extra_tools(&rendered.content, &["WebSearch", "WebFetch"]);
-        let output =
-            run_shell_command(&command, self.config.timeout).map_err(map_subprocess_error)?;
+        let argv = self.build_argv_with_extra_tools(&["WebSearch", "WebFetch"]);
+        let output = run_command_with_stdin(
+            &argv,
+            rendered.content.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
 
         if output.exit_code != Some(0) {
             return Err(classify_nonzero_exit(
@@ -696,10 +738,10 @@ impl LlmAdapter for ClaudeCliAdapter {
     ) -> Result<(RunHealthCheckResponse, ProvenanceRecord), LlmAdapterError> {
         let prompt = "respond with OK";
         let timeout = health_check_timeout(self.config.timeout);
-        let command = self.build_command(prompt);
+        let argv = self.build_argv();
 
         let started_at = unix_time_ms()?;
-        let result = run_shell_command(&command, timeout);
+        let result = run_command_with_stdin(&argv, prompt.as_bytes(), &[], timeout);
         let ended_at = unix_time_ms()?;
 
         let output = result.map_err(|e| match e {
@@ -946,10 +988,6 @@ fn string_at_path(value: &Value, path: &[&str]) -> Option<String> {
         current = current.get(*segment)?;
     }
     current.as_str().map(ToOwned::to_owned)
-}
-
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 /// Format an alias list for the `concept_body.md` prompt.
@@ -1260,28 +1298,46 @@ mod tests {
         );
     }
 
+    /// bn-18xw: build a fake-claude shell script that captures argv to
+    /// `args_path`, captures stdin to `stdin_path`, and prints
+    /// `response_body` on stdout. Mirrors the opencode-side helper because
+    /// both adapters now deliver the prompt via stdin instead of a
+    /// shell-quoted positional.
+    fn write_fake_claude_script(
+        script_path: &Path,
+        args_path: &Path,
+        stdin_path: &Path,
+        response_body: &str,
+    ) {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\ncat > '{stdin}'\nprintf '%s' '{body}'\n",
+            args = args_path.display(),
+            stdin = stdin_path.display(),
+            body = response_body.replace('\'', "'\\''"),
+        );
+        fs::write(script_path, script).expect("write fake claude script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(script_path).expect("metadata").permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(script_path, permissions).expect("chmod");
+        }
+    }
+
     #[test]
     fn summarize_document_invokes_claude_cli_and_builds_provenance() {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-claude.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_claude_script(
             &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\n' \"$@\" > '{}'\nprintf '%s' '{}'\n",
-                args_path.display(),
-                r#"{"result":"summary from claude","model":"claude-haiku","usage":{"input_tokens":21,"output_tokens":6}}"#
-            ),
-        )
-        .expect("write fake claude script");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script_path, permissions).expect("chmod");
-        }
+            &args_path,
+            &stdin_path,
+            r#"{"result":"summary from claude","model":"claude-haiku","usage":{"input_tokens":21,"output_tokens":6}}"#,
+        );
 
         let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
             command: script_path.display().to_string(),
@@ -1319,9 +1375,16 @@ mod tests {
         assert!(args.contains("default"));
         assert!(args.contains("--model"));
         assert!(args.contains("claude-haiku"));
-        assert!(args.contains("Example Source"));
-        assert!(args.contains("A long source document."));
-        assert!(args.contains("80 words"));
+
+        // bn-18xw: the rendered prompt is delivered on stdin, not in argv.
+        let stdin_bytes = fs::read_to_string(&stdin_path).expect("read captured stdin");
+        assert!(stdin_bytes.contains("Example Source"));
+        assert!(stdin_bytes.contains("A long source document."));
+        assert!(stdin_bytes.contains("80 words"));
+        assert!(
+            !args.contains("Example Source"),
+            "prompt body MUST NOT appear in argv (bn-18xw): {args}"
+        );
     }
 
     #[test]
@@ -1329,23 +1392,13 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-claude.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_claude_script(
             &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\n' \"$@\" > '{}'\ncat <<'EOF'\n{}\nEOF\n",
-                args_path.display(),
-                r#"{"result":"{\"concepts\":[{\"name\":\"Borrow checker\",\"aliases\":[\"borrowck\"],\"definition_hint\":\"Rust's reference safety analysis.\",\"source_anchors\":[{\"heading_anchor\":\"ownership\",\"quote\":\"The borrow checker validates references.\"}]}]}","model":"claude-haiku","usage":{"input_tokens":30,"output_tokens":9}}"#
-            ),
-        )
-        .expect("write fake claude script");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(&script_path, permissions).expect("chmod");
-        }
+            &args_path,
+            &stdin_path,
+            r#"{"result":"{\"concepts\":[{\"name\":\"Borrow checker\",\"aliases\":[\"borrowck\"],\"definition_hint\":\"Rust's reference safety analysis.\",\"source_anchors\":[{\"heading_anchor\":\"ownership\",\"quote\":\"The borrow checker validates references.\"}]}]}","model":"claude-haiku","usage":{"input_tokens":30,"output_tokens":9}}"#,
+        );
 
         let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
             command: script_path.display().to_string(),
@@ -1369,18 +1422,24 @@ mod tests {
         assert_eq!(response.concepts[0].aliases, vec!["borrowck"]);
         assert_eq!(provenance.prompt_template_name, "extract_concepts.md");
 
-        let args = fs::read_to_string(&args_path).expect("read fake claude args");
-        assert!(args.contains("Ownership Notes"));
-        assert!(args.contains("Rust ownership overview"));
-        assert!(args.contains('5'));
+        // bn-18xw: prompt template variables travel via stdin.
+        let stdin_bytes = fs::read_to_string(&stdin_path).expect("read captured stdin");
+        assert!(stdin_bytes.contains("Ownership Notes"));
+        assert!(stdin_bytes.contains("Rust ownership overview"));
+        assert!(stdin_bytes.contains('5'));
     }
 
     #[test]
     fn run_health_check_returns_healthy_when_output_contains_ok() {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-claude.sh");
-        fs::write(&script_path, "#!/bin/sh\nprintf '{\"result\":\"OK\"}'")
-            .expect("write fake claude script");
+        // bn-18xw: drain stdin so the parent's writer thread doesn't EPIPE
+        // before the child can finish writing its OK envelope.
+        fs::write(
+            &script_path,
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"result\":\"OK\"}'",
+        )
+        .expect("write fake claude script");
 
         #[cfg(unix)]
         {
@@ -1409,8 +1468,11 @@ mod tests {
     fn run_health_check_returns_degraded_when_output_does_not_contain_ok() {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-claude.sh");
-        fs::write(&script_path, "#!/bin/sh\nprintf '{\"result\":\"Error\"}'")
-            .expect("write fake claude script");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\ncat > /dev/null\nprintf '{\"result\":\"Error\"}'",
+        )
+        .expect("write fake claude script");
 
         #[cfg(unix)]
         {
@@ -1471,28 +1533,21 @@ mod tests {
 
     #[test]
     fn answer_question_forwards_image_data_uris_to_claude_prompt() {
-        // bn-3dkw: the argv captured by the fake-claude harness must include
-        // the data-URI-embedded prompt so an actual Claude invocation would
-        // see the image bytes.
+        // bn-3dkw: the prompt the fake-claude harness sees on stdin must
+        // include the data-URI-embedded image so an actual Claude
+        // invocation would see the image bytes.
+        // bn-18xw: the prompt is now delivered on stdin (not argv), so we
+        // assert against captured stdin instead of captured argv.
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-claude.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_claude_script(
             &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"result\":\"ok\"}}'\n",
-                args_path.display(),
-            ),
-        )
-        .expect("write fake claude script");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms).expect("chmod");
-        }
+            &args_path,
+            &stdin_path,
+            r#"{"result":"ok"}"#,
+        );
 
         let img = tmp.path().join("diagram.png");
         fs::write(&img, b"\x89PNGfake").expect("png");
@@ -1518,14 +1573,152 @@ mod tests {
             .expect("answer");
         assert_eq!(response.answer, "ok");
 
-        let args = fs::read_to_string(&args_path).expect("captured args");
+        let stdin_bytes = fs::read_to_string(&stdin_path).expect("captured stdin");
         assert!(
-            args.contains("data:image/png;base64,"),
-            "claude argv must include data URI: {args}"
+            stdin_bytes.contains("data:image/png;base64,"),
+            "claude stdin must include data URI"
         );
         assert!(
-            args.contains("diagram.png"),
-            "claude argv must include image label: {args}"
+            stdin_bytes.contains("diagram.png"),
+            "claude stdin must include image label"
+        );
+
+        // Argv MUST stay free of the rendered prompt — that's the whole
+        // point of bn-18xw.
+        let args = fs::read_to_string(&args_path).expect("captured args");
+        assert!(
+            !args.contains("data:image/png;base64,"),
+            "data URI must NOT appear in argv (bn-18xw): {args}"
+        );
+    }
+
+    #[test]
+    fn build_argv_does_not_include_prompt() {
+        // bn-18xw: the prompt MUST NOT appear in argv — it's piped to stdin
+        // so we sidestep ARG_MAX and shell-quoting. Even with all flags
+        // populated, argv stays small and tidy.
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+            command: "claude".to_string(),
+            model: Some("claude-opus".to_string()),
+            permission_mode: Some("default".to_string()),
+            timeout: Duration::from_secs(5),
+            project_root: None,
+        });
+        let argv = adapter.build_argv();
+
+        // Locate flags by position so a regression that breaks pairing
+        // (flag without value, value without flag) is caught.
+        let model_idx = argv
+            .iter()
+            .position(|s| s == "--model")
+            .expect("missing --model");
+        assert_eq!(argv.get(model_idx + 1).map(String::as_str), Some("claude-opus"));
+        let perm_idx = argv
+            .iter()
+            .position(|s| s == "--permission-mode")
+            .expect("missing --permission-mode");
+        assert_eq!(argv.get(perm_idx + 1).map(String::as_str), Some("default"));
+        let format_idx = argv
+            .iter()
+            .position(|s| s == "--output-format")
+            .expect("missing --output-format");
+        assert_eq!(argv.get(format_idx + 1).map(String::as_str), Some("json"));
+
+        // argv stays well under 1 KB regardless of how big a prompt the
+        // caller hands to run_command_with_stdin.
+        let total_bytes: usize = argv.iter().map(String::len).sum();
+        assert!(
+            total_bytes < 256,
+            "claude argv ballooned past 256 bytes; prompt may have leaked: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_argv_with_extra_tools_passes_comma_joined_list() {
+        // bn-xt4o + bn-18xw: --allowedTools takes a comma-or-space joined
+        // list. We pass a single comma-joined arg via Command::args (no
+        // shell quoting); previously this went through shell_quote.
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig::default());
+        let argv = adapter.build_argv_with_extra_tools(&["WebSearch", "WebFetch"]);
+
+        let tools_idx = argv
+            .iter()
+            .position(|s| s == "--allowedTools")
+            .expect("missing --allowedTools");
+        assert_eq!(
+            argv.get(tools_idx + 1).map(String::as_str),
+            Some("WebSearch,WebFetch")
+        );
+    }
+
+    #[test]
+    fn build_argv_contains_no_shell_metacharacters_for_pathological_inputs() {
+        // bn-18xw regression guard: shell-active characters in config
+        // values flow into argv verbatim — Command::args bypasses the
+        // shell entirely so quoting is unnecessary.
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+            command: "claude".to_string(),
+            model: Some("model'with`backticks$and$dollar".to_string()),
+            permission_mode: Some("'$(rm -rf /)'".to_string()),
+            timeout: Duration::from_secs(5),
+            project_root: None,
+        });
+        let argv = adapter.build_argv();
+
+        assert!(argv.iter().any(|s| s == "model'with`backticks$and$dollar"));
+        assert!(argv.iter().any(|s| s == "'$(rm -rf /)'"));
+    }
+
+    #[test]
+    fn run_prompt_pipes_one_mb_prompt_through_stdin_without_arg_max_failure() {
+        // bn-18xw acceptance: the original sh -c path failed unpredictably
+        // on ~1 MB prompts. With stdin delivery, argv stays tiny and a
+        // 1 MB prompt round-trips cleanly. Captures stdin to disk so we
+        // can verify byte-for-byte fidelity.
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-claude.sh");
+        let args_path = tmp.path().join("args.txt");
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_claude_script(
+            &script_path,
+            &args_path,
+            &stdin_path,
+            r#"{"result":"answered","model":"claude-haiku","usage":{"input_tokens":1,"output_tokens":1}}"#,
+        );
+
+        let adapter = ClaudeCliAdapter::new(ClaudeCliConfig {
+            command: script_path.display().to_string(),
+            model: Some("claude-haiku".to_string()),
+            permission_mode: Some("default".to_string()),
+            timeout: Duration::from_secs(15),
+            project_root: None,
+        });
+
+        let big_prompt = "y".repeat(1024 * 1024);
+        let (response, _prov) = adapter
+            .summarize_document(SummarizeDocumentRequest {
+                title: "big".to_string(),
+                body: big_prompt.clone(),
+                max_words: 80,
+            })
+            .expect("1 MB prompt via stdin should succeed");
+        assert_eq!(response.summary, "answered");
+
+        // argv stays tiny.
+        let args_bytes = fs::metadata(&args_path).expect("args metadata").len();
+        assert!(
+            args_bytes < 1024,
+            "claude argv ballooned past 1 KB ({args_bytes} bytes); prompt may have leaked"
+        );
+
+        // stdin captures the prompt body — exact equality fails because the
+        // template wraps the body in a prompt scaffold, but the body MUST
+        // appear there in full.
+        let captured = fs::read_to_string(&stdin_path).expect("read captured stdin");
+        assert!(
+            captured.contains(&big_prompt),
+            "1 MB body missing from captured stdin (length {})",
+            captured.len()
         );
     }
 

@@ -19,7 +19,7 @@ use crate::adapter::{
     parse_merge_concept_candidates_json,
 };
 use crate::provenance::ProvenanceRecord;
-use crate::subprocess::{SubprocessError, run_shell_command};
+use crate::subprocess::{SubprocessError, run_command_with_stdin};
 use crate::templates::Template;
 
 /// Configuration for the opencode subprocess backend.
@@ -132,67 +132,82 @@ impl OpencodeAdapter {
         Ok((dir, config_path))
     }
 
-    /// Build the shell command string for `opencode run`.
-    fn build_command(&self, config_path: &Path, prompt: &str) -> String {
-        self.build_command_with_attachments(config_path, prompt, &[], false)
+    /// Build the argv for `opencode run` (no shell, no quoting).
+    ///
+    /// The prompt is **not** included here — it travels via the child's
+    /// stdin so we sidestep `ARG_MAX` entirely and avoid handing the model's
+    /// rendered prompt to `sh` for re-parsing. Caller writes
+    /// `prompt.as_bytes()` to stdin via [`run_command_with_stdin`] and
+    /// passes `OPENCODE_CONFIG` via [`Self::build_env`].
+    fn build_argv(&self) -> Vec<String> {
+        self.build_argv_with_attachments(&[], false)
     }
 
-    /// Build the shell command string for `opencode run`, appending one `-f`
-    /// flag per image attachment. `opencode run -f <path>` is repeatable
-    /// (declared as `[array]` in `opencode run --help`), and opencode is
-    /// routed to openai/gpt-5.4 which accepts multimodal inputs natively —
-    /// so each image path flows through as an attachment the model can see.
+    /// Build the argv for `opencode run`, appending one `-f` flag per image
+    /// attachment. `opencode run -f <path>` is repeatable (declared as
+    /// `[array]` in `opencode run --help`), and opencode is routed to
+    /// openai/gpt-5.4 which accepts multimodal inputs natively — so each
+    /// image path flows through as an attachment the model can see.
     ///
     /// bn-1ikn: when `json_events` is `true`, passes `--format json` so
     /// opencode emits its NDJSON event stream instead of the rendered
     /// plain-text transcript. Caller is responsible for parsing the stream
     /// via [`extract_final_answer_from_json_events`].
-    fn build_command_with_attachments(
+    ///
+    /// bn-18xw: the prompt is no longer included in argv — it's piped to
+    /// the child's stdin. `opencode run` reads stdin when no positional
+    /// `message` is provided, which means we never pay the shell-quoting
+    /// tax or the `ARG_MAX` penalty for large prompts (real example: a
+    /// 520 KB prompt that previously had to round-trip through `sh -c`).
+    /// `OPENCODE_CONFIG` is delivered via `Command::env` rather than an
+    /// inline shell assignment.
+    fn build_argv_with_attachments(
         &self,
-        config_path: &Path,
-        prompt: &str,
         image_paths: &[PathBuf],
         json_events: bool,
-    ) -> String {
-        // OPENCODE_CONFIG env var is set inline before the command (sh -c handles this)
-        let mut parts = vec![
-            format!(
-                "OPENCODE_CONFIG={}",
-                shell_quote(&config_path.display().to_string())
-            ),
+    ) -> Vec<String> {
+        let mut argv = vec![
             self.config.command.clone(),
             "run".to_string(),
             "--agent".to_string(),
-            shell_quote(&self.config.agent_name),
+            self.config.agent_name.clone(),
         ];
 
         if let Some(ref variant) = self.config.variant {
-            parts.push("--variant".to_string());
-            parts.push(shell_quote(variant));
+            argv.push("--variant".to_string());
+            argv.push(variant.clone());
         }
 
         if let Some(ref session_id) = self.config.session_id {
-            parts.push("--session".to_string());
-            parts.push(shell_quote(session_id));
+            argv.push("--session".to_string());
+            argv.push(session_id.clone());
         }
 
         if json_events {
-            parts.push("--format".to_string());
-            parts.push("json".to_string());
+            argv.push("--format".to_string());
+            argv.push("json".to_string());
         }
 
-        // opencode's yargs config marks `-f / --file` as `[array]`, which
-        // greedily consumes subsequent positionals. Emit the prompt
-        // positional BEFORE any -f flags so it's parsed as the `message`
-        // rather than slurped into the file list.
-        parts.push(shell_quote(prompt));
-
+        // No positional prompt — opencode reads it from stdin. The earlier
+        // bn-19r7 ordering hazard ("prompt must come before -f") is moot
+        // when there's no positional in argv at all.
         for image in image_paths {
-            parts.push("-f".to_string());
-            parts.push(shell_quote(&image.display().to_string()));
+            argv.push("-f".to_string());
+            argv.push(image.display().to_string());
         }
 
-        parts.join(" ")
+        argv
+    }
+
+    /// Build the env block (extra vars layered onto the inherited env)
+    /// for an `opencode run` invocation. Today this just carries
+    /// `OPENCODE_CONFIG`; pulled into a helper so the prompt path and the
+    /// health-check path stay in sync.
+    fn build_env(config_path: &Path) -> Vec<(String, String)> {
+        vec![(
+            "OPENCODE_CONFIG".to_string(),
+            config_path.display().to_string(),
+        )]
     }
 
     fn render_extract_concepts_prompt(
@@ -245,8 +260,14 @@ impl OpencodeAdapter {
         extra_tools: &[(&str, bool)],
     ) -> Result<String, LlmAdapterError> {
         let (_temp_dir, config_path) = self.write_config_with_extra_tools(extra_tools)?;
-        let command = self.build_command(&config_path, prompt);
-        let result = run_shell_command(&command, self.config.timeout);
+        let argv = self.build_argv();
+        let env = Self::build_env(&config_path);
+        let result = run_command_with_stdin(
+            &argv,
+            prompt.as_bytes(),
+            &env,
+            self.config.timeout,
+        );
 
         let output = result.map_err(|e| match e {
             SubprocessError::TimedOut { timeout, .. } => {
@@ -295,9 +316,14 @@ impl OpencodeAdapter {
         // `_temp_dir` is held for the duration of the subprocess; its Drop removes
         // the config directory even if we panic or unwind here.
         let (_temp_dir, config_path) = self.write_config()?;
-        let command =
-            self.build_command_with_attachments(&config_path, prompt, image_paths, json_events);
-        let result = run_shell_command(&command, self.config.timeout);
+        let argv = self.build_argv_with_attachments(image_paths, json_events);
+        let env = Self::build_env(&config_path);
+        let result = run_command_with_stdin(
+            &argv,
+            prompt.as_bytes(),
+            &env,
+            self.config.timeout,
+        );
 
         let output = result.map_err(|e| match e {
             SubprocessError::TimedOut { timeout, .. } => {
@@ -734,10 +760,11 @@ impl LlmAdapter for OpencodeAdapter {
         let timeout = health_check_timeout(self.config.timeout);
 
         let (temp_dir, config_path) = self.write_config()?;
-        let command = self.build_command(&config_path, prompt);
+        let argv = self.build_argv();
+        let env = Self::build_env(&config_path);
 
         let started_at = unix_time_ms()?;
-        let result = run_shell_command(&command, timeout);
+        let result = run_command_with_stdin(&argv, prompt.as_bytes(), &env, timeout);
         let ended_at = unix_time_ms()?;
 
         // Clean up temp dir regardless of outcome
@@ -911,10 +938,6 @@ fn strip_ansi_header(text: &str) -> String {
     lines.join("\n").trim().to_string()
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
 /// Format an alias list for the `concept_body.md` prompt.
 /// Empty list renders as "(none)" so the template line "Aliases: " stays grammatical.
 fn format_aliases_for_prompt(aliases: &[String]) -> String {
@@ -1037,9 +1060,27 @@ mod tests {
     use tempfile::TempDir;
 
     fn test_adapter_with_script(script: &str) -> (OpencodeAdapter, TempDir) {
+        // bn-18xw: prompts now travel via stdin. Inject a `cat > /dev/null`
+        // prologue if the caller's script doesn't already drain stdin, so
+        // the writer thread isn't left dangling on a SIGPIPE-or-EOF race.
+        // Most short scripts in this module don't read stdin; we add it
+        // here uniformly to keep callers tidy. If a script needs to capture
+        // stdin, it should not use this helper.
+        let drained_script = if script.contains("cat ") {
+            script.to_string()
+        } else {
+            // Insert the drain just after the shebang line.
+            match script.split_once('\n') {
+                Some((shebang, rest)) => {
+                    format!("{shebang}\ncat > /dev/null\n{rest}")
+                }
+                None => format!("#!/bin/sh\ncat > /dev/null\n{script}"),
+            }
+        };
+
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-opencode.sh");
-        fs::write(&script_path, script).expect("write script");
+        fs::write(&script_path, drained_script).expect("write script");
 
         #[cfg(unix)]
         {
@@ -1100,27 +1141,51 @@ mod tests {
         );
     }
 
+    /// Build a fake-opencode shell script that captures argv to `args_path`,
+    /// captures stdin to `stdin_path`, and prints `response_body` on stdout.
+    /// bn-18xw: argv is now lean (no prompt) and the prompt is delivered on
+    /// stdin — so tests verify both channels separately.
+    fn write_fake_opencode_script(
+        script_path: &Path,
+        args_path: &Path,
+        stdin_path: &Path,
+        response_body: &str,
+    ) {
+        // The fake script must record stdin BEFORE printing on stdout because
+        // the parent's writer thread closes stdin on EOF — `cat` blocks until
+        // we close the handle, which the new run_command_with_stdin does
+        // promptly. Using `cat > stdin.txt` is safe.
+        // We use a heredoc-like single-quoted body so the response body can
+        // contain backslash escapes without shell expansion mangling them.
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\ncat > '{stdin}'\nprintf '%s' '{body}'\n",
+            args = args_path.display(),
+            stdin = stdin_path.display(),
+            body = response_body.replace('\'', "'\\''"),
+        );
+        fs::write(script_path, script).expect("write fake opencode script");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(script_path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(script_path, perms).expect("chmod");
+        }
+    }
+
     #[test]
     fn summarize_document_invokes_opencode_run_and_parses_output() {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-opencode.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_opencode_script(
             &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'Summary from opencode.'\n",
-                args_path.display(),
-            ),
-        )
-        .expect("write fake opencode script");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms).expect("chmod");
-        }
+            &args_path,
+            &stdin_path,
+            "Summary from opencode.",
+        );
 
         let adapter = OpencodeAdapter::new(OpencodeConfig {
             command: script_path.display().to_string(),
@@ -1145,26 +1210,30 @@ mod tests {
         assert!(provenance.tokens.is_none());
 
         let args = fs::read_to_string(&args_path).expect("read captured args");
-        assert!(args.contains("run"), "args should contain 'run': {args}");
+        assert!(args.contains("run"), "argv should contain 'run': {args}");
         assert!(
             args.contains("--agent"),
-            "args should contain '--agent': {args}"
+            "argv should contain '--agent': {args}"
+        );
+        assert!(args.contains("kb"), "argv should contain agent name: {args}");
+
+        // bn-18xw: prompt body MUST land on stdin, not in argv.
+        let stdin_bytes = fs::read_to_string(&stdin_path).expect("read captured stdin");
+        assert!(
+            stdin_bytes.contains("Example Source"),
+            "stdin should contain source title: {stdin_bytes}"
         );
         assert!(
-            args.contains("kb"),
-            "args should contain agent name: {args}"
+            stdin_bytes.contains("A long source document."),
+            "stdin should contain document text"
         );
         assert!(
-            args.contains("Example Source"),
-            "args should contain source title: {args}"
+            stdin_bytes.contains("80 words"),
+            "stdin should contain max word budget"
         );
         assert!(
-            args.contains("A long source document."),
-            "args should contain document text: {args}"
-        );
-        assert!(
-            args.contains("80 words"),
-            "args should contain max word budget: {args}"
+            !args.contains("Example Source"),
+            "prompt body MUST NOT appear in argv (bn-18xw): {args}"
         );
     }
 
@@ -1173,22 +1242,12 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-opencode.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '{{\"concepts\":[{{\"name\":\"Borrow checker\",\"aliases\":[\"borrowck\"],\"definition_hint\":\"Rust''s reference safety analysis.\",\"source_anchors\":[{{\"heading_anchor\":\"ownership\",\"quote\":\"The borrow checker validates references.\"}}]}}]}}'\n",
-                args_path.display(),
-            ),
-        )
-        .expect("write fake opencode script");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms).expect("chmod");
-        }
+        let stdin_path = tmp.path().join("stdin.txt");
+        // The response body contains literal single quotes in
+        // "Rust's reference safety analysis." — write_fake_opencode_script
+        // shell-escapes them, so we pass the raw string here.
+        let response = r#"{"concepts":[{"name":"Borrow checker","aliases":["borrowck"],"definition_hint":"Rust's reference safety analysis.","source_anchors":[{"heading_anchor":"ownership","quote":"The borrow checker validates references."}]}]}"#;
+        write_fake_opencode_script(&script_path, &args_path, &stdin_path, response);
 
         let adapter = OpencodeAdapter::new(OpencodeConfig {
             command: script_path.display().to_string(),
@@ -1212,19 +1271,23 @@ mod tests {
         assert_eq!(response.concepts[0].aliases, vec!["borrowck"]);
         assert_eq!(provenance.prompt_template_name, "extract_concepts.md");
 
-        let args = fs::read_to_string(&args_path).expect("read captured args");
-        assert!(args.contains("Ownership Notes"));
-        assert!(args.contains("Rust ownership overview"));
-        assert!(args.contains('5'));
+        // bn-18xw: prompt template variables travel via stdin, not argv.
+        let stdin_bytes = fs::read_to_string(&stdin_path).expect("read captured stdin");
+        assert!(stdin_bytes.contains("Ownership Notes"));
+        assert!(stdin_bytes.contains("Rust ownership overview"));
+        assert!(stdin_bytes.contains('5'));
     }
 
     #[test]
     fn nonzero_exit_surfaces_stderr_in_error() {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fail-opencode.sh");
+        // Drain stdin so the writer thread doesn't block on EPIPE while we
+        // tear down the child — the new run_command_with_stdin pipes the
+        // prompt regardless of whether the child cares to read it.
         fs::write(
             &script_path,
-            "#!/bin/sh\nprintf 'opencode-error-output' >&2\nexit 1\n",
+            "#!/bin/sh\ncat > /dev/null\nprintf 'opencode-error-output' >&2\nexit 1\n",
         )
         .expect("write fail script");
 
@@ -1252,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn variant_and_session_flags_appear_in_command() {
+    fn variant_and_session_flags_appear_in_argv() {
         let adapter = OpencodeAdapter::new(OpencodeConfig {
             command: "opencode".to_string(),
             agent_name: "kb".to_string(),
@@ -1261,16 +1324,28 @@ mod tests {
             ..Default::default()
         });
 
-        let config_path = PathBuf::from("/tmp/opencode.json");
-        let cmd = adapter.build_command(&config_path, "test prompt");
-        assert!(cmd.contains("--variant"), "missing --variant: {cmd}");
-        assert!(cmd.contains("fast"), "missing variant value: {cmd}");
-        assert!(cmd.contains("--session"), "missing --session: {cmd}");
-        assert!(cmd.contains("sess-123"), "missing session value: {cmd}");
+        let argv = adapter.build_argv();
+
+        // Each flag/value should be its own argv entry — no shell quoting,
+        // no concatenation. Use position-based assertions so we catch
+        // ordering regressions (e.g. value separated from its flag).
+        let variant_idx = argv
+            .iter()
+            .position(|s| s == "--variant")
+            .expect("missing --variant in argv");
+        assert_eq!(argv.get(variant_idx + 1).map(String::as_str), Some("fast"));
+        let session_idx = argv
+            .iter()
+            .position(|s| s == "--session")
+            .expect("missing --session in argv");
+        assert_eq!(
+            argv.get(session_idx + 1).map(String::as_str),
+            Some("sess-123")
+        );
     }
 
     #[test]
-    fn build_command_with_attachments_emits_f_flag_per_image() {
+    fn build_argv_with_attachments_emits_f_flag_per_image() {
         // bn-3dkw: each image must appear as its own `-f <path>` pair so
         // opencode's yargs parser picks them up as an array.
         let adapter = OpencodeAdapter::new(OpencodeConfig {
@@ -1279,39 +1354,84 @@ mod tests {
             ..Default::default()
         });
 
-        let config_path = PathBuf::from("/tmp/opencode.json");
-        let images = [
-            PathBuf::from("/abs/a.png"),
-            PathBuf::from("/abs/b.jpg"),
-        ];
-        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &images, false);
+        let images = [PathBuf::from("/abs/a.png"), PathBuf::from("/abs/b.jpg")];
+        let argv = adapter.build_argv_with_attachments(&images, false);
 
-        let f_flag_count = cmd.matches("-f ").count();
-        assert_eq!(f_flag_count, 2, "expected two -f flags in: {cmd}");
-        assert!(cmd.contains("/abs/a.png"), "missing a.png in: {cmd}");
-        assert!(cmd.contains("/abs/b.jpg"), "missing b.jpg in: {cmd}");
-
-        // bn-19r7: opencode's yargs config marks `-f / --file` as `[array]`,
-        // which greedily consumes subsequent positionals. The prompt
-        // positional MUST appear before any -f flag or it gets slurped into
-        // the file list ("File not found: <prompt>"). Lock that ordering.
-        let prompt_idx = cmd.find("'prompt'").expect("prompt present");
-        let first_f_idx = cmd.find(" -f ").expect("-f present");
+        let f_flag_count = argv.iter().filter(|s| s.as_str() == "-f").count();
+        assert_eq!(f_flag_count, 2, "expected two -f flags in: {argv:?}");
         assert!(
-            prompt_idx < first_f_idx,
-            "prompt must appear before -f to avoid yargs slurping it: {cmd}"
+            argv.iter().any(|s| s == "/abs/a.png"),
+            "missing a.png in: {argv:?}"
+        );
+        assert!(
+            argv.iter().any(|s| s == "/abs/b.jpg"),
+            "missing b.jpg in: {argv:?}"
         );
     }
 
     #[test]
-    fn build_command_omits_f_flag_when_no_attachments() {
+    fn build_argv_omits_f_flag_when_no_attachments() {
         let adapter = OpencodeAdapter::new(OpencodeConfig::default());
-        let config_path = PathBuf::from("/tmp/opencode.json");
-        let cmd = adapter.build_command_with_attachments(&config_path, "prompt", &[], false);
+        let argv = adapter.build_argv_with_attachments(&[], false);
         assert!(
-            !cmd.contains(" -f "),
-            "no -f flag expected when image_paths empty: {cmd}"
+            !argv.iter().any(|s| s == "-f"),
+            "no -f flag expected when image_paths empty: {argv:?}"
         );
+    }
+
+    #[test]
+    fn build_argv_does_not_include_prompt() {
+        // bn-18xw: the prompt MUST NOT appear in argv — it's piped to stdin
+        // so we sidestep `ARG_MAX` and shell-quoting. The argv should stay
+        // tiny regardless of how big the hypothetical prompt is.
+        let adapter = OpencodeAdapter::new(OpencodeConfig::default());
+        let argv = adapter.build_argv();
+
+        // Sanity: argv contains the executable, "run", "--agent", and the
+        // agent name — that's the full lean shape today.
+        assert_eq!(argv.len(), 4, "unexpected argv length: {argv:?}");
+        assert_eq!(argv[1], "run");
+        assert_eq!(argv[2], "--agent");
+
+        // Argv stays well under 1 KB by construction.
+        let total_bytes: usize = argv.iter().map(String::len).sum();
+        assert!(
+            total_bytes < 1024,
+            "argv ballooned past 1 KB; prompt may have leaked into argv: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn build_env_carries_opencode_config_path() {
+        // bn-18xw: OPENCODE_CONFIG used to be inlined into a shell command
+        // string. It now flows through Command::env so we don't need to
+        // shell-quote the path.
+        let config_path = PathBuf::from("/tmp/opencode.json");
+        let env = OpencodeAdapter::build_env(&config_path);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "OPENCODE_CONFIG");
+        assert_eq!(env[0].1, "/tmp/opencode.json");
+    }
+
+    #[test]
+    fn build_argv_contains_no_shell_metacharacters_for_pathological_inputs() {
+        // bn-18xw regression guard: even if the agent name or variant
+        // contains shell-active characters (single quotes, backticks,
+        // dollar signs), nothing in our argv should require quoting because
+        // we hand each arg to Command::args verbatim. Validates the
+        // argv-direct contract.
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: "opencode".to_string(),
+            agent_name: "agent'with`dangerous$chars".to_string(),
+            variant: Some("'$(rm -rf /)'".to_string()),
+            ..Default::default()
+        });
+        let argv = adapter.build_argv();
+
+        // Pathological strings appear in argv exactly as written — no
+        // wrapping in single quotes, no backslash escaping.
+        assert!(argv.iter().any(|s| s == "agent'with`dangerous$chars"));
+        assert!(argv.iter().any(|s| s == "'$(rm -rf /)'"));
     }
 
     #[test]
@@ -1322,22 +1442,8 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-opencode.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'answer from opencode'\n",
-                args_path.display(),
-            ),
-        )
-        .expect("write fake opencode script");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms).expect("chmod");
-        }
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_opencode_script(&script_path, &args_path, &stdin_path, "answer from opencode");
 
         let image_one = tmp.path().join("pic1.png");
         let image_two = tmp.path().join("pic2.png");
@@ -1385,22 +1491,8 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-opencode.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'answer without images'\n",
-                args_path.display(),
-            ),
-        )
-        .expect("write fake opencode");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms).expect("chmod");
-        }
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_opencode_script(&script_path, &args_path, &stdin_path, "answer without images");
 
         let adapter = OpencodeAdapter::new(OpencodeConfig {
             command: script_path.display().to_string(),
@@ -1648,27 +1740,27 @@ mod tests {
     }
 
     #[test]
-    fn build_command_adds_format_json_flag_when_requested() {
+    fn build_argv_adds_format_json_flag_when_requested() {
         // bn-1ikn: `--format json` only appears in the argv when callers
         // explicitly ask for the structured event stream. Other calls must
         // NOT include the flag (it would disturb their plain-text parsing).
         let adapter = OpencodeAdapter::new(OpencodeConfig::default());
-        let config_path = PathBuf::from("/tmp/opencode.json");
 
-        let plain = adapter.build_command_with_attachments(&config_path, "p", &[], false);
+        let plain = adapter.build_argv_with_attachments(&[], false);
         assert!(
-            !plain.contains("--format"),
-            "plain-text path must not include --format flag: {plain}"
+            !plain.iter().any(|s| s == "--format"),
+            "plain-text path must not include --format flag: {plain:?}"
         );
 
-        let json = adapter.build_command_with_attachments(&config_path, "p", &[], true);
-        assert!(
-            json.contains("--format"),
-            "json path must include --format flag: {json}"
-        );
-        assert!(
-            json.contains("json"),
-            "json path must include 'json' argument: {json}"
+        let json = adapter.build_argv_with_attachments(&[], true);
+        let format_idx = json
+            .iter()
+            .position(|s| s == "--format")
+            .expect("json path missing --format flag");
+        assert_eq!(
+            json.get(format_idx + 1).map(String::as_str),
+            Some("json"),
+            "--format flag must be followed by 'json': {json:?}"
         );
     }
 
@@ -1681,6 +1773,7 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-opencode.sh");
         let args_path = tmp.path().join("args.txt");
+        let stdin_path = tmp.path().join("stdin.txt");
 
         // Emit two narration events followed by a final_answer event.
         let event_stream = concat!(
@@ -1688,11 +1781,14 @@ mod tests {
             r#"{"type":"text","part":{"type":"text","text":"Running now.","metadata":{"openai":{"phase":"response_reasoning"}}}}"#, "\n",
             r#"{"type":"text","part":{"type":"text","text":"The caption is this.","metadata":{"openai":{"phase":"final_answer"}}}}"#, "\n",
         );
+        // bn-18xw: drain stdin into stdin_path, capture argv to args_path,
+        // then emit the heredoc'd event stream.
         fs::write(
             &script_path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat <<'JSON_END'\n{}JSON_END\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\ncat <<'JSON_END'\n{}JSON_END\n",
                 args_path.display(),
+                stdin_path.display(),
                 event_stream,
             ),
         )
@@ -1749,22 +1845,8 @@ mod tests {
         let tmp = TempDir::new().expect("temp dir");
         let script_path = tmp.path().join("fake-opencode.sh");
         let args_path = tmp.path().join("args.txt");
-        fs::write(
-            &script_path,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'plain answer'\n",
-                args_path.display(),
-            ),
-        )
-        .expect("write fake opencode");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&script_path, perms).expect("chmod");
-        }
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_opencode_script(&script_path, &args_path, &stdin_path, "plain answer");
 
         let adapter = OpencodeAdapter::new(OpencodeConfig {
             command: script_path.display().to_string(),
@@ -1790,6 +1872,57 @@ mod tests {
         assert!(
             !args.lines().any(|l| l == "--format"),
             "--format flag must NOT appear when structured_output is false: {args}"
+        );
+    }
+
+    #[test]
+    fn run_prompt_pipes_one_mb_prompt_through_stdin_without_arg_max_failure() {
+        // bn-18xw acceptance: the original sh -c path failed unpredictably on
+        // ~1 MB prompts (ARG_MAX is 4 MB on Linux but envp halves it in
+        // practice). With stdin delivery, argv stays tiny and we should
+        // round-trip a 1 MB prompt cleanly. The fake-opencode script captures
+        // stdin to disk so we can verify byte-for-byte round-trip.
+        let tmp = TempDir::new().expect("temp dir");
+        let script_path = tmp.path().join("fake-opencode.sh");
+        let args_path = tmp.path().join("args.txt");
+        let stdin_path = tmp.path().join("stdin.txt");
+        write_fake_opencode_script(
+            &script_path,
+            &args_path,
+            &stdin_path,
+            "answer for big prompt",
+        );
+
+        let adapter = OpencodeAdapter::new(OpencodeConfig {
+            command: script_path.display().to_string(),
+            timeout: Duration::from_secs(15),
+            ..Default::default()
+        });
+
+        // 1 MB prompt — well past anything you'd safely cram into argv.
+        let big_prompt = "x".repeat(1024 * 1024);
+        let answer = adapter
+            .run_prompt(&big_prompt)
+            .expect("1 MB prompt via stdin should succeed");
+        assert_eq!(answer, "answer for big prompt");
+
+        // argv stays small — the prompt is NOT in it.
+        let args_bytes = fs::metadata(&args_path).expect("args metadata").len();
+        assert!(
+            args_bytes < 1024,
+            "argv ballooned past 1 KB ({args_bytes} bytes); prompt may have leaked into argv"
+        );
+
+        // stdin captured the full 1 MB.
+        let captured_stdin = fs::read(&stdin_path).expect("read captured stdin");
+        assert_eq!(
+            captured_stdin.len(),
+            big_prompt.len(),
+            "stdin byte count mismatch"
+        );
+        assert!(
+            captured_stdin.iter().all(|&b| b == b'x'),
+            "stdin payload corrupted in flight"
         );
     }
 }
