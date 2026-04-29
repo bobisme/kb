@@ -1187,17 +1187,16 @@ fn run_per_document_passes(
             .with_context(|| format!("save build record for source_summary {doc_id}"))?;
         build_records_emitted += 1;
 
+        // bn-1l1t: render each citation as a clickable markdown link to the
+        // normalized source content. The path convention matches what
+        // `rewrite_summary_image_refs` already uses for asset refs:
+        // `../../.kb/normalized/<doc_id>/source.md`. Anchors land as URL
+        // fragments so Obsidian jumps to the right heading. When no anchor
+        // is available we link to the file head and label with the rev id.
         let citations_display: Vec<String> = summary_artifact
             .citations
             .iter()
-            .map(|c| {
-                let anchor = c
-                    .heading_anchor
-                    .as_deref()
-                    .map(|h| format!("#{h}"))
-                    .unwrap_or_default();
-                format!("{}{}", c.source_revision_id, anchor)
-            })
+            .map(|c| format_source_citation_link(doc_id, c))
             .collect();
 
         let generated_at = summary_artifact.build_record.metadata.created_at_millis;
@@ -1459,6 +1458,24 @@ fn run_concept_merge_from_state(
 /// before persisting, so step 1 is rarely hit in practice — it's there as
 /// defense against future paths that might preserve frontmatter and to make
 /// the fallback order explicit.
+/// bn-1l1t: render a single source-page citation entry as a clickable
+/// markdown link pointing at the normalized source content. The relative
+/// path matches `rewrite_summary_image_refs`' convention so the citations
+/// region and the summary's asset refs both resolve from the same root.
+///
+/// Label preference: the heading anchor when present (most readable;
+/// matches what the reader sees in the source); falls back to the rev id
+/// for whole-document citations. The link target always points at
+/// `source.md`; the anchor is dropped from the fragment when none is
+/// recorded.
+fn format_source_citation_link(doc_id: &str, citation: &kb_core::Citation) -> String {
+    let anchor = citation.heading_anchor.as_deref().filter(|s| !s.is_empty());
+    let path = format!("../../.kb/normalized/{doc_id}/source.md");
+    let target = anchor.map_or_else(|| path.clone(), |a| format!("{path}#{a}"));
+    let label = anchor.map_or_else(|| citation.source_revision_id.clone(), str::to_string);
+    format!("[{label}]({target})")
+}
+
 fn derive_title(canonical_text: &str, stem_fallback: Option<&str>, fallback_id: &str) -> String {
     if let Some(title) = frontmatter_title(canonical_text) {
         return title;
@@ -1578,6 +1595,69 @@ mod tests {
         assert!(!opts.progress, "progress must default to false (quiet)");
         assert!(!opts.force);
         assert!(!opts.dry_run);
+    }
+
+    /// bn-1l1t: each source-page citation must render as a clickable
+    /// markdown link to the normalized source content (`source.md`) with a
+    /// fragment for the heading anchor when one is recorded.
+    #[test]
+    fn format_source_citation_link_with_anchor_targets_normalized_source() {
+        let citation = kb_core::Citation {
+            metadata: EntityMetadata {
+                id: "citation:rev-3jevbz#unhygienix".to_string(),
+                created_at_millis: 1,
+                updated_at_millis: 1,
+                source_hashes: vec![],
+                model_version: None,
+                tool_version: None,
+                prompt_template_hash: None,
+                dependencies: vec![],
+                output_paths: vec![],
+                status: Status::Fresh,
+            },
+            source_revision_id: "rev-3jevbz".to_string(),
+            claim_text: None,
+            heading_anchor: Some("unhygienix".to_string()),
+            line_span: None,
+            char_span: None,
+            page_number: None,
+            asset_ref: None,
+        };
+        let link = format_source_citation_link("src-jwk", &citation);
+        assert_eq!(
+            link,
+            "[unhygienix](../../.kb/normalized/src-jwk/source.md#unhygienix)",
+        );
+    }
+
+    /// bn-1l1t: citations without a heading anchor — i.e. whole-document
+    /// citations — fall back to the rev id as label and link to the file
+    /// head with no fragment.
+    #[test]
+    fn format_source_citation_link_without_anchor_uses_rev_id_label() {
+        let citation = kb_core::Citation {
+            metadata: EntityMetadata {
+                id: "citation:rev-abc".to_string(),
+                created_at_millis: 1,
+                updated_at_millis: 1,
+                source_hashes: vec![],
+                model_version: None,
+                tool_version: None,
+                prompt_template_hash: None,
+                dependencies: vec![],
+                output_paths: vec![],
+                status: Status::Fresh,
+            },
+            source_revision_id: "rev-abc".to_string(),
+            claim_text: None,
+            heading_anchor: None,
+            line_span: None,
+            char_span: None,
+            page_number: None,
+            asset_ref: None,
+        };
+        let link = format_source_citation_link("src-xyz", &citation);
+        assert_eq!(link, "[rev-abc](../../.kb/normalized/src-xyz/source.md)");
     }
 
     #[test]
