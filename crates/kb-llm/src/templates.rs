@@ -50,6 +50,9 @@ impl Template {
         match name {
             "ask.md" => Ok(include_str!("../prompts/ask.md").to_string()),
             "ask_chart.md" => Ok(include_str!("../prompts/ask_chart.md").to_string()),
+            "ask_excalidraw.md" => {
+                Ok(include_str!("../prompts/ask_excalidraw.md").to_string())
+            }
             "compile.md" => Ok(include_str!("../prompts/compile.md").to_string()),
             "summarize_document.md" => {
                 Ok(include_str!("../prompts/summarize_document.md").to_string())

@@ -165,8 +165,10 @@ enum Command {
         /// Question to ask (reads from stdin if omitted or "-")
         query: Option<String>,
 
-        /// Artifact format for the answer (md, marp, json, chart, figure, png)
-        #[arg(long, value_parser = ["md", "marp", "json", "chart", "figure", "png"])]
+        /// Artifact format for the answer (md, marp, json, chart, figure, excalidraw, diagram, png)
+        #[arg(long, value_parser = [
+            "md", "marp", "json", "chart", "figure", "excalidraw", "diagram", "png",
+        ])]
         format: Option<String>,
 
         /// Propose promoting the answer into the wiki
@@ -1952,6 +1954,93 @@ fn write_chart_failure_artifacts(
     Ok(())
 }
 
+/// bn-28ob: counterpart to [`write_chart_failure_artifacts`] for the
+/// `excalidraw` format. Persists `answer.md` + `metadata.json` describing
+/// why no diagrams landed in the q-dir, so the user can inspect what went
+/// wrong without re-running the LLM.
+fn write_excalidraw_failure_artifacts(
+    dir_abs: &Path,
+    reason: &str,
+    raw_llm_output: Option<&str>,
+) -> Result<()> {
+    use kb_core::fs::atomic_write;
+
+    std::fs::create_dir_all(dir_abs)
+        .with_context(|| format!("create excalidraw failure dir {}", dir_abs.display()))?;
+
+    let raw_section = match raw_llm_output {
+        Some(body) if !body.trim().is_empty() => body.to_string(),
+        Some(_) => "_(LLM produced no output.)_".to_string(),
+        None => "_(LLM call failed before producing any output.)_".to_string(),
+    };
+    let answer_body = format!(
+        "## Excalidraw generation failed\n\n\
+         Reason: {reason}\n\n\
+         ## LLM output\n\n\
+         {raw_section}\n"
+    );
+    atomic_write(dir_abs.join("answer.md"), answer_body.as_bytes()).with_context(|| {
+        format!("write excalidraw failure answer.md in {}", dir_abs.display())
+    })?;
+
+    let metadata = serde_json::json!({
+        "requested_format": "excalidraw",
+        "success": false,
+        "error": reason,
+    });
+    let metadata_json = serde_json::to_string_pretty(&metadata)
+        .context("serialize excalidraw failure metadata.json")?;
+    atomic_write(dir_abs.join("metadata.json"), metadata_json.as_bytes()).with_context(|| {
+        format!("write excalidraw failure metadata.json in {}", dir_abs.display())
+    })?;
+
+    Ok(())
+}
+
+/// bn-28ob: move accepted Excalidraw files out of the per-question sandbox
+/// dir (`<q-dir>/.diagrams/`) into the q-dir itself, alongside `answer.md`.
+///
+/// Anything that doesn't match `*.excalidraw` or `*.excalidraw.md` is left
+/// in the sandbox so the caller can decide to delete or inspect it. We
+/// rename when possible and fall back to copy+remove for cross-device
+/// edge cases. Returns the absolute paths of the promoted files in the
+/// destination dir.
+fn promote_excalidraw_files(sandbox: &Path, dest_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut moved = Vec::new();
+    let entries = std::fs::read_dir(sandbox)
+        .with_context(|| format!("read excalidraw sandbox {}", sandbox.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let accepted = name_str.ends_with(".excalidraw")
+            || name_str.ends_with(".excalidraw.md");
+        if !accepted {
+            continue;
+        }
+        let src = entry.path();
+        let dest = dest_dir.join(&name);
+        if let Err(rename_err) = std::fs::rename(&src, &dest) {
+            std::fs::copy(&src, &dest).with_context(|| {
+                format!(
+                    "copy {} to {} (rename failed: {rename_err})",
+                    src.display(),
+                    dest.display(),
+                )
+            })?;
+            std::fs::remove_file(&src).with_context(|| {
+                format!("remove sandbox file {} after copy", src.display())
+            })?;
+        }
+        moved.push(dest);
+    }
+    Ok(moved)
+}
+
 #[allow(clippy::too_many_lines, clippy::fn_params_excessive_bools)]
 #[allow(clippy::too_many_arguments)]
 fn run_ask(
@@ -1983,7 +2072,7 @@ fn run_ask(
     // as validation so `kb status` doesn't count it as a failed run.
     if requested_format == "png" {
         return Err(ValidationError::new(
-            "--format png is not yet supported; supported formats: md, marp, json",
+            "--format png is not yet supported; supported formats: md, marp, json, chart, excalidraw",
         )
         .into());
     }
@@ -2073,6 +2162,21 @@ fn run_ask(
         (None, None)
     };
 
+    // bn-28ob: Excalidraw plumbing. The LLM is given a sandbox dir under
+    // base_dir and asked to drop one or more `.excalidraw` JSON files there.
+    // Once the run finishes, accepted files are moved up alongside answer.md
+    // and the sandbox dir is removed — see below. Pre-create both dirs so
+    // the model's `write` tool can drop files without `mkdir -p`.
+    let excalidraw_sandbox_abs = if requested_format == "excalidraw" {
+        let abs = root.join(&base_dir).join(".diagrams");
+        fs::create_dir_all(&abs).with_context(|| {
+            format!("create excalidraw sandbox dir {}", abs.display())
+        })?;
+        Some(abs)
+    } else {
+        None
+    };
+
     let assembled = kb_query::assemble_context(root, &retrieval_plan)?;
     let citation_manifest = kb_query::build_citation_manifest(&assembled);
     let manifest_text = kb_query::render_manifest_for_prompt(&citation_manifest);
@@ -2089,22 +2193,28 @@ fn run_ask(
         Vec::new()
     };
 
-    let (template_override, output_path_override) = if requested_format == "chart" {
-        (
+    let (template_override, output_path_override) = match requested_format {
+        "chart" => (
             Some("ask_chart.md"),
             chart_abs
                 .as_ref()
                 .map(|p| p.to_string_lossy().into_owned()),
-        )
-    } else {
-        (None, None)
+        ),
+        "excalidraw" => (
+            Some("ask_excalidraw.md"),
+            excalidraw_sandbox_abs
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned()),
+        ),
+        _ => (None, None),
     };
 
-    // bn-1ikn: chart runs ask the adapter for a structured event stream so we
-    // can pull just the final assistant message and skip the per-tool
-    // narration opencode emits ahead of it. Other formats keep plain-text
-    // output — their caller doesn't drive the LLM through tool calls.
-    let structured_output = requested_format == "chart";
+    // bn-1ikn: chart and excalidraw runs ask the adapter for a structured
+    // event stream so we can pull just the final assistant message and skip
+    // the per-tool narration opencode emits ahead of it. Other formats keep
+    // plain-text output — their caller doesn't drive the LLM through tools.
+    let structured_output =
+        matches!(requested_format, "chart" | "excalidraw");
 
     let llm_outcome = try_generate_answer(
         &cfg,
@@ -2180,6 +2290,71 @@ fn run_ask(
         }
     }
 
+    // bn-28ob: Excalidraw success criteria — at least one accepted
+    // `.excalidraw[.md]` file must land in the q-dir alongside `answer.md`.
+    // Mirrors the chart code path: on any failure (LLM error, ERROR: reply,
+    // empty sandbox), persist `answer.md` + `metadata.json` so the user can
+    // inspect *why*, then bail. On success, move accepted files up out of
+    // the sandbox dir and remove the sandbox so it doesn't litter the q-dir.
+    let excalidraw_promoted: Vec<PathBuf> = if requested_format == "excalidraw" {
+        let sandbox = excalidraw_sandbox_abs
+            .as_ref()
+            .expect("sandbox set for excalidraw format")
+            .clone();
+        let q_dir_abs = root.join(&base_dir);
+        let answer_md_rel_display = base_dir.join("answer.md").to_string_lossy().into_owned();
+        match &llm_outcome {
+            Err(err) => {
+                let reason = format!("LLM call failed: {err}");
+                let _ = std::fs::remove_dir_all(&sandbox);
+                write_excalidraw_failure_artifacts(&q_dir_abs, &reason, None)?;
+                bail!(
+                    "--format excalidraw failed: {reason}. See {answer_md_rel_display} for details."
+                );
+            }
+            Ok((result, _)) => {
+                let trimmed = result.body.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("ERROR:") {
+                    let reason =
+                        format!("LLM declined to produce a diagram: {}", rest.trim());
+                    let _ = std::fs::remove_dir_all(&sandbox);
+                    write_excalidraw_failure_artifacts(
+                        &q_dir_abs,
+                        &reason,
+                        Some(&result.body),
+                    )?;
+                    bail!(
+                        "--format excalidraw failed: {reason}. See {answer_md_rel_display} for LLM output."
+                    );
+                }
+                let promoted = promote_excalidraw_files(&sandbox, &q_dir_abs)
+                    .with_context(|| {
+                        format!(
+                            "move excalidraw files from {} into {}",
+                            sandbox.display(),
+                            q_dir_abs.display()
+                        )
+                    })?;
+                let _ = std::fs::remove_dir_all(&sandbox);
+                if promoted.is_empty() {
+                    let reason = "no .excalidraw files were produced".to_string();
+                    write_excalidraw_failure_artifacts(
+                        &q_dir_abs,
+                        &reason,
+                        Some(&result.body),
+                    )?;
+                    bail!(
+                        "--format excalidraw failed: {reason}. \
+                         See {answer_md_rel_display} for LLM output."
+                    );
+                }
+                promoted
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     let (model_version, template_hash, artifact_status, artifact_body, llm_info) =
         match llm_outcome {
             Ok((result, provenance)) => {
@@ -2196,18 +2371,47 @@ fn run_ask(
                 // the body has a markdown heading or a blank-line paragraph
                 // break. Markdown / JSON asks don't invoke tools and are
                 // intentionally untouched.
-                let body = if requested_format == "chart" {
-                    let caption = kb_query::strip_tool_narration(&result.body)
-                        .trim()
-                        .to_string();
-                    let image_line = "![chart](chart.png)";
-                    if caption.is_empty() {
-                        format!("{image_line}\n")
-                    } else {
-                        format!("{caption}\n\n{image_line}\n")
+                let body = match requested_format {
+                    "chart" => {
+                        let caption = kb_query::strip_tool_narration(&result.body)
+                            .trim()
+                            .to_string();
+                        let image_line = "![chart](chart.png)";
+                        if caption.is_empty() {
+                            format!("{image_line}\n")
+                        } else {
+                            format!("{caption}\n\n{image_line}\n")
+                        }
                     }
-                } else {
-                    result.body.clone()
+                    "excalidraw" => {
+                        // bn-28ob: strip opencode's tool-call narration the
+                        // same way chart does, then ensure every promoted
+                        // diagram is referenced — if the model forgot to
+                        // embed one, append the wikilink so the answer never
+                        // ships orphaned files.
+                        let caption = kb_query::strip_tool_narration(&result.body)
+                            .trim()
+                            .to_string();
+                        let mut body = String::new();
+                        if !caption.is_empty() {
+                            body.push_str(&caption);
+                            body.push('\n');
+                        }
+                        for path in &excalidraw_promoted {
+                            if let Some(name) =
+                                path.file_name().and_then(|s| s.to_str())
+                            {
+                                let embed = format!("![[{name}]]");
+                                if !body.contains(&embed) {
+                                    body.push('\n');
+                                    body.push_str(&embed);
+                                    body.push('\n');
+                                }
+                            }
+                        }
+                        body
+                    }
+                    _ => result.body.clone(),
                 };
                 (
                     Some(provenance.model.clone()),
@@ -2235,6 +2439,19 @@ fn run_ask(
 
     let mut question_output_paths = vec![question_rel, answer_rel.clone(), plan_rel];
     if let Some(rel) = chart_rel.as_ref() {
+        question_output_paths.push(rel.clone());
+    }
+    // bn-28ob: record promoted excalidraw files as outputs of this ask so
+    // tooling that walks dependency graphs (compile, lint orphans) sees them.
+    let excalidraw_rels: Vec<PathBuf> = excalidraw_promoted
+        .iter()
+        .filter_map(|abs| {
+            abs.strip_prefix(root)
+                .ok()
+                .map(std::path::Path::to_path_buf)
+        })
+        .collect();
+    for rel in &excalidraw_rels {
         question_output_paths.push(rel.clone());
     }
 
@@ -2265,6 +2482,9 @@ fn run_ask(
     if let Some(rel) = chart_rel.as_ref() {
         artifact_output_paths.push(rel.clone());
     }
+    for rel in &excalidraw_rels {
+        artifact_output_paths.push(rel.clone());
+    }
 
     let artifact = Artifact {
         metadata: EntityMetadata {
@@ -2284,7 +2504,7 @@ fn run_ask(
         },
         question_id: question_id.clone(),
         artifact_kind: match requested_format {
-            "png" | "chart" => ArtifactKind::Figure,
+            "png" | "chart" | "excalidraw" => ArtifactKind::Figure,
             "marp" => ArtifactKind::SlideDeck,
             "json" => ArtifactKind::JsonSpec,
             _ => ArtifactKind::AnswerNote,
@@ -2881,7 +3101,10 @@ fn normalize_ask_format(format: &str) -> Result<&str> {
         "markdown" => Ok("md"),
         // `figure` is an alias for `chart`; both map to the matplotlib pipeline.
         "figure" => Ok("chart"),
-        "md" | "marp" | "json" | "chart" | "png" => Ok(format),
+        // `diagram` is an alias for `excalidraw`; both produce one or more
+        // `.excalidraw` JSON files alongside `answer.md`.
+        "diagram" => Ok("excalidraw"),
+        "md" | "marp" | "json" | "chart" | "excalidraw" | "png" => Ok(format),
         other => bail!("unsupported ask format: {other}"),
     }
 }
@@ -5638,5 +5861,87 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
         }
 
         drop(lock);
+    }
+
+    /// bn-28ob: `excalidraw` and `diagram` are accepted spellings; `diagram`
+    /// is normalized into `excalidraw` so the rest of the dispatch only
+    /// has to handle one canonical name.
+    #[test]
+    fn normalize_ask_format_accepts_excalidraw_and_diagram_alias() {
+        assert_eq!(
+            normalize_ask_format("excalidraw").expect("excalidraw"),
+            "excalidraw",
+        );
+        assert_eq!(
+            normalize_ask_format("diagram").expect("diagram alias"),
+            "excalidraw",
+        );
+        // Existing surface still works.
+        assert_eq!(normalize_ask_format("md").expect("md"), "md");
+        assert_eq!(
+            normalize_ask_format("figure").expect("figure alias"),
+            "chart",
+        );
+        assert!(normalize_ask_format("not-a-format").is_err());
+    }
+
+    /// bn-28ob: `promote_excalidraw_files` should move accepted Excalidraw
+    /// files out of the sandbox into the destination dir, drop everything
+    /// else, and report what landed.
+    #[test]
+    fn promote_excalidraw_files_moves_only_excalidraw_extensions() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let sandbox = root.join("sandbox");
+        let dest = root.join("dest");
+        fs::create_dir_all(&sandbox).expect("create sandbox");
+        fs::create_dir_all(&dest).expect("create dest");
+
+        // Two valid diagrams, plus one stray file the model shouldn't have
+        // written. The stray file must NOT be promoted.
+        fs::write(sandbox.join("system.excalidraw"), b"{\"type\":\"excalidraw\"}")
+            .expect("write system.excalidraw");
+        fs::write(
+            sandbox.join("flow.excalidraw.md"),
+            b"---\nexcalidraw-plugin: true\n---\n# excalidraw\n",
+        )
+        .expect("write flow.excalidraw.md");
+        fs::write(sandbox.join("notes.txt"), b"ignored").expect("write notes.txt");
+        // Non-file entries (a sub-directory) must also be ignored.
+        fs::create_dir_all(sandbox.join("scratch")).expect("create scratch dir");
+
+        let moved = promote_excalidraw_files(&sandbox, &dest).expect("promote");
+        let mut moved_names: Vec<String> = moved
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|s| s.to_str()).map(str::to_string))
+            .collect();
+        moved_names.sort();
+        assert_eq!(
+            moved_names,
+            vec!["flow.excalidraw.md".to_string(), "system.excalidraw".to_string()],
+        );
+
+        assert!(dest.join("system.excalidraw").exists());
+        assert!(dest.join("flow.excalidraw.md").exists());
+        // Stray file stayed behind in the sandbox so it can be cleaned up.
+        assert!(sandbox.join("notes.txt").exists());
+        assert!(!dest.join("notes.txt").exists());
+    }
+
+    /// bn-28ob: empty sandbox returns an empty Vec rather than erroring,
+    /// so the caller can decide what "no files produced" means (the
+    /// `run_ask` caller turns it into a clean failure with persisted
+    /// artifacts).
+    #[test]
+    fn promote_excalidraw_files_returns_empty_when_sandbox_is_empty() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        let sandbox = root.join("sandbox");
+        let dest = root.join("dest");
+        fs::create_dir_all(&sandbox).expect("create sandbox");
+        fs::create_dir_all(&dest).expect("create dest");
+
+        let moved = promote_excalidraw_files(&sandbox, &dest).expect("promote");
+        assert!(moved.is_empty());
     }
 }
