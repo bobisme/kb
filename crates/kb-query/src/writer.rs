@@ -176,6 +176,12 @@ fn render_answer_json(
         "question_id".into(),
         serde_json::Value::String(input.question.metadata.id.clone()),
     );
+    // bn-15w4: surface the original prompt alongside its id so JSON consumers
+    // don't have to round-trip to question.json to render it.
+    obj.insert(
+        "question".into(),
+        serde_json::Value::String(input.question.raw_query.clone()),
+    );
     obj.insert(
         "generated_at".into(),
         serde_json::Value::Number(input.artifact.metadata.created_at_millis.into()),
@@ -481,7 +487,31 @@ fn render_answer_frontmatter(input: &WriteArtifactInput<'_>) -> Result<String, s
     }
 
     let yaml = serde_yaml::to_string(&fm)?;
-    Ok(format!("---\n{yaml}---\n\n{}", input.artifact_body))
+    let question_block = format_question_blockquote(&input.question.raw_query);
+    Ok(format!(
+        "---\n{yaml}---\n\n{question_block}{body}",
+        body = input.artifact_body,
+    ))
+}
+
+/// bn-15w4: render the original `raw_query` as a markdown blockquote that gets
+/// inserted between the frontmatter and the answer body, so readers opening
+/// `answer.md` in Obsidian see what was asked without round-tripping to
+/// `question.json`. Empty/whitespace queries collapse to nothing rather than
+/// emitting an empty quote.
+fn format_question_blockquote(raw_query: &str) -> String {
+    let trimmed = raw_query.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("> **Question:**\n>\n");
+    for line in trimmed.lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push('\n');
+    out
 }
 
 fn json_io_err(e: serde_json::Error) -> std::io::Error {
@@ -639,6 +669,75 @@ mod tests {
         assert!(content.contains("source_document_ids:"));
         assert!(content.contains("retrieval_candidates:"));
         assert!(content.contains("Answer text here."));
+        // bn-15w4: the original question must appear above the body.
+        assert!(content.contains("> **Question:**"));
+        assert!(content.contains("> What is Rust?"));
+    }
+
+    /// bn-15w4: the question blockquote must precede the answer body so it
+    /// reads naturally in Obsidian. Multi-line queries become a continuous
+    /// blockquote rather than collapsing onto a single line.
+    #[test]
+    fn answer_md_renders_multiline_question_above_body() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut question = sample_question("q-multi");
+        question.raw_query = "Line one of the question.\nLine two follows.".into();
+        let artifact = sample_artifact("q-multi");
+        let plan = sample_plan();
+
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &question,
+            artifact: &artifact,
+            retrieval_plan: &plan,
+            artifact_result: None,
+            provenance: None,
+            artifact_body: "ANSWER_BODY",
+            cited_source_paths: &[],
+            build_record_id: None,
+            question_dir_name: None,
+        })
+        .unwrap();
+
+        let content = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
+        let (_, after_fm) = content.split_once("\n---\n").expect("frontmatter");
+        let body_idx = after_fm.find("ANSWER_BODY").expect("body present");
+        let preamble = &after_fm[..body_idx];
+        assert!(preamble.contains("> Line one of the question."), "got: {preamble}");
+        assert!(preamble.contains("> Line two follows."), "got: {preamble}");
+        // The question must appear *before* the body, not after.
+        assert!(preamble.contains("> **Question:**"));
+    }
+
+    /// bn-15w4: an empty `raw_query` collapses to nothing rather than emitting
+    /// an empty `> **Question:**` block.
+    #[test]
+    fn answer_md_omits_empty_question_block() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let mut question = sample_question("q-empty");
+        question.raw_query = "   \n  ".into();
+        let artifact = sample_artifact("q-empty");
+        let plan = sample_plan();
+
+        let output = write_artifact(&WriteArtifactInput {
+            root,
+            question: &question,
+            artifact: &artifact,
+            retrieval_plan: &plan,
+            artifact_result: None,
+            provenance: None,
+            artifact_body: "ANSWER",
+            cited_source_paths: &[],
+            build_record_id: None,
+            question_dir_name: None,
+        })
+        .unwrap();
+
+        let content = std::fs::read_to_string(root.join(&output.answer_path)).unwrap();
+        assert!(!content.contains("**Question:**"));
+        assert!(content.contains("ANSWER"));
     }
 
     #[test]
@@ -865,6 +964,8 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
         assert_eq!(parsed["type"], "question_answer");
         assert_eq!(parsed["question_id"], "q-json");
+        // bn-15w4: JSON output mirrors the original prompt next to its id.
+        assert_eq!(parsed["question"], "What is Rust?");
         assert_eq!(parsed["requested_format"], "json");
         assert_eq!(parsed["body"], "Markdown body with a citation [1].");
         assert_eq!(parsed["build_record_id"], "build:ask:q-json");

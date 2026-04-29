@@ -1345,16 +1345,23 @@ fn ask_format_chart_strips_llm_tool_narration_preamble() {
     );
 
     // Body starts after the second `---\n`. Extract it and verify the
-    // narration preamble was stripped: body begins at the '# Chart caption'
-    // heading, not at 'narration line 1'.
+    // narration preamble was stripped: the caption begins at the
+    // '# Chart caption' heading, not at 'narration line 1'.
+    //
+    // bn-15w4 prepends a `> **Question:**` blockquote between the frontmatter
+    // and the body, so skip past it before asserting on the caption shape.
     let body = answer_md
         .splitn(3, "---\n")
         .nth(2)
         .expect("answer.md must have a body after frontmatter")
         .trim_start_matches('\n');
+    let caption_start = body
+        .find("# Chart caption")
+        .unwrap_or_else(|| panic!("answer.md must contain the chart caption, got body:\n{body}"));
+    let caption = &body[caption_start..];
     assert!(
-        body.starts_with("# Chart caption"),
-        "answer.md body must begin at the '# Chart caption' heading after \
+        caption.starts_with("# Chart caption"),
+        "answer.md caption must begin at the '# Chart caption' heading after \
          strip_tool_narration; narration lines must be dropped. Got body:\n{body}"
     );
     assert!(
