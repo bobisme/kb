@@ -1166,17 +1166,14 @@ fn ask_format_json_writes_structured_artifact() {
 fn install_fake_chart_harness(root: &Path) -> PathBuf {
     let bin_dir = root.join("fake-chart-bin");
     fs::create_dir_all(&bin_dir).expect("create fake chart bin dir");
-    // The prompt is the last positional arg. Grep it for the absolute path
-    // ending in `chart.png`, write a non-empty byte sequence there (minimal
-    // PNG signature + IHDR/IEND; real matplotlib output is much larger but the
+    // bn-3049: kb-cli now feeds the prompt via stdin (not argv). Drain
+    // stdin into `prompt` and grep it for the absolute path ending in
+    // `chart.png`, write a non-empty byte sequence there (minimal PNG
+    // signature + IHDR/IEND; real matplotlib output is much larger but the
     // only thing kb verifies is that the file exists), and emit a caption.
     let script = r#"#!/bin/sh
 set -e
-# The prompt is the final positional argument. Shift to it portably.
-prompt=""
-for arg in "$@"; do
-    prompt="$arg"
-done
+prompt="$(cat)"
 png_path="$(printf '%s' "$prompt" | grep -oE '/[^ ]+chart\.png' | head -n1)"
 if [ -z "$png_path" ]; then
     echo "fake-chart-opencode: no chart.png path found in prompt" >&2
@@ -1291,12 +1288,10 @@ fn install_fake_narration_chart_harness(root: &Path) -> PathBuf {
     // printed caption intentionally begins with two narration lines that
     // the LLM-driven tool loop would emit before settling on the final
     // assistant message. strip_tool_narration should cut them.
+    // bn-3049: kb-cli now feeds the prompt via stdin (not argv).
     let script = r#"#!/bin/sh
 set -e
-prompt=""
-for arg in "$@"; do
-    prompt="$arg"
-done
+prompt="$(cat)"
 png_path="$(printf '%s' "$prompt" | grep -oE '/[^ ]+chart\.png' | head -n1)"
 if [ -z "$png_path" ]; then
     echo "fake-narration-chart-opencode: no chart.png path found in prompt" >&2
@@ -7313,17 +7308,14 @@ fn ask_editor_empty_content_is_validation_error_no_failed_job() {
 fn install_fake_concept_candidate_harness(root: &Path, canonical: &str, category: &str) -> PathBuf {
     let bin_dir = root.join("fake-concept-candidate-bin");
     fs::create_dir_all(&bin_dir).expect("create fake bin dir");
-    // The prompt is the last positional arg. If it's the
-    // generate_concept_from_candidate prompt (which names the candidate term),
-    // return the canonical JSON. Otherwise fall through to a plain-text reply
-    // used by the concept_body two-step prompt.
+    // bn-3049: kb-cli now feeds the prompt via stdin (not argv). If it's
+    // the generate_concept_from_candidate prompt (which names the candidate
+    // term), return the canonical JSON. Otherwise fall through to a
+    // plain-text reply used by the concept_body two-step prompt.
     let script = format!(
         r#"#!/bin/sh
 set -e
-prompt=""
-for arg in "$@"; do
-    prompt="$arg"
-done
+prompt="$(cat)"
 case "$prompt" in
   *"drafting a canonical concept entry"*)
     printf '{{"canonical_name":"{canonical}","aliases":["FooBar"],"category":"{category}","definition":"{canonical} is a coordinated system described across multiple sources that covers its design, failure modes, and operational characteristics."}}'
