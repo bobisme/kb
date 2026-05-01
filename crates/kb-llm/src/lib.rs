@@ -10,14 +10,16 @@ mod templates;
 
 pub use adapter::{
     AnswerQuestionRequest, AnswerQuestionResponse, CandidateSourceSnippet, ConceptCandidate,
-    ContradictionQuote, DetectContradictionsRequest, DetectContradictionsResponse,
-    ExtractConceptsRequest, ExtractConceptsResponse, GenerateConceptBodyRequest,
-    GenerateConceptBodyResponse, GenerateConceptFromCandidateRequest,
-    GenerateConceptFromCandidateResponse, GenerateSlidesRequest, GenerateSlidesResponse,
-    ImputeGapKind, ImputeGapRequest, ImputeGapResponse, ImputedWebSource, LlmAdapter,
-    LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, MergeGroup,
+    ConceptSuggestionInput, ContradictionQuote, DetectContradictionsRequest,
+    DetectContradictionsResponse, ExtractConceptsRequest, ExtractConceptsResponse,
+    FilterConceptSuggestionsRequest, GenerateConceptBodyRequest, GenerateConceptBodyResponse,
+    GenerateConceptFromCandidateRequest, GenerateConceptFromCandidateResponse,
+    GenerateSlidesRequest, GenerateSlidesResponse, ImputeGapKind, ImputeGapRequest,
+    ImputeGapResponse, ImputedWebSource, LlmAdapter, LlmAdapterError,
+    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, MergeGroup,
     RunHealthCheckRequest, RunHealthCheckResponse, SourceAnchor, SummarizeDocumentRequest,
-    SummarizeDocumentResponse, parse_detect_contradictions_json,
+    SummarizeDocumentResponse, FilterConceptSuggestionsResponse,
+    parse_detect_contradictions_json, parse_filter_concept_suggestions_json,
     parse_generate_concept_from_candidate_json, parse_impute_gap_json,
     parse_merge_concept_candidates_json,
 };

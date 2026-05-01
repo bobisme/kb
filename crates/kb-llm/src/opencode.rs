@@ -9,14 +9,14 @@ use tempfile::TempDir;
 use crate::adapter::{
     AnswerQuestionRequest, AnswerQuestionResponse, DetectContradictionsRequest,
     DetectContradictionsResponse, ExtractConceptsRequest, ExtractConceptsResponse,
-    GenerateConceptBodyRequest, GenerateConceptBodyResponse, GenerateConceptFromCandidateRequest,
-    GenerateConceptFromCandidateResponse, GenerateSlidesRequest, GenerateSlidesResponse,
-    ImputeGapRequest, ImputeGapResponse, LlmAdapter, LlmAdapterError,
-    MergeConceptCandidatesRequest, MergeConceptCandidatesResponse, RunHealthCheckRequest,
-    RunHealthCheckResponse, SummarizeDocumentRequest, SummarizeDocumentResponse,
-    parse_detect_contradictions_json, parse_extract_concepts_json,
-    parse_generate_concept_from_candidate_json, parse_impute_gap_json,
-    parse_merge_concept_candidates_json,
+    FilterConceptSuggestionsRequest, GenerateConceptBodyRequest, GenerateConceptBodyResponse,
+    GenerateConceptFromCandidateRequest, GenerateConceptFromCandidateResponse,
+    GenerateSlidesRequest, GenerateSlidesResponse, ImputeGapRequest, ImputeGapResponse, LlmAdapter,
+    LlmAdapterError, MergeConceptCandidatesRequest, MergeConceptCandidatesResponse,
+    RunHealthCheckRequest, RunHealthCheckResponse, SummarizeDocumentRequest,
+    SummarizeDocumentResponse, parse_detect_contradictions_json, parse_extract_concepts_json,
+    parse_filter_concept_suggestions_json, parse_generate_concept_from_candidate_json,
+    parse_impute_gap_json, parse_merge_concept_candidates_json,
 };
 use crate::provenance::ProvenanceRecord;
 use crate::subprocess::{SubprocessError, run_command_with_stdin};
@@ -745,6 +745,51 @@ impl LlmAdapter for OpencodeAdapter {
         };
 
         Ok((response, provenance))
+    }
+
+    fn filter_concept_suggestions(
+        &self,
+        request: &FilterConceptSuggestionsRequest,
+    ) -> Result<Vec<String>, LlmAdapterError> {
+        // bn-13zx. Render the candidate list as JSON, hand it to the model
+        // via the standard template, parse the slug list back out. The
+        // template instructs the model to emit JSON only, but we tolerate
+        // code-fence wrappers in the parser.
+        if request.candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let template =
+            Template::load("filter_concept_suggestions.md", self.config.project_root.as_deref())
+                .map_err(|err| {
+                    LlmAdapterError::Other(format!(
+                        "load filter_concept_suggestions template: {err}"
+                    ))
+                })?;
+
+        let candidates_json = serde_json::to_string_pretty(&request.candidates).map_err(|err| {
+            LlmAdapterError::Other(format!("serialize concept-suggestion candidates: {err}"))
+        })?;
+
+        let mut context = HashMap::new();
+        context.insert("candidates_json".to_string(), candidates_json);
+
+        let rendered = template.render(&context).map_err(|err| {
+            LlmAdapterError::Other(format!("render filter_concept_suggestions template: {err}"))
+        })?;
+
+        let raw = self.run_prompt(&rendered.content)?;
+        let parsed = parse_filter_concept_suggestions_json(&raw)?;
+        // Defensive: drop any slug the model invented that isn't in the
+        // input list. The prompt forbids it but model drift happens.
+        let known: std::collections::BTreeSet<&str> =
+            request.candidates.iter().map(|c| c.slug.as_str()).collect();
+        let kept: Vec<String> = parsed
+            .accepted
+            .into_iter()
+            .filter(|slug| known.contains(slug.as_str()))
+            .collect();
+        Ok(kept)
     }
 
     fn caption_image(

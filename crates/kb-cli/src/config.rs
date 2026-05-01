@@ -246,6 +246,10 @@ pub struct CompileConfig {
     /// `[compile.captions]` — bn-2qda. Vision-LLM auto-captions for
     /// undescribed images.
     pub captions: CaptionsConfig,
+    /// `[compile.concept_suggestions]` — bn-13zx. RAKE-based concept
+    /// candidate discovery + LLM filter, queued as `concept_candidate`
+    /// review items.
+    pub concept_suggestions: ConceptSuggestionsConfig,
 }
 
 impl Default for CompileConfig {
@@ -253,6 +257,77 @@ impl Default for CompileConfig {
         Self {
             token_budget: 25_000,
             captions: CaptionsConfig::default(),
+            concept_suggestions: ConceptSuggestionsConfig::default(),
+        }
+    }
+}
+
+/// `[compile.concept_suggestions]` section of `kb.toml`. bn-13zx.
+///
+/// Auto-discovers concept-page candidates from source bodies via two
+/// signals: the existing capitalized-multiword + backtick-identifier
+/// detector (cf. `kb_lint::check_missing_concepts_hits`) and a
+/// RAKE-style keyphrase extractor that picks up lower-case noun phrases
+/// the regex skips. The merged candidate list is fed through the
+/// configured LLM adapter to drop obvious noise; survivors land in the
+/// review queue as `concept_candidate` items, where the existing
+/// approve/reject flow takes over.
+///
+/// Default: `enabled = true`, `llm_filter = true`. Without an LLM
+/// adapter the filter falls back to queueing the unfiltered list with
+/// a warning rather than silently dropping signal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct ConceptSuggestionsConfig {
+    pub enabled: bool,
+    /// Cap on the number of RAKE candidates kept per source before the
+    /// global merge. Default: 8.
+    pub max_per_source: usize,
+    /// Global cap on candidates handed to the LLM filter. Default: 24.
+    pub top_k_global: usize,
+    /// When `true`, route the merged candidate list through the
+    /// configured LLM adapter for usefulness filtering. When `false`,
+    /// every candidate becomes a review item unchanged.
+    pub llm_filter: bool,
+    /// Cross-source threshold for the regex-based detector — a candidate
+    /// must appear in at least this many sources. Mirrors
+    /// `[lint.missing_concepts] min_sources`. Default: 3.
+    pub min_sources: usize,
+    /// Total-mention threshold for the regex-based detector. Default: 5.
+    pub min_mentions: usize,
+}
+
+impl Default for ConceptSuggestionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_per_source: 8,
+            top_k_global: 24,
+            llm_filter: true,
+            min_sources: 3,
+            min_mentions: 5,
+        }
+    }
+}
+
+impl ConceptSuggestionsConfig {
+    /// Translate the TOML config into the runtime
+    /// [`kb_compile::concept_suggestions::ConceptSuggestionsOptions`].
+    #[must_use]
+    pub const fn to_pipeline_options(
+        &self,
+    ) -> kb_compile::concept_suggestions::ConceptSuggestionsOptions {
+        kb_compile::concept_suggestions::ConceptSuggestionsOptions {
+            enabled: self.enabled,
+            max_per_source: self.max_per_source,
+            top_k_global: self.top_k_global,
+            llm_filter: self.llm_filter,
+            missing_concepts: kb_lint::MissingConceptsConfig {
+                enabled: true,
+                min_sources: self.min_sources,
+                min_mentions: self.min_mentions,
+            },
         }
     }
 }

@@ -181,6 +181,27 @@ pub struct GenerateConceptFromCandidateRequest {
     pub existing_categories: Vec<String>,
 }
 
+/// One auto-discovered concept-candidate entry passed into the
+/// `filter_concept_suggestions` adapter call (bn-13zx).
+///
+/// `slug` is the deterministic filename slug; `name` is the surface form
+/// the LLM should reason about. The adapter returns the slug list of
+/// surviving candidates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConceptSuggestionInput {
+    pub slug: String,
+    pub name: String,
+    pub source_ids: Vec<String>,
+    pub mention_count: usize,
+}
+
+/// Request payload for `filter_concept_suggestions` (bn-13zx).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterConceptSuggestionsRequest {
+    /// Candidate phrases discovered by the compile pass.
+    pub candidates: Vec<ConceptSuggestionInput>,
+}
+
 /// One source's contribution to a concept-candidate prompt.
 ///
 /// The `snippet` is already trimmed/truncated by the caller before being
@@ -388,6 +409,46 @@ pub fn parse_detect_contradictions_json(
     serde_json::from_str(json_text).map_err(|err| {
         LlmAdapterError::Parse(format!(
             "detect_contradictions response had invalid shape: {err}"
+        ))
+    })
+}
+
+/// JSON shape returned by the `filter_concept_suggestions` prompt (bn-13zx).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilterConceptSuggestionsResponse {
+    /// Slugs of accepted candidates, in the order the model judges most
+    /// useful.
+    pub accepted: Vec<String>,
+}
+
+/// Parse a `filter_concept_suggestions` LLM response into the slug list.
+///
+/// Tolerant of code-fence wrappers (```json ... ```) — the model is
+/// instructed to emit raw JSON but most adapters happily wrap it anyway.
+///
+/// # Errors
+///
+/// Returns [`LlmAdapterError::Parse`] when the text is empty, not valid
+/// JSON, or does not match the expected response schema.
+pub fn parse_filter_concept_suggestions_json(
+    text: &str,
+) -> Result<FilterConceptSuggestionsResponse, LlmAdapterError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(LlmAdapterError::Parse(
+            "filter_concept_suggestions response was empty".to_string(),
+        ));
+    }
+
+    let json_text = trimmed
+        .strip_prefix("```")
+        .and_then(|body| body.split_once('\n').map(|(_, rest)| rest))
+        .and_then(|body| body.rsplit_once("```").map(|(json, _)| json.trim()))
+        .unwrap_or(trimmed);
+
+    serde_json::from_str(json_text).map_err(|err| {
+        LlmAdapterError::Parse(format!(
+            "filter_concept_suggestions response had invalid shape: {err}"
         ))
     })
 }
@@ -768,6 +829,39 @@ pub trait LlmAdapter: Send + Sync {
     ) -> Result<(String, ProvenanceRecord), LlmAdapterError> {
         Err(LlmAdapterError::Other(
             "caption_image is not implemented by this adapter (vision unsupported)".to_string(),
+        ))
+    }
+
+    /// Filter a list of auto-discovered concept candidates down to those
+    /// that would make useful KB concept pages.
+    ///
+    /// bn-13zx: the compile `concept_suggestions` pass extracts candidate
+    /// keyphrases via RAKE + the existing capitalized-span detector, then
+    /// asks the configured adapter to keep only the candidates that look
+    /// like real KB concepts (single, well-defined topics worth a page —
+    /// not generic phrases or noise).
+    ///
+    /// The adapter receives `request.candidates` (each carrying slug,
+    /// surface name, source ids, mention count) and returns the slugs of
+    /// the candidates it judges useful. Order does not matter; the caller
+    /// uses the slug set as a filter mask.
+    ///
+    /// Default implementation returns [`LlmAdapterError::Other`]; adapters
+    /// without an LLM runner cause the pass to fall back to queueing the
+    /// unfiltered candidate set with a warning, which is preferable to
+    /// silently dropping signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmAdapterError` if the backend cannot be reached, times
+    /// out, returns malformed JSON, or the adapter does not implement
+    /// this call.
+    fn filter_concept_suggestions(
+        &self,
+        _request: &FilterConceptSuggestionsRequest,
+    ) -> Result<Vec<String>, LlmAdapterError> {
+        Err(LlmAdapterError::Other(
+            "filter_concept_suggestions is not implemented by this adapter".to_string(),
         ))
     }
 

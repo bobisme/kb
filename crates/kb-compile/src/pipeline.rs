@@ -217,6 +217,9 @@ pub struct CompileOptions {
     /// Configuration for the bn-2qda image-captioning pass. Defaults match
     /// `[compile.captions]` in `kb.toml`.
     pub captions: crate::captions::CaptionsConfig,
+    /// Configuration for the bn-13zx concept-suggestions pass. Defaults match
+    /// `[compile.concept_suggestions]` in `kb.toml`.
+    pub concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions,
 }
 
 impl std::fmt::Debug for CompileOptions {
@@ -232,6 +235,10 @@ impl std::fmt::Debug for CompileOptions {
             )
             .field("semantic_backend", &self.semantic_backend.kind)
             .field("captions_enabled", &self.captions.enabled)
+            .field(
+                "concept_suggestions_enabled",
+                &self.concept_suggestions.enabled,
+            )
             .finish()
     }
 }
@@ -609,6 +616,12 @@ pub fn run_compile_with_llm(
         }
 
         passes.push((
+            "concept_suggestions".to_string(),
+            PassStatus::DryRun {
+                would_process: vec!["normalized/*/source.md".to_string()],
+            },
+        ));
+        passes.push((
             "backlinks".to_string(),
             PassStatus::DryRun {
                 would_process: vec!["wiki/concepts/*".to_string()],
@@ -808,6 +821,37 @@ pub fn run_compile_with_llm(
                 reason: "no LLM adapter configured".to_string(),
             },
         ));
+    }
+
+    // Pass: concept_suggestions — bn-13zx. Scans normalized sources for
+    // candidate keyphrases (regex multi-word + RAKE) and queues survivors as
+    // ConceptCandidate review items. Reuses the existing review queue's
+    // approve/reject UX (see crates/kb-cli/src/review.rs) rather than
+    // standing up a parallel `.kb/suggestions/` store. The LLM filter is
+    // optional — without an adapter we still queue regex hits so users get
+    // the missing-concepts signal even with no model configured.
+    match crate::concept_suggestions::run_concept_suggestions_pass(
+        root,
+        &options.concept_suggestions,
+        adapter,
+    ) {
+        Ok(stats) => {
+            passes.push((
+                "concept_suggestions".to_string(),
+                PassStatus::Executed {
+                    affected: stats.review_items,
+                },
+            ));
+        }
+        Err(err) => {
+            tracing::warn!("concept_suggestions pass failed: {err:#}");
+            passes.push((
+                "concept_suggestions".to_string(),
+                PassStatus::Skipped {
+                    reason: format!("error: {err}"),
+                },
+            ));
+        }
     }
 
     // Pass: backlinks (no LLM — scans wiki links and updates concept pages)
@@ -2192,6 +2236,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("compile");
@@ -2219,6 +2264,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("compile with progress");
@@ -2243,6 +2289,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("compile");
@@ -2276,6 +2323,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("compile");
@@ -2303,6 +2351,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("first compile");
@@ -2317,6 +2366,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("second compile");
@@ -2344,6 +2394,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("first compile");
@@ -2361,6 +2412,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("second compile");
@@ -2387,6 +2439,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("first compile");
@@ -2401,6 +2454,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("force compile");
@@ -2427,6 +2481,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("dry run");
@@ -2494,6 +2549,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -2576,6 +2632,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             None::<&dyn LlmAdapter>,
         )
@@ -2630,6 +2687,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("first compile");
@@ -2644,6 +2702,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("dry run with clean state");
@@ -2676,6 +2735,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("dry run");
@@ -2690,6 +2750,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("live run");
@@ -2753,6 +2814,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("first compile");
@@ -2767,6 +2829,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("second compile — no changes");
@@ -2791,6 +2854,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("third compile — template changed");
@@ -2937,6 +3001,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -2997,6 +3062,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3039,6 +3105,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3102,6 +3169,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3147,6 +3215,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3193,6 +3262,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3215,6 +3285,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3245,6 +3316,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3282,6 +3354,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3311,6 +3384,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3353,6 +3427,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )
@@ -3433,6 +3508,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
         )
         .expect("compile");
@@ -3555,6 +3631,7 @@ mod tests {
             reporter: None,
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
+            concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile");
 
@@ -3618,6 +3695,7 @@ mod tests {
             reporter: None,
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
+            concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile succeeds (failures logged, not bubbled)");
 
@@ -3710,6 +3788,7 @@ mod tests {
             reporter: Some(Arc::new(reporter.clone())),
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
+            concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3800,6 +3879,7 @@ mod tests {
             reporter: Some(Arc::new(reporter.clone())),
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
+            concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3838,6 +3918,7 @@ mod tests {
             reporter: Some(Arc::new(reporter.clone())),
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
+            concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3915,6 +3996,7 @@ mod tests {
             reporter: None,
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
+            concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
         };
         let rendered = format!("{with_sink:?}");
         assert!(rendered.contains("Some(\"<LogSink>\")"), "got {rendered}");
@@ -4203,6 +4285,7 @@ mod tests {
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
+                concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
             },
             Some(&adapter),
         )

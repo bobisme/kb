@@ -3892,6 +3892,11 @@ fn run_compile_action(
         .as_ref()
         .map(|cfg| cfg.compile.captions.to_pipeline_config())
         .unwrap_or_default();
+    // bn-13zx: same shape for `[compile.concept_suggestions]`.
+    let concept_suggestions = loaded_config
+        .as_ref()
+        .map(|cfg| cfg.compile.concept_suggestions.to_pipeline_options())
+        .unwrap_or_default();
 
     let options = kb_compile::pipeline::CompileOptions {
         force,
@@ -3905,6 +3910,7 @@ fn run_compile_action(
         reporter: Some(reporter),
         semantic_backend,
         captions,
+        concept_suggestions,
     };
 
     // Dry-run does not call the LLM; skip adapter construction so users can

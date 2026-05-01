@@ -5,6 +5,7 @@ pub mod captions;
 pub mod concept_candidate;
 pub mod concept_extraction;
 pub mod concept_merge;
+pub mod concept_suggestions;
 pub mod imputed_fix;
 pub mod index_page;
 pub mod pipeline;
