@@ -608,6 +608,10 @@ impl RetrievalConfig {
     /// `kb-query` crate consumes, picking backend-tuned floors when the
     /// user hasn't pinned `min_semantic_score` /
     /// `min_semantic_top_score_no_lexical` in `kb.toml`. bn-2xbd.
+    ///
+    /// Rerank settings come from `[semantic.rerank]` (bn-1cp2) — see
+    /// [`Config::to_hybrid_options`] for the convenience wrapper that
+    /// folds both sections together.
     #[must_use]
     pub const fn to_hybrid_options(
         &self,
@@ -626,7 +630,29 @@ impl RetrievalConfig {
             rrf_k: self.rrf_k,
             min_semantic_score: min_score,
             min_semantic_top_score_no_lexical: min_top,
+            rerank: kb_query::RerankSettings {
+                enabled: false,
+                top_k: kb_query::RERANK_DEFAULT_TOP_K,
+                keep: kb_query::RERANK_DEFAULT_KEEP,
+            },
         }
+    }
+}
+
+impl Config {
+    /// Build [`HybridOptions`] folding in both `[retrieval]` and
+    /// `[semantic.rerank]`. Most callers should prefer this over
+    /// [`RetrievalConfig::to_hybrid_options`] alone — the rerank knobs
+    /// live in a different config section but logically belong on the
+    /// same options bag.
+    #[must_use]
+    pub const fn to_hybrid_options(
+        &self,
+        backend_kind: kb_query::SemanticBackendKind,
+    ) -> kb_query::HybridOptions {
+        let mut opts = self.retrieval.to_hybrid_options(backend_kind);
+        opts.rerank = self.semantic.rerank.to_settings();
+        opts
     }
 }
 
@@ -647,6 +673,9 @@ impl RetrievalConfig {
 /// Backend changes are detected by `kb compile`'s embedding-sync pass —
 /// the on-disk vector store is wiped and rebuilt automatically when the
 /// stored `backend_id` no longer matches the active backend.
+///
+/// `[semantic.rerank]` adds the cross-encoder reranker (bn-1cp2) — see
+/// [`RerankConfig`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
@@ -654,6 +683,76 @@ pub struct SemanticConfig {
     pub backend: SemanticBackendKindConfig,
     pub model_path: Option<String>,
     pub tokenizer_path: Option<String>,
+    pub rerank: RerankConfig,
+}
+
+/// `[semantic.rerank]` section of `kb.toml`. Cross-encoder rerank pass
+/// (bn-1cp2) that reads `(query, candidate)` jointly to produce a
+/// precision-focused re-ordering of the top-K hybrid results.
+///
+/// Defaults to `enabled = false` because each opt-in adds an ~80MB ONNX
+/// model download on first use and a few hundred milliseconds of CPU
+/// latency per query. Once a user has the model cached, flipping this to
+/// `true` is the only change needed — the model auto-downloads from
+/// Hugging Face the first time `kb ask` / `kb search` runs.
+///
+/// `top_k` is the number of fused candidates fed into the cross-encoder.
+/// `keep` is the number of results returned after re-sorting.
+///
+/// `model_path` and `tokenizer_path` override the cache convention
+/// (`~/.cache/kb/models/cross-encoder-ms-marco-minilm-l6-*`) — useful for
+/// air-gapped installs that pre-stage the files. `~`-prefixed paths are
+/// expanded against the user's home directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct RerankConfig {
+    pub enabled: bool,
+    pub top_k: usize,
+    pub keep: usize,
+    pub model_path: Option<String>,
+    pub tokenizer_path: Option<String>,
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            top_k: kb_query::RERANK_DEFAULT_TOP_K,
+            keep: kb_query::RERANK_DEFAULT_KEEP,
+            model_path: None,
+            tokenizer_path: None,
+        }
+    }
+}
+
+impl RerankConfig {
+    /// Distill the kb-cli config into the `Copy` settings struct that
+    /// travels through [`kb_query::HybridOptions`]. Path overrides live
+    /// outside this struct because they're consumed by the caller-side
+    /// loader, not the hybrid layer.
+    #[must_use]
+    pub const fn to_settings(&self) -> kb_query::RerankSettings {
+        kb_query::RerankSettings {
+            enabled: self.enabled,
+            top_k: self.top_k,
+            keep: self.keep,
+        }
+    }
+
+    /// Resolve the optional model/tokenizer paths to absolute `PathBuf`s,
+    /// expanding `~/`. Returns `None` for unset paths so the loader
+    /// falls back to the OS cache convention.
+    #[must_use]
+    pub fn resolved_model_path(&self) -> Option<std::path::PathBuf> {
+        self.model_path.as_deref().map(expand_user_path)
+    }
+
+    /// See [`Self::resolved_model_path`].
+    #[must_use]
+    pub fn resolved_tokenizer_path(&self) -> Option<std::path::PathBuf> {
+        self.tokenizer_path.as_deref().map(expand_user_path)
+    }
 }
 
 /// Mirror of [`kb_query::SemanticBackendKind`] kept here so `kb-query`
@@ -967,6 +1066,45 @@ token_budget = 12000
         assert_eq!(cfg.semantic.backend, expected_cfg_kind);
         let backend = cfg.semantic.to_backend_config();
         assert_eq!(backend.kind, expected_runtime_kind);
+    }
+
+    #[test]
+    fn rerank_section_defaults_disabled_match_kb_query_constants() {
+        let cfg = RerankConfig::default();
+        assert!(
+            !cfg.enabled,
+            "rerank ships off by default; flip to true once the model is cached"
+        );
+        assert_eq!(cfg.top_k, kb_query::RERANK_DEFAULT_TOP_K);
+        assert_eq!(cfg.keep, kb_query::RERANK_DEFAULT_KEEP);
+        let s = cfg.to_settings();
+        assert!(!s.enabled);
+        assert_eq!(s.top_k, kb_query::RERANK_DEFAULT_TOP_K);
+        assert_eq!(s.keep, kb_query::RERANK_DEFAULT_KEEP);
+    }
+
+    #[test]
+    fn rerank_section_round_trips_via_toml() -> Result<()> {
+        let toml = r#"
+[semantic.rerank]
+enabled = true
+top_k = 25
+keep = 5
+model_path = "~/.cache/kb/models/cross-encoder-ms-marco-minilm-l6-int8.onnx"
+tokenizer_path = "~/.cache/kb/models/cross-encoder-ms-marco-minilm-l6-tokenizer.json"
+"#;
+        let parsed = Config::from_toml(toml)?;
+        assert!(parsed.semantic.rerank.enabled);
+        assert_eq!(parsed.semantic.rerank.top_k, 25);
+        assert_eq!(parsed.semantic.rerank.keep, 5);
+        assert!(parsed.semantic.rerank.resolved_model_path().is_some());
+        assert!(parsed.semantic.rerank.resolved_tokenizer_path().is_some());
+
+        let opts = parsed.to_hybrid_options(kb_query::SemanticBackendKind::Minilm);
+        assert!(opts.rerank.enabled);
+        assert_eq!(opts.rerank.top_k, 25);
+        assert_eq!(opts.rerank.keep, 5);
+        Ok(())
     }
 
     #[test]

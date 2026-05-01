@@ -11,8 +11,8 @@ use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use kb_query::{
-    HybridOptions, HybridResult, LexicalIndex, SemanticBackend, SemanticBackendConfig,
-    SemanticBackendKind,
+    HybridOptions, HybridResult, LexicalIndex, Reranker, RerankSettings, SemanticBackend,
+    SemanticBackendConfig, SemanticBackendKind,
 };
 use serde::Deserialize;
 
@@ -37,6 +37,13 @@ struct WebStateInner {
     /// at server start so the ONNX session (when `MiniLM` is configured) is
     /// reused across requests rather than rebuilt per query. bn-1rww.
     backend: SemanticBackend,
+    /// Optional cross-encoder reranker (bn-1cp2). When `Some`, the search
+    /// handler runs the rerank pass after fusion. Loaded once at server
+    /// start so the ONNX session is reused across requests.
+    reranker: Option<Box<dyn Reranker>>,
+    /// Rerank knobs (top-K + keep). Defaults are off; the kb-cli serve
+    /// path passes through `[semantic.rerank]` from `kb.toml`.
+    rerank_settings: RerankSettings,
 }
 
 impl WebState {
@@ -74,6 +81,23 @@ impl WebState {
     /// Returns an error if the lexical index cannot be parsed or the
     /// configured backend fails to load.
     pub fn with_backend_config(root: PathBuf, backend: &SemanticBackendConfig) -> Result<Self> {
+        Self::with_backend_and_reranker(root, backend, None, RerankSettings::default())
+    }
+
+    /// `with_backend_config` plus optional cross-encoder reranker
+    /// (bn-1cp2). Used by the kb-cli `serve` path so `[semantic.rerank]`
+    /// from `kb.toml` is honored at the web layer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lexical index cannot be parsed or the
+    /// configured backend fails to load.
+    pub fn with_backend_and_reranker(
+        root: PathBuf,
+        backend: &SemanticBackendConfig,
+        reranker: Option<Box<dyn Reranker>>,
+        rerank_settings: RerankSettings,
+    ) -> Result<Self> {
         let index = LexicalIndex::load(&root)
             .with_context(|| format!("load lexical index at {}", root.display()))?;
         let backend = SemanticBackend::from_config(backend)
@@ -83,6 +107,8 @@ impl WebState {
                 root,
                 index,
                 backend,
+                reranker,
+                rerank_settings,
             }),
         })
     }
@@ -97,6 +123,14 @@ impl WebState {
 
     fn backend(&self) -> &SemanticBackend {
         &self.inner.backend
+    }
+
+    fn reranker(&self) -> Option<&dyn Reranker> {
+        self.inner.reranker.as_deref()
+    }
+
+    fn rerank_settings(&self) -> RerankSettings {
+        self.inner.rerank_settings
     }
 }
 
@@ -241,13 +275,16 @@ async fn search_handler(
         return axum::Json(SearchResponse { results: Vec::new() }).into_response();
     }
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
-    let results = match kb_query::hybrid_search_with_index_and_backend(
+    let options = HybridOptions::for_backend(state.backend().kind())
+        .with_rerank(state.rerank_settings());
+    let results = match kb_query::hybrid_search_with_index_and_backend_and_reranker(
         state.root(),
         state.index(),
         &query,
         limit,
-        HybridOptions::for_backend(state.backend().kind()),
+        options,
         state.backend(),
+        state.reranker(),
     ) {
         Ok(hits) => hits,
         Err(err) => {

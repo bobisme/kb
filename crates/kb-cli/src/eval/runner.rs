@@ -83,6 +83,11 @@ pub struct RunInputs<'a> {
     pub backend_id: &'a str,
     pub run_id: String,
     pub corpus_hash: String,
+    /// Optional cross-encoder reranker (bn-1cp2). When `Some` and
+    /// `options.rerank.enabled`, scoring goes through the rerank pass.
+    /// `None` reproduces the pre-rerank baseline so users can A/B the
+    /// effect of rerank on MRR without rebuilding the corpus.
+    pub reranker: Option<&'a dyn kb_query::Reranker>,
 }
 
 /// Run every golden query through the hybrid retriever and assemble an
@@ -109,12 +114,13 @@ pub fn run(inputs: &RunInputs<'_>) -> Result<EvalRun> {
 }
 
 fn score_query(q: &GoldenQuery, inputs: &RunInputs<'_>) -> Result<QueryResult> {
-    let plan = kb_query::plan_retrieval_hybrid_with_backend(
+    let plan = kb_query::plan_retrieval_hybrid_with_backend_and_reranker(
         inputs.root,
         &q.query,
         EVAL_TOKEN_BUDGET,
         inputs.options,
         inputs.backend,
+        inputs.reranker,
     )
     .with_context(|| format!("retrieval failed for golden query `{}`", q.id))?;
 

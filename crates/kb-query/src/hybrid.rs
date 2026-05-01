@@ -24,6 +24,7 @@ use rusqlite::Connection;
 use tracing::warn;
 
 use crate::lexical::{LexicalIndex, RetrievalCandidate, RetrievalPlan, SearchResult};
+use crate::semantic::rerank::{Reranker, RerankSettings};
 use crate::semantic::{
     EmbeddingBackend, HashEmbedBackend, embed::embedding_db_path,
     search::{aggregate_chunks_to_items, knn_search},
@@ -112,6 +113,12 @@ pub struct HybridOptions {
     /// Stricter floor on the *top* semantic hit when lexical returned
     /// nothing. Same backend-relative tuning as [`Self::min_semantic_score`].
     pub min_semantic_top_score_no_lexical: f32,
+    /// Cross-encoder rerank knobs (bn-1cp2). The `RerankSettings` is the
+    /// `Copy` subset of the rerank config — the actual model lives on the
+    /// caller-side and is plumbed through the `_with_reranker` function
+    /// variants. When `enabled = false` (the default), the hybrid pipeline
+    /// behaves exactly like before bn-1cp2.
+    pub rerank: RerankSettings,
 }
 
 impl Default for HybridOptions {
@@ -121,6 +128,11 @@ impl Default for HybridOptions {
             rrf_k: RRF_K,
             min_semantic_score: MIN_SEMANTIC_SCORE,
             min_semantic_top_score_no_lexical: MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
+            rerank: RerankSettings {
+                enabled: false,
+                top_k: crate::semantic::rerank::DEFAULT_TOP_K,
+                keep: crate::semantic::rerank::DEFAULT_KEEP,
+            },
         }
     }
 }
@@ -137,7 +149,21 @@ impl HybridOptions {
             rrf_k: RRF_K,
             min_semantic_score: kind.default_min_semantic_score(),
             min_semantic_top_score_no_lexical: kind.default_min_semantic_top_score_no_lexical(),
+            rerank: RerankSettings {
+                enabled: false,
+                top_k: crate::semantic::rerank::DEFAULT_TOP_K,
+                keep: crate::semantic::rerank::DEFAULT_KEEP,
+            },
         }
+    }
+
+    /// Return a copy with rerank settings overridden. Convenience for
+    /// callers that build options first and then layer in rerank from a
+    /// separate config section.
+    #[must_use]
+    pub const fn with_rerank(mut self, rerank: RerankSettings) -> Self {
+        self.rerank = rerank;
+        self
     }
 }
 
@@ -210,6 +236,10 @@ pub fn hybrid_search_with_index(
 /// embed the corpus at compile time must match the backend used to embed
 /// the query, otherwise the cosine space is incoherent.
 ///
+/// Equivalent to [`hybrid_search_with_backend_and_reranker`] with
+/// `reranker = None`. Callers that want cross-encoder rerank (bn-1cp2)
+/// should use the `_and_reranker` variant.
+///
 /// # Errors
 ///
 /// Returns an error when the lexical index cannot be loaded.
@@ -220,11 +250,41 @@ pub fn hybrid_search_with_backend(
     options: HybridOptions,
     backend: &dyn EmbeddingBackend,
 ) -> Result<Vec<HybridResult>> {
+    hybrid_search_with_backend_and_reranker(root, query, limit, options, backend, None)
+}
+
+/// `hybrid_search_with_backend` plus optional cross-encoder rerank
+/// (bn-1cp2). See [`hybrid_search_with_index_and_backend_and_reranker`]
+/// for the semantics.
+///
+/// # Errors
+///
+/// Returns an error when the lexical index cannot be loaded.
+pub fn hybrid_search_with_backend_and_reranker(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    options: HybridOptions,
+    backend: &dyn EmbeddingBackend,
+    reranker: Option<&dyn Reranker>,
+) -> Result<Vec<HybridResult>> {
     let lexical_index = LexicalIndex::load(root).context("load lexical index")?;
-    hybrid_search_with_index_and_backend(root, &lexical_index, query, limit, options, backend)
+    hybrid_search_with_index_and_backend_and_reranker(
+        root,
+        &lexical_index,
+        query,
+        limit,
+        options,
+        backend,
+        reranker,
+    )
 }
 
 /// Caller-owned-index variant of [`hybrid_search_with_backend`].
+///
+/// Equivalent to [`hybrid_search_with_index_and_backend_and_reranker`]
+/// with `reranker = None`. Callers wanting cross-encoder rerank
+/// (bn-1cp2) should use the `_and_reranker` variant.
 ///
 /// # Errors
 ///
@@ -237,15 +297,65 @@ pub fn hybrid_search_with_index_and_backend(
     options: HybridOptions,
     backend: &dyn EmbeddingBackend,
 ) -> Result<Vec<HybridResult>> {
+    hybrid_search_with_index_and_backend_and_reranker(
+        root,
+        lexical_index,
+        query,
+        limit,
+        options,
+        backend,
+        None,
+    )
+}
+
+/// `hybrid_search_with_index_and_backend` plus optional cross-encoder rerank.
+///
+/// (bn-1cp2.) When `reranker` is `Some` and `options.rerank.enabled` is
+/// true, the fused top-`limit` list is fed to the reranker and
+/// re-ordered. The result is then truncated to
+/// `min(limit, options.rerank.keep)`.
+///
+/// We score the fused list (not the unbounded top-K) because callers of
+/// this function (the `kb search` CLI, the `/search` web endpoint) ask
+/// for a specific `limit` of results — they want to display N hits,
+/// not feed K candidates to a downstream LLM. The plan-based ask path
+/// uses [`plan_retrieval_hybrid_with_backend_and_reranker`] which honors
+/// `rerank.top_k` independently.
+///
+/// # Errors
+///
+/// Returns an error when the semantic store cannot be opened.
+pub fn hybrid_search_with_index_and_backend_and_reranker(
+    root: &Path,
+    lexical_index: &LexicalIndex,
+    query: &str,
+    limit: usize,
+    options: HybridOptions,
+    backend: &dyn EmbeddingBackend,
+    reranker: Option<&dyn Reranker>,
+) -> Result<Vec<HybridResult>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
-    let lexical_hits = lexical_index.search(query, limit);
+    // When rerank is on, pull a wider candidate pool from each tier so
+    // the cross-encoder has room to surface hits that would otherwise
+    // fall outside the user-requested `limit`. The fused list is
+    // truncated back down by `fuse(...)` to `pool_limit`, then by the
+    // rerank pass to the final `keep`. With rerank off this is identical
+    // to the pre-bn-1cp2 behavior.
+    let want_rerank = options.rerank.enabled && reranker.is_some();
+    let pool_limit = if want_rerank {
+        options.rerank.effective_top_k().max(limit)
+    } else {
+        limit
+    };
+
+    let lexical_hits = lexical_index.search(query, pool_limit);
 
     let semantic_enabled = options.semantic_enabled && semantic_env_enabled();
     let semantic_hits = if semantic_enabled {
-        match run_semantic(root, query, limit, backend) {
+        match run_semantic(root, query, pool_limit, backend) {
             Ok(hits) => hits,
             Err(err) => {
                 if !SEMANTIC_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
@@ -265,12 +375,121 @@ pub fn hybrid_search_with_index_and_backend(
         options.min_semantic_top_score_no_lexical,
     );
 
-    Ok(fuse(
+    let mut fused = fuse(
         &lexical_hits,
         &semantic_filtered,
-        limit,
+        pool_limit,
         options.rrf_k,
-    ))
+    );
+
+    if want_rerank
+        && let Some(reranker) = reranker
+        && !fused.is_empty()
+    {
+        apply_rerank_to_search(
+            &mut fused,
+            query,
+            reranker,
+            lexical_index,
+            options.rerank,
+        );
+    }
+
+    if fused.len() > limit {
+        fused.truncate(limit);
+    }
+    Ok(fused)
+}
+
+/// `apply_rerank` for the [`HybridResult`]-shaped search path.
+///
+/// Mirrors [`apply_rerank`] but operates on `Vec<HybridResult>` because
+/// `kb search` and the web `/search` endpoint don't go through
+/// `RetrievalCandidate`. Score is written into the `score` field
+/// (overwriting the fused RRF score) so downstream sorts honor the
+/// post-rerank order.
+fn apply_rerank_to_search(
+    fused: &mut Vec<HybridResult>,
+    query: &str,
+    reranker: &dyn Reranker,
+    lexical_index: &LexicalIndex,
+    settings: RerankSettings,
+) {
+    let top_k = settings.effective_top_k();
+    let keep = settings.effective_keep();
+    if fused.len() > top_k {
+        fused.truncate(top_k);
+    }
+
+    let summaries: HashMap<&str, &str> = lexical_index
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str(), e.summary.as_str()))
+        .collect();
+
+    let texts: Vec<String> = fused
+        .iter()
+        .map(|c| candidate_text_for_rerank_hybrid(c, &summaries))
+        .collect();
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+    let scores = match reranker.score_batch(query, &text_refs) {
+        Ok(scores) => scores,
+        Err(err) => {
+            if !RERANK_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
+                warn!("cross-encoder rerank failed; using fused order: {err:#}");
+            }
+            return;
+        }
+    };
+    if scores.len() != fused.len() {
+        if !RERANK_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
+            warn!(
+                "cross-encoder rerank returned {} scores for {} candidates; using fused order",
+                scores.len(),
+                fused.len()
+            );
+        }
+        return;
+    }
+
+    let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+    indexed.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| fused[a.0].item_id.cmp(&fused[b.0].item_id))
+    });
+
+    let original = std::mem::take(fused);
+    *fused = indexed
+        .into_iter()
+        .take(keep)
+        .map(|(idx, score)| {
+            let mut hit = original[idx].clone();
+            hit.score = score;
+            hit.reasons
+                .push(format!("cross-encoder rerank (score {score:.4})"));
+            hit
+        })
+        .collect();
+}
+
+fn candidate_text_for_rerank_hybrid(
+    hit: &HybridResult,
+    summaries: &HashMap<&str, &str>,
+) -> String {
+    let summary = summaries
+        .get(hit.item_id.as_str())
+        .copied()
+        .unwrap_or("")
+        .trim();
+    if summary.is_empty() {
+        hit.title.clone()
+    } else if hit.title.is_empty() {
+        summary.to_string()
+    } else {
+        format!("{}: {}", hit.title, summary)
+    }
 }
 
 fn run_semantic(
@@ -460,6 +679,10 @@ pub fn plan_retrieval_hybrid(
 /// Use this when you've built a [`super::semantic::SemanticBackend`] from
 /// `kb.toml [semantic]` so the query embedding matches the corpus.
 ///
+/// Equivalent to [`plan_retrieval_hybrid_with_backend_and_reranker`] with
+/// `reranker = None`. Callers that want the cross-encoder rerank pass
+/// (bn-1cp2) should use the `_and_reranker` variant.
+///
 /// # Errors
 ///
 /// Returns an error when the lexical index cannot be loaded.
@@ -470,121 +693,292 @@ pub fn plan_retrieval_hybrid_with_backend(
     options: HybridOptions,
     backend: &dyn EmbeddingBackend,
 ) -> Result<RetrievalPlan> {
+    plan_retrieval_hybrid_with_backend_and_reranker(
+        root,
+        query,
+        token_budget,
+        options,
+        backend,
+        None,
+    )
+}
+
+/// Full hybrid plan with optional cross-encoder rerank (bn-1cp2).
+///
+/// When `reranker` is `Some` and `options.rerank.enabled` is true, the
+/// fused candidate list is passed to the reranker after step 4. The
+/// reranker scores each `(query, candidate_text)` pair, candidates are
+/// re-sorted by descending score, then truncated to `options.rerank.keep`.
+/// Each reranked candidate gets a "cross-encoder rerank (score 0.42)"
+/// reason appended for explainability, and `fused_score` is overwritten
+/// with the cross-encoder logit so downstream consumers (eval harness,
+/// CLI dry-run output) report the post-rerank order rather than the
+/// fused-only order.
+///
+/// When either flag is missing, the function behaves identically to
+/// pre-rerank: the cross-encoder pass is skipped end-to-end.
+///
+/// # Errors
+///
+/// Returns an error when the lexical index cannot be loaded. Reranker
+/// failures degrade gracefully — the un-reranked fused order is returned
+/// with a one-shot warning.
+pub fn plan_retrieval_hybrid_with_backend_and_reranker(
+    root: &Path,
+    query: &str,
+    token_budget: u32,
+    options: HybridOptions,
+    backend: &dyn EmbeddingBackend,
+    reranker: Option<&dyn Reranker>,
+) -> Result<RetrievalPlan> {
     let lexical_index = LexicalIndex::load(root).context("load lexical index")?;
     let mut plan = lexical_index.plan_retrieval(query, token_budget, root);
 
     let semantic_enabled = options.semantic_enabled && semantic_env_enabled();
-    if !semantic_enabled {
-        return Ok(plan);
-    }
+    if semantic_enabled {
+        // Treat the already-budgeted lexical candidate count as the soft
+        // cap for the semantic-only tail. We never want to silently bloat
+        // the candidate set far past the lexical's natural top-K.
+        let semantic_limit = plan
+            .candidates
+            .len()
+            .max(crate::lexical::DEFAULT_RETRIEVAL_TOP_K_FOR_HYBRID);
 
-    // Treat the already-budgeted lexical candidate count as the soft cap
-    // for the semantic-only tail. We never want to silently bloat the
-    // candidate set far past the lexical's natural top-K.
-    let semantic_limit = plan
-        .candidates
-        .len()
-        .max(crate::lexical::DEFAULT_RETRIEVAL_TOP_K_FOR_HYBRID);
-
-    let semantic_hits = match run_semantic(root, query, semantic_limit, backend) {
-        Ok(hits) => filter_semantic(
-            hits,
-            plan.candidates.is_empty(),
-            options.min_semantic_score,
-            options.min_semantic_top_score_no_lexical,
-        ),
-        Err(err) => {
-            if !SEMANTIC_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
-                warn!("semantic retrieval unavailable; using lexical only: {err:#}");
+        let semantic_hits = match run_semantic(root, query, semantic_limit, backend) {
+            Ok(hits) => filter_semantic(
+                hits,
+                plan.candidates.is_empty(),
+                options.min_semantic_score,
+                options.min_semantic_top_score_no_lexical,
+            ),
+            Err(err) => {
+                if !SEMANTIC_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
+                    warn!("semantic retrieval unavailable; using lexical only: {err:#}");
+                }
+                Vec::new()
             }
-            Vec::new()
-        }
-    };
+        };
 
-    if semantic_hits.is_empty() {
-        return Ok(plan);
+        if !semantic_hits.is_empty() {
+            let semantic_ranks: std::collections::HashMap<&str, (usize, f32)> = semantic_hits
+                .iter()
+                .enumerate()
+                .map(|(i, hit)| (hit.item_id.as_str(), (i + 1, hit.score)))
+                .collect();
+
+            // Step 2: enrich existing candidates with semantic + lexical ranks.
+            for (lex_rank, candidate) in plan.candidates.iter_mut().enumerate() {
+                candidate.lexical_rank = Some(lex_rank + 1);
+                if let Some((sem_rank, sem_score)) =
+                    semantic_ranks.get(candidate.id.as_str()).copied()
+                {
+                    candidate.semantic_rank = Some(sem_rank);
+                    candidate.semantic_score = Some(sem_score);
+                    candidate.reasons.push(format!(
+                        "semantic match (rank {sem_rank}, score {sem_score:.2})"
+                    ));
+                }
+            }
+
+            // Step 3: append semantic-only tail candidates respecting the budget.
+            let lexical_ids: std::collections::HashSet<String> =
+                plan.candidates.iter().map(|c| c.id.clone()).collect();
+            for (i, hit) in semantic_hits.iter().enumerate() {
+                if lexical_ids.contains(&hit.item_id) {
+                    continue;
+                }
+                let abs = root.join(&hit.item_id);
+                if !abs.is_file() {
+                    continue;
+                }
+                let entry_tokens = crate::lexical::estimate_path_tokens_for_hybrid(&abs);
+                if plan
+                    .estimated_tokens
+                    .saturating_add(entry_tokens)
+                    > plan.token_budget
+                {
+                    continue;
+                }
+                plan.estimated_tokens = plan.estimated_tokens.saturating_add(entry_tokens);
+                plan.candidates.push(RetrievalCandidate {
+                    id: hit.item_id.clone(),
+                    title: crate::lexical::fallback_title_for_hybrid(&abs, &hit.item_id),
+                    score: 0,
+                    estimated_tokens: entry_tokens,
+                    reasons: vec![format!(
+                        "semantic match (rank {}, score {:.2})",
+                        i + 1,
+                        hit.score
+                    )],
+                    semantic_score: Some(hit.score),
+                    semantic_rank: Some(i + 1),
+                    lexical_rank: None,
+                    fused_score: None,
+                });
+            }
+
+            // Step 4: compute fused RRF score per candidate from its
+            // (lexical_rank, semantic_rank) pair, then sort by it.
+            // Without this the plan would keep the lexical-only order
+            // even though the candidate set has been augmented with
+            // semantic-only tail hits — confusing for users who see
+            // `semantic match (rank 1, score 0.59)` on a candidate
+            // sitting below several lower-ranked lexical-only entries.
+            for candidate in &mut plan.candidates {
+                let lex = candidate
+                    .lexical_rank
+                    .map_or(0.0, |r| rank_to_score(r, RRF_K));
+                let sem = candidate
+                    .semantic_rank
+                    .map_or(0.0, |r| rank_to_score(r, RRF_K));
+                candidate.fused_score = Some(lex + sem);
+            }
+            plan.candidates.sort_by(|a, b| {
+                b.fused_score
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a.fused_score.unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        }
     }
 
-    let semantic_ranks: std::collections::HashMap<&str, (usize, f32)> = semantic_hits
-        .iter()
-        .enumerate()
-        .map(|(i, hit)| (hit.item_id.as_str(), (i + 1, hit.score)))
-        .collect();
-
-    // Step 2: enrich existing candidates with semantic + lexical ranks.
-    for (lex_rank, candidate) in plan.candidates.iter_mut().enumerate() {
-        candidate.lexical_rank = Some(lex_rank + 1);
-        if let Some((sem_rank, sem_score)) = semantic_ranks.get(candidate.id.as_str()).copied() {
-            candidate.semantic_rank = Some(sem_rank);
-            candidate.semantic_score = Some(sem_score);
-            candidate
-                .reasons
-                .push(format!("semantic match (rank {sem_rank}, score {sem_score:.2})"));
-        }
+    // Step 5 (bn-1cp2): cross-encoder rerank pass.
+    //
+    // Re-orders the top-K candidates by reading (query, candidate) jointly
+    // — dramatically more precise than the bi-encoder cosine that produced
+    // the fused order, but slow, so we cap at K (default 30) and keep
+    // (default 8). Skipped when:
+    //  - the caller didn't pass a `reranker` (no model loaded),
+    //  - `options.rerank.enabled` is false (kb.toml opt-in),
+    //  - the candidate list is empty,
+    //  - or the rerank scoring call returns Err (degrade to fused order).
+    if options.rerank.enabled
+        && let Some(reranker) = reranker
+        && !plan.candidates.is_empty()
+    {
+        apply_rerank(&mut plan, query, reranker, &lexical_index, options.rerank);
     }
-
-    // Step 3: append semantic-only tail candidates respecting the budget.
-    let lexical_ids: std::collections::HashSet<String> =
-        plan.candidates.iter().map(|c| c.id.clone()).collect();
-    for (i, hit) in semantic_hits.iter().enumerate() {
-        if lexical_ids.contains(&hit.item_id) {
-            continue;
-        }
-        let abs = root.join(&hit.item_id);
-        if !abs.is_file() {
-            continue;
-        }
-        let entry_tokens = crate::lexical::estimate_path_tokens_for_hybrid(&abs);
-        if plan
-            .estimated_tokens
-            .saturating_add(entry_tokens)
-            > plan.token_budget
-        {
-            continue;
-        }
-        plan.estimated_tokens = plan.estimated_tokens.saturating_add(entry_tokens);
-        plan.candidates.push(RetrievalCandidate {
-            id: hit.item_id.clone(),
-            title: crate::lexical::fallback_title_for_hybrid(&abs, &hit.item_id),
-            score: 0,
-            estimated_tokens: entry_tokens,
-            reasons: vec![format!(
-                "semantic match (rank {}, score {:.2})",
-                i + 1,
-                hit.score
-            )],
-            semantic_score: Some(hit.score),
-            semantic_rank: Some(i + 1),
-            lexical_rank: None,
-            fused_score: None,
-        });
-    }
-
-    // Step 4: compute fused RRF score per candidate from its (lexical_rank,
-    // semantic_rank) pair, then sort by it. Without this the plan would
-    // keep the lexical-only order even though the candidate set has been
-    // augmented with semantic-only tail hits — confusing for users who
-    // see `semantic match (rank 1, score 0.59)` on a candidate sitting
-    // below several lower-ranked lexical-only entries.
-    for candidate in &mut plan.candidates {
-        let lex = candidate
-            .lexical_rank
-            .map_or(0.0, |r| rank_to_score(r, RRF_K));
-        let sem = candidate
-            .semantic_rank
-            .map_or(0.0, |r| rank_to_score(r, RRF_K));
-        candidate.fused_score = Some(lex + sem);
-    }
-    plan.candidates.sort_by(|a, b| {
-        b.fused_score
-            .unwrap_or(0.0)
-            .partial_cmp(&a.fused_score.unwrap_or(0.0))
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.id.cmp(&b.id))
-    });
 
     Ok(plan)
 }
+
+/// Re-rank `plan.candidates` in place using the cross-encoder.
+///
+/// Truncates to `settings.effective_top_k()` before scoring (so we don't
+/// pay for candidates we'd discard anyway), runs `reranker.score_batch`
+/// once for the whole window, then sorts by descending score and
+/// truncates to `settings.effective_keep()`. Candidate text is the
+/// lexical entry's summary when available, with title fallbacks.
+///
+/// Failures degrade silently to the un-reranked fused order plus a
+/// one-shot warning. We don't propagate the error because the rerank pass
+/// is opt-in: the user already has a usable answer; killing the query
+/// because the cross-encoder choked is worse than returning the fused
+/// list.
+fn apply_rerank(
+    plan: &mut RetrievalPlan,
+    query: &str,
+    reranker: &dyn Reranker,
+    lexical_index: &LexicalIndex,
+    settings: RerankSettings,
+) {
+    let top_k = settings.effective_top_k();
+    let keep = settings.effective_keep();
+    if plan.candidates.len() > top_k {
+        plan.candidates.truncate(top_k);
+    }
+
+    let summaries: std::collections::HashMap<&str, &str> = lexical_index
+        .entries
+        .iter()
+        .map(|e| (e.id.as_str(), e.summary.as_str()))
+        .collect();
+
+    let texts: Vec<String> = plan
+        .candidates
+        .iter()
+        .map(|c| candidate_text_for_rerank(c, &summaries))
+        .collect();
+    let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+
+    let scores = match reranker.score_batch(query, &text_refs) {
+        Ok(scores) => scores,
+        Err(err) => {
+            if !RERANK_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
+                warn!("cross-encoder rerank failed; using fused order: {err:#}");
+            }
+            // Don't truncate on failure — preserve the un-reranked
+            // ordering rather than silently dropping candidates the
+            // caller expected to see.
+            return;
+        }
+    };
+
+    if scores.len() != plan.candidates.len() {
+        if !RERANK_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
+            warn!(
+                "cross-encoder rerank returned {} scores for {} candidates; using fused order",
+                scores.len(),
+                plan.candidates.len()
+            );
+        }
+        return;
+    }
+
+    // Pair candidates with scores, sort by score desc + id asc, truncate.
+    let mut indexed: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+    indexed.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                plan.candidates[a.0]
+                    .id
+                    .cmp(&plan.candidates[b.0].id)
+            })
+    });
+
+    let original = std::mem::take(&mut plan.candidates);
+    plan.candidates = indexed
+        .into_iter()
+        .take(keep)
+        .map(|(idx, score)| {
+            let mut cand = original[idx].clone();
+            // Overwrite fused_score with the cross-encoder logit so the
+            // dry-run output and eval harness reflect the post-rerank
+            // ordering. Keep the original semantic_score / lexical_rank
+            // intact for explainability.
+            cand.fused_score = Some(score);
+            cand.reasons
+                .push(format!("cross-encoder rerank (score {score:.4})"));
+            cand
+        })
+        .collect();
+}
+
+fn candidate_text_for_rerank(
+    candidate: &RetrievalCandidate,
+    summaries: &std::collections::HashMap<&str, &str>,
+) -> String {
+    // Prefer summary when the lexical entry has one (typical case for
+    // wiki/sources/* and concept pages). Fall back to title alone for
+    // semantic-only or fallback-injected candidates with no lexical
+    // entry. Never empty — the cross-encoder needs *some* text to score.
+    let summary = summaries
+        .get(candidate.id.as_str())
+        .copied()
+        .unwrap_or("")
+        .trim();
+    if summary.is_empty() {
+        candidate.title.clone()
+    } else if candidate.title.is_empty() {
+        summary.to_string()
+    } else {
+        format!("{}: {}", candidate.title, summary)
+    }
+}
+
+static RERANK_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn semantic_env_enabled() -> bool {
     !matches!(
@@ -693,5 +1087,252 @@ mod tests {
         assert!(reasons.iter().any(|r| r.contains("lexical match")));
         assert!(reasons.iter().any(|r| r.contains("title contains alpha")));
         assert!(reasons.iter().any(|r| r.contains("semantic match")));
+    }
+
+    /// Rerank wiring tests — bn-1cp2.
+    ///
+    /// We exercise [`apply_rerank`] with a stub [`Reranker`] that maps
+    /// candidate id → score by lookup table. This proves:
+    /// 1. The hook is wired (a stub that *reverses* the fused order
+    ///    actually reverses the result).
+    /// 2. With rerank disabled (or no reranker passed), the candidate
+    ///    list is unchanged.
+    /// 3. Truncation honors `keep`.
+    /// 4. Failures degrade silently rather than panicking.
+    mod rerank {
+        use super::*;
+        use crate::lexical::{LexicalEntry, RetrievalCandidate, RetrievalPlan};
+
+        struct StubReranker {
+            // Returns the score for candidate text; default 0.0 if missing.
+            scores: std::collections::HashMap<String, f32>,
+            // When set, score_batch returns Err so we can exercise the
+            // graceful-degrade path.
+            fail: bool,
+        }
+
+        impl StubReranker {
+            fn from_pairs(pairs: &[(&str, f32)]) -> Self {
+                Self {
+                    scores: pairs
+                        .iter()
+                        .map(|(t, s)| ((*t).to_string(), *s))
+                        .collect(),
+                    fail: false,
+                }
+            }
+
+            fn always_fails() -> Self {
+                Self {
+                    scores: std::collections::HashMap::new(),
+                    fail: true,
+                }
+            }
+        }
+
+        impl Reranker for StubReranker {
+            fn score_batch(&self, _query: &str, candidates: &[&str]) -> Result<Vec<f32>> {
+                if self.fail {
+                    anyhow::bail!("stub reranker failure");
+                }
+                Ok(candidates
+                    .iter()
+                    .map(|c| self.scores.get(*c).copied().unwrap_or(0.0))
+                    .collect())
+            }
+        }
+
+        fn entry(id: &str, summary: &str) -> LexicalEntry {
+            LexicalEntry {
+                id: id.to_string(),
+                title: id.to_string(),
+                aliases: Vec::new(),
+                headings: Vec::new(),
+                summary: summary.to_string(),
+            }
+        }
+
+        fn cand(id: &str, fused: f32) -> RetrievalCandidate {
+            RetrievalCandidate {
+                id: id.to_string(),
+                title: id.to_string(),
+                score: 1,
+                estimated_tokens: 10,
+                reasons: vec![format!("lexical match (rank ?, score 1)")],
+                semantic_score: None,
+                semantic_rank: None,
+                lexical_rank: Some(1),
+                fused_score: Some(fused),
+            }
+        }
+
+        fn plan_with(candidates: Vec<RetrievalCandidate>) -> RetrievalPlan {
+            RetrievalPlan {
+                query: "q".to_string(),
+                token_budget: 1000,
+                estimated_tokens: 100,
+                candidates,
+                fallback_reason: None,
+            }
+        }
+
+        #[test]
+        fn rerank_reverses_order_when_stub_assigns_inverted_scores() {
+            // Pre-rerank fused order: a (0.5), b (0.4), c (0.3).
+            // Stub assigns: a=0.1, b=0.5, c=0.9 → post-rerank: c, b, a.
+            let mut plan = plan_with(vec![cand("a", 0.5), cand("b", 0.4), cand("c", 0.3)]);
+            let index = LexicalIndex {
+                entries: vec![
+                    entry("a", "alpha summary"),
+                    entry("b", "beta summary"),
+                    entry("c", "charlie summary"),
+                ],
+            };
+            let stub = StubReranker::from_pairs(&[
+                ("a: alpha summary", 0.1),
+                ("b: beta summary", 0.5),
+                ("c: charlie summary", 0.9),
+            ]);
+            let settings = RerankSettings {
+                enabled: true,
+                top_k: 30,
+                keep: 8,
+            };
+            apply_rerank(&mut plan, "q", &stub, &index, settings);
+
+            let order: Vec<&str> = plan.candidates.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(order, vec!["c", "b", "a"]);
+            // Cross-encoder reason is appended.
+            assert!(
+                plan.candidates[0]
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains("cross-encoder rerank"))
+            );
+            // fused_score is overwritten with the cross-encoder logit.
+            let top_score = plan.candidates[0]
+                .fused_score
+                .expect("rerank pass populates fused_score with the cross-encoder logit");
+            assert!((top_score - 0.9).abs() < 1e-6);
+        }
+
+        #[test]
+        fn rerank_truncates_to_keep() {
+            let mut plan = plan_with(vec![
+                cand("a", 0.5),
+                cand("b", 0.4),
+                cand("c", 0.3),
+                cand("d", 0.2),
+            ]);
+            let index = LexicalIndex {
+                entries: vec![
+                    entry("a", ""),
+                    entry("b", ""),
+                    entry("c", ""),
+                    entry("d", ""),
+                ],
+            };
+            // Empty summaries → text falls back to title.
+            let stub = StubReranker::from_pairs(&[
+                ("a", 1.0),
+                ("b", 0.5),
+                ("c", 0.7),
+                ("d", 0.2),
+            ]);
+            let settings = RerankSettings {
+                enabled: true,
+                top_k: 4,
+                keep: 2,
+            };
+            apply_rerank(&mut plan, "q", &stub, &index, settings);
+            assert_eq!(plan.candidates.len(), 2);
+            // Top 2 by score: a (1.0), c (0.7).
+            assert_eq!(plan.candidates[0].id, "a");
+            assert_eq!(plan.candidates[1].id, "c");
+        }
+
+        #[test]
+        fn rerank_caps_input_at_top_k_before_scoring() {
+            // 5 candidates, top_k=3. Only the first 3 should reach the
+            // reranker; the rest are dropped before scoring.
+            let mut plan = plan_with(vec![
+                cand("a", 0.5),
+                cand("b", 0.4),
+                cand("c", 0.3),
+                cand("d", 0.2),
+                cand("e", 0.1),
+            ]);
+            let index = LexicalIndex {
+                entries: vec![
+                    entry("a", ""),
+                    entry("b", ""),
+                    entry("c", ""),
+                    entry("d", ""),
+                    entry("e", ""),
+                ],
+            };
+            let stub = StubReranker::from_pairs(&[
+                ("a", 0.1),
+                ("b", 0.2),
+                ("c", 0.3),
+                // d/e shouldn't be queried; if they were, default 0.0
+                // would still leave them after a/b/c.
+            ]);
+            let settings = RerankSettings {
+                enabled: true,
+                top_k: 3,
+                keep: 3,
+            };
+            apply_rerank(&mut plan, "q", &stub, &index, settings);
+            assert_eq!(plan.candidates.len(), 3);
+            // Sorted ascending of pre-rerank index by score asc → c, b, a
+            // (since stub assigned 0.3, 0.2, 0.1 to a, b, c reversed)
+            assert_eq!(plan.candidates[0].id, "c");
+            assert_eq!(plan.candidates[1].id, "b");
+            assert_eq!(plan.candidates[2].id, "a");
+        }
+
+        #[test]
+        fn rerank_failure_preserves_original_order() {
+            let original = vec![cand("a", 0.5), cand("b", 0.4), cand("c", 0.3)];
+            let mut plan = plan_with(original);
+            let index = LexicalIndex {
+                entries: vec![entry("a", ""), entry("b", ""), entry("c", "")],
+            };
+            let stub = StubReranker::always_fails();
+            let settings = RerankSettings {
+                enabled: true,
+                top_k: 30,
+                keep: 8,
+            };
+            apply_rerank(&mut plan, "q", &stub, &index, settings);
+
+            let order: Vec<&str> = plan.candidates.iter().map(|c| c.id.as_str()).collect();
+            assert_eq!(order, vec!["a", "b", "c"], "fail-on-degrade preserves order");
+            // No "cross-encoder rerank" reason because we degraded.
+            assert!(
+                !plan.candidates[0]
+                    .reasons
+                    .iter()
+                    .any(|r| r.contains("cross-encoder rerank"))
+            );
+        }
+
+        #[test]
+        fn candidate_text_uses_summary_with_title_prefix() {
+            let summaries: HashMap<&str, &str> =
+                std::iter::once(("a", "Alpha summary text")).collect();
+            let c = cand("a", 0.5);
+            let text = candidate_text_for_rerank(&c, &summaries);
+            assert_eq!(text, "a: Alpha summary text");
+        }
+
+        #[test]
+        fn candidate_text_falls_back_to_title_when_no_summary() {
+            let summaries: HashMap<&str, &str> = HashMap::new();
+            let c = cand("a", 0.5);
+            let text = candidate_text_for_rerank(&c, &summaries);
+            assert_eq!(text, "a");
+        }
     }
 }

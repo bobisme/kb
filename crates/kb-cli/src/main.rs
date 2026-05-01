@@ -58,6 +58,56 @@ pub(crate) fn emit_json<T: Serialize>(command: &str, data: T) -> Result<()> {
     Ok(())
 }
 
+/// Load the cross-encoder reranker (bn-1cp2) from `[semantic.rerank]`.
+///
+/// Returns `None` when rerank is disabled in config (the v1 default).
+/// Returns an error when:
+/// - the binary was built without `semantic-ort` but the user enabled
+///   rerank (so the user gets an actionable diagnostic instead of a
+///   silently-skipped pass), OR
+/// - the cross-encoder model/tokenizer cannot be loaded.
+///
+/// Loading the reranker on a hot path adds an ONNX session warm-up
+/// (~100ms). Callers cache the returned value across the lifetime of one
+/// `kb` invocation; no need to short-circuit further.
+///
+/// Output type is `Box<dyn Reranker>` so the build-time feature gate is
+/// invisible to call-sites: the same kb-cli source compiles with or
+/// without `semantic-ort`.
+pub(crate) fn load_optional_reranker(
+    cfg: &Config,
+) -> Result<Option<Box<dyn kb_query::Reranker>>> {
+    if !cfg.semantic.rerank.enabled {
+        return Ok(None);
+    }
+    // Note: kb-cli's `semantic-ort` feature flag isn't a perfect signal —
+    // non-Windows builds enable kb-query's `semantic-ort` via the
+    // target-specific dep section in kb-cli/Cargo.toml without forwarding
+    // through kb-cli's own feature. The `any(...)` ladder mirrors that
+    // logic so users get rerank automatically on Linux/macOS without
+    // having to rebuild with `--features semantic-ort`.
+    #[cfg(any(feature = "semantic-ort", not(target_os = "windows")))]
+    {
+        let paths = kb_query::CrossEncoderConfig {
+            model_path: cfg.semantic.rerank.resolved_model_path(),
+            tokenizer_path: cfg.semantic.rerank.resolved_tokenizer_path(),
+        };
+        let encoder = kb_query::CrossEncoder::load_with_paths(&paths)
+            .context("load cross-encoder reranker (kb.toml [semantic.rerank])")?;
+        Ok(Some(Box::new(encoder) as Box<dyn kb_query::Reranker>))
+    }
+    #[cfg(not(any(feature = "semantic-ort", not(target_os = "windows"))))]
+    {
+        let _ = cfg;
+        bail!(
+            "kb.toml [semantic.rerank] enabled = true but this kb binary was built without \
+             the `semantic-ort` feature. Rebuild with `cargo build --features semantic-ort` \
+             to use the cross-encoder (Windows users only — Linux/macOS builds enable it \
+             automatically via the target-specific dep)."
+        )
+    }
+}
+
 /// Return true when `host` resolves to loopback (IPv4 `127.0.0.0/8`, IPv6
 /// `::1`, or the string "localhost"). Used to gate `kb serve`'s network
 /// exposure.
@@ -845,12 +895,16 @@ fn run(cli: Cli) -> Result<()> {
 
             let backend_config = cfg.semantic.to_backend_config();
             let backend = kb_query::SemanticBackend::from_config(&backend_config)?;
-            let results = kb_query::hybrid_search_with_backend(
+            let reranker = load_optional_reranker(&cfg)?;
+            let reranker_dyn: Option<&dyn kb_query::Reranker> =
+                reranker.as_deref();
+            let results = kb_query::hybrid_search_with_backend_and_reranker(
                 search_root,
                 &query,
                 limit,
-                cfg.retrieval.to_hybrid_options(backend_config.kind),
+                cfg.to_hybrid_options(backend_config.kind),
                 &backend,
+                reranker_dyn,
             )?;
             if cli.json {
                 emit_json("search", &results)?;
@@ -1043,10 +1097,28 @@ fn run(cli: Cli) -> Result<()> {
             // lock. The request handlers read the lexical index and wiki
             // tree directly; concurrent `kb compile` runs will not be
             // reflected until restart.
-            let semantic_backend = Config::load_from_root(&serve_root, None)
+            let cfg_for_web = Config::load_from_root(&serve_root, None).ok();
+            let semantic_backend = cfg_for_web
+                .as_ref()
                 .map(|cfg| cfg.semantic.to_backend_config())
                 .unwrap_or_default();
-            let state = kb_web::WebState::with_backend_config(serve_root, &semantic_backend)?;
+            // bn-1cp2: load the cross-encoder once at startup so the ONNX
+            // session is shared across requests rather than rebuilt per
+            // query. None when `[semantic.rerank].enabled = false` (the
+            // default).
+            let (rerank_box, rerank_settings) = match cfg_for_web.as_ref() {
+                Some(cfg) => (
+                    load_optional_reranker(cfg)?,
+                    cfg.semantic.rerank.to_settings(),
+                ),
+                None => (None, kb_query::RerankSettings::default()),
+            };
+            let state = kb_web::WebState::with_backend_and_reranker(
+                serve_root,
+                &semantic_backend,
+                rerank_box,
+                rerank_settings,
+            )?;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -2272,12 +2344,15 @@ fn run_ask(
 
     let backend_config = cfg.semantic.to_backend_config();
     let backend = kb_query::SemanticBackend::from_config(&backend_config)?;
-    let retrieval_plan = kb_query::plan_retrieval_hybrid_with_backend(
+    let reranker = load_optional_reranker(&cfg)?;
+    let reranker_dyn: Option<&dyn kb_query::Reranker> = reranker.as_deref();
+    let retrieval_plan = kb_query::plan_retrieval_hybrid_with_backend_and_reranker(
         root,
         query,
         cfg.ask.token_budget,
-        cfg.retrieval.to_hybrid_options(backend_config.kind),
+        cfg.to_hybrid_options(backend_config.kind),
         &backend,
+        reranker_dyn,
     )?;
 
     if dry_run {

@@ -50,7 +50,10 @@ pub fn cmd_run(root: &Path, flags: &RunFlags) -> Result<()> {
     let cfg = Config::load_from_root(root, None)?;
     let backend_config = cfg.semantic.to_backend_config();
     let backend = kb_query::SemanticBackend::from_config(&backend_config)?;
-    let options = cfg.retrieval.to_hybrid_options(backend_config.kind);
+    // bn-1cp2: fold rerank settings into the eval options so opt-in
+    // benchmarks vs. baseline are a one-flag flip in kb.toml.
+    let options = cfg.to_hybrid_options(backend_config.kind);
+    let reranker = crate::load_optional_reranker(&cfg)?;
 
     let paths = EvalPaths::new(root);
     let golden_path = paths.golden_path();
@@ -89,6 +92,7 @@ pub fn cmd_run(root: &Path, flags: &RunFlags) -> Result<()> {
         backend_id: &backend_id,
         run_id,
         corpus_hash,
+        reranker: reranker.as_deref(),
     };
     let result = run_inner(&inputs)?;
 

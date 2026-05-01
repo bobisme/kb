@@ -15,9 +15,11 @@ pub use artifact::{
 };
 pub use hybrid::{
     HybridOptions, HybridResult, MIN_SEMANTIC_SCORE, MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL, RRF_K,
-    hybrid_search, hybrid_search_with_backend, hybrid_search_with_index,
-    hybrid_search_with_index_and_backend, hybrid_search_with_options, plan_retrieval_hybrid,
-    plan_retrieval_hybrid_with_backend,
+    hybrid_search, hybrid_search_with_backend, hybrid_search_with_backend_and_reranker,
+    hybrid_search_with_index, hybrid_search_with_index_and_backend,
+    hybrid_search_with_index_and_backend_and_reranker, hybrid_search_with_options,
+    plan_retrieval_hybrid, plan_retrieval_hybrid_with_backend,
+    plan_retrieval_hybrid_with_backend_and_reranker,
 };
 pub use images::{MAX_IMAGES_PER_QUERY, plan_mentions_images, resolve_candidate_image_paths};
 pub use lexical::{
@@ -28,8 +30,11 @@ pub use lexical::{
 pub use paths::resolve_question_dir;
 pub use semantic::{
     EMBEDDING_DB_REL, EmbeddingBackend, HASH_BACKEND_ID, HashEmbedBackend, MINILM_BACKEND_ID,
-    SemanticBackend, SemanticBackendConfig, SemanticBackendKind, SemanticChunkHit,
-    SemanticIndexStats, SemanticItemHit, SyncStats, aggregate_chunks_to_items, chunk_id_for,
-    chunk_markdown, embedding_db_path, knn_search, semantic_index_stats, sync_embeddings,
+    RERANK_DEFAULT_KEEP, RERANK_DEFAULT_TOP_K, Reranker, RerankSettings, SemanticBackend,
+    SemanticBackendConfig, SemanticBackendKind, SemanticChunkHit, SemanticIndexStats,
+    SemanticItemHit, SyncStats, aggregate_chunks_to_items, chunk_id_for, chunk_markdown,
+    embedding_db_path, knn_search, semantic_index_stats, sync_embeddings,
 };
+#[cfg(feature = "semantic-ort")]
+pub use semantic::{CrossEncoder, CrossEncoderConfig, RerankConfig};
 pub use writer::{ArtifactSidecar, WriteArtifactInput, WriteArtifactOutput, write_artifact};
