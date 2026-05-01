@@ -89,7 +89,7 @@ pub struct RerankSettings {
 impl Default for RerankSettings {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             top_k: DEFAULT_TOP_K,
             keep: DEFAULT_KEEP,
         }
@@ -170,9 +170,13 @@ mod ort_impl {
     /// plumbing the way [`crate::SemanticBackendConfig`] is.
     ///
     /// `enabled = false` skips the cross-encoder entirely — the hybrid
-    /// layer behaves identically to the pre-rerank pipeline. This is the
-    /// v1 default because each enable adds a model download (~80MB on
-    /// first use) and a few hundred milliseconds of CPU latency per query.
+    /// layer behaves identically to the pre-rerank pipeline. The `Default`
+    /// impl uses `false` because constructing this struct via
+    /// `Default::default()` doesn't load a model; callers are expected to
+    /// populate `paths` and flip `enabled` explicitly. The user-facing
+    /// `kb.toml` default (in `kb-cli::RerankConfig`) is `true` after
+    /// bn-14tr's conditional rerank gate eliminated the regression that
+    /// motivated the original off-by-default posture.
     #[derive(Debug, Clone, Default)]
     pub struct RerankConfig {
         /// Master switch. When false, the hybrid retriever skips the
@@ -712,9 +716,12 @@ mod settings_tests {
     use super::*;
 
     #[test]
-    fn settings_defaults_are_disabled_with_documented_top_k_and_keep() {
+    fn settings_defaults_are_enabled_with_documented_top_k_and_keep() {
         let s = RerankSettings::default();
-        assert!(!s.enabled, "rerank ships disabled by default");
+        assert!(
+            s.enabled,
+            "after bn-14tr (rich candidate text + conditional gate) rerank ships enabled by default"
+        );
         assert_eq!(s.effective_top_k(), DEFAULT_TOP_K);
         assert_eq!(s.effective_keep(), DEFAULT_KEEP);
     }

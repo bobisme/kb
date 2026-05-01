@@ -777,22 +777,32 @@ pub struct SemanticConfig {
 }
 
 /// `[semantic.rerank]` section of `kb.toml`. Cross-encoder rerank pass
-/// (bn-1cp2) that reads `(query, candidate)` jointly to produce a
-/// precision-focused re-ordering of the top-K hybrid results.
+/// (bn-1cp2 + bn-14tr) that reads `(query, candidate)` jointly to
+/// produce a precision-focused re-ordering of the top-K hybrid
+/// results.
 ///
-/// Defaults to `enabled = false` because each opt-in adds an ~80MB ONNX
-/// model download on first use and a few hundred milliseconds of CPU
-/// latency per query. Once a user has the model cached, flipping this to
-/// `true` is the only change needed — the model auto-downloads from
-/// Hugging Face the first time `kb ask` / `kb search` runs.
+/// Defaults to `enabled = true` after bn-14tr's two-part fix: (1) the
+/// candidate text now includes the page body's first paragraph rather
+/// than just `title + summary`, so the cross-encoder gets enough
+/// signal for short prose; and (2) the rerank pass is gated on
+/// lexical/semantic top-1 disagreement, so confident queries skip the
+/// cross-encoder entirely (paying ~0ms instead of a few hundred ms,
+/// and avoiding the regressions bn-1cp2 saw on `pasta-doneness` /
+/// `auth-paraphrase`). On the bn-1cp2 paraphrase fixture the conditional
+/// pass beats rerank-off across P@5 (+0.033), MRR (tied at 1.0), and
+/// nDCG@10 (+0.028).
+///
+/// First-use cost: ~80MB ONNX model download from Hugging Face. Cache
+/// at `~/.cache/kb/models/cross-encoder-ms-marco-minilm-l6-*`. Set
+/// `enabled = false` to skip the model download and pay zero rerank
+/// latency.
 ///
 /// `top_k` is the number of fused candidates fed into the cross-encoder.
 /// `keep` is the number of results returned after re-sorting.
 ///
-/// `model_path` and `tokenizer_path` override the cache convention
-/// (`~/.cache/kb/models/cross-encoder-ms-marco-minilm-l6-*`) — useful for
-/// air-gapped installs that pre-stage the files. `~`-prefixed paths are
-/// expanded against the user's home directory.
+/// `model_path` and `tokenizer_path` override the cache convention —
+/// useful for air-gapped installs that pre-stage the files.
+/// `~`-prefixed paths are expanded against the user's home directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
@@ -807,7 +817,7 @@ pub struct RerankConfig {
 impl Default for RerankConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             top_k: kb_query::RERANK_DEFAULT_TOP_K,
             keep: kb_query::RERANK_DEFAULT_KEEP,
             model_path: None,
@@ -1200,16 +1210,16 @@ token_budget = 12000
     }
 
     #[test]
-    fn rerank_section_defaults_disabled_match_kb_query_constants() {
+    fn rerank_section_defaults_enabled_match_kb_query_constants() {
         let cfg = RerankConfig::default();
         assert!(
-            !cfg.enabled,
-            "rerank ships off by default; flip to true once the model is cached"
+            cfg.enabled,
+            "after bn-14tr (rich candidate text + conditional gate) rerank ships enabled by default"
         );
         assert_eq!(cfg.top_k, kb_query::RERANK_DEFAULT_TOP_K);
         assert_eq!(cfg.keep, kb_query::RERANK_DEFAULT_KEEP);
         let s = cfg.to_settings();
-        assert!(!s.enabled);
+        assert!(s.enabled);
         assert_eq!(s.top_k, kb_query::RERANK_DEFAULT_TOP_K);
         assert_eq!(s.keep, kb_query::RERANK_DEFAULT_KEEP);
     }

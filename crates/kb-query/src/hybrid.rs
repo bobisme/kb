@@ -126,11 +126,15 @@ pub struct HybridOptions {
     /// Stricter floor on the *top* semantic hit when lexical returned
     /// nothing. Same backend-relative tuning as [`Self::min_semantic_score`].
     pub min_semantic_top_score_no_lexical: f32,
-    /// Cross-encoder rerank knobs (bn-1cp2). The `RerankSettings` is the
-    /// `Copy` subset of the rerank config — the actual model lives on the
-    /// caller-side and is plumbed through the `_with_reranker` function
-    /// variants. When `enabled = false` (the default), the hybrid pipeline
-    /// behaves exactly like before bn-1cp2.
+    /// Cross-encoder rerank knobs (bn-1cp2 + bn-14tr). The
+    /// `RerankSettings` is the `Copy` subset of the rerank config — the
+    /// actual model lives on the caller-side and is plumbed through the
+    /// `_with_reranker` function variants. When `enabled = true` (the
+    /// default after bn-14tr), the rerank pass runs only on queries
+    /// where the lexical and semantic tiers disagree on the top-1 hit;
+    /// confident queries skip the cross-encoder for zero added latency.
+    /// Set `enabled = false` to fall back to the pre-bn-1cp2 fused
+    /// order unconditionally.
     pub rerank: RerankSettings,
     /// Citation-graph + personalized-PageRank tier (bn-32od). When
     /// `enabled = true` (the default), the third RRF tier reads the graph
@@ -149,7 +153,7 @@ impl Default for HybridOptions {
             min_semantic_score: MIN_SEMANTIC_SCORE,
             min_semantic_top_score_no_lexical: MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
             rerank: RerankSettings {
-                enabled: false,
+                enabled: true,
                 top_k: crate::semantic::rerank::DEFAULT_TOP_K,
                 keep: crate::semantic::rerank::DEFAULT_KEEP,
             },
@@ -176,7 +180,7 @@ impl HybridOptions {
             min_semantic_score: kind.default_min_semantic_score(),
             min_semantic_top_score_no_lexical: kind.default_min_semantic_top_score_no_lexical(),
             rerank: RerankSettings {
-                enabled: false,
+                enabled: true,
                 top_k: crate::semantic::rerank::DEFAULT_TOP_K,
                 keep: crate::semantic::rerank::DEFAULT_KEEP,
             },
@@ -434,6 +438,7 @@ pub fn hybrid_search_with_index_and_backend_and_reranker(
     if want_rerank
         && let Some(reranker) = reranker
         && !fused.is_empty()
+        && should_rerank_search(&fused)
     {
         apply_rerank_to_search(
             &mut fused,
@@ -441,6 +446,7 @@ pub fn hybrid_search_with_index_and_backend_and_reranker(
             reranker,
             lexical_index,
             options.rerank,
+            root,
         );
     }
 
@@ -463,6 +469,7 @@ fn apply_rerank_to_search(
     reranker: &dyn Reranker,
     lexical_index: &LexicalIndex,
     settings: RerankSettings,
+    root: &Path,
 ) {
     let top_k = settings.effective_top_k();
     let keep = settings.effective_keep();
@@ -478,7 +485,7 @@ fn apply_rerank_to_search(
 
     let texts: Vec<String> = fused
         .iter()
-        .map(|c| candidate_text_for_rerank_hybrid(c, &summaries))
+        .map(|c| candidate_text_for_rerank_hybrid(c, &summaries, root))
         .collect();
     let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
@@ -526,19 +533,14 @@ fn apply_rerank_to_search(
 fn candidate_text_for_rerank_hybrid(
     hit: &HybridResult,
     summaries: &HashMap<&str, &str>,
+    root: &Path,
 ) -> String {
     let summary = summaries
         .get(hit.item_id.as_str())
         .copied()
         .unwrap_or("")
         .trim();
-    if summary.is_empty() {
-        hit.title.clone()
-    } else if hit.title.is_empty() {
-        summary.to_string()
-    } else {
-        format!("{}: {}", hit.title, summary)
-    }
+    build_rich_candidate_text(&hit.title, summary, &hit.item_id, root)
 }
 
 fn run_semantic(
@@ -1037,8 +1039,16 @@ pub fn plan_retrieval_hybrid_with_backend_and_reranker(
     if options.rerank.enabled
         && let Some(reranker) = reranker
         && !plan.candidates.is_empty()
+        && should_rerank_plan(&plan)
     {
-        apply_rerank(&mut plan, query, reranker, &lexical_index, options.rerank);
+        apply_rerank(
+            &mut plan,
+            query,
+            reranker,
+            &lexical_index,
+            options.rerank,
+            root,
+        );
     }
 
     Ok(plan)
@@ -1063,6 +1073,7 @@ fn apply_rerank(
     reranker: &dyn Reranker,
     lexical_index: &LexicalIndex,
     settings: RerankSettings,
+    root: &Path,
 ) {
     let top_k = settings.effective_top_k();
     let keep = settings.effective_keep();
@@ -1079,7 +1090,7 @@ fn apply_rerank(
     let texts: Vec<String> = plan
         .candidates
         .iter()
-        .map(|c| candidate_text_for_rerank(c, &summaries))
+        .map(|c| candidate_text_for_rerank(c, &summaries, root))
         .collect();
     let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
 
@@ -1140,23 +1151,184 @@ fn apply_rerank(
 fn candidate_text_for_rerank(
     candidate: &RetrievalCandidate,
     summaries: &std::collections::HashMap<&str, &str>,
+    root: &Path,
 ) -> String {
-    // Prefer summary when the lexical entry has one (typical case for
-    // wiki/sources/* and concept pages). Fall back to title alone for
-    // semantic-only or fallback-injected candidates with no lexical
-    // entry. Never empty — the cross-encoder needs *some* text to score.
     let summary = summaries
         .get(candidate.id.as_str())
         .copied()
         .unwrap_or("")
         .trim();
-    if summary.is_empty() {
-        candidate.title.clone()
-    } else if candidate.title.is_empty() {
-        summary.to_string()
-    } else {
-        format!("{}: {}", candidate.title, summary)
+    build_rich_candidate_text(&candidate.title, summary, &candidate.id, root)
+}
+
+/// Build the candidate text fed to the cross-encoder (bn-14tr).
+///
+/// The original implementation used `"{title}: {summary}"` from the
+/// lexical index. That works for source pages (which have managed
+/// summary regions) but degrades to *just the title* for concept pages
+/// — they don't carry a managed summary region, so the cross-encoder
+/// was scoring queries against ~4 tokens of signal and mis-ranking
+/// short prose.
+///
+/// This routine reads the candidate's body from disk and appends the
+/// first body paragraph after the H1 (concept "definition" sentence
+/// for concepts, normalized first paragraph for sources). The
+/// cross-encoder caps inputs at 256 tokens, so the truncation in
+/// `encode_pair` keeps the latency budget intact even when the body
+/// is long.
+///
+/// Returns the title alone when the file cannot be read or has no
+/// usable paragraph — the caller already filtered out empty inputs
+/// via this path so there is always *some* signal.
+fn build_rich_candidate_text(title: &str, summary: &str, id: &str, root: &Path) -> String {
+    let summary = summary.trim();
+    let body = read_first_body_paragraph(root, id).unwrap_or_default();
+    let body = body.trim();
+    let mut parts: Vec<&str> = Vec::with_capacity(3);
+    if !title.is_empty() {
+        parts.push(title);
     }
+    if !summary.is_empty() {
+        parts.push(summary);
+    }
+    if !body.is_empty() && body != summary {
+        parts.push(body);
+    }
+    if parts.is_empty() {
+        // Last-ditch fallback so we never hand the cross-encoder an
+        // empty string (its tokenizer would emit just `[CLS] [SEP] [SEP]`
+        // and produce a meaningless logit).
+        return id.to_string();
+    }
+    parts.join("\n\n")
+}
+
+/// Decide whether to run the cross-encoder rerank pass given a
+/// post-fusion plan (bn-14tr angle 3).
+///
+/// The cross-encoder helps disambiguate queries where the lexical and
+/// bi-encoder tiers disagree about the top hit (paraphrase queries
+/// where lexical is weak, or polysemous queries where semantic drift
+/// matters). When both tiers agree on the top hit, fusion already has
+/// a high-confidence answer and rerank tends to *demote* it in favor
+/// of structurally-similar pages — the regression bn-1cp2 saw on
+/// `pasta-doneness` and `auth-paraphrase` was caused by exactly this.
+///
+/// Gate logic:
+/// 1. If both lexical and semantic produced a top-1 hit AND they
+///    point at the same id → tiers agree → skip rerank.
+/// 2. If they disagree → run rerank (the cross-encoder reads query and
+///    candidate jointly, which is exactly what disambiguating two
+///    top-1 candidates needs).
+/// 3. If either tier is missing (semantic disabled, lexical empty) →
+///    skip rerank. There is no second opinion to disambiguate against.
+fn should_rerank_plan(plan: &RetrievalPlan) -> bool {
+    let lexical_top = plan
+        .candidates
+        .iter()
+        .find(|c| c.lexical_rank == Some(1))
+        .map(|c| c.id.as_str());
+    let semantic_top = plan
+        .candidates
+        .iter()
+        .find(|c| c.semantic_rank == Some(1))
+        .map(|c| c.id.as_str());
+    matches!((lexical_top, semantic_top), (Some(l), Some(s)) if l != s)
+}
+
+/// Mirror of [`should_rerank_plan`] for the `Vec<HybridResult>` path
+/// driven by `kb search` and the web `/search` endpoint. `HybridResult`
+/// uses `usize::MAX` to mean "not in this tier's ranked list" rather
+/// than `Option`, so the Some/Some check becomes a `!= MAX` check.
+fn should_rerank_search(fused: &[HybridResult]) -> bool {
+    let lexical_top = fused
+        .iter()
+        .find(|c| c.lexical_rank == 1)
+        .map(|c| c.item_id.as_str());
+    let semantic_top = fused
+        .iter()
+        .find(|c| c.semantic_rank == 1)
+        .map(|c| c.item_id.as_str());
+    matches!((lexical_top, semantic_top), (Some(l), Some(s)) if l != s)
+}
+
+/// Cap on how much of a page body to feed the cross-encoder. The
+/// tokenizer truncates to 256 tokens (~700-1000 chars); this cap is a
+/// belt-and-suspenders bound that also keeps the disk read cheap.
+const RERANK_BODY_CHAR_BUDGET: usize = 800;
+
+/// Extract the first body paragraph after the H1 of a wiki page.
+///
+/// Skips frontmatter, the H1 line, managed `<!-- kb:begin/end -->`
+/// markers, and section headings. Returns the first non-empty
+/// paragraph found before any H2, capped at [`RERANK_BODY_CHAR_BUDGET`]
+/// characters. Returns `None` when the file cannot be read or no
+/// paragraph is found — the caller falls back to title-only candidate
+/// text.
+fn read_first_body_paragraph(root: &Path, id: &str) -> Option<String> {
+    let path = root.join(id);
+    let bytes = std::fs::read(&path).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    let body = strip_frontmatter(&text);
+
+    let mut current = String::new();
+    let mut found_h1 = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        // Hard stop at H2 — paragraphs after the H1 belong to the
+        // page's introduction; H2 sections are auxiliary.
+        if trimmed.starts_with("## ") {
+            break;
+        }
+        if trimmed.starts_with("# ") {
+            // First H1 marks where the body content begins.
+            found_h1 = true;
+            continue;
+        }
+        // Skip managed-region markers and other HTML comments — they
+        // are structure, not content.
+        if trimmed.starts_with("<!--") || trimmed.is_empty() {
+            if !current.is_empty() {
+                // Blank line after content closes the paragraph.
+                break;
+            }
+            continue;
+        }
+        if !found_h1 {
+            // Allow the H1-less concept-summary case where the body is
+            // just text. Fall through.
+            found_h1 = true;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(trimmed);
+        if current.len() >= RERANK_BODY_CHAR_BUDGET {
+            current.truncate(RERANK_BODY_CHAR_BUDGET);
+            break;
+        }
+    }
+    if current.is_empty() {
+        None
+    } else {
+        Some(current)
+    }
+}
+
+/// Skip a leading `---\n...\n---\n` YAML frontmatter block, returning
+/// the remainder. Tolerates files without frontmatter.
+fn strip_frontmatter(text: &str) -> &str {
+    let trimmed = text.trim_start();
+    if !trimmed.starts_with("---") {
+        return trimmed;
+    }
+    let after_first = trimmed.strip_prefix("---").unwrap_or(trimmed);
+    // Find the closing `---` line.
+    if let Some(close_idx) = after_first.find("\n---") {
+        let rest = &after_first[close_idx + 4..];
+        return rest.trim_start_matches('\n').trim_start_matches('\r');
+    }
+    trimmed
 }
 
 static RERANK_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
@@ -1383,16 +1555,16 @@ mod tests {
                 ],
             };
             let stub = StubReranker::from_pairs(&[
-                ("a: alpha summary", 0.1),
-                ("b: beta summary", 0.5),
-                ("c: charlie summary", 0.9),
+                ("a\n\nalpha summary", 0.1),
+                ("b\n\nbeta summary", 0.5),
+                ("c\n\ncharlie summary", 0.9),
             ]);
             let settings = RerankSettings {
                 enabled: true,
                 top_k: 30,
                 keep: 8,
             };
-            apply_rerank(&mut plan, "q", &stub, &index, settings);
+            apply_rerank(&mut plan, "q", &stub, &index, settings, Path::new("/nonexistent"));
 
             let order: Vec<&str> = plan.candidates.iter().map(|c| c.id.as_str()).collect();
             assert_eq!(order, vec!["c", "b", "a"]);
@@ -1438,7 +1610,7 @@ mod tests {
                 top_k: 4,
                 keep: 2,
             };
-            apply_rerank(&mut plan, "q", &stub, &index, settings);
+            apply_rerank(&mut plan, "q", &stub, &index, settings, Path::new("/nonexistent"));
             assert_eq!(plan.candidates.len(), 2);
             // Top 2 by score: a (1.0), c (0.7).
             assert_eq!(plan.candidates[0].id, "a");
@@ -1477,7 +1649,7 @@ mod tests {
                 top_k: 3,
                 keep: 3,
             };
-            apply_rerank(&mut plan, "q", &stub, &index, settings);
+            apply_rerank(&mut plan, "q", &stub, &index, settings, Path::new("/nonexistent"));
             assert_eq!(plan.candidates.len(), 3);
             // Sorted ascending of pre-rerank index by score asc → c, b, a
             // (since stub assigned 0.3, 0.2, 0.1 to a, b, c reversed)
@@ -1499,7 +1671,7 @@ mod tests {
                 top_k: 30,
                 keep: 8,
             };
-            apply_rerank(&mut plan, "q", &stub, &index, settings);
+            apply_rerank(&mut plan, "q", &stub, &index, settings, Path::new("/nonexistent"));
 
             let order: Vec<&str> = plan.candidates.iter().map(|c| c.id.as_str()).collect();
             assert_eq!(order, vec!["a", "b", "c"], "fail-on-degrade preserves order");
@@ -1513,20 +1685,163 @@ mod tests {
         }
 
         #[test]
-        fn candidate_text_uses_summary_with_title_prefix() {
+        fn candidate_text_combines_title_and_summary_when_no_body_on_disk() {
+            // bn-14tr: candidate text is now "{title}\n\n{summary}" rather
+            // than "{title}: {summary}". The body paragraph is loaded
+            // from disk; with a nonexistent root the read returns None
+            // and the result is title + summary only.
             let summaries: HashMap<&str, &str> =
                 std::iter::once(("a", "Alpha summary text")).collect();
             let c = cand("a", 0.5);
-            let text = candidate_text_for_rerank(&c, &summaries);
-            assert_eq!(text, "a: Alpha summary text");
+            let text = candidate_text_for_rerank(&c, &summaries, Path::new("/nonexistent"));
+            assert_eq!(text, "a\n\nAlpha summary text");
         }
 
         #[test]
-        fn candidate_text_falls_back_to_title_when_no_summary() {
+        fn candidate_text_falls_back_to_title_when_no_summary_or_body() {
             let summaries: HashMap<&str, &str> = HashMap::new();
             let c = cand("a", 0.5);
-            let text = candidate_text_for_rerank(&c, &summaries);
+            let text = candidate_text_for_rerank(&c, &summaries, Path::new("/nonexistent"));
             assert_eq!(text, "a");
+        }
+
+        #[test]
+        fn candidate_text_appends_body_paragraph_from_disk() {
+            // bn-14tr: when the candidate id resolves to a real file on
+            // disk, the first body paragraph after the H1 is appended so
+            // the cross-encoder has more than ~4 tokens of signal for
+            // concept pages without managed summary regions.
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let id = "wiki/concepts/foo.md";
+            std::fs::create_dir_all(dir.path().join("wiki/concepts"))
+                .expect("create concepts dir");
+            std::fs::write(
+                dir.path().join(id),
+                "---\nname: Foo\n---\n# Foo\n\nFoo is a concept that does X and Y.\n\n## Backlinks\nstuff\n",
+            )
+            .expect("write concept page");
+
+            let summaries: HashMap<&str, &str> = HashMap::new();
+            let mut c = cand(id, 0.5);
+            c.title = "Foo".to_string();
+            let text = candidate_text_for_rerank(&c, &summaries, dir.path());
+            assert_eq!(text, "Foo\n\nFoo is a concept that does X and Y.");
+        }
+
+        #[test]
+        fn candidate_text_skips_managed_region_markers_in_body() {
+            // Source pages bracket their summary with `<!-- kb:begin -->`
+            // / `<!-- kb:end -->` markers around the H1; the rich-text
+            // builder must skip these to find the actual prose.
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let id = "wiki/sources/src-x.md";
+            std::fs::create_dir_all(dir.path().join("wiki/sources"))
+                .expect("create sources dir");
+            std::fs::write(
+                dir.path().join(id),
+                "---\nid: x\n---\n# Source\n<!-- kb:begin id=title -->\nMy Title\n<!-- kb:end id=title -->\n\n## Summary\n",
+            )
+            .expect("write source page");
+
+            let summaries: HashMap<&str, &str> =
+                std::iter::once((id, "Outer summary")).collect();
+            let mut c = cand(id, 0.5);
+            c.title = "My Title".to_string();
+            let text = candidate_text_for_rerank(&c, &summaries, dir.path());
+            // Outer summary survives; the H2 boundary stops body
+            // extraction before "## Summary" content; the H1-Source +
+            // managed-region prelude is filtered to "My Title".
+            assert!(text.contains("My Title"));
+            assert!(text.contains("Outer summary"));
+        }
+
+        #[test]
+        fn read_first_body_paragraph_returns_none_for_missing_file() {
+            assert!(super::read_first_body_paragraph(Path::new("/nonexistent"), "x.md").is_none());
+        }
+
+        #[test]
+        fn read_first_body_paragraph_caps_at_char_budget() {
+            let dir = tempfile::tempdir().expect("tmpdir");
+            let id = "long.md";
+            let body: String = std::iter::repeat_n('a', 2_000).collect();
+            std::fs::write(
+                dir.path().join(id),
+                format!("# Title\n\n{body}\n"),
+            )
+            .expect("write long body");
+            let got = super::read_first_body_paragraph(dir.path(), id).expect("paragraph");
+            assert!(got.len() <= super::RERANK_BODY_CHAR_BUDGET);
+        }
+
+        #[test]
+        fn strip_frontmatter_removes_yaml_block() {
+            let s = "---\nfoo: bar\n---\n# Title\nbody";
+            assert_eq!(super::strip_frontmatter(s), "# Title\nbody");
+        }
+
+        #[test]
+        fn strip_frontmatter_passes_through_when_absent() {
+            let s = "# Title\nbody";
+            assert_eq!(super::strip_frontmatter(s), "# Title\nbody");
+        }
+
+        // ── bn-14tr angle 3: conditional rerank gate ────────────────
+
+        fn cand_with_ranks(
+            id: &str,
+            lex_rank: Option<usize>,
+            sem_rank: Option<usize>,
+        ) -> RetrievalCandidate {
+            let mut c = cand(id, 0.5);
+            c.lexical_rank = lex_rank;
+            c.semantic_rank = sem_rank;
+            c
+        }
+
+        #[test]
+        fn should_rerank_plan_skips_when_lexical_and_semantic_top1_agree() {
+            // Both tiers agree the top hit is `a` — the fused order
+            // already reflects high confidence, rerank would only
+            // demote a known-good answer.
+            let plan = plan_with(vec![
+                cand_with_ranks("a", Some(1), Some(1)),
+                cand_with_ranks("b", Some(2), Some(2)),
+            ]);
+            assert!(!super::should_rerank_plan(&plan));
+        }
+
+        #[test]
+        fn should_rerank_plan_runs_when_lexical_and_semantic_top1_disagree() {
+            // Lexical says `a`, semantic says `b` — the cross-encoder
+            // reads query and candidate jointly, which is exactly the
+            // case where its precision actually pays off.
+            let plan = plan_with(vec![
+                cand_with_ranks("a", Some(1), Some(2)),
+                cand_with_ranks("b", Some(2), Some(1)),
+            ]);
+            assert!(super::should_rerank_plan(&plan));
+        }
+
+        #[test]
+        fn should_rerank_plan_skips_when_no_semantic_tier() {
+            // Semantic disabled (no candidate has semantic_rank set).
+            // Without a second opinion to disambiguate against, rerank
+            // can't do better than the lexical-only fused order.
+            let plan = plan_with(vec![
+                cand_with_ranks("a", Some(1), None),
+                cand_with_ranks("b", Some(2), None),
+            ]);
+            assert!(!super::should_rerank_plan(&plan));
+        }
+
+        #[test]
+        fn should_rerank_plan_skips_when_no_lexical_tier() {
+            let plan = plan_with(vec![
+                cand_with_ranks("a", None, Some(1)),
+                cand_with_ranks("b", None, Some(2)),
+            ]);
+            assert!(!super::should_rerank_plan(&plan));
         }
     }
 }
