@@ -5240,41 +5240,15 @@ fn run_lint(
 
     let cfg = Config::load_from_root(root, None)?;
     let check = kb_lint::LintRule::parse(check)?;
-    let missing_citations_level = match cfg.lint.missing_citations_level.as_str() {
-        "warn" | "warning" => kb_lint::MissingCitationsLevel::Warn,
-        "error" => kb_lint::MissingCitationsLevel::Error,
-        other => bail!(
-            "invalid lint.missing_citations_level in kb.toml: {other} (expected warn or error)"
-        ),
-    };
-    let missing_concepts_cfg = kb_lint::MissingConceptsConfig {
-        enabled: cfg.lint.missing_concepts.enabled,
-        min_sources: cfg.lint.missing_concepts.min_sources,
-        min_mentions: cfg.lint.missing_concepts.min_mentions,
-    };
-    let contradictions_cfg = kb_lint::ContradictionsConfig {
-        // bn-3axp: when the user asks for `--check contradictions` we
-        // honor the request even if the TOML says `enabled = false`.
-        // The config flag only controls whether it runs as part of
-        // `LintRule::All` (which currently never includes it). Run-mode
-        // override happens below when we dispatch the rule.
-        enabled: cfg.lint.contradictions.enabled,
-        min_sources: cfg.lint.contradictions.min_sources,
-    };
-    let citation_verification_cfg = build_citation_verification_cfg(&cfg)?;
-    let options = kb_lint::LintOptions {
-        require_citations: cfg.lint.require_citations,
-        missing_citations_level,
-        missing_concepts: missing_concepts_cfg.clone(),
-        citation_verification: citation_verification_cfg.clone(),
-    };
+    let LintRunOptions {
+        options,
+        contradictions_cfg,
+        missing_concepts_cfg,
+        rules_args,
+    } = build_lint_run_options(&cfg)?;
 
     let rules = if matches!(check, kb_lint::LintRule::All) {
-        lint_rules_for_root(
-            cfg.lint.require_citations,
-            missing_concepts_cfg.enabled,
-            citation_verification_cfg.enabled,
-        )
+        lint_rules_for_root(rules_args)
     } else {
         vec![check]
     };
@@ -5411,30 +5385,153 @@ fn build_citation_verification_cfg(cfg: &Config) -> Result<kb_lint::CitationVeri
     })
 }
 
-fn lint_rules_for_root(
+/// Bundle of toggles `lint_rules_for_root` consults to assemble the
+/// default rule list. Bagged into a struct (rather than long argument
+/// list) because clippy's `too_many_arguments` lint fires once we add
+/// orphan-sources / stale-citations / drift switches. The "many bools"
+/// pattern is unavoidable here — each is a TOML knob that genuinely
+/// gates a distinct lint pass.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Copy)]
+struct LintRulesForRootArgs {
     require_citations: bool,
     missing_concepts_enabled: bool,
     citation_verification_enabled: bool,
-) -> Vec<kb_lint::LintRule> {
+    orphan_sources_enabled: bool,
+    stale_citations_enabled: bool,
+    drift_enabled: bool,
+}
+
+fn lint_rules_for_root(args: LintRulesForRootArgs) -> Vec<kb_lint::LintRule> {
     let mut rules = vec![
         kb_lint::LintRule::BrokenLinks,
         kb_lint::LintRule::Orphans,
         kb_lint::LintRule::StaleRevision,
         kb_lint::LintRule::StaleArtifacts,
     ];
-    if require_citations {
+    if args.require_citations {
         rules.push(kb_lint::LintRule::MissingCitations);
     }
-    if missing_concepts_enabled {
+    if args.missing_concepts_enabled {
         rules.push(kb_lint::LintRule::MissingConcepts);
     }
-    if citation_verification_enabled {
+    if args.citation_verification_enabled {
         rules.push(kb_lint::LintRule::UnverifiedQuote);
+    }
+    if args.orphan_sources_enabled {
+        rules.push(kb_lint::LintRule::OrphanSources);
+    }
+    if args.stale_citations_enabled {
+        rules.push(kb_lint::LintRule::StaleCitations);
+    }
+    if args.drift_enabled {
+        rules.push(kb_lint::LintRule::Drift);
     }
     // Deliberately exclude LintRule::Contradictions: it's LLM-powered and
     // expensive, so it's opt-in per-command via `kb lint --check contradictions`,
     // never part of the default lint sweep.
     rules
+}
+
+/// Translate the parsed `[lint.orphans]` TOML section into the runtime
+/// [`kb_lint::OrphanSourcesConfig`] (bn-asr2). Returns an error when
+/// `level` is misspelled.
+fn build_orphan_sources_cfg(cfg: &Config) -> Result<kb_lint::OrphanSourcesConfig> {
+    let level = parse_lint_level("lint.orphans.level", &cfg.lint.orphans.level)?;
+    Ok(kb_lint::OrphanSourcesConfig {
+        enabled: cfg.lint.orphans.enabled,
+        level,
+        exempt_globs: cfg.lint.orphans.exempt_globs.clone(),
+    })
+}
+
+/// Translate the parsed `[lint.stale_citations]` TOML section into the
+/// runtime [`kb_lint::StaleCitationsConfig`] (bn-asr2). Returns an
+/// error when `level` is misspelled.
+fn build_stale_citations_cfg(cfg: &Config) -> Result<kb_lint::StaleCitationsConfig> {
+    let level = parse_lint_level("lint.stale_citations.level", &cfg.lint.stale_citations.level)?;
+    Ok(kb_lint::StaleCitationsConfig {
+        enabled: cfg.lint.stale_citations.enabled,
+        level,
+    })
+}
+
+/// Translate the parsed `[lint.drift]` TOML section into the runtime
+/// [`kb_lint::DriftConfig`] (bn-asr2). Returns an error when `level`
+/// is misspelled.
+fn build_drift_cfg(cfg: &Config) -> Result<kb_lint::DriftConfig> {
+    let level = parse_lint_level("lint.drift.level", &cfg.lint.drift.level)?;
+    Ok(kb_lint::DriftConfig {
+        enabled: cfg.lint.drift.enabled,
+        level,
+        fuzz_per_100_chars: cfg.lint.drift.fuzz_per_100_chars,
+    })
+}
+
+fn parse_lint_level(label: &str, raw: &str) -> Result<kb_lint::MissingCitationsLevel> {
+    match raw {
+        "warn" | "warning" => Ok(kb_lint::MissingCitationsLevel::Warn),
+        "error" => Ok(kb_lint::MissingCitationsLevel::Error),
+        other => bail!("invalid {label} in kb.toml: {other} (expected warn or error)"),
+    }
+}
+
+/// Bundle the runtime configs `run_lint` produces from the parsed
+/// `kb.toml`. Extracted so `run_lint` itself stays under clippy's
+/// 100-line cap.
+struct LintRunOptions {
+    options: kb_lint::LintOptions,
+    contradictions_cfg: kb_lint::ContradictionsConfig,
+    missing_concepts_cfg: kb_lint::MissingConceptsConfig,
+    rules_args: LintRulesForRootArgs,
+}
+
+fn build_lint_run_options(cfg: &Config) -> Result<LintRunOptions> {
+    let missing_citations_level = parse_lint_level(
+        "lint.missing_citations_level",
+        &cfg.lint.missing_citations_level,
+    )?;
+    let missing_concepts_cfg = kb_lint::MissingConceptsConfig {
+        enabled: cfg.lint.missing_concepts.enabled,
+        min_sources: cfg.lint.missing_concepts.min_sources,
+        min_mentions: cfg.lint.missing_concepts.min_mentions,
+    };
+    let contradictions_cfg = kb_lint::ContradictionsConfig {
+        // bn-3axp: when the user asks for `--check contradictions` we
+        // honor the request even if the TOML says `enabled = false`.
+        // The config flag only controls whether it runs as part of
+        // `LintRule::All` (which currently never includes it). Run-mode
+        // override happens at dispatch time.
+        enabled: cfg.lint.contradictions.enabled,
+        min_sources: cfg.lint.contradictions.min_sources,
+    };
+    let citation_verification_cfg = build_citation_verification_cfg(cfg)?;
+    let orphan_sources_cfg = build_orphan_sources_cfg(cfg)?;
+    let stale_citations_cfg = build_stale_citations_cfg(cfg)?;
+    let drift_cfg = build_drift_cfg(cfg)?;
+    let rules_args = LintRulesForRootArgs {
+        require_citations: cfg.lint.require_citations,
+        missing_concepts_enabled: missing_concepts_cfg.enabled,
+        citation_verification_enabled: citation_verification_cfg.enabled,
+        orphan_sources_enabled: orphan_sources_cfg.enabled,
+        stale_citations_enabled: stale_citations_cfg.enabled,
+        drift_enabled: drift_cfg.enabled,
+    };
+    let options = kb_lint::LintOptions {
+        require_citations: cfg.lint.require_citations,
+        missing_citations_level,
+        missing_concepts: missing_concepts_cfg.clone(),
+        citation_verification: citation_verification_cfg,
+        orphan_sources: orphan_sources_cfg,
+        stale_citations: stale_citations_cfg,
+        drift: drift_cfg,
+    };
+    Ok(LintRunOptions {
+        options,
+        contradictions_cfg,
+        missing_concepts_cfg,
+        rules_args,
+    })
 }
 
 /// Dispatch the LLM-powered contradictions check.

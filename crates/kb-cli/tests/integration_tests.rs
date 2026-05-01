@@ -8965,3 +8965,210 @@ fn session_rejects_path_escape_in_id() {
         "session id with path-escape characters must be rejected"
     );
 }
+
+// ---------------------------------------------------------------------------
+// bn-asr2: orphan-source / stale-citation / drift integration tests.
+//
+// These exercise the new lints end-to-end via the kb binary so the
+// CLI plumbing (config sections, --check aliases, exit codes) stays
+// honest. Unit-level coverage lives in `crates/kb-lint/src/{orphan_sources,
+// stale_citations, drift}.rs`.
+
+#[test]
+fn lint_orphan_sources_warns_on_uncited_unlinked_source() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("mkdir sources");
+    fs::write(
+        kb_root.join("wiki/sources/src-orphan.md"),
+        "# Orphan source\nbody.\n",
+    )
+    .expect("write orphan source");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint").arg("--check").arg("orphan-sources");
+    let output = cmd.output().expect("run kb lint orphan-sources");
+
+    // Orphan defaults to warn — exit 0 unless --strict.
+    assert!(
+        output.status.success(),
+        "lint orphan-sources should exit 0 (warn): stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("orphan source"),
+        "expected orphan-source warning in stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("wiki/sources/src-orphan.md"),
+        "expected orphan path in stdout: {stdout}"
+    );
+}
+
+#[test]
+fn lint_stale_citations_errors_on_unknown_src_id() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("mkdir sources");
+    fs::create_dir_all(kb_root.join("wiki/concepts")).expect("mkdir concepts");
+    // src-known exists; src-missing does not.
+    fs::write(kb_root.join("wiki/sources/src-known.md"), "# Known\n").expect("write src");
+    fs::write(
+        kb_root.join("wiki/concepts/foo.md"),
+        "# Foo\nValid [src-known]. Invalid [src-missing] here.\n",
+    )
+    .expect("write concept");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint").arg("--check").arg("stale-citations");
+    let output = cmd.output().expect("run kb lint stale-citations");
+
+    assert!(
+        !output.status.success(),
+        "stale-citations defaults to error level so exit should be non-zero"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("src-missing"),
+        "expected stale-citation issue mentioning src-missing: {stdout}"
+    );
+}
+
+#[test]
+fn lint_drift_warns_when_source_no_longer_contains_quote() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("mkdir sources");
+    fs::create_dir_all(kb_root.join("wiki/concepts")).expect("mkdir concepts");
+    fs::write(
+        kb_root.join("wiki/sources/src-paper.md"),
+        "# Paper\nThis paper now says something completely different.\n",
+    )
+    .expect("write src");
+    fs::write(
+        kb_root.join("wiki/concepts/foo.md"),
+        "# Foo\n\nThe paper claims \"the answer is 42\" [src-paper].\n",
+    )
+    .expect("write concept");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("lint").arg("--check").arg("drift");
+    let output = cmd.output().expect("run kb lint drift");
+
+    // Drift defaults to warn — exit 0 unless --strict.
+    assert!(
+        output.status.success(),
+        "drift should default to warn: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("drift"), "expected drift warning: {stdout}");
+    assert!(stdout.contains("src-paper"), "expected src-id: {stdout}");
+}
+
+#[test]
+fn lint_orphan_exempt_globs_silence_archival_paths() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Replace the empty `exempt_globs = []` line in the rendered
+    // [lint.orphans] section with our archive glob. `kb init` already
+    // emits the section so we patch in place rather than appending.
+    let toml_path = kb_root.join("kb.toml");
+    let toml = fs::read_to_string(&toml_path).expect("read kb.toml");
+    let patched = toml.replace(
+        "exempt_globs = []",
+        "exempt_globs = [\"wiki/sources/archive/**\"]",
+    );
+    assert_ne!(patched, toml, "expected exempt_globs = [] line in rendered kb.toml");
+    fs::write(&toml_path, patched).expect("rewrite kb.toml");
+
+    fs::create_dir_all(kb_root.join("wiki/sources/archive")).expect("mkdir archive");
+    fs::write(
+        kb_root.join("wiki/sources/archive/src-old.md"),
+        "# Old\n",
+    )
+    .expect("write archive source");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("lint").arg("--check").arg("orphan-sources");
+    let output = cmd.output().expect("run kb lint orphan-sources");
+    assert!(
+        output.status.success(),
+        "exempted path should not produce any issues: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse lint json");
+    let checks = envelope["data"]["checks"]
+        .as_array()
+        .expect("checks array");
+    assert_eq!(checks.len(), 1);
+    assert_eq!(checks[0]["check"], "orphan-sources");
+    assert_eq!(checks[0]["issue_count"], 0);
+}
+
+#[test]
+fn lint_all_includes_new_asr2_checks() {
+    // A KB with one defect of each kind exercises the new checks via
+    // `kb lint` (no --check) so we know the default-rules list got
+    // updated with the new rules.
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    fs::create_dir_all(kb_root.join("wiki/sources")).expect("mkdir sources");
+    fs::create_dir_all(kb_root.join("wiki/concepts")).expect("mkdir concepts");
+    // Orphan source.
+    fs::write(kb_root.join("wiki/sources/src-orphan.md"), "# Orphan\n").expect("orphan src");
+    // Source with content that doesn't match the concept's quoted span (drift).
+    fs::write(
+        kb_root.join("wiki/sources/src-drifted.md"),
+        "# Drifted\nThe source says something else now.\n",
+    )
+    .expect("drifted src");
+    // Concept references a non-existent src (stale-citation) AND quotes
+    // src-drifted (drift). Cite src-drifted with the bracket form too so
+    // it counts as cited and doesn't itself become an orphan.
+    fs::write(
+        kb_root.join("wiki/concepts/foo.md"),
+        "# Foo\n\nClaims \"the answer is 42\" [src-drifted].\nMissing [src-vanished].\n",
+    )
+    .expect("concept");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("lint");
+    let output = cmd.output().expect("run kb lint --json");
+
+    // stale-citations is an error — overall exit is non-zero.
+    assert!(!output.status.success(), "expected exit non-zero from stale-citations");
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let checks = envelope["data"]["checks"]
+        .as_array()
+        .expect("checks array");
+    let names: Vec<String> = checks
+        .iter()
+        .map(|c| c["check"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(
+        names.contains(&"orphan-sources".to_string()),
+        "rules should include orphan-sources: {names:?}"
+    );
+    assert!(
+        names.contains(&"stale-citations".to_string()),
+        "rules should include stale-citations: {names:?}"
+    );
+    assert!(
+        names.contains(&"drift".to_string()),
+        "rules should include drift: {names:?}"
+    );
+
+    let find = |name: &str| -> &Value {
+        checks
+            .iter()
+            .find(|c| c["check"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("missing check {name} in {names:?}"))
+    };
+    assert_eq!(find("orphan-sources")["issue_count"], 1);
+    assert_eq!(find("stale-citations")["issue_count"], 1);
+    assert_eq!(find("drift")["issue_count"], 1);
+}

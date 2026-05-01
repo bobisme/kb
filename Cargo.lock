@@ -1922,6 +1922,7 @@ name = "kb-lint"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "globset",
  "kb-core",
  "kb-llm",
  "regex",

@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+globset.workspace = true
 kb-core.workspace = true
 kb-llm.workspace = true
 regex.workspace = true

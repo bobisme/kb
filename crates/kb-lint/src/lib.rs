@@ -24,6 +24,15 @@ pub use impute::{
     load_imputed_fix_payload, outcomes_to_lint_issues, run_impute_pass, save_imputed_fix_payload,
 };
 
+pub mod drift;
+pub use drift::{DriftConfig, detect_drift};
+
+pub mod orphan_sources;
+pub use orphan_sources::{OrphanSourcesConfig, detect_orphan_sources};
+
+pub mod stale_citations;
+pub use stale_citations::{StaleCitationsConfig, detect_stale_citations};
+
 const WIKI_DIR: &str = "wiki";
 const MD_EXT: &str = "md";
 
@@ -42,6 +51,17 @@ pub enum LintRule {
     /// Verifies that quoted spans adjacent to a citation actually appear
     /// in the cited source (bn-166d). Pure on-disk lookup — no LLM.
     UnverifiedQuote,
+    /// Source pages with no incoming citations or wiki-links (bn-asr2).
+    /// Distinct from [`Self::Orphans`] (which targets pages whose
+    /// upstream source document is missing).
+    OrphanSources,
+    /// `[src-id]` citations that don't resolve to a known source page
+    /// (bn-asr2).
+    StaleCitations,
+    /// Quoted spans whose source resolves but no longer matches verbatim
+    /// (bn-asr2). Subset of [`Self::UnverifiedQuote`] tuned to surface
+    /// content drift specifically.
+    Drift,
     All,
 }
 
@@ -75,6 +95,15 @@ impl LintRule {
                 | "citation-verification" | "citation_verification" | "verify-citations"
                 | "verify_citations",
             ) => Ok(Self::UnverifiedQuote),
+            Some(
+                "orphan-sources" | "orphan_sources" | "orphansources" | "orphan-source"
+                | "orphan_source",
+            ) => Ok(Self::OrphanSources),
+            Some(
+                "stale-citations" | "stale_citations" | "stalecitations" | "stale-citation"
+                | "stale_citation",
+            ) => Ok(Self::StaleCitations),
+            Some("drift") => Ok(Self::Drift),
             Some(other) => Err(anyhow!("unsupported lint rule: {other}")),
         }
     }
@@ -90,6 +119,9 @@ impl LintRule {
             Self::MissingConcepts => "missing-concepts",
             Self::Contradictions => "contradictions",
             Self::UnverifiedQuote => "unverified-quote",
+            Self::OrphanSources => "orphan-sources",
+            Self::StaleCitations => "stale-citations",
+            Self::Drift => "drift",
             Self::All => "all",
         }
     }
@@ -161,6 +193,17 @@ pub enum IssueKind {
     /// source (bn-166d). Either the model fabricated the quote or the
     /// source was rewritten between extraction and verification.
     UnverifiedQuote,
+    /// A source page is not cited by any concept and not wiki-linked
+    /// from any other source (bn-asr2). Warning by default.
+    OrphanSource,
+    /// A `[src-id]` citation references a src-id that doesn't resolve
+    /// to any known source page (bn-asr2). Error by default.
+    StaleCitation,
+    /// A quoted span next to a citation no longer matches the cited
+    /// source verbatim, even though the source page still exists
+    /// (bn-asr2). Warning by default. Distinct from `UnverifiedQuote`
+    /// in that it skips the source-not-found case.
+    Drift,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +228,9 @@ pub struct LintOptions {
     pub missing_citations_level: MissingCitationsLevel,
     pub missing_concepts: MissingConceptsConfig,
     pub citation_verification: CitationVerificationConfig,
+    pub orphan_sources: OrphanSourcesConfig,
+    pub stale_citations: StaleCitationsConfig,
+    pub drift: DriftConfig,
 }
 
 impl Default for LintOptions {
@@ -194,6 +240,9 @@ impl Default for LintOptions {
             missing_citations_level: MissingCitationsLevel::Warn,
             missing_concepts: MissingConceptsConfig::default(),
             citation_verification: CitationVerificationConfig::default(),
+            orphan_sources: OrphanSourcesConfig::default(),
+            stale_citations: StaleCitationsConfig::default(),
+            drift: DriftConfig::default(),
         }
     }
 }
@@ -268,6 +317,19 @@ pub fn run_lint_with_options(
         && matches!(rule, LintRule::UnverifiedQuote | LintRule::All)
     {
         issues.extend(detect_unverified_quotes(root, &options.citation_verification)?);
+    }
+    if options.orphan_sources.enabled
+        && matches!(rule, LintRule::OrphanSources | LintRule::All)
+    {
+        issues.extend(detect_orphan_sources(root, &options.orphan_sources)?);
+    }
+    if options.stale_citations.enabled
+        && matches!(rule, LintRule::StaleCitations | LintRule::All)
+    {
+        issues.extend(detect_stale_citations(root, &options.stale_citations)?);
+    }
+    if options.drift.enabled && matches!(rule, LintRule::Drift | LintRule::All) {
+        issues.extend(detect_drift(root, &options.drift)?);
     }
 
     Ok(LintReport {
@@ -1102,7 +1164,7 @@ fn build_record_output_missing(root: &Path, record: &BuildRecord) -> Option<Lint
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn markdown_files_under(root: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn markdown_files_under(root: &Path) -> Result<Vec<PathBuf>> {
     let mut files = Vec::new();
     if !root.exists() {
         return Ok(files);
@@ -1299,7 +1361,7 @@ fn citations_exist(text: &str) -> bool {
     })
 }
 
-fn line_number_at(text: &str, offset: usize) -> usize {
+pub(crate) fn line_number_at(text: &str, offset: usize) -> usize {
     text[..offset.min(text.len())]
         .bytes()
         .filter(|byte| *byte == b'\n')
@@ -1348,7 +1410,7 @@ fn frontmatter_string(frontmatter: &serde_yaml::Mapping, key: &str) -> Option<St
     }
 }
 
-fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
+pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root)
         .map_or_else(|_| path.to_path_buf(), Path::to_path_buf)
 }
@@ -1463,7 +1525,7 @@ fn detect_unverified_quotes(
 /// raw body. Mirrors `kb_compile::source_page::resolve_source_page_path`
 /// without taking on a dependency cycle (kb-lint is consumed by
 /// kb-compile, not the other way around).
-fn load_source_body_for_id(root: &Path, src_id: &str) -> Option<String> {
+pub(crate) fn load_source_body_for_id(root: &Path, src_id: &str) -> Option<String> {
     let dir = root.join("wiki/sources");
     if !dir.exists() {
         return None;
@@ -1491,14 +1553,14 @@ fn load_source_body_for_id(root: &Path, src_id: &str) -> Option<String> {
     fs::read_to_string(&path).ok()
 }
 
-fn count_lines_before(text: &str, offset: usize) -> usize {
+pub(crate) fn count_lines_before(text: &str, offset: usize) -> usize {
     text[..offset.min(text.len())]
         .bytes()
         .filter(|byte| *byte == b'\n')
         .count()
 }
 
-fn truncate_for_message(s: &str, max_chars: usize) -> String {
+pub(crate) fn truncate_for_message(s: &str, max_chars: usize) -> String {
     let mut out = String::with_capacity(max_chars + 1);
     for (i, ch) in s.chars().enumerate() {
         if i >= max_chars {
@@ -2303,6 +2365,9 @@ mod tests {
                 missing_citations_level: MissingCitationsLevel::Error,
                 missing_concepts: MissingConceptsConfig::default(),
                 citation_verification: CitationVerificationConfig::default(),
+                orphan_sources: OrphanSourcesConfig::default(),
+                stale_citations: StaleCitationsConfig::default(),
+                drift: DriftConfig::default(),
             },
         )
         .expect("lint report");

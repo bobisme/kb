@@ -492,6 +492,89 @@ pub enum VerificationKind {
     QuoteNotInSource,
 }
 
+/// One mention of `[src-id]` (or `[src-id#section]`, or `(src-id)`) in a
+/// body. Used by the stale-citation lint to find every reference, whether
+/// or not it has an adjacent quote.
+///
+/// Suffix-tolerance: bn-3ij3 may extend the bracket form to carry page
+/// hints (`[src-x p.7]`, `[src-x pp.7-9]`). The parser captures the bare
+/// `src-id` prefix and treats trailing tokens it doesn't recognize as
+/// "valid syntax, just don't care about them" — so the stale-citation
+/// check only fires when the `src-id` itself is unknown, not when a
+/// future-format suffix is present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrcIdReference {
+    /// Bare src-id, e.g. `src-abc`. Prefix preserved.
+    pub src_id: String,
+    /// Optional `#section-slug` suffix from the bracket form. `None` for
+    /// the parenthesized form or when the bracket form is bare.
+    pub section_anchor: Option<String>,
+    /// 0-based byte offset of the opening `[` or `(` in the (smart-quote-folded) body.
+    pub offset: usize,
+}
+
+// `[src-XXX]` or `[src-XXX#section]` or `[src-XXX <anything-not-bracket>]`.
+// The third form catches future suffixes (e.g. `[src-x p.7]`, `[src-x pp.7-9]`)
+// without needing a parser update — we only require a single-char gap that's
+// not `]` to admit any trailing token.
+//
+// Captures: 1 = src-id, 2 = optional section anchor.
+static SRC_ID_BRACKET_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)(?:#([A-Za-z0-9][A-Za-z0-9_-]*))?(?:[ \t][^\]\r\n]*)?\]",
+    )
+    .expect("valid src-id bracket regex")
+});
+
+// `(src-XXX)`.
+static SRC_ID_PAREN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\((src-[A-Za-z0-9][A-Za-z0-9_-]*)\)").expect("valid src-id paren regex")
+});
+
+/// Collect every `[src-id]`-style citation reference in a body.
+///
+/// Walks `body` and yields one [`SrcIdReference`] per match, regardless
+/// of whether the citation sits next to a quoted span. Used by the
+/// stale-citation lint (bn-asr2) to verify that every cited src-id
+/// resolves to a known source on disk.
+///
+/// All three syntactic forms recognized by [`extract_quote_citations`]
+/// are covered: bracket (`[src-x]`), bracket+anchor (`[src-x#sec]`), and
+/// parenthesized (`(src-x)`). Trailing tokens inside the bracket form
+/// (e.g. `[src-x p.7]`) are tolerated — the parser captures only the
+/// `src-id` prefix and ignores the rest.
+///
+/// Smart quotes are folded first, so offsets index into the
+/// folded body. Duplicate `(src-id, anchor, offset)` triples cannot
+/// occur because regex `find_iter` doesn't overlap.
+#[must_use]
+pub fn extract_src_id_references(body: &str) -> Vec<SrcIdReference> {
+    let folded = fold_smart_quotes(body);
+    let mut out = Vec::new();
+
+    for cap in SRC_ID_BRACKET_RE.captures_iter(&folded) {
+        let Some(m_full) = cap.get(0) else { continue };
+        let Some(id) = cap.get(1) else { continue };
+        let anchor = cap.get(2).map(|m| m.as_str().to_string());
+        out.push(SrcIdReference {
+            src_id: id.as_str().to_string(),
+            section_anchor: anchor,
+            offset: m_full.start(),
+        });
+    }
+    for cap in SRC_ID_PAREN_RE.captures_iter(&folded) {
+        let Some(m_full) = cap.get(0) else { continue };
+        let Some(id) = cap.get(1) else { continue };
+        out.push(SrcIdReference {
+            src_id: id.as_str().to_string(),
+            section_anchor: None,
+            offset: m_full.start(),
+        });
+    }
+    out.sort_by_key(|r| r.offset);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +834,51 @@ mod tests {
         let nq = normalize_for_match(&pairs[0].quote);
         let ns = normalize_for_match(source);
         assert!(matches!(is_quote_present(&nq, &ns, 1), QuoteMatch::Exact));
+    }
+
+    // bn-asr2: src-id reference parser used by stale-citation lint.
+
+    #[test]
+    fn extract_src_id_references_captures_all_forms() {
+        let body =
+            "Bare bracket [src-aaa]. Anchor [src-bbb#chapter-2]. Paren (src-ccc).\nBoth: [src-ddd] then (src-eee).";
+        let refs = extract_src_id_references(body);
+        let ids: Vec<_> = refs.iter().map(|r| r.src_id.as_str()).collect();
+        assert_eq!(ids, vec!["src-aaa", "src-bbb", "src-ccc", "src-ddd", "src-eee"]);
+        assert_eq!(refs[0].section_anchor, None);
+        assert_eq!(refs[1].section_anchor.as_deref(), Some("chapter-2"));
+        assert_eq!(refs[2].section_anchor, None);
+    }
+
+    #[test]
+    fn extract_src_id_references_tolerates_unknown_suffixes() {
+        // bn-3ij3 may add `p.7` / `pp.7-9` suffixes; parser must still
+        // capture the src-id prefix and ignore the trailing tokens.
+        let body = "Cited [src-aaa p.7]. Range [src-bbb pp.7-9]. Anchored [src-ccc#sec p.10].";
+        let refs = extract_src_id_references(body);
+        let ids: Vec<_> = refs.iter().map(|r| r.src_id.as_str()).collect();
+        assert_eq!(ids, vec!["src-aaa", "src-bbb", "src-ccc"]);
+        assert_eq!(refs[2].section_anchor.as_deref(), Some("sec"));
+    }
+
+    #[test]
+    fn extract_src_id_references_skips_unrelated_brackets() {
+        let body = "Numeric [1] reference, wikilink [[concept]], and a real [src-abc].";
+        let refs = extract_src_id_references(body);
+        let ids: Vec<_> = refs.iter().map(|r| r.src_id.as_str()).collect();
+        assert_eq!(ids, vec!["src-abc"]);
+    }
+
+    #[test]
+    fn extract_src_id_references_orders_by_offset() {
+        // Bracket and paren forms should be returned in document order.
+        let body = "A (src-zzz) then B [src-aaa] then C (src-mmm).";
+        let refs = extract_src_id_references(body);
+        let offsets: Vec<usize> = refs.iter().map(|r| r.offset).collect();
+        let mut sorted = offsets.clone();
+        sorted.sort_unstable();
+        assert_eq!(offsets, sorted);
+        let ids: Vec<_> = refs.iter().map(|r| r.src_id.as_str()).collect();
+        assert_eq!(ids, vec!["src-zzz", "src-aaa", "src-mmm"]);
     }
 }

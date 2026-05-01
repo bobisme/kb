@@ -29,6 +29,7 @@ anyhow = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
+globset = "0.4"
 ignore = "0.4"
 regex = "1"
 rusqlite = { version = "0.30", features = ["bundled"] }

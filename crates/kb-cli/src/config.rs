@@ -351,6 +351,9 @@ pub struct LintConfig {
     pub missing_concepts: LintMissingConceptsConfig,
     pub contradictions: LintContradictionsConfig,
     pub citation_verification: LintCitationVerificationConfig,
+    pub orphans: LintOrphanSourcesConfig,
+    pub stale_citations: LintStaleCitationsConfig,
+    pub drift: LintDriftConfig,
 }
 
 impl Default for LintConfig {
@@ -361,6 +364,9 @@ impl Default for LintConfig {
             missing_concepts: LintMissingConceptsConfig::default(),
             contradictions: LintContradictionsConfig::default(),
             citation_verification: LintCitationVerificationConfig::default(),
+            orphans: LintOrphanSourcesConfig::default(),
+            stale_citations: LintStaleCitationsConfig::default(),
+            drift: LintDriftConfig::default(),
         }
     }
 }
@@ -431,6 +437,85 @@ pub struct LintCitationVerificationConfig {
 }
 
 impl Default for LintCitationVerificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: "warn".to_string(),
+            fuzz_per_100_chars: kb_core::DEFAULT_FUZZ_PER_100_CHARS,
+        }
+    }
+}
+
+/// `[lint.orphans]` section of `kb.toml`. Controls the orphan-source
+/// lint added in bn-asr2 — flags source pages with no incoming citation
+/// and no incoming wiki-link.
+///
+/// Distinct from the older `orphans` rule (singular file-level `Orphans`
+/// in `kb_lint::LintRule`) which targets pages whose upstream source
+/// document is missing. This section controls the *new* orphan-source
+/// check; the legacy orphan-page check has no separate TOML knobs.
+///
+/// `exempt_globs` admits paths under `wiki/sources/` that should never
+/// fire the warning — e.g. archival sources kept around as evidence
+/// even though no concept points at them. Globs are evaluated against
+/// the path *relative to the KB root*.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct LintOrphanSourcesConfig {
+    pub enabled: bool,
+    pub level: String,
+    pub exempt_globs: Vec<String>,
+}
+
+impl Default for LintOrphanSourcesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: "warn".to_string(),
+            exempt_globs: Vec::new(),
+        }
+    }
+}
+
+/// `[lint.stale_citations]` section of `kb.toml`. Controls the
+/// stale-citation lint added in bn-asr2 — flags `[src-id]` references
+/// that don't resolve to a known source page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct LintStaleCitationsConfig {
+    pub enabled: bool,
+    pub level: String,
+}
+
+impl Default for LintStaleCitationsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: "error".to_string(),
+        }
+    }
+}
+
+/// `[lint.drift]` section of `kb.toml`. Controls the content-drift lint
+/// added in bn-asr2 — flags `"…" [src-x]` quoted spans whose source
+/// resolves but no longer matches verbatim.
+///
+/// `fuzz_per_100_chars` mirrors the citation-verification knob (default
+/// `1` ≈ 1% slack) so users have one mental model for fuzz tuning, but
+/// the two checks share neither a config slot nor a `LintRule` so they
+/// can be dialed independently.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct LintDriftConfig {
+    pub enabled: bool,
+    pub level: String,
+    pub fuzz_per_100_chars: u32,
+}
+
+impl Default for LintDriftConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -923,5 +1008,53 @@ allow_paths = ["wiki/", "private-sources/"]
         // out of the kb.toml schema so the prompt text doesn't sprawl into
         // user config.
         assert!(!pipeline_cfg.prompt.is_empty());
+    }
+
+    // bn-asr2: orphan-sources / stale-citations / drift sections.
+
+    #[test]
+    fn lint_asr2_sections_default_to_sensible_values() {
+        let cfg = Config::default();
+        assert!(cfg.lint.orphans.enabled);
+        assert_eq!(cfg.lint.orphans.level, "warn");
+        assert!(cfg.lint.orphans.exempt_globs.is_empty());
+
+        assert!(cfg.lint.stale_citations.enabled);
+        assert_eq!(cfg.lint.stale_citations.level, "error");
+
+        assert!(cfg.lint.drift.enabled);
+        assert_eq!(cfg.lint.drift.level, "warn");
+        assert_eq!(
+            cfg.lint.drift.fuzz_per_100_chars,
+            kb_core::DEFAULT_FUZZ_PER_100_CHARS
+        );
+    }
+
+    #[test]
+    fn lint_asr2_sections_round_trip_through_toml() -> Result<()> {
+        let toml = r#"
+[lint.orphans]
+enabled = true
+level = "error"
+exempt_globs = ["wiki/sources/archive/**"]
+
+[lint.stale_citations]
+enabled = false
+level = "warn"
+
+[lint.drift]
+enabled = true
+level = "error"
+fuzz_per_100_chars = 3
+"#;
+        let parsed = Config::from_toml(toml)?;
+        assert_eq!(parsed.lint.orphans.level, "error");
+        assert_eq!(
+            parsed.lint.orphans.exempt_globs,
+            vec!["wiki/sources/archive/**".to_string()]
+        );
+        assert!(!parsed.lint.stale_citations.enabled);
+        assert_eq!(parsed.lint.drift.fuzz_per_100_chars, 3);
+        Ok(())
     }
 }
