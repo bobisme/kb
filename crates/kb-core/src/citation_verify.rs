@@ -27,6 +27,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::managed_region::slug_from_title;
+
 /// Default fuzz allowance (edits per 100 normalized characters). Mirrors
 /// the bone's specification — picked to absorb chunk-boundary rewrites
 /// from ingestion without admitting wholesale fabrications.
@@ -42,6 +44,12 @@ pub struct QuoteCitation {
     /// The bare src-id, e.g. `src-abc`. The leading `src-` prefix is
     /// preserved so callers can route directly to wiki/sources.
     pub src_id: String,
+    /// Optional section anchor extracted from the `[src-id#section-name]`
+    /// form (bn-3rzz). The captured slug is the lowercase-hyphenated
+    /// heading text the model emitted; callers wanting to resolve it to a
+    /// chunk should slugify the on-disk heading the same way and compare.
+    /// `None` for the bare `[src-id]` form.
+    pub section_anchor: Option<String>,
     /// 0-based byte offset of the opening `"` in the (smart-quote-folded)
     /// body. Useful for line attribution in lint reports.
     pub offset: usize,
@@ -96,6 +104,12 @@ pub fn fold_smart_quotes(text: &str) -> String {
 /// - `[src-XXX] "<text>"`  (citation immediately before opening quote)
 /// - `"<text>" (src-XXX)`  (parenthesized form)
 ///
+/// bn-3rzz: the bracket forms also recognize an optional `#section-slug`
+/// suffix — `[src-XXX#section-name]` — which routes the citation to a
+/// specific chunk for retrieval. The slug captured here is opaque (the
+/// lowercase-hyphenated heading text the model emitted); resolution
+/// happens at render time by slugifying the on-disk heading and comparing.
+///
 /// Smart quotes are normalized first via [`fold_smart_quotes`]. Up to
 /// one whitespace run is allowed between the quote and the citation
 /// marker — agents tend to soft-wrap and we'd rather match too much
@@ -106,15 +120,24 @@ pub fn fold_smart_quotes(text: &str) -> String {
 pub fn extract_quote_citations(body: &str) -> Vec<QuoteCitation> {
     let folded = fold_smart_quotes(body);
     let mut out = Vec::new();
-    let mut seen: std::collections::HashSet<(String, String)> =
+    // Dedup by (quote, src_id, section_anchor) so the same quote cited
+    // with two different anchors (or once with, once without) doesn't
+    // collapse into a single record.
+    let mut seen: std::collections::HashSet<(String, String, Option<String>)> =
         std::collections::HashSet::new();
 
-    let mut push_unique = |q: &str, id: &str, offset: usize, out: &mut Vec<QuoteCitation>| {
-        let key = (q.to_string(), id.to_string());
+    let mut push_unique = |q: &str,
+                           id: &str,
+                           anchor: Option<&str>,
+                           offset: usize,
+                           out: &mut Vec<QuoteCitation>| {
+        let anchor_owned = anchor.map(str::to_string);
+        let key = (q.to_string(), id.to_string(), anchor_owned.clone());
         if seen.insert(key) {
             out.push(QuoteCitation {
                 quote: q.to_string(),
                 src_id: id.to_string(),
+                section_anchor: anchor_owned,
                 offset,
             });
         }
@@ -122,38 +145,72 @@ pub fn extract_quote_citations(body: &str) -> Vec<QuoteCitation> {
 
     for cap in QUOTE_THEN_BRACKET_RE.captures_iter(&folded) {
         if let (Some(q), Some(id)) = (cap.get(1), cap.get(2)) {
-            push_unique(q.as_str(), id.as_str(), q.start().saturating_sub(1), &mut out);
+            let anchor = cap.get(3).map(|m| m.as_str());
+            push_unique(
+                q.as_str(),
+                id.as_str(),
+                anchor,
+                q.start().saturating_sub(1),
+                &mut out,
+            );
         }
     }
     for cap in BRACKET_THEN_QUOTE_RE.captures_iter(&folded) {
-        if let (Some(id), Some(q)) = (cap.get(1), cap.get(2)) {
-            push_unique(q.as_str(), id.as_str(), q.start().saturating_sub(1), &mut out);
+        if let (Some(id), Some(q)) = (cap.get(1), cap.get(3)) {
+            let anchor = cap.get(2).map(|m| m.as_str());
+            push_unique(
+                q.as_str(),
+                id.as_str(),
+                anchor,
+                q.start().saturating_sub(1),
+                &mut out,
+            );
         }
     }
     for cap in QUOTE_THEN_PAREN_RE.captures_iter(&folded) {
         if let (Some(q), Some(id)) = (cap.get(1), cap.get(2)) {
-            push_unique(q.as_str(), id.as_str(), q.start().saturating_sub(1), &mut out);
+            // The parenthesized form does not carry an anchor — agents
+            // tend to use the bracket forms when they want to point at a
+            // section. Keeping the paren form anchor-less avoids
+            // ambiguous parses against `(src-id) "..." (different stuff)`.
+            push_unique(
+                q.as_str(),
+                id.as_str(),
+                None,
+                q.start().saturating_sub(1),
+                &mut out,
+            );
         }
     }
 
     out
 }
 
-// `"text" [src-XXX]` — captures: 1=quote-body, 2=src-id (with prefix).
+// `"text" [src-XXX#section-slug]` — captures:
+//   1 = quote-body
+//   2 = src-id (with prefix)
+//   3 = section anchor slug, optional
 static QUOTE_THEN_BRACKET_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#""([^"\r\n]+)"\s*\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)\]"#)
-        .expect("valid quote-bracket regex")
+    Regex::new(
+        r#""([^"\r\n]+)"\s*\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)(?:#([A-Za-z0-9][A-Za-z0-9_-]*))?\]"#,
+    )
+    .expect("valid quote-bracket regex")
 });
 
-// `[src-XXX] "text"` — captures: 1=src-id, 2=quote-body.
+// `[src-XXX#section-slug] "text"` — captures:
+//   1 = src-id
+//   2 = section anchor slug, optional
+//   3 = quote-body
 //
 // We only allow whitespace (any kind, including line breaks) between the
 // closing bracket and the opening quote. Anything else — punctuation,
 // "notes:", a sentence-ending word — should not anchor the next quote
 // to this citation.
 static BRACKET_THEN_QUOTE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)\]\s+"([^"\r\n]+)""#)
-        .expect("valid bracket-quote regex")
+    Regex::new(
+        r#"\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)(?:#([A-Za-z0-9][A-Za-z0-9_-]*))?\]\s+"([^"\r\n]+)""#,
+    )
+    .expect("valid bracket-quote regex")
 });
 
 // `"text" (src-XXX)` — captures: 1=quote-body, 2=src-id.
@@ -391,6 +448,35 @@ impl QuoteVerification {
     }
 }
 
+/// Resolve a citation's `section_anchor` against the list of on-disk `headings`.
+///
+/// Returns the original heading text on match (caller uses
+/// [`slug_from_title`] for the URL fragment) or `None` when the anchor
+/// doesn't correspond to any heading on the page.
+///
+/// Match strategy: slugify each heading via [`slug_from_title`] and
+/// compare against the anchor string (already a slug). Case- and
+/// punctuation-insensitive by construction.
+///
+/// This is a soft routing helper — an unresolved anchor doesn't change
+/// quote verification (the `src-id` already determines which source to
+/// fetch), and renderers should fall back to the bare `[src-id]` form
+/// rather than emitting a broken link.
+#[must_use]
+pub fn resolve_section_anchor<'a>(
+    section_anchor: Option<&str>,
+    headings: &'a [String],
+) -> Option<&'a str> {
+    let anchor = section_anchor?;
+    if anchor.is_empty() {
+        return None;
+    }
+    headings
+        .iter()
+        .find(|h| slug_from_title(h) == anchor)
+        .map(String::as_str)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationKind {
     /// Exact substring match found in the normalized source.
@@ -417,6 +503,51 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].quote, "the answer is 42");
         assert_eq!(pairs[0].src_id, "src-abc");
+        assert_eq!(pairs[0].section_anchor, None);
+    }
+
+    /// bn-3rzz: bracket form supports an optional `#section-slug` suffix.
+    #[test]
+    fn extract_pairs_with_section_anchor_after_quote() {
+        let body =
+            r#"They argued "the answer is 42" [src-abc#methods-and-results] and moved on."#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].quote, "the answer is 42");
+        assert_eq!(pairs[0].src_id, "src-abc");
+        assert_eq!(
+            pairs[0].section_anchor.as_deref(),
+            Some("methods-and-results"),
+        );
+    }
+
+    /// bn-3rzz: the bracket-then-quote form also supports the anchor suffix.
+    #[test]
+    fn extract_pairs_with_section_anchor_before_quote() {
+        let body = r#"[src-xyz#chapter-3] "raft uses a leader" — full stop."#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].quote, "raft uses a leader");
+        assert_eq!(pairs[0].src_id, "src-xyz");
+        assert_eq!(pairs[0].section_anchor.as_deref(), Some("chapter-3"));
+    }
+
+    /// bn-3rzz: the same quote cited once bare and once anchored produces
+    /// two distinct records (dedup keys on (quote, src-id, anchor)).
+    #[test]
+    fn extract_pairs_dedup_distinguishes_anchor_variants() {
+        let body = r#"
+            "the answer" [src-abc].
+            "the answer" [src-abc#section-a].
+        "#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 2);
+        let anchors: Vec<Option<&str>> = pairs
+            .iter()
+            .map(|p| p.section_anchor.as_deref())
+            .collect();
+        assert!(anchors.contains(&None));
+        assert!(anchors.contains(&Some("section-a")));
     }
 
     #[test]
@@ -576,6 +707,39 @@ mod tests {
             by_quote["anything"],
             VerificationKind::SourceNotFound
         ));
+    }
+
+    /// bn-3rzz: anchor matches when the citation's slug equals the
+    /// slugified on-disk heading. The match returns the original heading
+    /// text so renderers can build the URL fragment via `slug_from_title`.
+    #[test]
+    fn resolve_section_anchor_matches_slugified_heading() {
+        let headings = vec![
+            "Introduction".to_string(),
+            "Methods and Results".to_string(),
+            "Conclusion".to_string(),
+        ];
+        let resolved = resolve_section_anchor(Some("methods-and-results"), &headings);
+        assert_eq!(resolved, Some("Methods and Results"));
+    }
+
+    /// bn-3rzz: when the anchor doesn't correspond to any heading, the
+    /// resolver returns `None` so renderers can fall back to the bare
+    /// `[src-id]` link.
+    #[test]
+    fn resolve_section_anchor_returns_none_on_unknown() {
+        let headings = vec!["Introduction".to_string()];
+        assert_eq!(resolve_section_anchor(Some("conclusion"), &headings), None);
+    }
+
+    /// bn-3rzz: the `None` and empty-string anchor inputs both bypass
+    /// resolution — the bare-citation case shouldn't accidentally match
+    /// a headless heading.
+    #[test]
+    fn resolve_section_anchor_returns_none_on_empty_or_missing() {
+        let headings = vec!["Anything".to_string()];
+        assert_eq!(resolve_section_anchor(None, &headings), None);
+        assert_eq!(resolve_section_anchor(Some(""), &headings), None);
     }
 
     #[test]

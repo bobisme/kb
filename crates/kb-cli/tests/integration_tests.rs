@@ -8184,6 +8184,153 @@ fn search_with_sqlite_vec_disabled_uses_rust_cosine_fallback_with_same_top_k() {
     );
 }
 
+/// bn-3rzz: a multi-section source must produce multiple rows in
+/// `chunk_embeddings` (one per H2 chunk after merging) and the chunk
+/// metadata (`item_id`, `chunk_idx`, heading) must be queryable via the new
+/// schema.
+#[test]
+fn multi_section_source_produces_multiple_chunk_embeddings() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Two H2 sections, each comfortably above the 100-token chunk floor
+    // so the merger doesn't collapse them. The chunker's body extraction
+    // runs on the page body (managed-region fences stripped), so the
+    // sections live alongside the standard summary region.
+    let dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&dir).expect("create wiki/sources");
+    let body = format!(
+        "---\nid: wiki-source-multi\ntype: source\ntitle: Multi-section source\n---\n\
+         \n# Source\n\
+         \n## Authentication\n\n{}\
+         \n## Authorization\n\n{}\n",
+        "auth ".repeat(200),
+        "perms ".repeat(200),
+    );
+    fs::write(dir.join("multi.md"), body).expect("write multi-section source");
+
+    // Drive the embedding sync directly (avoids a full `kb compile`,
+    // which needs an LLM for per-doc passes).
+    let backend = kb_query::HashEmbedBackend::new();
+    kb_query::sync_embeddings(&kb_root, &backend).expect("sync embeddings");
+
+    let db_path = kb_root.join(".kb/state/embeddings.db");
+    assert!(db_path.exists(), "embedding db should exist after sync");
+    let conn = rusqlite::Connection::open(&db_path).expect("open db");
+
+    // The new schema MUST be in place. The legacy `item_embeddings`
+    // table is dropped on first sync.
+    let chunk_table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'chunk_embeddings'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("check chunk_embeddings table");
+    assert_eq!(chunk_table_exists, 1, "chunk_embeddings table must exist");
+
+    // Two H2 sections → at least 2 chunk rows for this item.
+    let item_id = "wiki/sources/multi.md".to_string();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunk_embeddings WHERE item_id = ?1",
+            rusqlite::params![item_id],
+            |row| row.get(0),
+        )
+        .expect("count rows");
+    assert!(
+        count >= 2,
+        "expected >=2 chunks for multi-section source, got {count}"
+    );
+
+    // Each chunk row carries the H2 heading text.
+    let headings: Vec<String> = conn
+        .prepare("SELECT heading FROM chunk_embeddings WHERE item_id = ?1 ORDER BY chunk_idx")
+        .expect("prep")
+        .query_map(rusqlite::params![item_id], |row| {
+            row.get::<_, Option<String>>(0)
+        })
+        .expect("query")
+        .filter_map(Result::ok)
+        .map(Option::unwrap_or_default)
+        .collect();
+    assert!(
+        headings.iter().any(|h| h == "Authentication"),
+        "expected an Authentication heading among chunks: {headings:?}"
+    );
+    assert!(
+        headings.iter().any(|h| h == "Authorization"),
+        "expected an Authorization heading among chunks: {headings:?}"
+    );
+}
+
+/// bn-3rzz: a query that matches a non-first section's content must surface
+/// the source via the chunk-aggregation aggregator. We bypass the full
+/// `kb search` CLI and exercise the pipeline directly so the test is
+/// hermetic (no LLM, no fancy backend).
+#[test]
+fn search_finds_source_via_non_first_section_chunk() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // First section is generic prose; second section contains the
+    // distinctive token "ratchet" only at the bottom of the source. With
+    // whole-document embedding, that token would average out under the
+    // 256-token MiniLM window. Per-chunk embedding lets the second
+    // chunk's vector light up against a "ratchet" query.
+    let dir = kb_root.join("wiki/sources");
+    fs::create_dir_all(&dir).expect("create wiki/sources");
+    let body = format!(
+        "---\nid: wiki-source-chunked\ntype: source\ntitle: Chunked retrieval\n---\n\
+         \n## Background\n\n{}\
+         \n## Ratchet specifics\n\n{}\n",
+        "background unrelated material ".repeat(80),
+        "ratchet ratchet ratchet protocol step by step ".repeat(80),
+    );
+    fs::write(dir.join("chunked.md"), body).expect("write source");
+
+    let backend = kb_query::HashEmbedBackend::new();
+    kb_query::sync_embeddings(&kb_root, &backend).expect("sync");
+
+    // Embed the query and KNN against chunk_embeddings, then aggregate.
+    let db_path = kb_root.join(".kb/state/embeddings.db");
+    let conn = rusqlite::Connection::open(&db_path).expect("open db");
+    let qvec = kb_query::EmbeddingBackend::embed(&backend, "ratchet protocol")
+        .expect("embed query");
+    let chunk_hits = kb_query::knn_search(&conn, &qvec, 16).expect("knn");
+    assert!(!chunk_hits.is_empty(), "knn should find chunks");
+
+    // The ratchet section chunk must outrank the background chunk for
+    // this query — chunk-level embedding is the whole point of bn-3rzz.
+    let item_id = "wiki/sources/chunked.md".to_string();
+    let our_chunks: Vec<&kb_query::SemanticChunkHit> = chunk_hits
+        .iter()
+        .filter(|c| c.item_id == item_id)
+        .collect();
+    assert!(
+        our_chunks.len() >= 2,
+        "expected >=2 chunks indexed for the source, got {}",
+        our_chunks.len()
+    );
+    let top_for_item = our_chunks[0];
+    assert_eq!(
+        top_for_item.heading.as_deref(),
+        Some("Ratchet specifics"),
+        "ratchet query should rank the ratchet chunk above background; \
+         got top heading {:?}",
+        top_for_item.heading
+    );
+
+    // Aggregator: the source surfaces with the ratchet chunk attached.
+    let item_hits = kb_query::aggregate_chunks_to_items(chunk_hits, 5);
+    let our_item = item_hits
+        .iter()
+        .find(|h| h.item_id == item_id)
+        .expect("source aggregated");
+    let best = our_item.best_chunk.as_ref().expect("best chunk attached");
+    assert_eq!(best.heading.as_deref(), Some("Ratchet specifics"));
+}
+
 #[test]
 fn forget_eagerly_drops_embedding_row_for_source() {
     let (_temp, kb_root) = make_temp_kb();
@@ -8206,12 +8353,12 @@ fn forget_eagerly_drops_embedding_row_for_source() {
     let conn = rusqlite::Connection::open(&db_path).expect("open db");
     let pre_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM item_embeddings WHERE item_id = ?1",
+            "SELECT COUNT(*) FROM chunk_embeddings WHERE item_id = ?1",
             rusqlite::params![format!("wiki/sources/{src_id}.md")],
             |row| row.get(0),
         )
         .expect("pre count");
-    assert_eq!(pre_count, 1, "embedding row should exist for {src_id}");
+    assert!(pre_count >= 1, "expected >=1 chunk row for {src_id}, got {pre_count}");
     drop(conn);
 
     let mut cmd = kb_cmd(&kb_root);
@@ -8227,12 +8374,12 @@ fn forget_eagerly_drops_embedding_row_for_source() {
     let conn = rusqlite::Connection::open(&db_path).expect("reopen db");
     let post_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM item_embeddings WHERE item_id = ?1",
+            "SELECT COUNT(*) FROM chunk_embeddings WHERE item_id = ?1",
             rusqlite::params![format!("wiki/sources/{src_id}.md")],
             |row| row.get(0),
         )
         .expect("post count");
-    assert_eq!(post_count, 0, "kb forget must eagerly drop the embedding row");
+    assert_eq!(post_count, 0, "kb forget must eagerly drop the embedding rows");
 }
 
 // bn-166d: a fake opencode that emits a deterministic answer body

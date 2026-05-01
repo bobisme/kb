@@ -438,7 +438,7 @@ pub mod transcript;
 pub use citation_verify::{
     DEFAULT_FUZZ_PER_100_CHARS, QuoteCitation, QuoteMatch, QuoteVerification, VerificationKind,
     bounded_levenshtein, extract_quote_citations, fold_smart_quotes, is_quote_present,
-    normalize_for_match, verify_body_quotes,
+    normalize_for_match, resolve_section_anchor, verify_body_quotes,
 };
 
 pub use hashing::{Hash, hash_bytes, hash_file, hash_many};

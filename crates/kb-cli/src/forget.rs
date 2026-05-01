@@ -733,8 +733,10 @@ fn drop_embedding_for_src(root: &Path, src_id: &str) -> Result<()> {
     // the prefix match readable.
     let pattern_bare = format!("wiki/sources/{src_id}.md");
     let pattern_slug = format!("wiki/sources/{src_id}-*.md");
+    // bn-3rzz: per-chunk schema. One source can have multiple rows
+    // (one per chunk) — the GLOB / `=` predicates on item_id strip them all.
     conn.execute(
-        "DELETE FROM item_embeddings
+        "DELETE FROM chunk_embeddings
          WHERE item_id = ?1
             OR item_id GLOB ?2",
         params![pattern_bare, pattern_slug],

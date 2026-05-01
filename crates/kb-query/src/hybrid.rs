@@ -25,7 +25,8 @@ use tracing::warn;
 
 use crate::lexical::{LexicalIndex, RetrievalCandidate, RetrievalPlan, SearchResult};
 use crate::semantic::{
-    EmbeddingBackend, HashEmbedBackend, embed::embedding_db_path, search::knn_search,
+    EmbeddingBackend, HashEmbedBackend, embed::embedding_db_path,
+    search::{aggregate_chunks_to_items, knn_search},
 };
 
 /// RRF constant `k`. Pulled directly from the standard literature and
@@ -287,8 +288,14 @@ fn run_semantic(
     let qvec = backend
         .embed(query)
         .context("embed query for semantic search")?;
-    let raw = knn_search(&conn, &qvec, limit).context("knn search")?;
-    Ok(raw
+    // bn-3rzz: pull more chunks than `limit` so the aggregator has room to
+    // collapse them down to `limit` distinct items. Many sources have
+    // multiple high-scoring chunks; without overscan we'd surface fewer
+    // items than requested.
+    let chunk_limit = limit.saturating_mul(4).max(limit);
+    let raw_chunks = knn_search(&conn, &qvec, chunk_limit).context("knn search")?;
+    let items = aggregate_chunks_to_items(raw_chunks, limit);
+    Ok(items
         .into_iter()
         .map(|hit| SemanticHit {
             item_id: hit.item_id,

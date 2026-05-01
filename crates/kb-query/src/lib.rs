@@ -28,7 +28,8 @@ pub use lexical::{
 pub use paths::resolve_question_dir;
 pub use semantic::{
     EMBEDDING_DB_REL, EmbeddingBackend, HASH_BACKEND_ID, HashEmbedBackend, MINILM_BACKEND_ID,
-    SemanticBackend, SemanticBackendConfig, SemanticBackendKind, SemanticIndexStats, SyncStats,
-    embedding_db_path, semantic_index_stats, sync_embeddings,
+    SemanticBackend, SemanticBackendConfig, SemanticBackendKind, SemanticChunkHit,
+    SemanticIndexStats, SemanticItemHit, SyncStats, aggregate_chunks_to_items, chunk_id_for,
+    chunk_markdown, embedding_db_path, knn_search, semantic_index_stats, sync_embeddings,
 };
 pub use writer::{ArtifactSidecar, WriteArtifactInput, WriteArtifactOutput, write_artifact};
