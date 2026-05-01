@@ -743,6 +743,36 @@ impl LlmAdapter for OpencodeAdapter {
         Ok((response, provenance))
     }
 
+    fn caption_image(
+        &self,
+        path: &Path,
+        prompt: &str,
+    ) -> Result<(String, ProvenanceRecord), LlmAdapterError> {
+        // bn-2qda: opencode's `-f <path>` flag delivers the image directly to
+        // the multimodal model — no base64 fallback needed.
+        let started_at = unix_time_ms()?;
+        let attachments = [path.to_path_buf()];
+        let caption = self.run_prompt_with_attachments(prompt, &attachments)?;
+        let ended_at = unix_time_ms()?;
+
+        let provenance = ProvenanceRecord {
+            harness: "opencode".to_string(),
+            harness_version: None,
+            model: self.config.model.clone(),
+            prompt_template_name: "caption_image".to_string(),
+            prompt_template_hash: kb_core::Hash::from([0u8; 32]),
+            prompt_render_hash: kb_core::hash_bytes(prompt.as_bytes()),
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: None,
+            cost_estimate: None,
+        };
+
+        Ok((caption.trim().to_string(), provenance))
+    }
+
     fn generate_slides(
         &self,
         _request: GenerateSlidesRequest,

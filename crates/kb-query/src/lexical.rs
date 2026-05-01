@@ -722,11 +722,33 @@ fn index_source_page(path: &Path, root: &Path) -> Result<LexicalEntry> {
         .unwrap_or("")
         .to_string();
 
-    let summary = extract_managed_regions(&body)
-        .into_iter()
+    // bn-2qda: Captions injected by the compile `captions` pass live in
+    // managed regions whose ids start with `caption-`. Merge their bodies
+    // into the indexed `summary` so query terms inside an image caption
+    // surface a hit on the source page. The summary field is the only
+    // "long" text in a `LexicalEntry`, so this is the cheapest place to
+    // pick up captions without touching the entry shape.
+    let regions = extract_managed_regions(&body);
+    let summary_body = regions
+        .iter()
         .find(|r| r.id == "summary")
         .map(|r| r.body(&body).trim().to_string())
         .unwrap_or_default();
+
+    let caption_bodies: Vec<String> = regions
+        .iter()
+        .filter(|r| r.id.starts_with("caption-"))
+        .map(|r| r.body(&body).trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    let summary = if caption_bodies.is_empty() {
+        summary_body
+    } else if summary_body.is_empty() {
+        caption_bodies.join("\n\n")
+    } else {
+        format!("{summary_body}\n\n{}", caption_bodies.join("\n\n"))
+    };
 
     let headings = extract_headings(&body);
 

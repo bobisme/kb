@@ -723,6 +723,63 @@ impl LlmAdapter for ClaudeCliAdapter {
         Ok((response, provenance))
     }
 
+    fn caption_image(
+        &self,
+        path: &Path,
+        prompt: &str,
+    ) -> Result<(String, ProvenanceRecord), LlmAdapterError> {
+        // bn-2qda: image is delivered to the model as a base64 data URI
+        // appended to the prompt — same approach used by `answer_question`
+        // because the `claude` CLI doesn't accept local image paths
+        // directly. Claude 4.X reads data URIs as real image inputs.
+        let prompt_with_image =
+            append_image_attachments_as_data_uris(prompt, std::slice::from_ref(&path.to_path_buf()))?;
+
+        let started_at = unix_time_ms()?;
+        let argv = self.build_argv();
+        let output = run_command_with_stdin(
+            &argv,
+            prompt_with_image.as_bytes(),
+            &[],
+            self.config.timeout,
+        )
+        .map_err(map_subprocess_error)?;
+
+        if output.exit_code != Some(0) {
+            return Err(classify_nonzero_exit(
+                output.exit_code,
+                &output.stderr,
+                &output.stdout,
+            ));
+        }
+
+        let parsed = parse_claude_json(&output.stdout)?;
+        let caption = strip_plain_text_wrappers(&parsed.text);
+        let ended_at = unix_time_ms()?;
+
+        let model = parsed
+            .model
+            .or_else(|| self.config.model.clone())
+            .unwrap_or_else(|| "claude".to_string());
+
+        let provenance = ProvenanceRecord {
+            harness: "claude".to_string(),
+            harness_version: None,
+            model,
+            prompt_template_name: "caption_image".to_string(),
+            prompt_template_hash: kb_core::Hash::from([0u8; 32]),
+            prompt_render_hash: kb_core::hash_bytes(prompt.as_bytes()),
+            started_at,
+            ended_at,
+            latency_ms: ended_at.saturating_sub(started_at),
+            retries: 0,
+            tokens: parsed.tokens,
+            cost_estimate: parsed.cost_estimate,
+        };
+
+        Ok((caption, provenance))
+    }
+
     fn generate_slides(
         &self,
         _request: GenerateSlidesRequest,

@@ -3067,8 +3067,17 @@ fn run_compile_action(
     // the validity check at the top of `main`, so falling back to defaults on
     // a load error here is intentional — the typical cause is that the file
     // is missing entirely (legacy or freshly-init'd vault).
-    let semantic_backend = Config::load_from_root(compile_root, None)
+    let loaded_config = Config::load_from_root(compile_root, None).ok();
+    let semantic_backend = loaded_config
+        .as_ref()
         .map(|cfg| cfg.semantic.to_backend_config())
+        .unwrap_or_default();
+    // bn-2qda: pull `[compile.captions]` so the captions pass picks up the
+    // user-configured allow_paths / enabled flag. Defaults match the
+    // `Default` impl on `CaptionsConfig`.
+    let captions = loaded_config
+        .as_ref()
+        .map(|cfg| cfg.compile.captions.to_pipeline_config())
         .unwrap_or_default();
 
     let options = kb_compile::pipeline::CompileOptions {
@@ -3082,6 +3091,7 @@ fn run_compile_action(
         log_sink,
         reporter: Some(reporter),
         semantic_backend,
+        captions,
     };
 
     // Dry-run does not call the LLM; skip adapter construction so users can

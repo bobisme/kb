@@ -211,6 +211,9 @@ pub struct CompileOptions {
     /// `kb.toml [semantic]` so a user-selected `MiniLM` backend is honored.
     /// bn-1rww.
     pub semantic_backend: kb_query::SemanticBackendConfig,
+    /// Configuration for the bn-2qda image-captioning pass. Defaults match
+    /// `[compile.captions]` in `kb.toml`.
+    pub captions: crate::captions::CaptionsConfig,
 }
 
 impl std::fmt::Debug for CompileOptions {
@@ -225,6 +228,7 @@ impl std::fmt::Debug for CompileOptions {
                 &self.reporter.as_ref().map(|_| "<ProgressReporter>"),
             )
             .field("semantic_backend", &self.semantic_backend.kind)
+            .field("captions_enabled", &self.captions.enabled)
             .finish()
     }
 }
@@ -567,6 +571,12 @@ pub fn run_compile_with_llm(
             },
         ));
         passes.push((
+            "captions".to_string(),
+            PassStatus::DryRun {
+                would_process: vec!["wiki/sources/*.md".to_string()],
+            },
+        ));
+        passes.push((
             "lexical_index".to_string(),
             PassStatus::DryRun {
                 would_process: vec!["wiki/**/*.md".to_string()],
@@ -763,6 +773,61 @@ pub fn run_compile_with_llm(
                 },
             ));
         }
+    }
+
+    // Pass: captions — bn-2qda. Walks every wiki source page for
+    // `![alt](path)` refs and injects a `kb:caption` managed region next
+    // to images whose alt text is empty / generic / equals the filename
+    // stem. Runs BEFORE `lexical_index` so the same compile picks up the
+    // injected caption text in the lexical (and downstream embedding)
+    // index. Always emits a pass entry (Executed or Skipped) so dry-run
+    // and live paths report the same set of pass names. Skipped when:
+    //   - no LLM adapter is configured (captions need vision input)
+    //   - `[compile.captions] enabled = false`
+    if let Some(adapter) = adapter {
+        if options.captions.enabled {
+            match run_captions_pass(root, adapter, &options.captions) {
+                Ok(stats) => {
+                    let line = format!(
+                        "  [ok] captions ({} captioned, {} cached, {} skipped)",
+                        stats.adapter_calls,
+                        stats.cache_hits,
+                        stats.skipped,
+                    );
+                    reporter.info(&line);
+                    log_message(options, &line);
+                    passes.push((
+                        "captions".to_string(),
+                        PassStatus::Executed {
+                            affected: stats.adapter_calls + stats.cache_hits,
+                        },
+                    ));
+                }
+                Err(err) => {
+                    tracing::warn!("captions pass failed: {err}");
+                    passes.push((
+                        "captions".to_string(),
+                        PassStatus::Skipped {
+                            reason: format!("error: {err}"),
+                        },
+                    ));
+                }
+            }
+        } else {
+            passes.push((
+                "captions".to_string(),
+                PassStatus::Skipped {
+                    reason: "disabled in kb.toml".to_string(),
+                },
+            ));
+        }
+    } else {
+        passes.push((
+            "captions".to_string(),
+            PassStatus::Skipped {
+                reason: "no LLM adapter configured".to_string(),
+            },
+        ));
     }
 
     // Pass: lexical index
@@ -1336,6 +1401,116 @@ fn run_per_document_passes(
     })
 }
 
+/// Aggregated captions-pass stats across every wiki source page. Mirrors
+/// `CaptionsPageReport` but accumulates across pages.
+#[derive(Debug, Clone, Default)]
+struct CaptionsRunStats {
+    /// Total caption-region injections (cache hit + adapter call).
+    images_captioned: usize,
+    /// Cache hits across all pages (no adapter call).
+    cache_hits: usize,
+    /// Adapter calls (cache miss).
+    adapter_calls: usize,
+    /// Refs that were skipped for any reason.
+    skipped: usize,
+    /// Number of pages whose body was modified and written back to disk.
+    pages_modified: usize,
+}
+
+/// Run the bn-2qda captions pass over every `wiki/sources/*.md`.
+///
+/// Reads each page, runs `caption_page` on its body, and atomically writes
+/// the result back when modified. Skips `index.md`. Frontmatter is preserved
+/// verbatim — captions are injected only into the page body.
+fn run_captions_pass(
+    root: &Path,
+    adapter: &(dyn LlmAdapter + '_),
+    config: &crate::captions::CaptionsConfig,
+) -> Result<CaptionsRunStats> {
+    let mut stats = CaptionsRunStats::default();
+    let sources_dir = root.join("wiki/sources");
+    if !sources_dir.exists() {
+        return Ok(stats);
+    }
+
+    let entries = std::fs::read_dir(&sources_dir)
+        .with_context(|| format!("scan {}", sources_dir.display()))?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        if path.file_stem().and_then(|s| s.to_str()) == Some("index") {
+            continue;
+        }
+        paths.push(path);
+    }
+    paths.sort();
+
+    for page_path in paths {
+        let raw = match std::fs::read_to_string(&page_path) {
+            Ok(text) => text,
+            Err(err) => {
+                tracing::warn!("captions: skip {}: {err}", page_path.display());
+                continue;
+            }
+        };
+
+        // Split out frontmatter so we don't try to caption inside YAML.
+        let (head, body) = raw
+            .strip_prefix("---\n")
+            .or_else(|| raw.strip_prefix("---\r\n"))
+            .map_or_else(
+                || (String::new(), raw.clone()),
+                |rest| {
+                    // Find the closing `---`.
+                    let mut offset = 0usize;
+                    let mut found = None;
+                    for line in rest.split_inclusive('\n') {
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        if trimmed == "---" {
+                            found = Some(offset + line.len());
+                            break;
+                        }
+                        offset += line.len();
+                    }
+                    found.map_or_else(
+                        || (String::new(), raw.clone()),
+                        |end| {
+                            let head_len = raw.len() - rest.len() + end;
+                            (raw[..head_len].to_string(), rest[end..].to_string())
+                        },
+                    )
+                },
+            );
+
+        let (new_body, page_report) =
+            crate::captions::caption_page(adapter, root, &page_path, &body, config)?;
+
+        stats.images_captioned += page_report.images_captioned;
+        stats.cache_hits += page_report.cache_hits;
+        stats.adapter_calls += page_report.adapter_calls;
+        stats.skipped += page_report.skipped_alt_present
+            + page_report.skipped_blocked_path
+            + page_report.skipped_missing_file
+            + page_report.skipped_unsupported;
+
+        if page_report.body_modified {
+            let merged = format!("{head}{new_body}");
+            kb_core::fs::atomic_write(&page_path, merged.as_bytes())
+                .with_context(|| format!("write captioned page {}", page_path.display()))?;
+            stats.pages_modified += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
 struct MergeRunReport {
     pages_written: usize,
     reviews_written: usize,
@@ -1702,6 +1877,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("compile");
@@ -1728,6 +1904,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("compile with progress");
@@ -1751,6 +1928,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("compile");
@@ -1783,6 +1961,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("compile");
@@ -1809,6 +1988,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("first compile");
@@ -1822,6 +2002,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("second compile");
@@ -1848,6 +2029,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("first compile");
@@ -1864,6 +2046,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("second compile");
@@ -1889,6 +2072,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("first compile");
@@ -1902,6 +2086,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("force compile");
@@ -1927,6 +2112,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("dry run");
@@ -1993,6 +2179,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             Some(&adapter),
         )
@@ -2074,6 +2261,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             None::<&dyn LlmAdapter>,
         )
@@ -2127,6 +2315,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("first compile");
@@ -2140,6 +2329,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("dry run with clean state");
@@ -2171,6 +2361,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("dry run");
@@ -2184,6 +2375,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("live run");
@@ -2246,6 +2438,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("first compile");
@@ -2259,6 +2452,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("second compile — no changes");
@@ -2282,6 +2476,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("third compile — template changed");
@@ -2427,6 +2622,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             Some(&adapter),
         )
@@ -2486,6 +2682,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             Some(&adapter),
         )
@@ -2523,6 +2720,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             Some(&adapter),
         )
@@ -2551,6 +2749,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             Some(&adapter),
         )
@@ -2592,6 +2791,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             Some(&adapter),
         )
@@ -2671,6 +2871,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
         )
         .expect("compile");
@@ -2792,6 +2993,7 @@ mod tests {
             log_sink: Some(Arc::new(sink.clone())),
             reporter: None,
             semantic_backend: kb_query::SemanticBackendConfig::default(),
+            captions: crate::captions::CaptionsConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile");
 
@@ -2854,6 +3056,7 @@ mod tests {
             log_sink: Some(Arc::new(sink.clone())),
             reporter: None,
             semantic_backend: kb_query::SemanticBackendConfig::default(),
+            captions: crate::captions::CaptionsConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile succeeds (failures logged, not bubbled)");
 
@@ -2945,6 +3148,7 @@ mod tests {
             log_sink: Some(Arc::new(sink.clone())),
             reporter: Some(Arc::new(reporter.clone())),
             semantic_backend: kb_query::SemanticBackendConfig::default(),
+            captions: crate::captions::CaptionsConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3034,6 +3238,7 @@ mod tests {
             })),
             reporter: Some(Arc::new(reporter.clone())),
             semantic_backend: kb_query::SemanticBackendConfig::default(),
+            captions: crate::captions::CaptionsConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3071,6 +3276,7 @@ mod tests {
             log_sink: None,
             reporter: Some(Arc::new(reporter.clone())),
             semantic_backend: kb_query::SemanticBackendConfig::default(),
+            captions: crate::captions::CaptionsConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3147,6 +3353,7 @@ mod tests {
             log_sink: Some(Arc::new(MemorySink::default())),
             reporter: None,
             semantic_backend: kb_query::SemanticBackendConfig::default(),
+            captions: crate::captions::CaptionsConfig::default(),
         };
         let rendered = format!("{with_sink:?}");
         assert!(rendered.contains("Some(\"<LogSink>\")"), "got {rendered}");
@@ -3406,6 +3613,7 @@ mod tests {
                 log_sink: None,
                 reporter: None,
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
             },
             Some(&adapter),
         )

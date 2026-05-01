@@ -735,6 +735,35 @@ pub trait LlmAdapter: Send + Sync {
         ))
     }
 
+    /// Caption an image at `path` given a prompt.
+    ///
+    /// bn-2qda: used by the compile `captions` pass to generate 2-3 sentence
+    /// descriptions for un-described images so screenshots, diagrams, and
+    /// charts become first-class searchable through the existing lexical +
+    /// embedding pipelines. The pass passes the absolute path on disk and a
+    /// fixed prompt; the adapter is responsible for delivering the image to
+    /// the underlying vision-capable model (e.g. as a base64 data URI for
+    /// Claude, or an `-f <path>` flag for opencode).
+    ///
+    /// The default implementation returns [`LlmAdapterError::Other`] so that
+    /// adapters without vision support (test doubles, future air-gapped
+    /// runners) cause the captions pass to log a warning and skip the image
+    /// rather than hard-failing the compile.
+    ///
+    /// # Errors
+    ///
+    /// Returns `LlmAdapterError` if the backend cannot be reached, times out,
+    /// fails to parse the response, the file cannot be read, or the adapter
+    /// does not implement vision input.
+    fn caption_image(
+        &self,
+        _path: &std::path::Path,
+        _prompt: &str,
+    ) -> Result<(String, ProvenanceRecord), LlmAdapterError> {
+        Err(LlmAdapterError::Other(
+            "caption_image is not implemented by this adapter (vision unsupported)".to_string(),
+        ))
+    }
 
     /// Answer a user question using context documents.
     ///

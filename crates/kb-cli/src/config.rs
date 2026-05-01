@@ -243,12 +243,79 @@ impl Default for LlmRunnerConfig {
 #[serde(deny_unknown_fields)]
 pub struct CompileConfig {
     pub token_budget: u32,
+    /// `[compile.captions]` — bn-2qda. Vision-LLM auto-captions for
+    /// undescribed images.
+    pub captions: CaptionsConfig,
 }
 
 impl Default for CompileConfig {
     fn default() -> Self {
         Self {
             token_budget: 25_000,
+            captions: CaptionsConfig::default(),
+        }
+    }
+}
+
+/// `[compile.captions]` section of `kb.toml`. bn-2qda.
+///
+/// Controls the vision-LLM auto-caption pass that runs during `kb compile`,
+/// generating 2-3 sentence descriptions for images whose alt-text is empty,
+/// generic, or matches the filename stem. Captions are cached by content
+/// hash (`<root>/.kb/cache/captions/<hash>.txt`) so a re-compile pays the
+/// LLM cost zero times.
+///
+/// Default: `enabled = true`, runner = "claude" (uses
+/// `caption_image` on the configured Claude adapter), model =
+/// "claude-haiku-4-5", `allow_paths = ["wiki/", "sources/", "raw/"]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct CaptionsConfig {
+    /// Master switch. When `false` the captions pass is a no-op.
+    pub enabled: bool,
+    /// Which `[llm.runners.<name>]` to use for vision input. The named
+    /// runner must implement `LlmAdapter::caption_image` — claude does, the
+    /// opencode adapter does too via the `-f <path>` flag, and any other
+    /// adapter falls back to "vision unsupported" which the pass logs and
+    /// skips.
+    pub runner: String,
+    /// Vision-capable model id passed through to the runner. Forwarded
+    /// verbatim — kb does not validate against a hardcoded model list.
+    pub model: String,
+    /// Path prefixes (relative to the KB root) the pass is allowed to read
+    /// images from. Privacy guard: an image outside any prefix is skipped
+    /// silently. Empty list means "no images allowed", failing closed
+    /// against a misconfigured TOML.
+    pub allow_paths: Vec<String>,
+}
+
+impl Default for CaptionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            runner: "claude".to_string(),
+            model: "claude-haiku-4-5".to_string(),
+            allow_paths: vec![
+                "wiki/".to_string(),
+                "sources/".to_string(),
+                "raw/".to_string(),
+            ],
+        }
+    }
+}
+
+impl CaptionsConfig {
+    /// Translate the parsed TOML into the runtime
+    /// [`kb_compile::captions::CaptionsConfig`] the captions pass consumes.
+    /// The two types are kept separate so the pipeline doesn't depend on
+    /// `toml`/`serde` plumbing.
+    #[must_use]
+    pub fn to_pipeline_config(&self) -> kb_compile::captions::CaptionsConfig {
+        kb_compile::captions::CaptionsConfig {
+            enabled: self.enabled,
+            allow_paths: self.allow_paths.clone(),
+            prompt: kb_compile::captions::DEFAULT_PROMPT.to_string(),
         }
     }
 }
@@ -805,5 +872,56 @@ tokenizer_path = "~/.cache/kb/models/minilm-l6-v2-tokenizer.json"
                 .and_then(|runner| runner.model.as_deref()),
             Some("cli-model")
         );
+    }
+
+    // bn-2qda: `[compile.captions]` section.
+
+    #[test]
+    fn captions_section_defaults_are_sane() {
+        let cfg = Config::default();
+        assert!(cfg.compile.captions.enabled);
+        assert_eq!(cfg.compile.captions.runner, "claude");
+        assert_eq!(cfg.compile.captions.model, "claude-haiku-4-5");
+        assert_eq!(
+            cfg.compile.captions.allow_paths,
+            vec![
+                "wiki/".to_string(),
+                "sources/".to_string(),
+                "raw/".to_string()
+            ],
+        );
+    }
+
+    #[test]
+    fn captions_section_round_trips_through_toml() -> Result<()> {
+        let toml = r#"
+[compile.captions]
+enabled = true
+runner = "claude"
+model = "claude-sonnet-4-7"
+allow_paths = ["wiki/", "private-sources/"]
+"#;
+        let parsed = Config::from_toml(toml)?;
+        assert_eq!(parsed.compile.captions.model, "claude-sonnet-4-7");
+        assert_eq!(
+            parsed.compile.captions.allow_paths,
+            vec!["wiki/".to_string(), "private-sources/".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn captions_to_pipeline_config_propagates_allow_paths() {
+        let cfg = CaptionsConfig {
+            allow_paths: vec!["only-here/".to_string()],
+            ..CaptionsConfig::default()
+        };
+        let pipeline_cfg = cfg.to_pipeline_config();
+        assert!(pipeline_cfg.enabled);
+        assert_eq!(pipeline_cfg.allow_paths, vec!["only-here/".to_string()]);
+        // Prompt is propagated from the captions module's default — kept
+        // out of the kb.toml schema so the prompt text doesn't sprawl into
+        // user config.
+        assert!(!pipeline_cfg.prompt.is_empty());
     }
 }

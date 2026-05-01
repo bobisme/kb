@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod backlinks;
+pub mod captions;
 pub mod concept_candidate;
 pub mod concept_extraction;
 pub mod concept_merge;
