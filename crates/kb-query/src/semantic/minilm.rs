@@ -1,4 +1,4 @@
-//! ONNX MiniLM-L6-v2 embedding backend (`semantic-ort` feature).
+//! ONNX `MiniLM-L6-v2` embedding backend (`semantic-ort` feature).
 //!
 //! Wraps the Sentence-Transformers `all-MiniLM-L6-v2` model exported to ONNX
 //! (Xenova quantized weights). 384-dim, mean-pool over token embeddings,
@@ -33,8 +33,8 @@ use super::model::{EmbeddingBackend, MINILM_BACKEND_ID, MINILM_DIM};
 const MODEL_FILENAME: &str = "minilm-l6-v2-int8.onnx";
 const TOKENIZER_FILENAME: &str = "minilm-l6-v2-tokenizer.json";
 
-/// Tokens beyond this index are dropped before inference. MiniLM-L6-v2 was
-/// trained with a 256-token window; longer inputs are clipped to that
+/// Tokens beyond this index are dropped before inference. `MiniLM-L6-v2`
+/// was trained with a 256-token window; longer inputs are clipped to that
 /// window to match the training distribution.
 const MAX_TOKENS: usize = 256;
 
@@ -51,7 +51,7 @@ const DOWNLOAD_READ_TIMEOUT_SECS: u64 = 60;
 static MODEL_DOWNLOAD_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static TOKENIZER_DOWNLOAD_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
-/// ONNX-backed MiniLM-L6-v2 embedding backend.
+/// ONNX-backed `MiniLM-L6-v2` embedding backend.
 pub struct MiniLmBackend {
     session: Mutex<Session>,
     tokenizer: Tokenizer,

@@ -12,6 +12,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use kb_query::{
     HybridOptions, HybridResult, LexicalIndex, SemanticBackend, SemanticBackendConfig,
+    SemanticBackendKind,
 };
 use serde::Deserialize;
 
@@ -42,13 +43,25 @@ impl WebState {
     /// Build a state from a kb root path using the always-available hash
     /// embedding backend.
     ///
+    /// Pins to [`SemanticBackendKind::Hash`] regardless of platform default
+    /// so callers (and tests) that haven't selected a specific backend can
+    /// construct a `WebState` even when the binary wasn't compiled with the
+    /// `semantic-ort` feature. Production paths should use
+    /// [`Self::with_backend_config`] with a config derived from `kb.toml`.
+    ///
     /// # Errors
     ///
     /// Returns an error if the lexical index at `<root>/state/indexes/lexical.json`
     /// exists but cannot be parsed. A missing index is not an error — search
     /// simply returns no results until `kb compile` is run.
     pub fn new(root: PathBuf) -> Result<Self> {
-        Self::with_backend_config(root, &SemanticBackendConfig::default())
+        Self::with_backend_config(
+            root,
+            &SemanticBackendConfig {
+                kind: SemanticBackendKind::Hash,
+                ..SemanticBackendConfig::default()
+            },
+        )
     }
 
     /// Build a state with an explicit embedding backend config. The kb-cli
@@ -233,7 +246,7 @@ async fn search_handler(
         state.index(),
         &query,
         limit,
-        HybridOptions::default(),
+        HybridOptions::for_backend(state.backend().kind()),
         state.backend(),
     ) {
         Ok(hits) => hits,

@@ -419,13 +419,23 @@ impl Default for LockConfig {
 /// lexical-only results indistinguishable from the pre-hybrid behavior.
 /// The `KB_SEMANTIC=0` env var overrides this at runtime — useful when
 /// debugging fusion regressions without touching the file.
+///
+/// `min_semantic_score` and `min_semantic_top_score_no_lexical` are
+/// optional (bn-2xbd) — when unset, the floors come from the active
+/// semantic backend's calibrated defaults (see
+/// [`kb_query::SemanticBackendKind::default_min_semantic_score`]). Hash and
+/// MiniLM live in different cosine score regimes, so a single global floor
+/// either lets noise through (low) or filters real matches (high).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct RetrievalConfig {
     pub semantic: bool,
     pub rrf_k: usize,
-    pub min_semantic_score: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_semantic_score: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_semantic_top_score_no_lexical: Option<f32>,
 }
 
 impl Default for RetrievalConfig {
@@ -433,21 +443,37 @@ impl Default for RetrievalConfig {
         Self {
             semantic: true,
             rrf_k: kb_query::RRF_K,
-            min_semantic_score: kb_query::MIN_SEMANTIC_SCORE,
+            // None = pick the active backend's calibrated floor at
+            // hybrid-options build time (see `to_hybrid_options`).
+            min_semantic_score: None,
+            min_semantic_top_score_no_lexical: None,
         }
     }
 }
 
 impl RetrievalConfig {
     /// Translate the parsed config into the runtime [`HybridOptions`] the
-    /// `kb-query` crate consumes. The two types are kept separate so
-    /// `kb-query` doesn't depend on `toml` / `serde` config plumbing.
+    /// `kb-query` crate consumes, picking backend-tuned floors when the
+    /// user hasn't pinned `min_semantic_score` /
+    /// `min_semantic_top_score_no_lexical` in `kb.toml`. bn-2xbd.
     #[must_use]
-    pub const fn to_hybrid_options(&self) -> kb_query::HybridOptions {
+    pub const fn to_hybrid_options(
+        &self,
+        backend_kind: kb_query::SemanticBackendKind,
+    ) -> kb_query::HybridOptions {
+        let min_score = match self.min_semantic_score {
+            Some(value) => value,
+            None => backend_kind.default_min_semantic_score(),
+        };
+        let min_top = match self.min_semantic_top_score_no_lexical {
+            Some(value) => value,
+            None => backend_kind.default_min_semantic_top_score_no_lexical(),
+        };
         kb_query::HybridOptions {
             semantic_enabled: self.semantic,
             rrf_k: self.rrf_k,
-            min_semantic_score: self.min_semantic_score,
+            min_semantic_score: min_score,
+            min_semantic_top_score_no_lexical: min_top,
         }
     }
 }
@@ -481,11 +507,16 @@ pub struct SemanticConfig {
 /// Mirror of [`kb_query::SemanticBackendKind`] kept here so `kb-query`
 /// stays free of `serde`/`toml` plumbing. The two enums must agree —
 /// see [`SemanticConfig::to_backend_config`].
+///
+/// `Default` is platform-aware (bn-2xbd): `Minilm` on non-Windows,
+/// `Hash` on Windows. Mirrors [`kb_query::SemanticBackendKind`] so a
+/// freshly-init'd `kb.toml` matches what the binary will actually use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticBackendKindConfig {
-    #[default]
+    #[cfg_attr(target_os = "windows", default)]
     Hash,
+    #[cfg_attr(not(target_os = "windows"), default)]
     Minilm,
 }
 
@@ -722,11 +753,21 @@ token_budget = 12000
     }
 
     #[test]
-    fn semantic_section_defaults_to_hash_backend() -> Result<()> {
+    fn semantic_section_defaults_match_platform() -> Result<()> {
         let cfg = Config::default();
-        assert_eq!(cfg.semantic.backend, SemanticBackendKindConfig::Hash);
+        let expected_cfg_kind = if cfg!(target_os = "windows") {
+            SemanticBackendKindConfig::Hash
+        } else {
+            SemanticBackendKindConfig::Minilm
+        };
+        let expected_runtime_kind = if cfg!(target_os = "windows") {
+            kb_query::SemanticBackendKind::Hash
+        } else {
+            kb_query::SemanticBackendKind::Minilm
+        };
+        assert_eq!(cfg.semantic.backend, expected_cfg_kind);
         let backend = cfg.semantic.to_backend_config();
-        assert_eq!(backend.kind, kb_query::SemanticBackendKind::Hash);
+        assert_eq!(backend.kind, expected_runtime_kind);
         Ok(())
     }
 

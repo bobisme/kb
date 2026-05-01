@@ -9,7 +9,7 @@
 //!   conceptual paraphrases.
 //!
 //! - [`MiniLmBackend`] — feature-gated behind `semantic-ort`. Wraps the
-//!   Sentence-Transformers all-MiniLM-L6-v2 ONNX model (384-dim, mean-pool +
+//!   Sentence-Transformers `all-MiniLM-L6-v2` ONNX model (384-dim, mean-pool +
 //!   L2 norm). Closes the lexical/semantic gap; bn-1rww. The model file is
 //!   cached under [`MiniLmBackend::cache_root`] and auto-downloaded from
 //!   Hugging Face on first use unless `KB_SEMANTIC_AUTO_DOWNLOAD=0`.
@@ -39,7 +39,7 @@ pub const HASH_BACKEND_ID: &str = "hash-embed-256";
 /// Stable identifier for the ORT `MiniLM` backend.
 pub const MINILM_BACKEND_ID: &str = "ort-minilm-384";
 
-/// Output dimensionality of the MiniLM-L6-v2 backend.
+/// Output dimensionality of the `MiniLM-L6-v2` backend.
 pub const MINILM_DIM: usize = 384;
 
 const NGRAM_MIN: usize = 3;
@@ -102,14 +102,49 @@ impl EmbeddingBackend for HashEmbedBackend {
 }
 
 /// Backend selector parsed from `kb.toml`.
+///
+/// `Default` is platform-aware (bn-2xbd, mirrors bones-cli):
+/// - non-Windows: [`Self::Minilm`] (assumes the `semantic-ort` feature is
+///   compiled in — kb-cli enables it via a target-specific dep).
+/// - Windows: [`Self::Hash`] — kb has no model2vec backend yet, and
+///   `ort`'s ONNX Runtime can clash with the MSVC CRT in the default
+///   distribution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticBackendKind {
     /// Always-available hash n-gram backend ([`HashEmbedBackend`]).
-    #[default]
+    #[cfg_attr(target_os = "windows", default)]
     Hash,
-    /// ONNX MiniLM-L6-v2 (`semantic-ort` feature).
+    /// ONNX `MiniLM-L6-v2` (`semantic-ort` feature).
+    #[cfg_attr(not(target_os = "windows"), default)]
     Minilm,
+}
+
+impl SemanticBackendKind {
+    /// Backend-tuned default for the [`crate::hybrid::HybridOptions::min_semantic_score`]
+    /// floor. Hash and `MiniLM` live in different cosine-score regimes — hash
+    /// unrelated text stays in `[0.05, 0.35]`, `MiniLM` in `[0.0, 0.15]` — so
+    /// a single global floor either lets noise through (low) or filters
+    /// real matches (high). Callers without an explicit user override
+    /// should consult this method.
+    #[must_use]
+    pub const fn default_min_semantic_score(self) -> f32 {
+        match self {
+            Self::Hash => crate::hybrid::HASH_MIN_SEMANTIC_SCORE,
+            Self::Minilm => crate::hybrid::MINILM_MIN_SEMANTIC_SCORE,
+        }
+    }
+
+    /// Backend-tuned default for the
+    /// [`crate::hybrid::HybridOptions`] top-when-no-lexical floor. Same
+    /// rationale as [`Self::default_min_semantic_score`].
+    #[must_use]
+    pub const fn default_min_semantic_top_score_no_lexical(self) -> f32 {
+        match self {
+            Self::Hash => crate::hybrid::HASH_MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
+            Self::Minilm => crate::hybrid::MINILM_MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
+        }
+    }
 }
 
 /// Configuration bag for [`SemanticBackend::from_config`].
@@ -159,6 +194,19 @@ impl std::fmt::Debug for SemanticBackend {
 }
 
 impl SemanticBackend {
+    /// Recover the [`SemanticBackendKind`] this instance was loaded with.
+    /// Used by callers (kb-web, kb-cli ask path) that hold a backend and
+    /// need to look up backend-tuned threshold defaults without re-reading
+    /// the config.
+    #[must_use]
+    pub const fn kind(&self) -> SemanticBackendKind {
+        match self {
+            Self::Hash(_) => SemanticBackendKind::Hash,
+            #[cfg(feature = "semantic-ort")]
+            Self::MiniLm(_) => SemanticBackendKind::Minilm,
+        }
+    }
+
     /// Construct a backend from the parsed config.
     ///
     /// # Errors
@@ -188,7 +236,7 @@ impl SemanticBackend {
         bail!(
             "kb.toml requests semantic backend `minilm` but this kb binary was built without \
              the `semantic-ort` feature. Rebuild with `cargo build --features semantic-ort` \
-             (or `just install --features semantic-ort`) to enable the ONNX MiniLM backend."
+             (or `just install --features semantic-ort`) to enable the ONNX `MiniLM` backend."
         )
     }
 }
@@ -334,14 +382,29 @@ mod tests {
         assert_eq!(backend.dimensions(), HASH_DIM);
     }
 
+    #[cfg(target_os = "windows")]
     #[test]
-    fn semantic_backend_dispatches_to_hash_by_default() {
+    fn semantic_backend_default_is_hash_on_windows() {
         let backend = SemanticBackend::from_config(&SemanticBackendConfig::default())
             .expect("hash backend always loads");
         assert_eq!(backend.backend_id(), HASH_BACKEND_ID);
         assert_eq!(backend.dimensions(), HASH_DIM);
         let v = backend.embed("hello").expect("embed");
         assert_eq!(v.len(), HASH_DIM);
+    }
+
+    #[test]
+    fn semantic_backend_explicit_hash_kind_dispatches_to_hash() {
+        // Independent of the platform default — when a user explicitly
+        // selects `Hash` (e.g. via `kb.toml backend = "hash"`), the
+        // dispatcher must honor it and return a hash-embed backend.
+        let backend = SemanticBackend::from_config(&SemanticBackendConfig {
+            kind: SemanticBackendKind::Hash,
+            ..SemanticBackendConfig::default()
+        })
+        .expect("hash backend always loads");
+        assert_eq!(backend.backend_id(), HASH_BACKEND_ID);
+        assert_eq!(backend.dimensions(), HASH_DIM);
     }
 
     #[cfg(not(feature = "semantic-ort"))]

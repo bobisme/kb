@@ -18,12 +18,21 @@ default = []
 # CUDA toolkit on the build host. Builds a non-portable binary; default
 # CPU build remains the supported distribution.
 cuda = ["kb-ingest-audio/cuda"]
-# Enable the ONNX MiniLM-L6-v2 semantic backend (bn-1rww). Pulls in the
-# `ort`, `tokenizers`, and `ureq` dependencies. Off by default so a plain
-# `cargo install --path crates/kb-cli` keeps the lighter dependency footprint.
-# Activate with `cargo install --path crates/kb-cli --features semantic-ort`
-# (or `just install-semantic-ort`).
+# Force the ONNX MiniLM-L6-v2 semantic backend on regardless of platform.
+# Non-Windows builds enable it automatically via the target-specific dep
+# section below; this flag is the escape hatch for Windows users (or
+# cross-compiles) who want to opt in despite the platform default.
 semantic-ort = ["kb-query/semantic-ort"]
+
+# Auto-select the semantic backend per platform (mirrors bones-cli, bn-2xbd).
+# Non-Windows: MiniLM-L6-v2 via ONNX Runtime — the higher-quality backend.
+# Windows: hash backend only, to avoid ONNX-Runtime CRT linking conflicts
+# until kb grows a model2vec backend.
+[target.'cfg(not(windows))'.dependencies]
+kb-query = { workspace = true, features = ["semantic-ort"] }
+
+[target.'cfg(windows)'.dependencies]
+kb-query = { workspace = true }
 
 [dependencies]
 anyhow.workspace = true
@@ -38,7 +47,6 @@ kb-ingest.workspace = true
 kb-ingest-audio.workspace = true
 kb-lint.workspace = true
 kb-llm.workspace = true
-kb-query.workspace = true
 kb-sqlite-vec.workspace = true
 kb-web.workspace = true
 rusqlite.workspace = true

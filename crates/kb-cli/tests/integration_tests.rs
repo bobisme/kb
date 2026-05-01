@@ -2659,10 +2659,14 @@ fn search_with_limit_flag() {
     assert!(output.status.success());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let line_count = stdout.lines().count();
-    assert!(
-        line_count <= 10,
-        "with --limit 2, output should have <=10 lines (title + reason lines): {stdout}"
+    // Counting result titles (one per `[score:` occurrence) is more robust
+    // than line-counting against per-hit reason lists, whose width varies
+    // with the active embedding backend (MiniLM emits an extra `semantic
+    // match` reason when scores clear the floor; hash often doesn't).
+    let result_count = stdout.matches("[score:").count();
+    assert_eq!(
+        result_count, 2,
+        "with --limit 2 we expect exactly 2 result titles in the output: {stdout}"
     );
 }
 

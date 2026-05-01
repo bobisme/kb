@@ -738,14 +738,13 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            let backend = kb_query::SemanticBackend::from_config(
-                &cfg.semantic.to_backend_config(),
-            )?;
+            let backend_config = cfg.semantic.to_backend_config();
+            let backend = kb_query::SemanticBackend::from_config(&backend_config)?;
             let results = kb_query::hybrid_search_with_backend(
                 search_root,
                 &query,
                 limit,
-                cfg.retrieval.to_hybrid_options(),
+                cfg.retrieval.to_hybrid_options(backend_config.kind),
                 &backend,
             )?;
             if cli.json {
@@ -2150,12 +2149,13 @@ fn run_ask(
         .into());
     }
 
-    let backend = kb_query::SemanticBackend::from_config(&cfg.semantic.to_backend_config())?;
+    let backend_config = cfg.semantic.to_backend_config();
+    let backend = kb_query::SemanticBackend::from_config(&backend_config)?;
     let retrieval_plan = kb_query::plan_retrieval_hybrid_with_backend(
         root,
         query,
         cfg.ask.token_budget,
-        cfg.retrieval.to_hybrid_options(),
+        cfg.retrieval.to_hybrid_options(backend_config.kind),
         &backend,
     )?;
 

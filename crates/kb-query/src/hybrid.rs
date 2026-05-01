@@ -34,15 +34,20 @@ pub const RRF_K: usize = 60;
 
 /// Hard floor on a semantic hit's score before it is included in fusion.
 ///
-/// The design doc lifted the `0.15` constant from `bones-search`, where
-/// it's tuned for ML-quality embeddings whose cosine for unrelated text
-/// hovers near 0. With kb v1's hash-embed backend, unrelated text shares
-/// enough character-n-gram surface for cosine to land in `[0.05, 0.35]`,
-/// so a 0.15 floor would let pure noise fuse with lexical hits. We raise
-/// the floor to `0.35` for the hash backend; when Phase 2 ships an ML
-/// backend the constant will likely move back down (or become
-/// backend-relative). Flagged as a deviation in the bone report.
-pub const MIN_SEMANTIC_SCORE: f32 = 0.35;
+/// Hash-embed-tuned default. Unrelated text shares enough character-n-gram
+/// surface for cosine to land in `[0.05, 0.35]`, so a lower floor would
+/// let pure noise fuse with lexical hits.
+///
+/// `MiniLM` unrelated text typically lands below `0.15`; for that backend,
+/// see [`MINILM_MIN_SEMANTIC_SCORE`]. [`SemanticBackendKind::default_min_semantic_score`]
+/// is the canonical lookup — read it instead of hardcoding the constant.
+pub const MIN_SEMANTIC_SCORE: f32 = HASH_MIN_SEMANTIC_SCORE;
+
+/// Hash-embed floor for fusion (bn-3qsj).
+pub const HASH_MIN_SEMANTIC_SCORE: f32 = 0.35;
+
+/// `MiniLM`-tuned floor for fusion. Matches `bones-search` (bn-2xbd).
+pub const MINILM_MIN_SEMANTIC_SCORE: f32 = 0.15;
 
 /// Stricter floor when lexical returned zero hits.
 ///
@@ -51,9 +56,16 @@ pub const MIN_SEMANTIC_SCORE: f32 = 0.35;
 /// as a real match. Hash-embed's morphological hits land in `[0.45,
 /// 0.55]`; pure noise against the same corpus hovers in `[0.20, 0.40]`.
 /// A floor of `0.45` catches the morphological match while still
-/// rejecting most of the noise. Same rationale as [`MIN_SEMANTIC_SCORE`]
-/// applies — the bones constant of 0.20 is too low for the hash backend.
-pub const MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL: f32 = 0.45;
+/// rejecting most of the noise.
+///
+/// `MiniLM` has cleaner separation; see [`MINILM_MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL`].
+pub const MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL: f32 = HASH_MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL;
+
+/// Hash-embed top-no-lexical floor.
+pub const HASH_MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL: f32 = 0.45;
+
+/// `MiniLM`-tuned top-no-lexical floor. Matches `bones-search` (bn-2xbd).
+pub const MINILM_MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL: f32 = 0.20;
 
 static SEMANTIC_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -90,8 +102,15 @@ pub struct HybridOptions {
     pub semantic_enabled: bool,
     /// `k` in `1 / (k + rank)`.
     pub rrf_k: usize,
-    /// Minimum semantic score for a hit to enter fusion.
+    /// Minimum semantic score for a hit to enter fusion. Hash and `MiniLM`
+    /// have very different score distributions; pick the right floor with
+    /// [`Self::for_backend`] (or
+    /// [`crate::SemanticBackendKind::default_min_semantic_score`])
+    /// instead of hardcoding [`MIN_SEMANTIC_SCORE`].
     pub min_semantic_score: f32,
+    /// Stricter floor on the *top* semantic hit when lexical returned
+    /// nothing. Same backend-relative tuning as [`Self::min_semantic_score`].
+    pub min_semantic_top_score_no_lexical: f32,
 }
 
 impl Default for HybridOptions {
@@ -100,6 +119,23 @@ impl Default for HybridOptions {
             semantic_enabled: true,
             rrf_k: RRF_K,
             min_semantic_score: MIN_SEMANTIC_SCORE,
+            min_semantic_top_score_no_lexical: MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
+        }
+    }
+}
+
+impl HybridOptions {
+    /// Construct options with thresholds calibrated for the given backend
+    /// (bn-2xbd). `MiniLM` lands in a much tighter cosine band than hash, so
+    /// a single global floor either lets junk through or filters real
+    /// matches — picking per-backend defaults avoids both failure modes.
+    #[must_use]
+    pub const fn for_backend(kind: crate::SemanticBackendKind) -> Self {
+        Self {
+            semantic_enabled: true,
+            rrf_k: RRF_K,
+            min_semantic_score: kind.default_min_semantic_score(),
+            min_semantic_top_score_no_lexical: kind.default_min_semantic_top_score_no_lexical(),
         }
     }
 }
@@ -225,6 +261,7 @@ pub fn hybrid_search_with_index_and_backend(
         semantic_hits,
         lexical_hits.is_empty(),
         options.min_semantic_score,
+        options.min_semantic_top_score_no_lexical,
     );
 
     Ok(fuse(
@@ -270,11 +307,12 @@ fn filter_semantic(
     hits: Vec<SemanticHit>,
     lexical_empty: bool,
     min_semantic_score: f32,
+    min_semantic_top_score_no_lexical: f32,
 ) -> Vec<SemanticHit> {
     if hits.is_empty() {
         return hits;
     }
-    if lexical_empty && hits[0].score < MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL {
+    if lexical_empty && hits[0].score < min_semantic_top_score_no_lexical {
         return Vec::new();
     }
     hits.into_iter()
@@ -446,6 +484,7 @@ pub fn plan_retrieval_hybrid_with_backend(
             hits,
             plan.candidates.is_empty(),
             options.min_semantic_score,
+            options.min_semantic_top_score_no_lexical,
         ),
         Err(err) => {
             if !SEMANTIC_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
@@ -598,7 +637,12 @@ mod tests {
     fn filter_semantic_drops_below_threshold() {
         // Default min is MIN_SEMANTIC_SCORE; only hits >= that survive.
         let hits = vec![sem("a", 0.7), sem("b", 0.40), sem("c", 0.10)];
-        let filtered = filter_semantic(hits, false, MIN_SEMANTIC_SCORE);
+        let filtered = filter_semantic(
+            hits,
+            false,
+            MIN_SEMANTIC_SCORE,
+            MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
+        );
         assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].item_id, "a");
         assert_eq!(filtered[1].item_id, "b");
@@ -610,14 +654,24 @@ mod tests {
         // no lexical safety net. The 0.45 floor blocks pure-noise
         // hash-embed scores that hover in [0.05, 0.40].
         let hits = vec![sem("a", 0.40), sem("b", 0.36)];
-        let filtered = filter_semantic(hits, true, MIN_SEMANTIC_SCORE);
+        let filtered = filter_semantic(
+            hits,
+            true,
+            MIN_SEMANTIC_SCORE,
+            MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
+        );
         assert!(filtered.is_empty());
     }
 
     #[test]
     fn filter_semantic_keeps_high_top_when_lexical_empty() {
         let hits = vec![sem("a", 0.85), sem("b", 0.60), sem("c", 0.10)];
-        let filtered = filter_semantic(hits, true, MIN_SEMANTIC_SCORE);
+        let filtered = filter_semantic(
+            hits,
+            true,
+            MIN_SEMANTIC_SCORE,
+            MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
+        );
         assert_eq!(filtered.len(), 2);
     }
 
