@@ -12,6 +12,7 @@ pub mod progress;
 pub mod promotion;
 pub mod source_page;
 pub mod source_summary;
+pub mod state;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};

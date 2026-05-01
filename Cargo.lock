@@ -1845,6 +1845,7 @@ dependencies = [
  "kb-llm",
  "kb-query",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",

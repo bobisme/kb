@@ -211,7 +211,13 @@ enum Command {
         audio_out: Option<PathBuf>,
     },
     /// Compile the knowledge base
-    Compile,
+    Compile {
+        /// bn-2n7l: print the per-stage incremental cache (`compile.db`)
+        /// and what would re-run vs. skip on the next compile, then
+        /// exit. Read-only — never invokes the LLM, never writes.
+        #[arg(long)]
+        explain: bool,
+    },
     /// Query the knowledge base with natural language
     Ask {
         /// Question to ask (reads from stdin if omitted or "-")
@@ -615,7 +621,7 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     match cli.command {
-        Some(Command::Compile) => {
+        Some(Command::Compile { explain }) => {
             let compile_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
@@ -624,7 +630,14 @@ fn run(cli: Cli) -> Result<()> {
             let json = cli.json;
             let quiet = cli.quiet;
             let cli_model = cli.model.clone();
-            if dry_run {
+            if explain {
+                // bn-2n7l: read-only inspection of the per-stage cache.
+                // Like dry-run, it does not take the root lock or emit
+                // a job manifest — running an explain mid-compile is
+                // intentional (operators want to see why a compile is
+                // grinding away even while it is still in flight).
+                run_compile_explain(compile_root, json)
+            } else if dry_run {
                 // Dry-run reads graph/hashes and prints what would happen; it
                 // writes nothing. Bypass `execute_mutating_command_with_handle`
                 // so we neither block on the root lock (held by an in-flight
@@ -3755,6 +3768,79 @@ fn render_quote_verification_footer(verifications: &[kb_core::QuoteVerification]
         }
     }
     out
+}
+
+/// bn-2n7l: read-only inspection of the per-stage incremental compile
+/// cache (`<root>/.kb/state/compile.db`).
+///
+/// Lists every recorded `(stage, entity_id)` row with its input hash and
+/// last-run timestamp so operators can see what the pipeline would skip
+/// vs. re-run on the next compile invocation. Never invokes the LLM,
+/// never takes the root lock — safe to run mid-compile.
+fn run_compile_explain(compile_root: &Path, json: bool) -> Result<()> {
+    let db_path = kb_compile::state::compile_db_path(compile_root);
+    if !db_path.exists() {
+        if json {
+            emit_json(
+                "compile",
+                serde_json::json!({
+                    "compile_db": db_path,
+                    "exists": false,
+                    "stages": [],
+                }),
+            )?;
+        } else {
+            println!(
+                "compile.db not found at {} — run `kb compile` once to populate it.",
+                db_path.display(),
+            );
+        }
+        return Ok(());
+    }
+
+    let conn = kb_compile::state::open_state_db(compile_root)
+        .context("open compile state db for --explain")?;
+    let stages = kb_compile::state::list_stage_records(&conn)
+        .context("read stage_state rows")?;
+
+    if json {
+        let rows: Vec<serde_json::Value> = stages
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "stage": row.stage,
+                    "entity_id": row.entity_id,
+                    "input_hash": row.input_hash,
+                    "last_run_at_millis": row.last_run_at_millis,
+                })
+            })
+            .collect();
+        emit_json(
+            "compile",
+            serde_json::json!({
+                "compile_db": db_path,
+                "exists": true,
+                "stages": rows,
+            }),
+        )?;
+        return Ok(());
+    }
+
+    println!("compile state db: {}", db_path.display());
+    if stages.is_empty() {
+        println!("  (no stage_state rows yet — first compile has not finished)");
+        return Ok(());
+    }
+    println!("  {} stage record(s) — next compile will skip stages whose", stages.len());
+    println!("  input fingerprint still matches:");
+    for row in &stages {
+        let ts = row
+            .last_run_at_millis
+            .map_or_else(|| "ts=?".to_string(), |ms| format!("ts={ms}"));
+        let short = row.input_hash.get(..12).unwrap_or(row.input_hash.as_str());
+        println!("    [{ts}] {} {}  (hash {})", row.stage, row.entity_id, short);
+    }
+    Ok(())
 }
 
 /// Execute one `kb compile` invocation (dry-run or real) against `root`.
@@ -7007,7 +7093,7 @@ generated_at: 0\nbuild_record_id: build-1\n---\n\n# Source\n",
             json: true,
             force: false,
             quiet: false,
-            command: Some(Command::Compile),
+            command: Some(Command::Compile { explain: false }),
         })
         .expect("compile --dry-run succeeds");
         assert!(

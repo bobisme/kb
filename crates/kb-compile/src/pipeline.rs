@@ -13,6 +13,9 @@ use kb_core::{prompts_dir, state_dir};
 use kb_llm::{ConceptCandidate, LlmAdapter};
 
 use crate::progress::{LineLogReporter, ProgressReporter};
+use crate::state::{
+    self, STAGE_CONCEPT_EXTRACTION, STAGE_SOURCE_SUMMARY, SourceStateRow, fingerprint_inputs,
+};
 use crate::{Graph, HashState, StaleNode, detect_stale};
 
 /// No-op reporter used when `options.progress = false` and no reporter is
@@ -356,6 +359,47 @@ fn compile_template_hash(root: &Path) -> String {
     hash_many(&refs).to_hex()
 }
 
+/// bn-2n7l: hash of a single named prompt template, used by the per-stage
+/// incremental cache. Distinct from [`compile_template_hash`] (combined
+/// hash over every template) so a change to e.g. `extract_concepts.md`
+/// does not invalidate the `source_summary` stage's cache for unrelated
+/// docs. Returns the empty string when the template can't be loaded —
+/// falls through to a "no template hash" input that re-hashes whenever
+/// the template is restored.
+fn single_template_hash(root: &Path, name: &str) -> String {
+    kb_llm::Template::load(name, Some(root))
+        .map(|t| t.template_hash.to_hex())
+        .unwrap_or_default()
+}
+
+/// bn-2n7l: prior-run model id for a per-source build record, if any.
+///
+/// `state/build_records/build:<pass>:<doc_id>.json` carries the
+/// `model_version` that ran last time. We feed it into the per-stage
+/// input hash so a model change in `kb.toml` naturally invalidates the
+/// cache once a fresh run lands a new build record. On the very first
+/// compile (no prior record), this returns `None` and the model is
+/// omitted from the fingerprint — same behavior as the existing
+/// `HashState`-based stale detection, which also doesn't include model.
+fn previous_model_for(root: &Path, pass: &str, doc_id: &str) -> Option<String> {
+    let path = kb_core::build_records_dir(root)
+        .join(format!("build:{pass}:{doc_id}.json"));
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let record: kb_core::BuildRecord = serde_json::from_str(&raw).ok()?;
+    record.metadata.model_version
+}
+
+/// Current Unix-epoch timestamp in milliseconds, clamped into `i64` so
+/// `SQLite`'s INTEGER column accepts it. Returns 0 on the (near-impossible)
+/// case where the system clock is before 1970 — preferable to refusing
+/// to write the row at all.
+fn now_millis_i64() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| {
+        i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
+    })
+}
+
 /// Key used in `HashState.hashes` for the global `concept_merge` fingerprint.
 /// Not a valid node id (contains ':'), so it cannot collide with per-doc keys.
 const CONCEPT_MERGE_FINGERPRINT_KEY: &str = "concept_merge:global";
@@ -616,6 +660,19 @@ pub fn run_compile_with_llm(
     reporter.info(&banner);
     log_message(options, &banner);
 
+    // bn-2n7l: open the per-stage incremental cache. Failure here is
+    // non-fatal — fall through with `None` and the per-doc passes will
+    // run unconditionally (legacy behavior). The DB lives at
+    // `<root>/.kb/state/compile.db` and survives across compile
+    // invocations; schema migrations are idempotent.
+    let state_conn = match state::open_state_db(root) {
+        Ok(conn) => Some(conn),
+        Err(err) => {
+            tracing::warn!("compile state db unavailable, incremental cache disabled: {err}");
+            None
+        }
+    };
+
     // Per-document LLM passes (only when an adapter is configured and we have stale docs).
     if let Some(adapter) = adapter {
         if !stale_doc_ids.is_empty() {
@@ -625,6 +682,7 @@ pub fn run_compile_with_llm(
                 adapter,
                 options,
                 reporter.as_ref(),
+                state_conn.as_ref(),
             ) {
                 Ok(report) => {
                     build_records_emitted += report.build_records_emitted;
@@ -1154,11 +1212,28 @@ struct PerDocumentReport {
     source_pages_written: usize,
     candidate_files_written: usize,
     build_records_emitted: usize,
+    /// bn-2n7l: count of stale docs whose `source_summary` `stage_state`
+    /// fingerprint matched the prior run, so the LLM call was skipped.
+    /// Currently consumed only by tests + `kb compile --explain`; the
+    /// outer report rolls these into `affected = 0` reads since the
+    /// pass-level Executed entry is the user-visible signal.
+    #[allow(dead_code)]
+    source_summary_skipped_incremental: usize,
+    /// bn-2n7l: per-doc skip count for `concept_extraction`.
+    #[allow(dead_code)]
+    concept_extraction_skipped_incremental: usize,
 }
 
 /// For each stale normalized document, run source summary + source page render +
 /// concept extraction. Writes are atomic; a failure for one document still lets the
 /// others finish (so a single bad source does not poison the whole compile).
+///
+/// `state_conn` is the per-stage incremental cache (`compile.db`, bn-2n7l).
+/// When `Some`, each stage looks up its `(stage, doc_id)` row before calling
+/// the LLM — a fingerprint match short-circuits the call and the doc's
+/// existing wiki page / candidates JSON are kept as-is. `force` bypasses
+/// the lookup but still upserts the new fingerprint so the cache stays
+/// current for the next compile.
 #[allow(clippy::too_many_lines)]
 fn run_per_document_passes(
     root: &Path,
@@ -1166,10 +1241,13 @@ fn run_per_document_passes(
     adapter: &(dyn LlmAdapter + '_),
     options: &CompileOptions,
     reporter: &dyn ProgressReporter,
+    state_conn: Option<&rusqlite::Connection>,
 ) -> Result<PerDocumentReport> {
     let mut source_pages_written = 0;
     let mut candidate_files_written = 0;
     let mut build_records_emitted = 0;
+    let mut source_summary_skipped_incremental = 0usize;
+    let mut concept_extraction_skipped_incremental = 0usize;
 
     let total = stale_doc_ids.len();
     let summary_overall_start = Instant::now();
@@ -1180,6 +1258,11 @@ fn run_per_document_passes(
     let concept_overall_start = Instant::now();
     let mut source_summary_affected = 0usize;
     let mut concept_extraction_affected = 0usize;
+
+    // Pre-load the per-stage template hashes once. Reading the file from
+    // disk per-doc would dominate the per-stage check otherwise.
+    let summary_template_hash = single_template_hash(root, "summarize_document.md");
+    let extract_template_hash = single_template_hash(root, "extract_concepts.md");
 
     for doc_id in stale_doc_ids {
         let mut doc = read_normalized_document(root, doc_id)
@@ -1221,6 +1304,78 @@ fn run_per_document_passes(
             .as_deref()
             .and_then(split_body_from_frontmatter);
         let page_id = format!("wiki-source-{}", slug_from_title(doc_id));
+
+        // bn-2n7l: per-stage incremental cache decision.
+        //
+        // Compose two input fingerprints — one for source_summary, one
+        // for concept_extraction — and look both up in `stage_state`. A
+        // hit means the stage's existing on-disk output is current; a
+        // miss means we must call the LLM.
+        //
+        // Summary's hash includes the wiki page path so a slug change
+        // (bn-nlw9) also triggers a re-render. Extraction depends on
+        // body + extract template + extract model — the summary text
+        // itself derives from the body, so when summary's cache hits
+        // the prior summary text is by definition still valid input.
+        //
+        // Coupling between the two stages: extract takes the summary
+        // text in-memory. If summary's cache HITS but extract's cache
+        // MISSES (e.g., a developer bumped only `extract_concepts.md`),
+        // we don't have the summary in memory to feed extract. In that
+        // case we MUST still run summary so extract has its input. This
+        // is the rare path; the common case (both hit, or both miss
+        // because the body changed) costs nothing extra.
+        let body_hash = hash_bytes(doc.canonical_text.as_bytes()).to_hex();
+        let prior_summary_model =
+            previous_model_for(root, "source-summary", doc_id).unwrap_or_default();
+        let summary_input_hash = fingerprint_inputs(&[
+            b"v1",
+            body_hash.as_bytes(),
+            summary_template_hash.as_bytes(),
+            prior_summary_model.as_bytes(),
+            page_path.to_string_lossy().as_bytes(),
+        ]);
+        let prior_extract_model =
+            previous_model_for(root, "extract-concepts", doc_id).unwrap_or_default();
+        let extract_input_hash = fingerprint_inputs(&[
+            b"v1",
+            body_hash.as_bytes(),
+            extract_template_hash.as_bytes(),
+            prior_extract_model.as_bytes(),
+        ]);
+
+        let candidates_path = crate::concept_extraction::concept_candidates_path(root, doc_id);
+
+        let summary_cache_hit = !options.force
+            && state_conn
+                .and_then(|conn| state::lookup_stage(conn, STAGE_SOURCE_SUMMARY, doc_id).ok())
+                .flatten()
+                .is_some_and(|row| row.input_hash == summary_input_hash);
+        let extract_cache_hit = !options.force
+            && candidates_path.exists()
+            && state_conn
+                .and_then(|conn| {
+                    state::lookup_stage(conn, STAGE_CONCEPT_EXTRACTION, doc_id).ok()
+                })
+                .flatten()
+                .is_some_and(|row| row.input_hash == extract_input_hash);
+
+        if summary_cache_hit && extract_cache_hit {
+            let skip_line =
+                format!("  [skip] source_summary: {doc_id} — incremental cache hit");
+            reporter.info(&skip_line);
+            log_message(options, &skip_line);
+            reporter.pass_item_done("source_summary", doc_id, Duration::ZERO);
+            source_summary_skipped_incremental += 1;
+            let skip_line = format!(
+                "  [skip] concept_extraction: {doc_id} — incremental cache hit"
+            );
+            reporter.info(&skip_line);
+            log_message(options, &skip_line);
+            reporter.pass_item_done("concept_extraction", doc_id, Duration::ZERO);
+            concept_extraction_skipped_incremental += 1;
+            continue;
+        }
 
         reporter.pass_item_start("source_summary", doc_id);
         log_message(options, &format!("  [run] source_summary: {doc_id}..."));
@@ -1274,6 +1429,51 @@ fn run_per_document_passes(
         save_build_record(root, &summary_artifact.build_record)
             .with_context(|| format!("save build record for source_summary {doc_id}"))?;
         build_records_emitted += 1;
+
+        // bn-2n7l: re-fingerprint with the actual model id we just got
+        // from the adapter's provenance. On the next compile we'll read
+        // this same model id from the build record we just saved.
+        let summary_model = summary_artifact
+            .build_record
+            .metadata
+            .model_version
+            .clone()
+            .unwrap_or_default();
+        let summary_input_hash_post = fingerprint_inputs(&[
+            b"v1",
+            body_hash.as_bytes(),
+            summary_template_hash.as_bytes(),
+            summary_model.as_bytes(),
+            page_path.to_string_lossy().as_bytes(),
+        ]);
+        if let Some(conn) = state_conn {
+            if let Err(err) = state::upsert_stage(
+                conn,
+                STAGE_SOURCE_SUMMARY,
+                doc_id,
+                &summary_input_hash_post,
+                now_millis_i64(),
+            ) {
+                // Cache write failures must not break the compile — the
+                // worst that happens is the next run re-summarizes.
+                tracing::warn!(
+                    "failed to upsert source_summary stage_state for {doc_id}: {err}"
+                );
+            }
+            if let Err(err) = state::upsert_source_state(
+                conn,
+                &SourceStateRow {
+                    source_id: doc_id.clone(),
+                    raw_path: stable_location.clone(),
+                    raw_hash: None,
+                    extracted_hash: None,
+                    body_hash: Some(body_hash.clone()),
+                    last_compiled_at_millis: Some(now_millis_i64()),
+                },
+            ) {
+                tracing::warn!("failed to upsert source_state for {doc_id}: {err}");
+            }
+        }
 
         // bn-1l1t: render each citation as a clickable markdown link to the
         // normalized source content. The path convention matches what
@@ -1336,7 +1536,24 @@ fn run_per_document_passes(
         }
         source_pages_written += 1;
 
-        let candidates_path = crate::concept_extraction::concept_candidates_path(root, doc_id);
+        // bn-2n7l: concept_extraction's incremental check was already
+        // computed up front (so we could short-circuit before running
+        // source_summary when both stages were cache hits). When extract
+        // hits cache here, source_summary must have been a cache miss
+        // (the both-hit branch above continues the loop) — that's the
+        // "templates_for_one_stage_changed" path. The candidates file
+        // on disk is the existing output; we leave it alone.
+        if extract_cache_hit {
+            let skip_line = format!(
+                "  [skip] concept_extraction: {doc_id} — incremental cache hit"
+            );
+            reporter.info(&skip_line);
+            log_message(options, &skip_line);
+            reporter.pass_item_done("concept_extraction", doc_id, Duration::ZERO);
+            concept_extraction_skipped_incremental += 1;
+            continue;
+        }
+
         reporter.pass_item_start("concept_extraction", doc_id);
         log_message(options, &format!("  [run] concept_extraction: {doc_id}..."));
         let extract_started = Instant::now();
@@ -1368,6 +1585,34 @@ fn run_per_document_passes(
                         elapsed.as_secs_f64(),
                     ),
                 );
+                // bn-2n7l: re-fingerprint with the model id from this
+                // run's provenance (mirrors the post-call upsert in
+                // source_summary above).
+                let extract_model = artifact
+                    .build_record
+                    .metadata
+                    .model_version
+                    .clone()
+                    .unwrap_or_default();
+                let extract_input_hash_post = fingerprint_inputs(&[
+                    b"v1",
+                    body_hash.as_bytes(),
+                    extract_template_hash.as_bytes(),
+                    extract_model.as_bytes(),
+                ]);
+                if let Some(conn) = state_conn {
+                    if let Err(err) = state::upsert_stage(
+                        conn,
+                        STAGE_CONCEPT_EXTRACTION,
+                        doc_id,
+                        &extract_input_hash_post,
+                        now_millis_i64(),
+                    ) {
+                        tracing::warn!(
+                            "failed to upsert concept_extraction stage_state for {doc_id}: {err}"
+                        );
+                    }
+                }
             }
             Err(err) => {
                 tracing::warn!("concept_extraction failed for {doc_id}: {err}");
@@ -1404,6 +1649,8 @@ fn run_per_document_passes(
         source_pages_written,
         candidate_files_written,
         build_records_emitted,
+        source_summary_skipped_incremental,
+        concept_extraction_skipped_incremental,
     })
 }
 
@@ -2727,6 +2974,253 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             2,
             "second compile must not call summarize again"
+        );
+    }
+
+    /// bn-2n7l: incremental cache. After a successful first compile, the
+    /// per-stage state DB records the fingerprint for `source_summary` +
+    /// `concept_extraction`. A second compile that sees no changes relies
+    /// on the legacy `HashState` to mark all docs clean — the per-stage
+    /// cache is a finer-grained backstop. Verify that `compile.db` is
+    /// populated with one row per (stage, `doc_id`) after compile #1.
+    #[test]
+    fn compile_populates_compile_db_after_first_run() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody A"))
+            .expect("write");
+        write_normalized_document(root, &test_doc("doc-b", "# Beta\nBody B"))
+            .expect("write");
+
+        let adapter = RecordingAdapter::default();
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
+            },
+            Some(&adapter),
+        )
+        .expect("compile");
+
+        let conn = crate::state::open_state_db(root).expect("open compile.db");
+        let rows = crate::state::list_stage_records(&conn).expect("list");
+        // One source_summary + one concept_extraction row per doc.
+        let stages: BTreeSet<(String, String)> = rows
+            .iter()
+            .map(|r| (r.stage.clone(), r.entity_id.clone()))
+            .collect();
+        assert!(stages.contains(&(
+            crate::state::STAGE_SOURCE_SUMMARY.to_string(),
+            "doc-a".to_string(),
+        )));
+        assert!(stages.contains(&(
+            crate::state::STAGE_SOURCE_SUMMARY.to_string(),
+            "doc-b".to_string(),
+        )));
+        assert!(stages.contains(&(
+            crate::state::STAGE_CONCEPT_EXTRACTION.to_string(),
+            "doc-a".to_string(),
+        )));
+        assert!(stages.contains(&(
+            crate::state::STAGE_CONCEPT_EXTRACTION.to_string(),
+            "doc-b".to_string(),
+        )));
+        assert_eq!(
+            stages.len(),
+            4,
+            "expected exactly 4 stage rows (2 stages × 2 docs); got {stages:?}"
+        );
+    }
+
+    /// bn-2n7l: when only one source's body changes between compiles, the
+    /// per-stage cache must skip the unchanged docs entirely — even if
+    /// `HashState` flags them all stale (e.g. because something else in
+    /// the combined template hash moved). Verify by mutating one doc and
+    /// confirming summarize/extract were called only once.
+    #[test]
+    fn editing_one_source_only_re_runs_its_per_stage_passes() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody A"))
+            .expect("write");
+        write_normalized_document(root, &test_doc("doc-b", "# Beta\nBody B"))
+            .expect("write");
+
+        let adapter = RecordingAdapter::default();
+        // First compile: 2 summarize + 2 extract calls.
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
+            },
+            Some(&adapter),
+        )
+        .expect("first compile");
+        assert_eq!(
+            adapter
+                .summarize_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        assert_eq!(
+            adapter
+                .extract_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+
+        // Mutate doc-a's body. Bump the source revision so HashState
+        // also sees doc-a as stale; doc-b stays untouched. We also need
+        // to delete the stored hashes.json entry for doc-b's body — the
+        // existing HashState path already handles this for us, but to
+        // exercise the per-stage cache we artificially mark *both* docs
+        // stale by clearing HashState entirely. The per-stage cache must
+        // then re-skip doc-b on its own.
+        let mut doc_a = kb_core::read_normalized_document(root, "doc-a").expect("read a");
+        doc_a.canonical_text = "# Alpha\nBody A — edited.".to_string();
+        doc_a.source_revision_id = "rev-a-v2".to_string();
+        kb_core::write_normalized_document(root, &doc_a).expect("rewrite a");
+        // Wipe HashState so the legacy filter does not also help us — we
+        // want to confirm the per-stage cache alone gates doc-b.
+        let hashes_path = state_dir(root).join("hashes.json");
+        if hashes_path.exists() {
+            std::fs::remove_file(&hashes_path).expect("remove hashes.json");
+        }
+
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
+            },
+            Some(&adapter),
+        )
+        .expect("second compile");
+
+        // Only doc-a should have triggered fresh LLM calls — doc-b's
+        // (stage, doc_id) row matches its prior fingerprint and is
+        // skipped by the per-stage cache.
+        assert_eq!(
+            adapter
+                .summarize_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "exactly one extra summarize call for doc-a; doc-b must skip"
+        );
+        assert_eq!(
+            adapter
+                .extract_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "exactly one extra extract call for doc-a; doc-b must skip"
+        );
+    }
+
+    /// bn-2n7l: `--force` re-runs every per-source pass regardless of
+    /// the per-stage cache, but still upserts fresh fingerprints so the
+    /// next compile (without `--force`) can resume incremental skips.
+    #[test]
+    fn force_flag_bypasses_per_stage_cache_and_refreshes_fingerprints() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        setup_kb(root);
+
+        write_normalized_document(root, &test_doc("doc-a", "# Alpha\nBody A"))
+            .expect("write");
+        let adapter = RecordingAdapter::default();
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
+            },
+            Some(&adapter),
+        )
+        .expect("first compile");
+        assert_eq!(
+            adapter
+                .summarize_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // --force: per-stage cache hit must be ignored.
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: true,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
+            },
+            Some(&adapter),
+        )
+        .expect("forced compile");
+        assert_eq!(
+            adapter
+                .summarize_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "--force must call the LLM even when fingerprint matches"
+        );
+        assert_eq!(
+            adapter
+                .extract_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "--force must call extract even when fingerprint matches"
+        );
+
+        // Third compile without --force: cache should hit again.
+        run_compile_with_llm(
+            root,
+            &CompileOptions {
+                force: false,
+                dry_run: false,
+                progress: false,
+                log_sink: None,
+                reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
+                captions: crate::captions::CaptionsConfig::default(),
+            },
+            Some(&adapter),
+        )
+        .expect("third compile");
+        assert_eq!(
+            adapter
+                .summarize_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "post-force compile must hit the cache again"
         );
     }
 
