@@ -1,0 +1,35 @@
+# Example golden set for `kb eval run`.
+#
+# Copy this file to <kb-root>/evals/golden.toml and edit it to match the
+# sources and concepts in your knowledge base. The runner scores each
+# query's top-10 hybrid retrieval ranking against the expected ids using
+# P@5, P@10, MRR, and nDCG@10.
+#
+# expected_sources:  bare source ids (the `src-<hex>` slug from
+#                    wiki/sources/<id>-<slug>.md). Substring match.
+# expected_concepts: concept slugs (the slug from
+#                    wiki/concepts/<slug>.md). Substring match.
+#
+# At least one of `expected_sources` or `expected_concepts` is required
+# per query — without expectations there is nothing to score against.
+
+[[query]]
+id = "auth-paraphrase"
+query = "how does authentication work?"
+expected_sources = ["src-cred"]
+expected_concepts = ["authentication"]
+
+[[query]]
+id = "auth-token-rotation"
+query = "when are authn tokens rotated?"
+expected_sources = ["src-cred"]
+
+[[query]]
+id = "billing-overview"
+query = "explain the billing pipeline"
+expected_sources = ["src-billing"]
+
+[[query]]
+id = "frontend-rendering"
+query = "how does the frontend render pixels?"
+expected_sources = ["src-frontend"]

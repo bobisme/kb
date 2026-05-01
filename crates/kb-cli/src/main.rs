@@ -2,6 +2,7 @@
 
 mod chat;
 mod config;
+mod eval;
 mod forget;
 mod id_resolve;
 mod init;
@@ -300,6 +301,36 @@ enum Command {
     /// moves each one into place via `std::fs::rename`. Idempotent — a
     /// second run on an already-migrated vault is a no-op.
     Migrate,
+    /// Run the golden Q/A retrieval-eval harness (bn-3sco)
+    ///
+    /// Loads `<kb-root>/evals/golden.toml`, runs every query through the
+    /// hybrid retriever (no LLM call), and scores the top-10 ranking
+    /// against the expected sources/concepts using P@K, MRR, and nDCG@10.
+    /// Results land in `evals/results/<UTC-timestamp>.json` plus a
+    /// `latest.md` summary.
+    Eval {
+        #[command(subcommand)]
+        action: EvalAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum EvalAction {
+    /// Run every golden query through hybrid retrieval and write a result
+    Run {
+        /// Compare the new run against a previously-saved result
+        /// (`evals/results/<name>.json`). When set, prints a side-by-side
+        /// diff table after the standard summary.
+        #[arg(long, value_name = "NAME")]
+        baseline: Option<String>,
+        /// Additionally copy the new result JSON to
+        /// `evals/results/<name>.json` so it can be referenced as a
+        /// baseline in later runs.
+        #[arg(long, value_name = "NAME")]
+        save_as: Option<String>,
+    },
+    /// List previously-written results in `evals/results/`, newest first
+    List,
 }
 
 #[derive(clap::Subcommand)]
@@ -957,6 +988,22 @@ fn run(cli: Cli) -> Result<()> {
             // not take the root lock. Running `kb compile` concurrently
             // would already have bailed out via the legacy-layout sentinel.
             migrate::run_migrate(migrate_root, cli.json)
+        }
+        Some(Command::Eval { action }) => {
+            let eval_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            match action {
+                EvalAction::Run { baseline, save_as } => {
+                    let flags = eval::RunFlags {
+                        baseline,
+                        save_as,
+                        json: cli.json,
+                    };
+                    eval::cmd_run(eval_root, &flags)
+                }
+                EvalAction::List => eval::cmd_list(eval_root, cli.json),
+            }
         }
         None => {
             println!("kb: a personal knowledge base compiler");

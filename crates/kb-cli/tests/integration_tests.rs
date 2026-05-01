@@ -8328,3 +8328,159 @@ fn ask_answer_footer_counts_verified_and_unverified_quotes() {
         "verified quote should not be re-listed under Unverified quotes:\n{unverified_section}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// bn-3sco: golden Q/A retrieval-eval harness
+// ---------------------------------------------------------------------------
+
+#[test]
+#[allow(clippy::too_many_lines, reason = "end-to-end test exercises three CLI invocations and validates output shape")]
+fn eval_run_writes_json_and_markdown_with_finite_metrics() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    // Tiny corpus: paraphrase fixture is enough to give the hybrid
+    // retriever something to rank.
+    write_paraphrase_fixture(&kb_root);
+
+    // Compile builds the lexical (+ semantic) index. No LLM call is
+    // needed because the eval harness skips LLMs entirely.
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    let compile_output = compile_cmd.output().expect("compile");
+    assert!(
+        compile_output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
+
+    // Drop a small golden.toml at <kb-root>/evals/golden.toml.
+    let evals_dir = kb_root.join("evals");
+    fs::create_dir_all(&evals_dir).expect("mkdir evals");
+    let golden_toml = r#"
+[[query]]
+id = "auth-paraphrase"
+query = "how does authentication work?"
+expected_sources = ["src-cred"]
+
+[[query]]
+id = "billing-overview"
+query = "explain the billing pipeline"
+expected_sources = ["src-billing"]
+"#;
+    fs::write(evals_dir.join("golden.toml"), golden_toml).expect("write golden.toml");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("eval").arg("run");
+    let output = cmd.output().expect("kb eval run");
+    assert!(
+        output.status.success(),
+        "kb eval run failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // The latest.md summary should always be present after a successful run.
+    let latest_md = kb_root.join("evals/results/latest.md");
+    assert!(
+        latest_md.exists(),
+        "expected {} to be written",
+        latest_md.display()
+    );
+    let md = fs::read_to_string(&latest_md).expect("read latest.md");
+    assert!(md.contains("auth-paraphrase"), "got latest.md: {md}");
+    assert!(md.contains("Aggregate"), "got latest.md: {md}");
+
+    // Locate the JSON result file (single file in evals/results/ apart
+    // from latest.md).
+    let results_dir = kb_root.join("evals/results");
+    let json_path = fs::read_dir(&results_dir)
+        .expect("read results dir")
+        .filter_map(Result::ok)
+        .find(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+        .map(|e| e.path())
+        .expect("json result file present");
+
+    let raw = fs::read_to_string(&json_path).expect("read json result");
+    let payload: Value = serde_json::from_str(&raw).expect("parse eval json");
+
+    // Sanity: top-level shape.
+    assert!(payload["run_id"].is_string(), "run_id missing: {payload}");
+    assert!(payload["backend_id"].is_string(), "backend_id missing");
+    let queries = payload["queries"].as_array().expect("queries array");
+    assert_eq!(queries.len(), 2, "expected two query results");
+
+    // Aggregate metrics must exist and be finite numbers (not NaN, not
+    // null) so callers can serialize them onward.
+    let agg = &payload["aggregate"];
+    for metric in ["p_at_5", "p_at_10", "mrr", "ndcg_10"] {
+        let value = agg[metric].as_f64();
+        assert!(
+            value.is_some_and(f64::is_finite),
+            "aggregate.{metric} should be a finite number, got {:?}",
+            agg[metric]
+        );
+    }
+
+    // Per-query metrics must also be finite.
+    for q in queries {
+        for metric in ["p_at_5", "p_at_10", "mrr", "ndcg_10"] {
+            let value = q[metric].as_f64();
+            assert!(
+                value.is_some_and(f64::is_finite),
+                "query.{metric} should be a finite number for {}, got {:?}",
+                q["id"], q[metric]
+            );
+        }
+        // ranking is a (possibly empty) array of strings.
+        assert!(q["ranking"].is_array(), "ranking missing on {q}");
+    }
+
+    // Now exercise --baseline + --save-as in a single follow-up run.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("eval")
+        .arg("run")
+        .arg("--save-as")
+        .arg("snap1");
+    let output = cmd.output().expect("save-as run");
+    assert!(
+        output.status.success(),
+        "save-as run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let snap_path = results_dir.join("snap1.json");
+    assert!(snap_path.exists(), "snap1.json should exist after --save-as");
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("eval")
+        .arg("run")
+        .arg("--baseline")
+        .arg("snap1");
+    let output = cmd.output().expect("baseline run");
+    assert!(
+        output.status.success(),
+        "baseline run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Eval diff"),
+        "baseline output should include the diff header, got:\n{stdout}"
+    );
+
+    // `kb eval list` should now show at least the snap1 + two timestamped
+    // runs in the listing.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("eval").arg("list");
+    let output = cmd.output().expect("list");
+    assert!(output.status.success(), "list failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("snap1"),
+        "list should include snap1: {stdout}"
+    );
+    assert!(
+        stdout.contains("(latest)"),
+        "list should mark a latest entry: {stdout}"
+    );
+}
