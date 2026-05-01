@@ -708,14 +708,17 @@ fn expand_user_path(raw: &str) -> std::path::PathBuf {
 }
 
 /// `[ingest]` section of `kb.toml`. Bundles per-stage knobs: the markitdown
-/// preprocessor and the OCR fallback that fires when markitdown's extraction
-/// is empty/short for a scanned PDF.
+/// preprocessor, the OCR fallback that fires when markitdown's extraction is
+/// empty/short for a scanned PDF, and (bn-3ij3) the page-aware PDF extractor
+/// that emits `<!-- kb:page N -->` markers so citations can deep-link to a
+/// specific page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct IngestConfig {
     pub markitdown: MarkitdownConfig,
     pub ocr: OcrConfig,
+    pub pdf: PdfConfig,
 }
 
 /// `[ingest.markitdown]` section of `kb.toml`. Controls whether `kb ingest`
@@ -828,6 +831,50 @@ impl OcrConfig {
             pdftoppm_command: self.pdftoppm_command.clone(),
             language: self.language.clone(),
             min_chars_threshold: self.min_chars_threshold,
+        }
+    }
+}
+
+/// `[ingest.pdf]` section of `kb.toml`. Controls the page-aware PDF
+/// extraction (bn-3ij3) that emits `<!-- kb:page N -->` markers so citations
+/// of the form `[src-id p.7]` can deep-link to a specific page in the
+/// rendered wiki source page. See `kb_ingest::PdfPageExtractOptions` for
+/// the runtime counterpart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct PdfConfig {
+    /// Master switch. Defaults on — the extraction is a no-op (warn + skip)
+    /// if `pdftotext` is missing on PATH, so leaving it on is safe even on
+    /// machines without poppler-utils installed. When disabled (or when
+    /// `pdftotext` isn't available), PDFs route through markitdown as
+    /// before, but the resulting markdown carries no page markers and
+    /// citations of the form `[src-id p.N]` will not resolve to a page
+    /// anchor.
+    pub enabled: bool,
+    /// `pdftotext` executable. Whitespace-split into program + leading argv
+    /// (so `"docker run --rm pdftotext"` works as a wrapper), mirroring
+    /// the `[ingest.ocr]` knobs.
+    pub pdftotext_command: String,
+}
+
+impl Default for PdfConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            pdftotext_command: "pdftotext".to_string(),
+        }
+    }
+}
+
+impl PdfConfig {
+    /// Translate the parsed config into the runtime `PdfPageExtractOptions`
+    /// the `kb-ingest` crate consumes.
+    #[must_use]
+    pub fn to_options(&self) -> kb_ingest::PdfPageExtractOptions {
+        kb_ingest::PdfPageExtractOptions {
+            enabled: self.enabled,
+            pdftotext_command: self.pdftotext_command.clone(),
         }
     }
 }

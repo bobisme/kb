@@ -16,7 +16,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use kb_ingest::{
-    IngestOptions, MarkitdownOptions, OcrCache, OcrOptions, ingest_paths_with_config,
+    IngestOptions, MarkitdownOptions, OcrCache, OcrOptions, PdfPageExtractOptions,
+    ingest_paths_with_config,
 };
 use tempfile::TempDir;
 
@@ -95,6 +96,10 @@ fn ocr_test_options(shim_dir: &Path) -> IngestOptions {
             language: "eng".to_string(),
             min_chars_threshold: 100,
         },
+        // Page-aware extraction off so the OCR fallback path is exercised
+        // exactly as before bn-3ij3 — these tests assert end-to-end on the
+        // markitdown→OCR pipeline, not on the new page-aware path.
+        pdf_page_extract: PdfPageExtractOptions::disabled(),
     }
 }
 
@@ -244,6 +249,7 @@ fn ocr_missing_binaries_are_warned_not_fatal() {
             language: "eng".to_string(),
             min_chars_threshold: 100,
         },
+        pdf_page_extract: PdfPageExtractOptions::disabled(),
     };
 
     let reports = ingest_paths_with_config(kb_root.path(), &[pdf], &options)

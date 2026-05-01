@@ -20,7 +20,9 @@
 //!     chunk_idx INTEGER NOT NULL,
 //!     heading TEXT,
 //!     content_hash TEXT NOT NULL,
-//!     embedding_json TEXT NOT NULL
+//!     embedding_json TEXT NOT NULL,
+//!     page_start INTEGER,                -- bn-3ij3: PDF page span, NULL for non-PDFs
+//!     page_end INTEGER
 //! );
 //! CREATE INDEX idx_chunk_item ON chunk_embeddings(item_id);
 //!
@@ -37,7 +39,9 @@
 //! incompatible. Bumping the `backend_id` (e.g. `ort-minilm-384` →
 //! `ort-minilm-384-chunked` for bn-3rzz) is therefore the migration
 //! mechanism: existing kb installs auto re-embed cleanly on first compile
-//! after upgrade.
+//! after upgrade. bn-3ij3 bumped both backend ids to the `-paged` suffix
+//! so that existing kb installs auto-rebuild and pick up `page_start` /
+//! `page_end` metadata for chunks coming from page-aware PDF ingest.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -151,7 +155,9 @@ pub fn ensure_embedding_schema(conn: &Connection) -> Result<()> {
             chunk_idx INTEGER NOT NULL,
             heading TEXT,
             content_hash TEXT NOT NULL,
-            embedding_json TEXT NOT NULL
+            embedding_json TEXT NOT NULL,
+            page_start INTEGER,
+            page_end INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS idx_chunk_item ON chunk_embeddings(item_id);
@@ -167,6 +173,43 @@ pub fn ensure_embedding_schema(conn: &Connection) -> Result<()> {
         VALUES (1, '', 0, 0);",
     )
     .context("create semantic index tables")?;
+
+    // Migration for kb installs that predate bn-3ij3: ALTER TABLE adds the
+    // `page_start` / `page_end` columns when they're missing. SQLite has
+    // no `IF NOT EXISTS` for `ADD COLUMN`, so we probe the schema first.
+    add_column_if_missing(conn, "chunk_embeddings", "page_start", "INTEGER")?;
+    add_column_if_missing(conn, "chunk_embeddings", "page_end", "INTEGER")?;
+    Ok(())
+}
+
+/// Add `<column> <type>` to `<table>` if the column is missing. Idempotent
+/// across multiple invocations (re-checks the schema each time). Used by
+/// [`ensure_embedding_schema`] to migrate older `chunk_embeddings` tables
+/// forward without dropping the existing rows; callers that need a hard
+/// reset should rely on [`handle_backend_change`] (which truncates on a
+/// `backend_id` mismatch).
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("prepare table_info for {table}"))?;
+    let columns: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("read columns for {table}"))?
+        .filter_map(Result::ok)
+        .collect();
+    if columns.iter().any(|c| c == column) {
+        return Ok(());
+    }
+    conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {column_type}"),
+        [],
+    )
+    .with_context(|| format!("add column {column} to {table}"))?;
     Ok(())
 }
 
@@ -225,6 +268,7 @@ pub fn sync_embeddings<B: EmbeddingBackend>(root: &Path, backend: &B) -> Result<
                 item_chunk.heading.as_deref(),
                 &item_chunk.content_hash,
                 &embedding,
+                item_chunk.page_range,
             )?;
             stats.embedded += 1;
         }
@@ -305,10 +349,15 @@ pub struct EmbeddingPipeline<'a, B: EmbeddingBackend> {
 impl<B: EmbeddingBackend> EmbeddingPipeline<'_, B> {
     /// Upsert a single chunk's embedding row.
     ///
+    /// `page_range` (bn-3ij3) is `Some((start, end))` for chunks coming
+    /// from page-aware PDF ingest and `None` for legacy text/markdown
+    /// sources. Both endpoints are inclusive.
+    ///
     /// # Errors
     ///
     /// Returns an error when the DB operation fails or the embedding
     /// vector dimensionality doesn't match the backend.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert(
         &self,
         chunk_id: &str,
@@ -317,6 +366,7 @@ impl<B: EmbeddingBackend> EmbeddingPipeline<'_, B> {
         heading: Option<&str>,
         content_hash: &str,
         embedding: &[f32],
+        page_range: Option<(u32, u32)>,
     ) -> Result<()> {
         if embedding.len() != self.backend.dimensions() {
             bail!(
@@ -327,17 +377,30 @@ impl<B: EmbeddingBackend> EmbeddingPipeline<'_, B> {
         }
         let json = encode_embedding_json(embedding);
         let chunk_idx_i64 = i64::try_from(chunk_idx).unwrap_or(i64::MAX);
+        let page_start: Option<i64> = page_range.map(|(s, _)| i64::from(s));
+        let page_end: Option<i64> = page_range.map(|(_, e)| i64::from(e));
         self.conn
             .execute(
-                "INSERT INTO chunk_embeddings (chunk_id, item_id, chunk_idx, heading, content_hash, embedding_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO chunk_embeddings (chunk_id, item_id, chunk_idx, heading, content_hash, embedding_json, page_start, page_end)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(chunk_id)
                  DO UPDATE SET item_id = excluded.item_id,
                                chunk_idx = excluded.chunk_idx,
                                heading = excluded.heading,
                                content_hash = excluded.content_hash,
-                               embedding_json = excluded.embedding_json",
-                params![chunk_id, item_id, chunk_idx_i64, heading, content_hash, json],
+                               embedding_json = excluded.embedding_json,
+                               page_start = excluded.page_start,
+                               page_end = excluded.page_end",
+                params![
+                    chunk_id,
+                    item_id,
+                    chunk_idx_i64,
+                    heading,
+                    content_hash,
+                    json,
+                    page_start,
+                    page_end
+                ],
             )
             .with_context(|| format!("upsert chunk_embedding for {chunk_id}"))?;
         Ok(())
@@ -486,6 +549,10 @@ struct ItemChunk {
     /// Hash of the embed input scoped by backend id + chunk index + heading,
     /// so identical bodies under different headings dedup independently.
     content_hash: String,
+    /// PDF page span this chunk covers (bn-3ij3). `None` for sources
+    /// without page metadata; `Some((start, end))` for chunks coming from
+    /// PDF page-aware ingest.
+    page_range: Option<(u32, u32)>,
 }
 
 fn collect_wiki_items(root: &Path) -> Result<Vec<WikiItem>> {
@@ -588,6 +655,7 @@ fn build_wiki_item(path: &Path, root: &Path, is_concept: bool) -> Result<WikiIte
                 heading,
                 embed_input: lead_trimmed.to_string(),
                 content_hash,
+                page_range: None,
             }]
         }
     } else {
@@ -631,6 +699,7 @@ fn build_item_chunk(idx: usize, lead: &str, chunk: &Chunk) -> ItemChunk {
         heading: chunk.heading.clone(),
         embed_input,
         content_hash,
+        page_range: chunk.page_range,
     }
 }
 
@@ -905,6 +974,71 @@ mod tests {
         assert!(!cleaned.contains("kb:end"));
         assert!(cleaned.contains("preamble"));
         assert!(cleaned.contains("epilogue"));
+    }
+
+    /// bn-3ij3: `page_start` and `page_end` columns are populated when the
+    /// source body carries `<!-- kb:page N -->` markers. Sources without
+    /// markers leave both columns NULL.
+    #[test]
+    fn paged_source_persists_page_columns() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        // Two-page body: one healthy paragraph per page.
+        let body = format!(
+            "<!-- kb:page 1 -->\n## First\n\n{}\n\n<!-- kb:page 2 -->\n## Second\n\n{}\n",
+            "alpha ".repeat(120),
+            "beta ".repeat(120),
+        );
+        write_source(root, "doc", "Doc", &body);
+
+        let backend = HashEmbedBackend::new();
+        sync_embeddings(root, &backend).expect("sync");
+
+        let conn = open_embedding_db(root).expect("open db");
+        let mut stmt = conn
+            .prepare(
+                "SELECT chunk_idx, page_start, page_end FROM chunk_embeddings \
+                 WHERE item_id = ?1 ORDER BY chunk_idx",
+            )
+            .expect("prep");
+        let rows: Vec<(i64, Option<i64>, Option<i64>)> = stmt
+            .query_map(params!["wiki/sources/doc.md"], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .expect("query")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(rows.len(), 2, "expected 2 chunks for 2-page source");
+        assert_eq!(rows[0].1, Some(1), "page_start should be 1 for first chunk");
+        assert_eq!(rows[0].2, Some(1), "page_end should be 1 for first chunk");
+        assert_eq!(rows[1].1, Some(2));
+        assert_eq!(rows[1].2, Some(2));
+    }
+
+    /// bn-3ij3: a source without page markers persists NULL page columns.
+    #[test]
+    fn unpaged_source_persists_null_page_columns() {
+        let tmp = tempdir().expect("tempdir");
+        let root = tmp.path();
+        write_source(root, "alpha", "Alpha", "## A\n\nBody A\n");
+
+        let backend = HashEmbedBackend::new();
+        sync_embeddings(root, &backend).expect("sync");
+
+        let conn = open_embedding_db(root).expect("open db");
+        let (page_start, page_end): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT page_start, page_end FROM chunk_embeddings WHERE item_id = ?1",
+                params!["wiki/sources/alpha.md"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read row");
+        assert_eq!(page_start, None);
+        assert_eq!(page_end, None);
     }
 
     #[test]

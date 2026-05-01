@@ -1297,6 +1297,11 @@ fn run_per_document_passes(
             &summary_artifact.summary,
             doc_id,
         );
+        // bn-3ij3: count `<!-- kb:page N -->` markers in the canonical
+        // text. When present, the source-page renderer emits a per-page
+        // anchor block so citations of the form `[src-id p.N]` deep-link
+        // to the correct page.
+        let pages_count = count_page_markers(&doc.canonical_text);
         let page_input = crate::source_page::SourcePageInput {
             page_id: &page_id,
             title: &title,
@@ -1307,6 +1312,7 @@ fn run_per_document_passes(
             summary: &rewritten_summary,
             key_topics: &summary_artifact.key_headings,
             citations: &citations_display,
+            pages: pages_count,
         };
 
         let page_artifact = crate::source_page::render_source_page(
@@ -1672,6 +1678,33 @@ fn format_source_citation_link(doc_id: &str, citation: &kb_core::Citation) -> St
     let target = anchor.map_or_else(|| path.clone(), |a| format!("{path}#{a}"));
     let label = anchor.map_or_else(|| citation.source_revision_id.clone(), str::to_string);
     format!("[{label}]({target})")
+}
+
+/// Count `<!-- kb:page N -->` markers in `text` and return the highest
+/// page number observed (bn-3ij3). When no markers are present the source
+/// didn't go through the page-aware ingest path and we return `None` so
+/// the source-page renderer skips the per-page anchor block.
+///
+/// We use the maximum N rather than the marker count because partial
+/// extraction failures may emit non-contiguous markers; rendering anchors
+/// up to the highest seen page guarantees every citation `[src-id p.K]`
+/// for K <= max has a matching anchor on the wiki page.
+fn count_page_markers(text: &str) -> Option<u32> {
+    let mut max_page: Option<u32> = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(inner) = trimmed.strip_prefix("<!--").and_then(|s| s.strip_suffix("-->")) else {
+            continue;
+        };
+        let inner = inner.trim();
+        let Some(rest) = inner.strip_prefix("kb:page") else {
+            continue;
+        };
+        if let Ok(n) = rest.trim().parse::<u32>() {
+            max_page = Some(max_page.map_or(n, |cur| cur.max(n)));
+        }
+    }
+    max_page
 }
 
 fn derive_title(canonical_text: &str, stem_fallback: Option<&str>, fallback_id: &str) -> String {
@@ -3512,6 +3545,34 @@ mod tests {
         let text = "---\ntitle: Explicit Title\n---\n# H1 heading\n";
         let title = derive_title(text, Some("file-stem"), "src-abc");
         assert_eq!(title, "Explicit Title");
+    }
+
+    /// bn-3ij3: a body with no kb:page markers returns `None`, signaling
+    /// to the source-page renderer that there are no per-page anchors to
+    /// inject.
+    #[test]
+    fn count_page_markers_returns_none_when_absent() {
+        assert_eq!(count_page_markers("plain body\n\n## section\n\nbody."), None);
+    }
+
+    /// bn-3ij3: with markers, the highest page number is returned. Non-
+    /// contiguous markers (page 1 missing, only 2 and 5 present) still
+    /// produce the maximum so the renderer covers every reachable page.
+    #[test]
+    fn count_page_markers_returns_max_page() {
+        let body = "<!-- kb:page 1 -->\nfirst\n\n<!-- kb:page 2 -->\nsecond\n\n<!-- kb:page 3 -->\nthird";
+        assert_eq!(count_page_markers(body), Some(3));
+
+        let body_with_gaps = "<!-- kb:page 2 -->\ntwo\n\n<!-- kb:page 5 -->\nfive";
+        assert_eq!(count_page_markers(body_with_gaps), Some(5));
+    }
+
+    /// bn-3ij3: managed-region fences (`<!-- kb:begin -->`, `<!-- kb:end -->`)
+    /// must NOT be misread as page markers.
+    #[test]
+    fn count_page_markers_ignores_other_kb_comments() {
+        let body = "<!-- kb:begin id=summary -->\nfoo\n<!-- kb:end id=summary -->";
+        assert_eq!(count_page_markers(body), None);
     }
 
     #[test]

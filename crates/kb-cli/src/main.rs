@@ -1795,6 +1795,7 @@ fn run_ingest(
         allow_empty,
         markitdown: cfg.ingest.markitdown.to_options(),
         ocr: cfg.ingest.ocr.to_options(),
+        pdf_page_extract: cfg.ingest.pdf.to_options(),
     };
 
     let mut results = Vec::new();

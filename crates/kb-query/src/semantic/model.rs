@@ -34,10 +34,17 @@ pub const HASH_DIM: usize = 256;
 
 /// Stable identifier for the hash backend. Stored in `semantic_meta` so
 /// changing backends triggers a re-embed of the corpus on the next compile.
-pub const HASH_BACKEND_ID: &str = "hash-embed-256-chunked";
+///
+/// bn-3ij3: bumped from `hash-embed-256-chunked` → `hash-embed-256-chunked-paged`
+/// so existing kb installs auto-rebuild and pick up `page_start` / `page_end`
+/// columns for chunks coming from page-aware PDF ingest.
+pub const HASH_BACKEND_ID: &str = "hash-embed-256-chunked-paged";
 
 /// Stable identifier for the ORT `MiniLM` backend.
-pub const MINILM_BACKEND_ID: &str = "ort-minilm-384-chunked";
+///
+/// bn-3ij3: bumped from `ort-minilm-384-chunked` → `ort-minilm-384-chunked-paged`
+/// for the same reason as [`HASH_BACKEND_ID`].
+pub const MINILM_BACKEND_ID: &str = "ort-minilm-384-chunked-paged";
 
 /// Output dimensionality of the `MiniLM-L6-v2` backend.
 pub const MINILM_DIM: usize = 384;
@@ -378,7 +385,7 @@ mod tests {
     #[test]
     fn backend_id_is_stable() {
         let backend = HashEmbedBackend::new();
-        assert_eq!(backend.backend_id(), "hash-embed-256-chunked");
+        assert_eq!(backend.backend_id(), "hash-embed-256-chunked-paged");
         assert_eq!(backend.dimensions(), HASH_DIM);
     }
 

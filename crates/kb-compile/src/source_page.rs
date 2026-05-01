@@ -13,6 +13,10 @@ const TITLE_REGION_ID: &str = "title";
 const SUMMARY_REGION_ID: &str = "summary";
 const KEY_TOPICS_REGION_ID: &str = "key_topics";
 const CITATIONS_REGION_ID: &str = "citations";
+/// bn-3ij3: per-page anchor list. Only emitted when the source carries
+/// `<!-- kb:page N -->` markers (page-aware PDF ingest); for legacy or
+/// non-PDF sources the section is omitted entirely.
+const PAGES_REGION_ID: &str = "pages";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourcePageInput<'a> {
@@ -25,6 +29,13 @@ pub struct SourcePageInput<'a> {
     pub summary: &'a str,
     pub key_topics: &'a [String],
     pub citations: &'a [String],
+    /// Total page count of the source, when the source was ingested with
+    /// page-aware extraction (bn-3ij3). When `None` or `Some(0)`, the
+    /// `## Pages` managed region is omitted entirely. When `Some(N)` the
+    /// region renders inline `<a name="page-K"></a>` anchors for K in
+    /// 1..=N so citations of the form `[src-id p.K]` can deep-link to the
+    /// right place via `wiki/sources/<src>.md#page-K`.
+    pub pages: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -352,12 +363,53 @@ fn upsert_source_page_body(existing_body: &str, input: &SourcePageInput<'_>) -> 
         KEY_TOPICS_REGION_ID,
         &render_bullet_list(input.key_topics),
     );
-    upsert_section(
+    body = upsert_section(
         &body,
         "## Citations",
         CITATIONS_REGION_ID,
         &render_bullet_list(input.citations),
-    )
+    );
+    // bn-3ij3: per-page anchor block. Only emitted when the source went
+    // through page-aware ingest. Existing region (from a previous compile
+    // when pages was Some) is preserved on stale-but-still-paged sources;
+    // a None pages count clears the region's content but leaves the fence
+    // in place so downstream tools see "we knew this was a paged source
+    // but the count is missing now".
+    if let Some(pages) = input.pages
+        && pages > 0
+    {
+        body = upsert_section(
+            &body,
+            "## Pages",
+            PAGES_REGION_ID,
+            &render_page_anchors(pages),
+        );
+    }
+    body
+}
+
+/// Render the per-page anchor block for the `## Pages` managed region.
+///
+/// Each page emits one `<a name="page-N"></a>` HTML anchor on its own
+/// line so a citation link `wiki/sources/<src>.md#page-N` resolves
+/// directly without relying on heading-id slugification (which differs
+/// across Markdown renderers). Markdown viewers that support inline HTML
+/// honor the anchor; viewers that don't see the human-readable label
+/// `Page N` next to it.
+///
+/// Page numbering follows the citation convention: 1-based, inclusive.
+fn render_page_anchors(pages: u32) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("\n");
+    for n in 1..=pages {
+        writeln!(
+            out,
+            "- <a name=\"{}\"></a>Page {n}",
+            kb_core::page_anchor_name(n),
+        )
+        .expect("write to String");
+    }
+    out
 }
 
 fn upsert_section(existing_body: &str, heading: &str, region_id: &str, content: &str) -> String {
@@ -474,6 +526,18 @@ mod tests {
             summary: "A concise summary.",
             key_topics,
             citations,
+            pages: None,
+        }
+    }
+
+    fn input_with_pages<'a>(
+        key_topics: &'a [String],
+        citations: &'a [String],
+        pages: u32,
+    ) -> SourcePageInput<'a> {
+        SourcePageInput {
+            pages: Some(pages),
+            ..input(key_topics, citations)
         }
     }
 
@@ -541,6 +605,33 @@ mod tests {
     fn render_source_page_uses_empty_placeholder_lists() {
         let artifact = render_source_page(&input(&[], &[]), None).expect("render");
         assert!(artifact.body.contains("- _None yet._"));
+    }
+
+    /// bn-3ij3: when the source has no page metadata, the `## Pages`
+    /// region must NOT appear so legacy/non-PDF sources stay clean.
+    #[test]
+    fn render_source_page_omits_pages_region_when_pages_absent() {
+        let artifact = render_source_page(&input(&[], &[]), None).expect("render");
+        assert!(!artifact.body.contains("<!-- kb:begin id=pages -->"));
+        assert!(!artifact.body.contains("## Pages"));
+    }
+
+    /// bn-3ij3: when the source carries page metadata, the `## Pages`
+    /// region renders an inline `<a name="page-N"></a>` for every page so
+    /// citation links of the form `wiki/sources/<src>.md#page-N` resolve.
+    #[test]
+    fn render_source_page_emits_pages_region_when_pages_known() {
+        let artifact =
+            render_source_page(&input_with_pages(&[], &[], 3), None).expect("render");
+        assert!(
+            artifact.body.contains("<!-- kb:begin id=pages -->"),
+            "pages region missing; body: {}",
+            artifact.body
+        );
+        assert!(artifact.body.contains("<a name=\"page-1\">"));
+        assert!(artifact.body.contains("<a name=\"page-2\">"));
+        assert!(artifact.body.contains("<a name=\"page-3\">"));
+        assert!(artifact.body.contains("Page 1"));
     }
 
     /// bn-1geb Part B acceptance: `rewrite_summary_image_refs` re-anchors

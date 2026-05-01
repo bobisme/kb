@@ -54,6 +54,12 @@ pub struct Chunk {
     /// Soft `chars / 4` token estimate. Used by the chunker to decide
     /// further splitting / merging; consumers can ignore it.
     pub estimated_tokens: usize,
+    /// PDF page span this chunk covers, when the source body carries
+    /// `<!-- kb:page N -->` markers (bn-3ij3). `None` for sources without
+    /// page metadata (existing markdown, transcripts, web articles, …).
+    /// Inclusive on both ends: `(7, 7)` means "lives entirely on page 7";
+    /// `(7, 9)` means "spans pages 7 through 9 inclusive".
+    pub page_range: Option<(u32, u32)>,
 }
 
 impl Chunk {
@@ -64,8 +70,10 @@ impl Chunk {
             heading,
             body: trimmed,
             estimated_tokens,
+            page_range: None,
         }
     }
+
 }
 
 #[inline]
@@ -84,14 +92,56 @@ fn estimate_tokens(text: &str) -> usize {
 /// - Mixed H2/H3 → an entry per H2 section; an oversized section gets
 ///   re-split by its H3 children, then by paragraph if any H3 chunk is
 ///   still too big.
+///
+/// bn-3ij3: when the body carries `<!-- kb:page N -->` page markers
+/// (emitted by page-aware PDF ingest), each chunk's `page_range` field is
+/// populated and chunks never span pages — the page boundary is treated
+/// as a hard boundary, with the merge pass collapsing small pages into
+/// their neighbor only if doing so keeps a single chunk on a single page
+/// or a contiguous page range.
 #[must_use]
 pub fn chunk_markdown(body: &str) -> Vec<Chunk> {
     let cleaned = strip_managed_region_fences(body);
-    let sections = split_by_heading(&cleaned, 2);
+
+    // Page-aware path: if the body has `<!-- kb:page N -->` markers, slice
+    // by page first and chunk each page independently. The merge pass
+    // collapses tiny adjacent pages into a contiguous range so a one-line
+    // page (a chapter heading on its own page, say) doesn't end up as a
+    // standalone chunk.
+    let pages = split_by_page_markers(&cleaned);
+    if pages.iter().any(|p| p.page_range.is_some()) {
+        let mut chunks: Vec<Chunk> = Vec::new();
+        for page in pages {
+            for chunk in chunk_section(&page.body, None) {
+                let mut c = chunk;
+                c.page_range = page.page_range;
+                chunks.push(c);
+            }
+        }
+        return merge_short_chunks(chunks);
+    }
+
+    // Non-paged path: legacy H2/H3/paragraph chunking.
+    let chunks = chunk_section(&cleaned, None);
+    merge_short_chunks(chunks)
+}
+
+/// Chunk a single contiguous markdown body (already stripped of managed-
+/// region fences and page markers). The optional `outer_heading` is used
+/// when the caller wants to label every chunk with the same H2 heading
+/// (e.g. when a single page's body is being chunked but the page lives
+/// inside an outer section). Today every call site passes `None` and lets
+/// the inner heading detection do the labeling.
+fn chunk_section(body: &str, outer_heading: Option<&str>) -> Vec<Chunk> {
+    let sections = split_by_heading(body, 2);
 
     let mut chunks: Vec<Chunk> = Vec::new();
     for section in sections {
-        let section_chunk = Chunk::new(section.heading.clone(), &section.body);
+        let section_label = section
+            .heading
+            .clone()
+            .or_else(|| outer_heading.map(str::to_string));
+        let section_chunk = Chunk::new(section_label.clone(), &section.body);
         if section_chunk.body.is_empty() {
             // A bare H2 with no body under it. Drop — embedding noise.
             continue;
@@ -110,8 +160,7 @@ pub fn chunk_markdown(body: &str) -> Vec<Chunk> {
         let h3_has_real_split = h3_sections.iter().any(|s| s.heading.is_some());
         if !h3_has_real_split {
             for piece in split_by_paragraph(&section.body) {
-                let label = section.heading.clone();
-                let c = Chunk::new(label, &piece);
+                let c = Chunk::new(section_label.clone(), &piece);
                 if !c.body.is_empty() {
                     chunks.push(c);
                 }
@@ -122,7 +171,7 @@ pub fn chunk_markdown(body: &str) -> Vec<Chunk> {
         for sub in h3_sections {
             // The pre-first-H3 prose under the H2 keeps the H2 heading;
             // each H3's chunks adopt the H3 heading.
-            let label = sub.heading.clone().or_else(|| section.heading.clone());
+            let label = sub.heading.clone().or_else(|| section_label.clone());
             let sub_chunk = Chunk::new(label.clone(), &sub.body);
             if sub_chunk.body.is_empty() {
                 continue;
@@ -140,8 +189,71 @@ pub fn chunk_markdown(body: &str) -> Vec<Chunk> {
             }
         }
     }
+    chunks
+}
 
-    merge_short_chunks(chunks)
+/// One page's slice of the body, produced by [`split_by_page_markers`].
+#[derive(Debug, Clone)]
+struct PageSection {
+    /// `Some((page, page))` when the slice was preceded by a
+    /// `<!-- kb:page N -->` marker; `None` for pre-first-marker prose
+    /// (which in practice should be empty for ingest-emitted PDFs but
+    /// could carry a YAML frontmatter or stray prose for hand-edited
+    /// pages).
+    page_range: Option<(u32, u32)>,
+    body: String,
+}
+
+/// Split `body` by `<!-- kb:page N -->` markers. Each marker opens a new
+/// `PageSection` whose `page_range` is `(N, N)`; the body of the section
+/// is everything between the marker and the next marker (or EOF). Bodies
+/// without any marker return a single section with `page_range: None` and
+/// the entire body — the caller can then fall through to legacy chunking.
+fn split_by_page_markers(body: &str) -> Vec<PageSection> {
+    let mut sections: Vec<PageSection> = Vec::new();
+    let mut current = PageSection {
+        page_range: None,
+        body: String::new(),
+    };
+    for line in body.lines() {
+        if let Some(page) = parse_page_marker(line) {
+            // Push the in-progress section before starting a new one. We
+            // tolerate empty pre-marker prose by dropping the leading
+            // empty section in the post-pass below.
+            sections.push(std::mem::replace(
+                &mut current,
+                PageSection {
+                    page_range: Some((page, page)),
+                    body: String::new(),
+                },
+            ));
+        } else {
+            current.body.push_str(line);
+            current.body.push('\n');
+        }
+    }
+    sections.push(current);
+
+    // Drop the leading no-page section when its body is empty (the common
+    // case for PDFs ingested via the page-aware path). We keep it when
+    // non-empty so frontmatter-style preamble doesn't silently disappear.
+    if let Some(first) = sections.first()
+        && first.page_range.is_none()
+        && first.body.trim().is_empty()
+    {
+        sections.remove(0);
+    }
+    sections
+}
+
+/// Recognize `<!-- kb:page N -->` (with arbitrary surrounding ASCII
+/// whitespace inside the comment). Returns `Some(N)` on match.
+fn parse_page_marker(line: &str) -> Option<u32> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix("<!--")?.strip_suffix("-->")?;
+    let inner = inner.trim();
+    let rest = inner.strip_prefix("kb:page")?;
+    rest.trim().parse::<u32>().ok()
 }
 
 /// Strip managed-region fences (`<!-- kb:begin id=... -->` / `<!-- kb:end id=... -->`)
@@ -323,6 +435,9 @@ fn merge_short_chunks(chunks: Vec<Chunk>) -> Vec<Chunk> {
         // `head.heading` was usually `None` anyway (pre-first-H2 prose).
         next.body = merged_body;
         next.estimated_tokens = estimate_tokens(&next.body);
+        // Forward-merge widens the page range too: the surviving chunk now
+        // covers both pages.
+        next.page_range = merge_page_ranges(head.page_range, next.page_range);
     }
 
     out
@@ -336,6 +451,24 @@ fn merge_into(target: &mut Chunk, src: &Chunk) {
     target.estimated_tokens = estimate_tokens(&target.body);
     // Preserve `target.heading`; merging short tail chunks shouldn't
     // promote the merger's heading into the merged-into chunk.
+    // Extend the page range to cover both contributors. A merge across a
+    // page boundary turns a single-page chunk into a multi-page chunk;
+    // citation rendering then emits `pp.M-N` instead of `p.M`.
+    target.page_range = merge_page_ranges(target.page_range, src.page_range);
+}
+
+/// Merge two optional page ranges. `(a, b) ⊕ (c, d) = (min(a,c), max(b,d))`.
+/// One-sided `None` returns the other side unchanged; both-`None` is
+/// itself `None`.
+fn merge_page_ranges(
+    a: Option<(u32, u32)>,
+    b: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    match (a, b) {
+        (Some((a0, a1)), Some((b0, b1))) => Some((a0.min(b0), a1.max(b1))),
+        (Some(r), None) | (None, Some(r)) => Some(r),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -511,6 +644,120 @@ mod tests {
         let headings: Vec<Option<String>> = chunks.iter().map(|c| c.heading.clone()).collect();
         assert!(!headings.iter().any(|l| l.as_deref() == Some("A")));
         assert!(headings.iter().any(|l| l.as_deref() == Some("B")));
+    }
+
+    /// bn-3ij3: when the body has no page markers, every chunk has
+    /// `page_range: None` and the legacy chunking behavior is preserved.
+    #[test]
+    fn chunks_without_page_markers_have_no_page_range() {
+        let body = "## Section\n\nbody text\n";
+        let chunks = chunk_markdown(body);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].page_range, None);
+    }
+
+    /// bn-3ij3: page markers split the body so each chunk's `page_range`
+    /// matches the page it lives on. Healthy multi-page sources produce
+    /// one chunk per page when each page is comfortably above MIN tokens.
+    #[test]
+    fn chunks_with_page_markers_carry_per_page_range() {
+        let big_para = "alpha ".repeat(120); // ~720 chars per page
+        let body = format!(
+            "<!-- kb:page 1 -->\n{big_para}\n\n<!-- kb:page 2 -->\n{big_para}\n",
+        );
+        let chunks = chunk_markdown(&body);
+        assert_eq!(chunks.len(), 2, "two healthy pages should be two chunks");
+        assert_eq!(chunks[0].page_range, Some((1, 1)));
+        assert_eq!(chunks[1].page_range, Some((2, 2)));
+    }
+
+    /// bn-3ij3: a chunk never spans pages unless a small page is merged
+    /// upward into the next chunk by [`merge_short_chunks`]. When a page's
+    /// body is too small to stand alone, the merger folds it into a
+    /// neighbor and the surviving chunk's range covers both pages.
+    #[test]
+    fn small_page_merges_upward_and_widens_range() {
+        let big_para = "z ".repeat(500); // ~1000 chars
+        // Page 1 is a tiny chapter heading; page 2 is a fat body. The
+        // merger folds page 1 into page 2 so the surviving chunk's range
+        // is (1, 2).
+        let body = format!(
+            "<!-- kb:page 1 -->\nshort intro line.\n\n<!-- kb:page 2 -->\n{big_para}\n",
+        );
+        let chunks = chunk_markdown(&body);
+        assert_eq!(chunks.len(), 1, "tiny page-1 should fold into page-2");
+        assert_eq!(chunks[0].page_range, Some((1, 2)));
+        assert!(chunks[0].body.contains("short intro line"));
+    }
+
+    /// bn-3ij3: a page boundary is a HARD boundary for healthy chunks.
+    /// Two adjacent healthy pages must NOT be merged by the H2-style
+    /// section logic — the page split happens before H2 chunking, so
+    /// page 1 and page 2 produce independent chunks even when they share
+    /// the same H2.
+    #[test]
+    fn page_boundary_is_a_hard_boundary_for_healthy_chunks() {
+        let big_para = "alpha ".repeat(120);
+        // Same H2 on both pages (a multi-page section); chunker still
+        // emits two chunks, one per page, both labelled with the H2.
+        let body = format!(
+            "<!-- kb:page 1 -->\n## Topic\n\n{big_para}\n\n<!-- kb:page 2 -->\n## Topic\n\n{big_para}\n",
+        );
+        let chunks = chunk_markdown(&body);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].page_range, Some((1, 1)));
+        assert_eq!(chunks[1].page_range, Some((2, 2)));
+        assert_eq!(chunks[0].heading.as_deref(), Some("Topic"));
+        assert_eq!(chunks[1].heading.as_deref(), Some("Topic"));
+    }
+
+    /// bn-3ij3: a page that's larger than `TARGET_MAX_TOKENS` still gets
+    /// split internally (by H2/H3/paragraph), and every produced chunk
+    /// keeps the same `page_range` — splitting WITHIN a page doesn't widen
+    /// the range.
+    #[test]
+    fn oversized_page_splits_internally_keeping_one_page() {
+        let para = "x ".repeat(700); // ~1400 chars per paragraph
+        let body = format!(
+            "<!-- kb:page 1 -->\n## Big section\n\n{para}\n\n{para}\n\n{para}\n\n{para}\n",
+        );
+        let chunks = chunk_markdown(&body);
+        assert!(
+            chunks.len() >= 2,
+            "expected paragraph-fallback splits, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            assert_eq!(
+                chunk.page_range,
+                Some((1, 1)),
+                "internal splits must keep the page range",
+            );
+        }
+    }
+
+    #[test]
+    fn parse_page_marker_recognizes_inline_form() {
+        assert_eq!(parse_page_marker("<!-- kb:page 7 -->"), Some(7));
+        assert_eq!(parse_page_marker("  <!-- kb:page 12 -->  "), Some(12));
+        // Non-marker comments are not pages.
+        assert_eq!(parse_page_marker("<!-- kb:begin id=summary -->"), None);
+        assert_eq!(parse_page_marker("regular line"), None);
+    }
+
+    #[test]
+    fn merge_page_ranges_combines_endpoints() {
+        assert_eq!(merge_page_ranges(None, None), None);
+        assert_eq!(merge_page_ranges(Some((3, 5)), None), Some((3, 5)));
+        assert_eq!(merge_page_ranges(None, Some((3, 5))), Some((3, 5)));
+        assert_eq!(
+            merge_page_ranges(Some((3, 5)), Some((4, 7))),
+            Some((3, 7)),
+        );
+        assert_eq!(
+            merge_page_ranges(Some((9, 9)), Some((1, 2))),
+            Some((1, 9)),
+        );
     }
 
     #[test]

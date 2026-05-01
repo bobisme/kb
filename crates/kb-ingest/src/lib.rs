@@ -222,6 +222,12 @@ pub struct IngestOptions {
     /// extraction is empty/short. Default = disabled so legacy callers
     /// keep their existing behavior.
     pub ocr: ocr::OcrOptions,
+    /// Settings for page-aware PDF extraction (bn-3ij3). When enabled and
+    /// `pdftotext` is on PATH, PDFs are extracted page-by-page so the
+    /// resulting markdown carries `<!-- kb:page N -->` markers. Default =
+    /// disabled so legacy callers and tests don't accidentally route
+    /// PDFs through poppler.
+    pub pdf_page_extract: pdf_page_extract::PdfPageExtractOptions,
 }
 
 impl IngestOptions {
@@ -233,6 +239,7 @@ impl IngestOptions {
             allow_empty: false,
             markitdown: preprocess::MarkitdownOptions::disabled(),
             ocr: ocr::OcrOptions::disabled(),
+            pdf_page_extract: pdf_page_extract::PdfPageExtractOptions::disabled(),
         }
     }
 }
@@ -275,8 +282,18 @@ pub fn ingest_paths_with_flags(
             allow_empty,
             markitdown: preprocess::MarkitdownOptions::disabled(),
             ocr: ocr::OcrOptions::disabled(),
+            pdf_page_extract: pdf_page_extract::PdfPageExtractOptions::disabled(),
         },
     )
+}
+
+/// Returns true if the page-aware extraction should be tried for `path`. PDFs
+/// only — `.docx`, `.pptx`, etc. don't have a page-by-page subprocess we can
+/// reliably exploit, and markitdown's section-heading output already carries
+/// enough structure for those formats. Mirrors the `is_pdf_source` helper
+/// used by the OCR fallback.
+fn should_try_pdf_page_extract(path: &Path, options: &PdfPageExtractOptions) -> bool {
+    options.enabled && is_pdf_source(path)
 }
 
 /// Full-configured entry point. All other public wrappers eventually funnel
@@ -394,28 +411,52 @@ fn ingest_file(
     let fs_metadata = fs::metadata(&canonical_source)
         .with_context(|| format!("failed to read metadata for {}", canonical_source.display()))?;
 
-    // Preprocess FIRST so PDFs / .docx / etc. can be routed through markitdown
-    // before the binary-detection gate rejects them. On a successful
-    // conversion, `normalized_bytes` is the markdown captured from
-    // markitdown's stdout and `original_bytes` is still the raw file we
-    // archive under `raw/inbox/<src>/<rev>/original.<ext>`. On an applicable
-    // but failed conversion (SkipFile) we usually drop the file — except for
-    // PDFs, where bn-2hyr's OCR fallback may still rescue the document.
-    let preprocessed = preprocess::maybe_preprocess(&canonical_source, &options.markitdown)?;
+    // bn-3ij3: page-aware PDF extraction. When enabled and `pdftotext` is on
+    // PATH, this is the preferred path for PDFs because it yields per-page
+    // `<!-- kb:page N -->` markers that downstream consumers (chunker,
+    // citation parser, source-page renderer) lift into citation-page
+    // metadata. On a successful extraction we treat the result like a
+    // markitdown conversion (archive original.pdf, persist source.md).
+    // Skipped or empty falls through to the existing markitdown + OCR flow.
     let source_is_pdf = is_pdf_source(&canonical_source);
-    let (mut normalized_bytes, was_preprocessed): (Vec<u8>, bool) = match preprocessed {
-        preprocess::Preprocessed::Converted(c) => (c.markdown, true),
-        preprocess::Preprocessed::NotApplicable => (original_bytes.clone(), false),
-        preprocess::Preprocessed::SkipFile => {
-            // bn-2hyr: a markitdown skip for a PDF usually means "extracted
-            // nothing useful" (scan-only). Treat that as an empty-but-
-            // preprocessed conversion so the OCR fallback below gets a
-            // chance to recover the text. Non-PDFs keep the legacy skip
-            // behavior; if a .docx skips it's a real failure, not a scan.
-            if source_is_pdf && options.ocr.enabled {
-                (Vec::new(), true)
-            } else {
-                return Ok(None);
+    let pdf_page_outcome = if should_try_pdf_page_extract(&canonical_source, &options.pdf_page_extract) {
+        pdf_page_extract::extract_pdf_pages(&canonical_source, &options.pdf_page_extract)?
+    } else {
+        pdf_page_extract::PdfPageExtractOutcome::Skipped
+    };
+
+    let (mut normalized_bytes, was_preprocessed): (Vec<u8>, bool) = match pdf_page_outcome {
+        pdf_page_extract::PdfPageExtractOutcome::Extracted { markdown, .. } => {
+            (markdown.into_bytes(), true)
+        }
+        // Empty / Skipped: route through the existing markitdown + OCR
+        // pipeline so scan-only PDFs and non-PDFs keep working.
+        pdf_page_extract::PdfPageExtractOutcome::Empty
+        | pdf_page_extract::PdfPageExtractOutcome::Skipped => {
+            // Preprocess FIRST so PDFs / .docx / etc. can be routed through markitdown
+            // before the binary-detection gate rejects them. On a successful
+            // conversion, `normalized_bytes` is the markdown captured from
+            // markitdown's stdout and `original_bytes` is still the raw file we
+            // archive under `raw/inbox/<src>/<rev>/original.<ext>`. On an applicable
+            // but failed conversion (SkipFile) we usually drop the file — except for
+            // PDFs, where bn-2hyr's OCR fallback may still rescue the document.
+            let preprocessed =
+                preprocess::maybe_preprocess(&canonical_source, &options.markitdown)?;
+            match preprocessed {
+                preprocess::Preprocessed::Converted(c) => (c.markdown, true),
+                preprocess::Preprocessed::NotApplicable => (original_bytes.clone(), false),
+                preprocess::Preprocessed::SkipFile => {
+                    // bn-2hyr: a markitdown skip for a PDF usually means "extracted
+                    // nothing useful" (scan-only). Treat that as an empty-but-
+                    // preprocessed conversion so the OCR fallback below gets a
+                    // chance to recover the text. Non-PDFs keep the legacy skip
+                    // behavior; if a .docx skips it's a real failure, not a scan.
+                    if source_is_pdf && options.ocr.enabled {
+                        (Vec::new(), true)
+                    } else {
+                        return Ok(None);
+                    }
+                }
             }
         }
     };
@@ -1579,6 +1620,9 @@ mod tests {
                 // perturbed by PATH state (whether tesseract is installed
                 // on the host shouldn't change ingest behavior here).
                 ocr: crate::OcrOptions::disabled(),
+                // Page-aware extraction off so tests focus on the markitdown
+                // path; the bn-3ij3 path is exercised in dedicated tests.
+                pdf_page_extract: crate::PdfPageExtractOptions::disabled(),
             }
         }
 
@@ -1753,6 +1797,7 @@ mod tests {
                     optional_extensions: Vec::new(),
                 },
                 ocr: crate::OcrOptions::disabled(),
+                pdf_page_extract: crate::PdfPageExtractOptions::disabled(),
             };
             let err = ingest_paths_with_config(kb_root.path(), &[pdf], &options)
                 .expect_err("binary file should still be rejected");
@@ -1817,6 +1862,7 @@ mod tests {
 mod headings;
 mod image_refs;
 mod ocr;
+mod pdf_page_extract;
 mod preprocess;
 mod repo;
 mod url;
@@ -1826,6 +1872,9 @@ pub use image_refs::{CopiedImages, rewrite_asset_refs, scan_and_stage};
 pub use ocr::{
     DEFAULT_MIN_CHARS_THRESHOLD as OCR_DEFAULT_MIN_CHARS_THRESHOLD, FallbackReason as OcrFallbackReason,
     OcrCache, OcrOptions, OcrOutcome, ocr_pdf, should_ocr_fallback,
+};
+pub use pdf_page_extract::{
+    PdfPageExtractOptions, PdfPageExtractOutcome, extract_pdf_pages,
 };
 pub use preprocess::{
     Converted, MarkitdownOptions, Preprocessed,

@@ -50,6 +50,13 @@ pub struct QuoteCitation {
     /// chunk should slugify the on-disk heading the same way and compare.
     /// `None` for the bare `[src-id]` form.
     pub section_anchor: Option<String>,
+    /// Optional PDF page span extracted from the `[src-id p.7]` or
+    /// `[src-id pp.7-9]` forms (bn-3ij3). Inclusive on both ends:
+    /// `Some((7, 7))` means `p.7`, `Some((7, 9))` means `pp.7-9`. The
+    /// `#section` and page suffixes can co-occur, e.g.
+    /// `[src-id#chapter-3 p.7]`. `None` for citations without a page
+    /// suffix.
+    pub page_range: Option<(u32, u32)>,
     /// 0-based byte offset of the opening `"` in the (smart-quote-folded)
     /// body. Useful for line attribution in lint reports.
     pub offset: usize,
@@ -118,26 +125,37 @@ pub fn fold_smart_quotes(text: &str) -> String {
 /// Returned offsets index into the *folded* body, not the original.
 #[must_use]
 pub fn extract_quote_citations(body: &str) -> Vec<QuoteCitation> {
+    /// Dedup key for citation extraction: quote, src-id, anchor, page range.
+    /// A nominal type avoids the `clippy::type-complexity` hit and reads
+    /// better at the call sites below.
+    type DedupKey = (String, String, Option<String>, Option<(u32, u32)>);
+
     let folded = fold_smart_quotes(body);
     let mut out = Vec::new();
-    // Dedup by (quote, src_id, section_anchor) so the same quote cited
-    // with two different anchors (or once with, once without) doesn't
-    // collapse into a single record.
-    let mut seen: std::collections::HashSet<(String, String, Option<String>)> =
-        std::collections::HashSet::new();
+    // Dedup by (quote, src_id, section_anchor, page_range) so the same
+    // quote cited with two different anchors / pages (or once with, once
+    // without) doesn't collapse into a single record.
+    let mut seen: std::collections::HashSet<DedupKey> = std::collections::HashSet::new();
 
     let mut push_unique = |q: &str,
                            id: &str,
                            anchor: Option<&str>,
+                           page_range: Option<(u32, u32)>,
                            offset: usize,
                            out: &mut Vec<QuoteCitation>| {
         let anchor_owned = anchor.map(str::to_string);
-        let key = (q.to_string(), id.to_string(), anchor_owned.clone());
+        let key: DedupKey = (
+            q.to_string(),
+            id.to_string(),
+            anchor_owned.clone(),
+            page_range,
+        );
         if seen.insert(key) {
             out.push(QuoteCitation {
                 quote: q.to_string(),
                 src_id: id.to_string(),
                 section_anchor: anchor_owned,
+                page_range,
                 offset,
             });
         }
@@ -146,22 +164,26 @@ pub fn extract_quote_citations(body: &str) -> Vec<QuoteCitation> {
     for cap in QUOTE_THEN_BRACKET_RE.captures_iter(&folded) {
         if let (Some(q), Some(id)) = (cap.get(1), cap.get(2)) {
             let anchor = cap.get(3).map(|m| m.as_str());
+            let page_range = cap.get(4).and_then(|m| parse_page_suffix(m.as_str()));
             push_unique(
                 q.as_str(),
                 id.as_str(),
                 anchor,
+                page_range,
                 q.start().saturating_sub(1),
                 &mut out,
             );
         }
     }
     for cap in BRACKET_THEN_QUOTE_RE.captures_iter(&folded) {
-        if let (Some(id), Some(q)) = (cap.get(1), cap.get(3)) {
+        if let (Some(id), Some(q)) = (cap.get(1), cap.get(4)) {
             let anchor = cap.get(2).map(|m| m.as_str());
+            let page_range = cap.get(3).and_then(|m| parse_page_suffix(m.as_str()));
             push_unique(
                 q.as_str(),
                 id.as_str(),
                 anchor,
+                page_range,
                 q.start().saturating_sub(1),
                 &mut out,
             );
@@ -177,6 +199,7 @@ pub fn extract_quote_citations(body: &str) -> Vec<QuoteCitation> {
                 q.as_str(),
                 id.as_str(),
                 None,
+                None,
                 q.start().saturating_sub(1),
                 &mut out,
             );
@@ -186,21 +209,59 @@ pub fn extract_quote_citations(body: &str) -> Vec<QuoteCitation> {
     out
 }
 
-// `"text" [src-XXX#section-slug]` — captures:
+/// Parse the page suffix of a bracket citation. Accepts the captured text
+/// between the optional `#anchor` and the closing `]`, with leading and
+/// trailing whitespace already stripped by the regex character class.
+///
+/// Recognized forms:
+///
+/// - `p.7` → `Some((7, 7))`
+/// - `pp.7-9` → `Some((7, 9))`
+///
+/// The trailing range form is bounded both ways: `pp.9-7` (start > end)
+/// is rejected as malformed and returns `None` so the citation falls
+/// back to a bare-link render.
+#[must_use]
+fn parse_page_suffix(suffix: &str) -> Option<(u32, u32)> {
+    let trimmed = suffix.trim();
+    if let Some(rest) = trimmed.strip_prefix("pp.") {
+        let (a, b) = rest.split_once('-')?;
+        let start: u32 = a.trim().parse().ok()?;
+        let end: u32 = b.trim().parse().ok()?;
+        if end < start {
+            return None;
+        }
+        return Some((start, end));
+    }
+    if let Some(rest) = trimmed.strip_prefix("p.") {
+        let n: u32 = rest.trim().parse().ok()?;
+        return Some((n, n));
+    }
+    None
+}
+
+// `"text" [src-XXX#section-slug p.N]` — captures:
 //   1 = quote-body
 //   2 = src-id (with prefix)
 //   3 = section anchor slug, optional
+//   4 = page suffix (`p.N` / `pp.N-M`), optional
+//
+// bn-3ij3: page suffix lives after a single space inside the brackets:
+// `[src-id p.7]`, `[src-id pp.7-9]`, `[src-id#anchor p.7]`. Capturing it
+// as a free-form trailing string lets the parser reject malformed
+// suffixes (`p.foo`) gracefully without a regex-level rejection.
 static QUOTE_THEN_BRACKET_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#""([^"\r\n]+)"\s*\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)(?:#([A-Za-z0-9][A-Za-z0-9_-]*))?\]"#,
+        r#""([^"\r\n]+)"\s*\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)(?:#([A-Za-z0-9][A-Za-z0-9_-]*))?(?:\s+(pp?\.[0-9]+(?:-[0-9]+)?))?\]"#,
     )
     .expect("valid quote-bracket regex")
 });
 
-// `[src-XXX#section-slug] "text"` — captures:
+// `[src-XXX#section-slug p.N] "text"` — captures:
 //   1 = src-id
 //   2 = section anchor slug, optional
-//   3 = quote-body
+//   3 = page suffix, optional
+//   4 = quote-body
 //
 // We only allow whitespace (any kind, including line breaks) between the
 // closing bracket and the opening quote. Anything else — punctuation,
@@ -208,12 +269,14 @@ static QUOTE_THEN_BRACKET_RE: LazyLock<Regex> = LazyLock::new(|| {
 // to this citation.
 static BRACKET_THEN_QUOTE_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)(?:#([A-Za-z0-9][A-Za-z0-9_-]*))?\]\s+"([^"\r\n]+)""#,
+        r#"\[(src-[A-Za-z0-9][A-Za-z0-9_-]*)(?:#([A-Za-z0-9][A-Za-z0-9_-]*))?(?:\s+(pp?\.[0-9]+(?:-[0-9]+)?))?\]\s+"([^"\r\n]+)""#,
     )
     .expect("valid bracket-quote regex")
 });
 
-// `"text" (src-XXX)` — captures: 1=quote-body, 2=src-id.
+// `"text" (src-XXX)` — captures: 1=quote-body, 2=src-id. The parenthesized
+// form intentionally does NOT support page suffixes; agents converge on
+// the bracket forms when they want to point at a specific page.
 static QUOTE_THEN_PAREN_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#""([^"\r\n]+)"\s*\((src-[A-Za-z0-9][A-Za-z0-9_-]*)\)"#)
         .expect("valid quote-paren regex")
@@ -445,6 +508,36 @@ impl QuoteVerification {
             self.outcome,
             VerificationKind::Verified | VerificationKind::VerifiedFuzzy { .. }
         )
+    }
+}
+
+/// Build the markdown anchor name for a given PDF page (bn-3ij3).
+///
+/// Source pages emit an `<a name="page-N"></a>` (or equivalent heading-id)
+/// at the start of every page so URL fragments like `#page-7` deep-link to
+/// the right place. The naming convention is centralized here so the
+/// renderer in `kb-compile` and the citation resolver in `kb-query` agree
+/// on the slug.
+#[must_use]
+pub fn page_anchor_name(page: u32) -> String {
+    format!("page-{page}")
+}
+
+/// Format a page span for a rendered citation:
+///
+/// - `(7, 7)` → `"p.7"`
+/// - `(7, 9)` → `"pp.7-9"`
+///
+/// Mirror image of [`parse_page_suffix`]. Used by the `kb ask` answer
+/// renderer when building `[src-id p.7]` markers from a `page_range` it
+/// already has on hand.
+#[must_use]
+pub fn format_page_span(page_range: (u32, u32)) -> String {
+    let (start, end) = page_range;
+    if start == end {
+        format!("p.{start}")
+    } else {
+        format!("pp.{start}-{end}")
     }
 }
 
@@ -790,6 +883,114 @@ mod tests {
             by_quote["anything"],
             VerificationKind::SourceNotFound
         ));
+    }
+
+    /// bn-3ij3: bracket form parses a single-page suffix as
+    /// `page_range = Some((N, N))`. Bare `[src-id]` keeps `page_range = None`.
+    #[test]
+    fn extract_pairs_with_single_page_suffix() {
+        let body = r#"They argued "the answer is 42" [src-abc p.7] and stopped."#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].quote, "the answer is 42");
+        assert_eq!(pairs[0].src_id, "src-abc");
+        assert_eq!(pairs[0].section_anchor, None);
+        assert_eq!(pairs[0].page_range, Some((7, 7)));
+    }
+
+    /// bn-3ij3: page-range form `pp.N-M` is parsed inclusive on both ends.
+    #[test]
+    fn extract_pairs_with_page_range_suffix() {
+        let body = r#"They wrote "spans pages" [src-xyz pp.7-9] and continued."#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].src_id, "src-xyz");
+        assert_eq!(pairs[0].page_range, Some((7, 9)));
+    }
+
+    /// bn-3ij3: `#anchor` and `p.N` co-occur cleanly, in that order.
+    #[test]
+    fn extract_pairs_with_anchor_and_page_combined() {
+        let body =
+            r#"They argued "this claim" [src-abc#methods-and-results p.7] strongly."#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].src_id, "src-abc");
+        assert_eq!(
+            pairs[0].section_anchor.as_deref(),
+            Some("methods-and-results"),
+        );
+        assert_eq!(pairs[0].page_range, Some((7, 7)));
+    }
+
+    /// bn-3ij3: bracket-then-quote form supports the same suffixes.
+    #[test]
+    fn extract_pairs_bracket_then_quote_with_page() {
+        let body = r#"[src-xyz pp.3-4] "raft uses a leader" — full stop."#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].src_id, "src-xyz");
+        assert_eq!(pairs[0].page_range, Some((3, 4)));
+    }
+
+    /// bn-3ij3: malformed page suffixes (`pp.9-7`, `p.foo`) parse the
+    /// citation but leave `page_range = None`. The bracket itself still
+    /// counts as a citation; only the page suffix is dropped.
+    #[test]
+    fn extract_pairs_with_malformed_page_falls_back_to_none() {
+        // `pp.9-7` is rejected by parse_page_suffix (start > end).
+        let body = r#""bad range" [src-abc pp.9-7] then text."#;
+        let pairs = extract_quote_citations(body);
+        // The regex itself accepts `pp.9-7` as a captured suffix, but
+        // parse_page_suffix rejects it — so the citation parses with
+        // page_range = None.
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].page_range, None);
+    }
+
+    /// bn-3ij3: same quote cited with two different pages produces two
+    /// records (the dedup key now includes `page_range`).
+    #[test]
+    fn extract_pairs_dedup_distinguishes_page_variants() {
+        let body = r#"
+            "the answer" [src-abc p.7].
+            "the answer" [src-abc p.9].
+        "#;
+        let pairs = extract_quote_citations(body);
+        assert_eq!(pairs.len(), 2);
+        let pages: Vec<Option<(u32, u32)>> = pairs.iter().map(|p| p.page_range).collect();
+        assert!(pages.contains(&Some((7, 7))));
+        assert!(pages.contains(&Some((9, 9))));
+    }
+
+    /// bn-3ij3: `format_page_span` renders single pages and ranges with the
+    /// expected prefixes.
+    #[test]
+    fn format_page_span_emits_p_or_pp() {
+        assert_eq!(format_page_span((7, 7)), "p.7");
+        assert_eq!(format_page_span((7, 9)), "pp.7-9");
+        assert_eq!(format_page_span((1, 1)), "p.1");
+    }
+
+    /// bn-3ij3: page anchor names are stable so the renderer and resolver
+    /// agree on the URL fragment.
+    #[test]
+    fn page_anchor_name_is_stable() {
+        assert_eq!(page_anchor_name(1), "page-1");
+        assert_eq!(page_anchor_name(42), "page-42");
+    }
+
+    /// bn-3ij3: `parse_page_suffix` accepts the documented forms and rejects
+    /// the rest.
+    #[test]
+    fn parse_page_suffix_accepts_documented_forms() {
+        assert_eq!(parse_page_suffix("p.7"), Some((7, 7)));
+        assert_eq!(parse_page_suffix("pp.7-9"), Some((7, 9)));
+        assert_eq!(parse_page_suffix("  p.7  "), Some((7, 7)));
+        assert_eq!(parse_page_suffix("pp.9-7"), None); // backwards range
+        assert_eq!(parse_page_suffix("p."), None);
+        assert_eq!(parse_page_suffix("page 7"), None);
+        assert_eq!(parse_page_suffix(""), None);
     }
 
     /// bn-3rzz: anchor matches when the citation's slug equals the
