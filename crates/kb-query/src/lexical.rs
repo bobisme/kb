@@ -159,6 +159,14 @@ pub struct RetrievalCandidate {
     /// drives the order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fused_score: Option<f32>,
+    /// Personalized-PageRank score from the citation graph (bn-32od).
+    /// `None` when the structural tier is disabled or the candidate
+    /// didn't appear in the PPR result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_score: Option<f32>,
+    /// 1-indexed rank in the structural ranked list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structural_rank: Option<usize>,
 }
 
 /// A budgeted context payload assembled from retrieval candidates.
@@ -346,6 +354,8 @@ impl LexicalIndex {
                 lexical_rank: None,
 
                 fused_score: None,
+                structural_score: None,
+                structural_rank: None,
             });
         }
 
@@ -432,6 +442,8 @@ fn append_low_coverage_fallback(
             lexical_rank: None,
 
             fused_score: None,
+            structural_score: None,
+            structural_rank: None,
         });
     };
 
@@ -1420,6 +1432,8 @@ mod tests {
                 lexical_rank: None,
 
                 fused_score: None,
+                structural_score: None,
+                structural_rank: None,
             }],
             fallback_reason: None,
         };
@@ -1488,6 +1502,8 @@ mod tests {
                 lexical_rank: None,
 
                 fused_score: None,
+                structural_score: None,
+                structural_rank: None,
             }],
             fallback_reason: None,
         };

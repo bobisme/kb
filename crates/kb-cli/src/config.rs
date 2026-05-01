@@ -635,6 +635,15 @@ impl RetrievalConfig {
                 top_k: kb_query::RERANK_DEFAULT_TOP_K,
                 keep: kb_query::RERANK_DEFAULT_KEEP,
             },
+            // Structural defaults (bn-32od). [`Config::to_hybrid_options`]
+            // overlays the parsed `[semantic.structural]` section so the
+            // `[retrieval]`-only callers still get the right defaults.
+            structural: kb_query::StructuralOptions {
+                enabled: true,
+                damping: 0.85,
+                max_iterations: 30,
+                epsilon: 1e-6,
+            },
         }
     }
 }
@@ -652,6 +661,7 @@ impl Config {
     ) -> kb_query::HybridOptions {
         let mut opts = self.retrieval.to_hybrid_options(backend_kind);
         opts.rerank = self.semantic.rerank.to_settings();
+        opts.structural = self.semantic.structural.to_options();
         opts
     }
 }
@@ -676,7 +686,11 @@ impl Config {
 ///
 /// `[semantic.rerank]` adds the cross-encoder reranker (bn-1cp2) — see
 /// [`RerankConfig`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+///
+/// `Eq` is intentionally not derived: the `[semantic.structural]`
+/// subsection (bn-32od) carries `f32` knobs which have no total
+/// ordering. `PartialEq` is preserved for tests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case", default)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticConfig {
@@ -684,6 +698,7 @@ pub struct SemanticConfig {
     pub model_path: Option<String>,
     pub tokenizer_path: Option<String>,
     pub rerank: RerankConfig,
+    pub structural: StructuralConfig,
 }
 
 /// `[semantic.rerank]` section of `kb.toml`. Cross-encoder rerank pass
@@ -722,6 +737,47 @@ impl Default for RerankConfig {
             keep: kb_query::RERANK_DEFAULT_KEEP,
             model_path: None,
             tokenizer_path: None,
+        }
+    }
+}
+
+/// `[semantic.structural]` section of `kb.toml`. Citation-graph +
+/// personalized-`PageRank` tier (bn-32od). On by default — building the
+/// graph at compile time is cheap (a single `SQLite` table) and the PPR
+/// computation per query is sub-millisecond on typical kb corpora.
+///
+/// Disabling `enabled` makes hybrid retrieval return identical results
+/// to the pre-bn-32od behavior. The `damping` / `max_iterations`
+/// knobs match the standard `PageRank` literature defaults; tweak them
+/// only if you know what you're doing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct StructuralConfig {
+    pub enabled: bool,
+    pub damping: f32,
+    pub max_iterations: usize,
+}
+
+impl Default for StructuralConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            damping: 0.85,
+            max_iterations: 30,
+        }
+    }
+}
+
+impl StructuralConfig {
+    /// Distill into the `Copy` runtime knobs the hybrid pipeline consumes.
+    #[must_use]
+    pub const fn to_options(&self) -> kb_query::StructuralOptions {
+        kb_query::StructuralOptions {
+            enabled: self.enabled,
+            damping: self.damping,
+            max_iterations: self.max_iterations,
+            epsilon: 1e-6,
         }
     }
 }

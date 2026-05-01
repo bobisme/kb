@@ -7,6 +7,7 @@ pub mod images;
 pub mod lexical;
 pub mod paths;
 pub mod semantic;
+pub mod structural;
 pub mod writer;
 
 pub use artifact::{
@@ -34,6 +35,11 @@ pub use semantic::{
     SemanticBackendConfig, SemanticBackendKind, SemanticChunkHit, SemanticIndexStats,
     SemanticItemHit, SyncStats, aggregate_chunks_to_items, chunk_id_for, chunk_markdown,
     embedding_db_path, knn_search, semantic_index_stats, sync_embeddings,
+};
+pub use structural::{
+    CitationGraph, GRAPH_DB_REL, GraphBuildStats, PageRankConfig, PageRankResult,
+    StructuralOptions, StructuralScorer, build_graph, graph_db_path, load_graph,
+    personalized_pagerank,
 };
 #[cfg(feature = "semantic-ort")]
 pub use semantic::{CrossEncoder, CrossEncoderConfig, RerankConfig};

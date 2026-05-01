@@ -29,6 +29,7 @@ use crate::semantic::{
     EmbeddingBackend, HashEmbedBackend, embed::embedding_db_path,
     search::{aggregate_chunks_to_items, knn_search},
 };
+use crate::structural::{StructuralOptions, StructuralScorer};
 
 /// RRF constant `k`. Pulled directly from the standard literature and
 /// matched to bones-search.
@@ -84,15 +85,27 @@ pub struct HybridResult {
     pub lexical_score: f32,
     /// Semantic RRF contribution (0.0 when not in the semantic list).
     pub semantic_score: f32,
+    /// Structural RRF contribution (0.0 when not in the structural list).
+    /// bn-32od.
+    #[serde(default)]
+    pub structural_score: f32,
     /// 1-indexed lexical rank (or `usize::MAX` when absent).
     pub lexical_rank: usize,
     /// 1-indexed semantic rank (or `usize::MAX` when absent).
     pub semantic_rank: usize,
+    /// 1-indexed structural rank (or `usize::MAX` when absent). bn-32od.
+    #[serde(default)]
+    pub structural_rank: usize,
     /// Underlying lexical scoring score, copied from the lexical search
     /// result for explanation. 0 when absent.
     pub lexical_raw_score: usize,
     /// Underlying semantic similarity score in `[0, 1]`. 0 when absent.
     pub semantic_raw_score: f32,
+    /// Underlying personalized-PageRank score from the citation graph.
+    /// 0.0 when the structural tier is disabled or the candidate didn't
+    /// participate. bn-32od.
+    #[serde(default)]
+    pub structural_raw_score: f32,
     /// Per-tier reasons assembled for human display.
     pub reasons: Vec<String>,
 }
@@ -119,6 +132,13 @@ pub struct HybridOptions {
     /// variants. When `enabled = false` (the default), the hybrid pipeline
     /// behaves exactly like before bn-1cp2.
     pub rerank: RerankSettings,
+    /// Citation-graph + personalized-PageRank tier (bn-32od). When
+    /// `enabled = true` (the default), the third RRF tier reads the graph
+    /// at `<root>/.kb/state/graph.db` and biases ranks toward sources
+    /// connected to the lexical/semantic seeds. Setting `enabled = false`
+    /// makes hybrid retrieval return identical results to the pre-bone
+    /// behavior.
+    pub structural: StructuralOptions,
 }
 
 impl Default for HybridOptions {
@@ -132,6 +152,12 @@ impl Default for HybridOptions {
                 enabled: false,
                 top_k: crate::semantic::rerank::DEFAULT_TOP_K,
                 keep: crate::semantic::rerank::DEFAULT_KEEP,
+            },
+            structural: StructuralOptions {
+                enabled: true,
+                damping: crate::structural::DEFAULT_DAMPING,
+                max_iterations: crate::structural::DEFAULT_MAX_ITERATIONS,
+                epsilon: crate::structural::DEFAULT_EPSILON,
             },
         }
     }
@@ -154,6 +180,12 @@ impl HybridOptions {
                 top_k: crate::semantic::rerank::DEFAULT_TOP_K,
                 keep: crate::semantic::rerank::DEFAULT_KEEP,
             },
+            structural: StructuralOptions {
+                enabled: true,
+                damping: crate::structural::DEFAULT_DAMPING,
+                max_iterations: crate::structural::DEFAULT_MAX_ITERATIONS,
+                epsilon: crate::structural::DEFAULT_EPSILON,
+            },
         }
     }
 
@@ -163,6 +195,14 @@ impl HybridOptions {
     #[must_use]
     pub const fn with_rerank(mut self, rerank: RerankSettings) -> Self {
         self.rerank = rerank;
+        self
+    }
+
+    /// Return a copy with structural settings overridden. Mirrors
+    /// [`Self::with_rerank`] for the bn-32od structural tier.
+    #[must_use]
+    pub const fn with_structural(mut self, structural: StructuralOptions) -> Self {
+        self.structural = structural;
         self
     }
 }
@@ -375,9 +415,18 @@ pub fn hybrid_search_with_index_and_backend_and_reranker(
         options.min_semantic_top_score_no_lexical,
     );
 
+    // bn-32od: structural tier. Seed PPR on the lexical+semantic seed
+    // union, run on the in-memory citation graph, and pass through to
+    // the fuse loop. When the tier is disabled or the graph is empty,
+    // `structural_hits` is empty and the fuse degenerates back to the
+    // pre-bone two-tier behavior.
+    let structural_seeds = collect_seed_ids(&lexical_hits, &semantic_filtered);
+    let structural_hits = run_structural(root, &structural_seeds, options.structural, pool_limit);
+
     let mut fused = fuse(
         &lexical_hits,
         &semantic_filtered,
+        &structural_hits,
         pool_limit,
         options.rrf_k,
     );
@@ -529,6 +578,76 @@ struct SemanticHit {
     score: f32,
 }
 
+/// Structural-tier hit produced by personalized `PageRank` over the
+/// citation graph (bn-32od). The shape mirrors [`SemanticHit`] so the
+/// fuse loop can treat all three tiers uniformly.
+#[derive(Debug, Clone)]
+struct StructuralHit {
+    item_id: String,
+    score: f32,
+}
+
+/// Build the seed set for personalized `PageRank`: the union of every
+/// lexical hit and every semantic hit, deduplicated and order-preserved
+/// (lexical first, then semantic-only). Lexical winners contribute the
+/// strongest evidence, so they go first; semantic-only ids extend the
+/// seed set with morphologically similar pages the lexical tier missed.
+fn collect_seed_ids(lexical: &[SearchResult], semantic: &[SemanticHit]) -> Vec<String> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for hit in lexical {
+        if seen.insert(hit.id.clone()) {
+            out.push(hit.id.clone());
+        }
+    }
+    for hit in semantic {
+        if seen.insert(hit.item_id.clone()) {
+            out.push(hit.item_id.clone());
+        }
+    }
+    out
+}
+
+/// Run the structural tier and convert the result into [`StructuralHit`]s.
+///
+/// Returns an empty vector when the tier is disabled, the graph file
+/// doesn't exist, or PPR returns no nodes. Any error opening the graph
+/// database is logged once and degrades gracefully — the lexical and
+/// semantic tiers are still useful on their own. `pool_limit` caps the
+/// number of structural hits we feed into the fuse so PPR's long tail
+/// of microscopic-rank nodes doesn't bloat the candidate set.
+fn run_structural(
+    root: &Path,
+    seeds: &[String],
+    options: StructuralOptions,
+    pool_limit: usize,
+) -> Vec<StructuralHit> {
+    if !options.enabled || pool_limit == 0 || !structural_env_enabled() {
+        return Vec::new();
+    }
+    let scorer = match StructuralScorer::load(root, options) {
+        Ok(scorer) => scorer,
+        Err(err) => {
+            if !STRUCTURAL_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
+                warn!("structural tier unavailable; using lex+sem only: {err:#}");
+            }
+            return Vec::new();
+        }
+    };
+    if scorer.edge_count() == 0 {
+        return Vec::new();
+    }
+    let result = scorer.score(seeds);
+    result
+        .ranked
+        .into_iter()
+        .take(pool_limit)
+        .map(|(item_id, score)| StructuralHit { item_id, score })
+        .collect()
+}
+
+static STRUCTURAL_DEGRADED_WARNED: AtomicBool = AtomicBool::new(false);
+
 fn filter_semantic(
     hits: Vec<SemanticHit>,
     lexical_empty: bool,
@@ -559,6 +678,7 @@ fn rank_to_score(rank: usize, k: usize) -> f32 {
 fn fuse(
     lexical: &[SearchResult],
     semantic: &[SemanticHit],
+    structural: &[StructuralHit],
     limit: usize,
     k: usize,
 ) -> Vec<HybridResult> {
@@ -572,9 +692,15 @@ fn fuse(
         semantic_meta.insert(hit.item_id.as_str(), (i + 1, hit.score));
     }
 
+    let mut structural_meta: HashMap<&str, (usize, f32)> = HashMap::new();
+    for (i, hit) in structural.iter().enumerate() {
+        structural_meta.insert(hit.item_id.as_str(), (i + 1, hit.score));
+    }
+
     // Deterministic union of candidate ids: lexical order first, then
-    // semantic-only ids in their semantic order, then a sorted fallback as
-    // tie-breaker so identical inputs always produce identical outputs.
+    // semantic-only ids in their semantic order, then structural-only ids
+    // in their PPR order, then a sorted fallback as tie-breaker so
+    // identical inputs always produce identical outputs.
     let mut order: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     for hit in lexical {
@@ -587,25 +713,34 @@ fn fuse(
             order.push(hit.item_id.clone());
         }
     }
+    for hit in structural {
+        if seen.insert(hit.item_id.clone()) {
+            order.push(hit.item_id.clone());
+        }
+    }
 
     let mut results: Vec<HybridResult> = order
         .into_iter()
         .filter_map(|id| {
             let lex = lexical_meta.get(id.as_str()).copied();
             let sem = semantic_meta.get(id.as_str()).copied();
-            if lex.is_none() && sem.is_none() {
+            let structural = structural_meta.get(id.as_str()).copied();
+            if lex.is_none() && sem.is_none() && structural.is_none() {
                 return None;
             }
             let lexical_rank = lex.map_or(usize::MAX, |(rank, _)| rank);
             let semantic_rank = sem.map_or(usize::MAX, |(rank, _)| rank);
+            let structural_rank = structural.map_or(usize::MAX, |(rank, _)| rank);
 
             let lexical_score = rank_to_score(lexical_rank, k);
             let semantic_score = rank_to_score(semantic_rank, k);
-            let score = lexical_score + semantic_score;
+            let structural_score = rank_to_score(structural_rank, k);
+            let score = lexical_score + semantic_score + structural_score;
 
             let title = lex.map_or_else(|| id.clone(), |(_, hit)| hit.title.clone());
             let lexical_raw_score = lex.map_or(0, |(_, hit)| hit.score);
             let semantic_raw_score = sem.map_or(0.0, |(_, score)| score);
+            let structural_raw_score = structural.map_or(0.0, |(_, score)| score);
 
             let mut reasons = Vec::new();
             if let Some((rank, hit)) = lex {
@@ -618,6 +753,11 @@ fn fuse(
             if let Some((rank, sim)) = sem {
                 reasons.push(format!("semantic match (rank {rank}, score {sim:.2})"));
             }
+            if let Some((rank, ppr)) = structural {
+                reasons.push(format!(
+                    "structural match (rank {rank}, score {ppr:.2})"
+                ));
+            }
 
             Some(HybridResult {
                 item_id: id,
@@ -625,10 +765,13 @@ fn fuse(
                 score,
                 lexical_score,
                 semantic_score,
+                structural_score,
                 lexical_rank,
                 semantic_rank,
+                structural_rank,
                 lexical_raw_score,
                 semantic_raw_score,
+                structural_raw_score,
                 reasons,
             })
         })
@@ -723,6 +866,7 @@ pub fn plan_retrieval_hybrid_with_backend(
 /// Returns an error when the lexical index cannot be loaded. Reranker
 /// failures degrade gracefully — the un-reranked fused order is returned
 /// with a one-shot warning.
+#[allow(clippy::too_many_lines)]
 pub fn plan_retrieval_hybrid_with_backend_and_reranker(
     root: &Path,
     query: &str,
@@ -814,16 +958,50 @@ pub fn plan_retrieval_hybrid_with_backend_and_reranker(
                     semantic_rank: Some(i + 1),
                     lexical_rank: None,
                     fused_score: None,
+                    structural_score: None,
+                    structural_rank: None,
                 });
             }
 
-            // Step 4: compute fused RRF score per candidate from its
-            // (lexical_rank, semantic_rank) pair, then sort by it.
-            // Without this the plan would keep the lexical-only order
-            // even though the candidate set has been augmented with
-            // semantic-only tail hits — confusing for users who see
-            // `semantic match (rank 1, score 0.59)` on a candidate
-            // sitting below several lower-ranked lexical-only entries.
+            // Step 4: structural tier (bn-32od). Run personalized
+            // PageRank over the citation graph using the existing
+            // candidate set as seeds, then enrich each candidate with
+            // its structural rank/score. Folded into the same RRF
+            // formula as lexical and semantic so the three signals
+            // compose cleanly.
+            let structural_seeds: Vec<String> =
+                plan.candidates.iter().map(|c| c.id.clone()).collect();
+            let structural_hits = run_structural(
+                root,
+                &structural_seeds,
+                options.structural,
+                structural_seeds.len().max(crate::lexical::DEFAULT_RETRIEVAL_TOP_K_FOR_HYBRID),
+            );
+            let structural_ranks: std::collections::HashMap<&str, (usize, f32)> = structural_hits
+                .iter()
+                .enumerate()
+                .map(|(i, hit)| (hit.item_id.as_str(), (i + 1, hit.score)))
+                .collect();
+            for candidate in &mut plan.candidates {
+                if let Some((rank, score)) =
+                    structural_ranks.get(candidate.id.as_str()).copied()
+                {
+                    candidate.structural_rank = Some(rank);
+                    candidate.structural_score = Some(score);
+                    candidate.reasons.push(format!(
+                        "structural match (rank {rank}, score {score:.2})"
+                    ));
+                }
+            }
+
+            // Step 5: compute fused RRF score per candidate from its
+            // (lexical_rank, semantic_rank, structural_rank) triple,
+            // then sort by it. Without this the plan would keep the
+            // lexical-only order even though the candidate set has
+            // been augmented with semantic-only tail hits — confusing
+            // for users who see `semantic match (rank 1, score 0.59)`
+            // on a candidate sitting below several lower-ranked
+            // lexical-only entries.
             for candidate in &mut plan.candidates {
                 let lex = candidate
                     .lexical_rank
@@ -831,7 +1009,10 @@ pub fn plan_retrieval_hybrid_with_backend_and_reranker(
                 let sem = candidate
                     .semantic_rank
                     .map_or(0.0, |r| rank_to_score(r, RRF_K));
-                candidate.fused_score = Some(lex + sem);
+                let structural = candidate
+                    .structural_rank
+                    .map_or(0.0, |r| rank_to_score(r, RRF_K));
+                candidate.fused_score = Some(lex + sem + structural);
             }
             plan.candidates.sort_by(|a, b| {
                 b.fused_score
@@ -987,6 +1168,17 @@ fn semantic_env_enabled() -> bool {
     )
 }
 
+/// Mirror of [`semantic_env_enabled`] for the structural tier (bn-32od).
+/// `KB_STRUCTURAL=0` short-circuits the citation-graph walk so the rest
+/// of hybrid retrieval behaves as it did before bn-32od. Useful in
+/// integration tests that want to A/B the tier.
+fn structural_env_enabled() -> bool {
+    !matches!(
+        std::env::var("KB_STRUCTURAL").ok().as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1013,7 +1205,7 @@ mod tests {
         let lexical = vec![lex("a", 9), lex("b", 5), lex("c", 1)];
         let semantic = vec![sem("c", 0.9), sem("a", 0.7), sem("d", 0.5)];
 
-        let fused = fuse(&lexical, &semantic, 4, 60);
+        let fused = fuse(&lexical, &semantic, &[], 4, 60);
         assert_eq!(fused.len(), 4);
         // 'a' is rank 1 in lexical and rank 2 in semantic — best fused score.
         assert_eq!(fused[0].item_id, "a");
@@ -1027,7 +1219,7 @@ mod tests {
     fn rrf_drops_items_not_present_in_either_list() {
         let lexical = vec![lex("a", 9)];
         let semantic = vec![sem("b", 0.6)];
-        let fused = fuse(&lexical, &semantic, 5, 60);
+        let fused = fuse(&lexical, &semantic, &[], 5, 60);
         assert_eq!(fused.len(), 2);
         let ids: Vec<&str> = fused.iter().map(|r| r.item_id.as_str()).collect();
         assert!(ids.contains(&"a"));
@@ -1082,7 +1274,7 @@ mod tests {
         a.reasons.push("title contains alpha".to_string());
         let lexical = vec![a];
         let semantic = vec![sem("a", 0.62)];
-        let fused = fuse(&lexical, &semantic, 5, 60);
+        let fused = fuse(&lexical, &semantic, &[], 5, 60);
         let reasons = &fused[0].reasons;
         assert!(reasons.iter().any(|r| r.contains("lexical match")));
         assert!(reasons.iter().any(|r| r.contains("title contains alpha")));
@@ -1163,6 +1355,8 @@ mod tests {
                 semantic_rank: None,
                 lexical_rank: Some(1),
                 fused_score: Some(fused),
+                structural_score: None,
+                structural_rank: None,
             }
         }
 

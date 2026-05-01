@@ -9172,3 +9172,140 @@ fn lint_all_includes_new_asr2_checks() {
     assert_eq!(find("stale-citations")["issue_count"], 1);
     assert_eq!(find("drift")["issue_count"], 1);
 }
+
+/// bn-32od fixture: two concept pages that both contain the query term
+/// "structural" (so they tie on lexical score), one source cited by
+/// both concepts (`src-shared`), one source cited by neither
+/// (`src-orphan`). The orphan still has the same lexical surface so
+/// it can compete for ranking on lexical-only.
+fn write_structural_tier_fixture(root: &Path) {
+    let concepts_dir = root.join("wiki/concepts");
+    fs::create_dir_all(&concepts_dir).expect("mkdir concepts");
+    fs::create_dir_all(root.join("wiki/sources")).expect("mkdir sources");
+
+    // Two concepts. Their bodies both mention `structural` so the
+    // query word matches them lexically; only `concept-alpha`'s body
+    // additionally cites `[src-shared]`, and only `concept-beta`'s
+    // body cites `[src-shared]` too. Together they form the seed set
+    // for the PPR pass that should bubble `src-shared` to the top.
+    fs::write(
+        concepts_dir.join("alpha.md"),
+        "---\nid: concept:alpha\nname: Alpha\n---\n\n# Alpha\n\
+         A structural overview, with citation [src-shared].\n",
+    )
+    .expect("write alpha concept");
+    fs::write(
+        concepts_dir.join("beta.md"),
+        "---\nid: concept:beta\nname: Beta\n---\n\n# Beta\n\
+         Another structural treatment, also citing [src-shared].\n",
+    )
+    .expect("write beta concept");
+
+    // Two source pages. Both pages mention "structural" verbatim in
+    // their summary so lexical-only ranking sees them at roughly equal
+    // weight; the structural tier is the tie-breaker that pushes the
+    // multi-cited one above the orphan.
+    write_source_page(
+        root,
+        "src-shared",
+        "Shared structural reference",
+        "A canonical structural reference cited by both alpha and beta concepts.",
+    );
+    write_source_page(
+        root,
+        "src-orphan",
+        "Lonely structural overview",
+        "A structural overview that nobody cites — a control for the ranking test.",
+    );
+}
+
+/// bn-32od: with the structural tier on, the source cited by both
+/// concepts (`src-shared`) outranks the otherwise-similar source that
+/// nobody cites (`src-orphan`). With the structural tier off (via
+/// `KB_STRUCTURAL=0`), the structural ranks vanish from the reasons
+/// list and the ordering reverts to the lexical+semantic baseline.
+#[test]
+fn structural_tier_boosts_multi_cited_source() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_structural_tier_fixture(&kb_root);
+
+    let mut compile_cmd = kb_cmd(&kb_root);
+    compile_cmd.arg("compile");
+    let output = compile_cmd.output().expect("compile");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Sanity: graph DB should exist after compile.
+    assert!(
+        kb_root.join(".kb/state/graph.db").exists(),
+        "compile must populate .kb/state/graph.db"
+    );
+
+    let run_search = |env: Option<(&str, &str)>| -> Vec<Value> {
+        let mut cmd = kb_cmd(&kb_root);
+        if let Some((k, v)) = env {
+            cmd.env(k, v);
+        }
+        cmd.arg("search").arg("structural").arg("--json");
+        let output = cmd.output().expect("search");
+        assert!(
+            output.status.success(),
+            "search failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: Value =
+            serde_json::from_slice(&output.stdout).expect("search returns json");
+        envelope["data"].as_array().cloned().unwrap_or_default()
+    };
+
+    // Structural tier ON (default).
+    let with_structural = run_search(None);
+    let shared_pos = with_structural
+        .iter()
+        .position(|r| {
+            r["item_id"]
+                .as_str()
+                .is_some_and(|s| s.contains("src-shared"))
+        })
+        .expect("src-shared should appear in results with structural tier on");
+    let orphan_pos = with_structural
+        .iter()
+        .position(|r| {
+            r["item_id"]
+                .as_str()
+                .is_some_and(|s| s.contains("src-orphan"))
+        })
+        .expect("src-orphan should appear in results with structural tier on");
+    assert!(
+        shared_pos < orphan_pos,
+        "with structural tier on, src-shared must rank above src-orphan: \
+         shared_pos={shared_pos}, orphan_pos={orphan_pos}, results={with_structural:?}"
+    );
+
+    // src-shared should also carry a structural-match reason.
+    let shared_reasons = with_structural[shared_pos]["reasons"]
+        .as_array()
+        .expect("reasons array");
+    assert!(
+        shared_reasons
+            .iter()
+            .any(|r| r.as_str().is_some_and(|s| s.contains("structural match"))),
+        "src-shared should carry a structural-match reason: {shared_reasons:?}",
+    );
+
+    // Structural tier OFF — no result should carry a structural-match reason.
+    let without_structural = run_search(Some(("KB_STRUCTURAL", "0")));
+    for hit in &without_structural {
+        let reasons = hit["reasons"].as_array().expect("reasons");
+        assert!(
+            reasons
+                .iter()
+                .all(|r| !r.as_str().is_some_and(|s| s.contains("structural match"))),
+            "structural-match reason should not appear when KB_STRUCTURAL=0; got: {hit}"
+        );
+    }
+}

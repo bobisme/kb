@@ -638,6 +638,12 @@ pub fn run_compile_with_llm(
             },
         ));
         passes.push((
+            "structural_index".to_string(),
+            PassStatus::DryRun {
+                would_process: vec!["wiki/**/*.md".to_string()],
+            },
+        ));
+        passes.push((
             "embedding_sync".to_string(),
             PassStatus::DryRun {
                 would_process: vec!["wiki/**/*.md".to_string()],
@@ -909,6 +915,34 @@ pub fn run_compile_with_llm(
             affected: index_count,
         },
     ));
+
+    // Pass: structural index (bn-32od). Walks every wiki page, extracts
+    // `[src-id]` citations and `[[wiki/...]]` wiki-links, and persists
+    // them to `.kb/state/graph.db` for the structural retrieval tier.
+    // Runs after `lexical_index` (which already walked the tree and
+    // would have flagged any malformed pages first) and before
+    // `embedding_sync` (so the heavier embedding pass doesn't gate on
+    // the structural pass — both can degrade independently). Failure
+    // is logged but not fatal: hybrid retrieval falls back to lex+sem.
+    match kb_query::build_graph(root) {
+        Ok(stats) => {
+            passes.push((
+                "structural_index".to_string(),
+                PassStatus::Executed {
+                    affected: stats.edges,
+                },
+            ));
+        }
+        Err(err) => {
+            tracing::warn!("structural index pass failed: {err:#}");
+            passes.push((
+                "structural_index".to_string(),
+                PassStatus::Skipped {
+                    reason: format!("error: {err}"),
+                },
+            ));
+        }
+    }
 
     // Pass: embedding sync. Walks wiki pages, hashes the embed input, and
     // re-embeds anything stale into .kb/state/embeddings.db. Idempotent —
