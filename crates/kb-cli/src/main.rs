@@ -13,6 +13,7 @@ mod migrate;
 mod publish;
 mod review;
 mod root;
+mod session;
 
 use std::env;
 use std::fs;
@@ -188,6 +189,27 @@ enum Command {
         /// Don't render the answer body to stdout; show only the artifact path
         #[arg(long)]
         no_render: bool,
+
+        /// bn-o6wv: continue a multi-turn session.
+        ///
+        /// Loads `<root>/.kb/sessions/<id>.json` (creating it on first use),
+        /// rewrites the new question against prior turns, runs hybrid
+        /// retrieval against the rewritten query, builds an answer prompt
+        /// that includes the conversation history, and appends both the
+        /// user and assistant turns back to the session file. Pass with no
+        /// query to drop into an interactive REPL on the same session.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+    /// Manage multi-turn ask sessions (bn-o6wv).
+    ///
+    /// Sessions are conversational `kb ask` transcripts stored under
+    /// `<root>/.kb/sessions/<id>.json`. Use `kb ask --session <id>` to
+    /// add new turns; the subcommands here let you list, inspect, and
+    /// create empty sessions.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
     },
     /// Lint knowledge base for issues
     Lint {
@@ -311,6 +333,23 @@ enum Command {
     Eval {
         #[command(subcommand)]
         action: EvalAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum SessionAction {
+    /// List sessions under `.kb/sessions/`, newest-first by last update.
+    List,
+    /// Print the full transcript for a session.
+    Show {
+        /// Session id (the `<id>` part of `<id>.json`).
+        #[arg(required = true)]
+        id: String,
+    },
+    /// Create a fresh empty session. If `<id>` is omitted, generates a terseid.
+    New {
+        /// Optional session id; defaults to a generated `s-...` terseid.
+        id: Option<String>,
     },
 }
 
@@ -572,34 +611,69 @@ fn run(cli: Cli) -> Result<()> {
                 .expect("root resolved for non-init commands");
             run_doctor_command(root, cli.json, cli.model.as_deref())
         }
-        Some(Command::Ask { query, format, promote, editor, no_render }) => {
+        Some(Command::Ask { query, format, promote, editor, no_render, session }) => {
             let ask_root = root
                 .as_deref()
                 .expect("root resolved for non-init commands");
-            let query = resolve_query(query, editor)?;
             let model = cli.model.clone();
             let dry_run = cli.dry_run;
             let json = cli.json;
             let quiet = cli.quiet;
-            let action = move || {
-                run_ask(
-                    ask_root,
-                    &query,
-                    format.as_deref(),
-                    model.as_deref(),
-                    json,
-                    dry_run,
-                    promote,
-                    quiet,
-                    no_render,
-                )
-            };
-            if dry_run {
-                // Dry-run doesn't write anything; no lock needed.
-                action()
+            // bn-o6wv: with `--session`, branch into the multi-turn flow.
+            // Without `--session`, keep the historical single-shot path
+            // exactly as it was — including the resolve_query semantics
+            // (positional > stdin > reedline > editor).
+            if let Some(session_id) = session {
+                session::validate_session_id(&session_id)
+                    .map_err(|err| ValidationError::new(format!("{err}")))?;
+                let action = move || {
+                    run_ask_session(
+                        ask_root,
+                        &session_id,
+                        query.as_deref(),
+                        editor,
+                        model.as_deref(),
+                        json,
+                        dry_run,
+                        quiet,
+                        no_render,
+                        promote,
+                        format.as_deref(),
+                    )
+                };
+                if dry_run {
+                    action()
+                } else {
+                    execute_mutating_command(Some(ask_root), "ask", action)
+                }
             } else {
-                execute_mutating_command(Some(ask_root), "ask", action)
+                let query = resolve_query(query, editor)?;
+                let action = move || {
+                    run_ask(
+                        ask_root,
+                        &query,
+                        format.as_deref(),
+                        model.as_deref(),
+                        json,
+                        dry_run,
+                        promote,
+                        quiet,
+                        no_render,
+                    )
+                };
+                if dry_run {
+                    // Dry-run doesn't write anything; no lock needed.
+                    action()
+                } else {
+                    execute_mutating_command(Some(ask_root), "ask", action)
+                }
             }
+        }
+        Some(Command::Session { action }) => {
+            let session_root = root
+                .as_deref()
+                .expect("root resolved for non-init commands");
+            run_session_subcommand(session_root, action, cli.json)
         }
         Some(Command::Ingest {
             sources,
@@ -2945,6 +3019,582 @@ fn run_ask(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// bn-o6wv: conversational `kb ask --session <id>` and `kb session ...`
+// ---------------------------------------------------------------------------
+
+/// Maximum number of prior turns to include in the rewrite prompt. The
+/// rewrite only needs the recent context — a long-running session pays
+/// for nothing by sending its first 50 turns to the rewriter every time.
+const SESSION_REWRITE_HISTORY_TURNS: usize = 8;
+
+/// Maximum number of prior turns to include in the answer prompt's
+/// `{{conversation}}` block. Older turns get trimmed first so the
+/// retrieval context still fits the token budget. Mirrors the rewrite
+/// budget so the model sees the same history shape across both calls.
+const SESSION_ANSWER_HISTORY_TURNS: usize = 8;
+
+/// One round-trip of a session-mode ask: rewrite (if needed), retrieve,
+/// answer, and append two turns to the on-disk session file.
+///
+/// `query.is_some()` does one round and exits. `query.is_none()` opens
+/// an interactive REPL on the session, looping until the user enters
+/// `:q` or sends EOF (Ctrl-D).
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
+fn run_ask_session(
+    root: &Path,
+    session_id: &str,
+    query: Option<&str>,
+    editor: bool,
+    cli_model: Option<&str>,
+    json: bool,
+    dry_run: bool,
+    quiet: bool,
+    no_render: bool,
+    promote: bool,
+    requested_format: Option<&str>,
+) -> Result<()> {
+    if dry_run {
+        return Err(ValidationError::new(
+            "kb ask --session does not support --dry-run yet",
+        )
+        .into());
+    }
+    if promote {
+        return Err(ValidationError::new(
+            "kb ask --session does not support --promote (sessions are scratch space; \
+             ask without --session to promote a single-turn answer)",
+        )
+        .into());
+    }
+
+    if let Some(q) = query {
+        // Single-shot turn against the named session.
+        let q = if editor {
+            // Editor mode is only sensible when there's no positional
+            // query — but if both are passed, prefer the editor (matches
+            // the historical resolve_query semantics).
+            read_from_editor()?
+        } else {
+            q.to_string()
+        };
+        run_session_turn(
+            root,
+            session_id,
+            &q,
+            cli_model,
+            json,
+            quiet,
+            no_render,
+            requested_format,
+        )?;
+        return Ok(());
+    }
+
+    // No query provided — interactive REPL on the session.
+    if editor {
+        // `--editor` + no positional + interactive session would fight over
+        // stdin between the REPL and the editor. Reject early.
+        return Err(ValidationError::new(
+            "kb ask --session --editor requires a positional question; drop --editor for the REPL",
+        )
+        .into());
+    }
+    run_session_repl(
+        root,
+        session_id,
+        cli_model,
+        json,
+        quiet,
+        no_render,
+        requested_format,
+    )
+}
+
+/// Drive the REPL loop for `kb ask --session <id>` with no query arg.
+fn run_session_repl(
+    root: &Path,
+    session_id: &str,
+    cli_model: Option<&str>,
+    json: bool,
+    quiet: bool,
+    no_render: bool,
+    requested_format: Option<&str>,
+) -> Result<()> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        return Err(ValidationError::new(
+            "kb ask --session with no positional question expects an interactive TTY; \
+             pass a question on the command line or pipe one with `kb ask --session <id> -`",
+        )
+        .into());
+    }
+
+    eprintln!(
+        "kb session {session_id}: type a question and press Enter, `:q` or Ctrl-D to exit.",
+    );
+    loop {
+        eprint!(">>> ");
+        std::io::Write::flush(&mut std::io::stderr()).ok();
+        let mut buf = String::new();
+        let read = std::io::stdin()
+            .read_line(&mut buf)
+            .context("read repl line")?;
+        if read == 0 {
+            // Ctrl-D / EOF.
+            eprintln!();
+            break;
+        }
+        let trimmed = buf.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == ":q" || trimmed == ":quit" || trimmed == ":exit" {
+            break;
+        }
+        if let Err(err) = run_session_turn(
+            root,
+            session_id,
+            trimmed,
+            cli_model,
+            json,
+            quiet,
+            no_render,
+            requested_format,
+        ) {
+            eprintln!("error: {err:#}");
+            // Don't bail — let the user retry with a new question.
+        }
+    }
+    Ok(())
+}
+
+/// Execute a single conversational turn:
+///
+/// 1. Load (or create) the on-disk session.
+/// 2. If prior turns exist, ask the LLM to rewrite the new question into
+///    a standalone retrieval query. On rewrite failure, fall back to the
+///    raw question — a flaky rewrite must not break the answer path.
+/// 3. Run hybrid retrieval against the (possibly rewritten) query.
+/// 4. Build an answer prompt that includes the prior turns plus the
+///    retrieved chunks; send to the LLM.
+/// 5. Persist a User turn (raw question + retrieval ids) and an
+///    Assistant turn (answer text + citation labels) to the session.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_session_turn(
+    root: &Path,
+    session_id: &str,
+    raw_question: &str,
+    cli_model: Option<&str>,
+    json: bool,
+    quiet: bool,
+    no_render: bool,
+    requested_format: Option<&str>,
+) -> Result<()> {
+    let raw_question = raw_question.trim();
+    if raw_question.is_empty() {
+        return Err(ValidationError::new("ask: question cannot be empty").into());
+    }
+
+    let cfg = Config::load_from_root(root, cli_model)?;
+    // bn-o6wv: sessions are conversational scratch — keep them on the
+    // markdown-only path so each turn produces a clean text answer
+    // without tool-driving (chart/excalidraw) side effects. Callers can
+    // still override with `--format` (validated below) but the default
+    // is `md` rather than the fancier `auto`.
+    let format = requested_format.unwrap_or("md");
+    let format = normalize_ask_format(format)?;
+    if !matches!(format, "md" | "marp" | "json") {
+        return Err(ValidationError::new(format!(
+            "kb ask --session only supports text formats (md, marp, json); got {format}"
+        ))
+        .into());
+    }
+
+    let mut sess = match session::load(root, session_id)? {
+        Some(s) => s,
+        None => session::Session::new(session_id)?,
+    };
+
+    // Step 1: rewrite when there's prior context.
+    let retrieval_query = if sess.turns.is_empty() {
+        raw_question.to_string()
+    } else {
+        match rewrite_query_with_history(&cfg, root, raw_question, &sess) {
+            Ok(rewritten) => {
+                if rewritten.trim().is_empty() {
+                    // Rewriter returned nothing usable — fall back.
+                    raw_question.to_string()
+                } else {
+                    rewritten
+                }
+            }
+            Err(err) => {
+                tracing::warn!("session rewrite failed: {err}; falling back to raw question");
+                raw_question.to_string()
+            }
+        }
+    };
+
+    // Step 2: hybrid retrieval against the rewritten query.
+    let backend_config = cfg.semantic.to_backend_config();
+    let backend = kb_query::SemanticBackend::from_config(&backend_config)?;
+    let retrieval_plan = kb_query::plan_retrieval_hybrid_with_backend(
+        root,
+        &retrieval_query,
+        cfg.ask.token_budget,
+        cfg.retrieval.to_hybrid_options(backend_config.kind),
+        &backend,
+    )?;
+    let retrieved_ids: Vec<String> = retrieval_plan
+        .candidates
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+
+    // Step 3: assemble context + manifest, then call the LLM with the
+    // session-aware template that includes a `{{conversation}}` block.
+    let assembled = kb_query::assemble_context(root, &retrieval_plan)?;
+    let citation_manifest = kb_query::build_citation_manifest(&assembled);
+    let manifest_text = kb_query::render_manifest_for_prompt(&citation_manifest);
+    let conversation_text = render_conversation_for_prompt(
+        &sess.turns,
+        SESSION_ANSWER_HISTORY_TURNS,
+    );
+
+    let llm_outcome = try_generate_session_answer(
+        &cfg,
+        root,
+        raw_question,
+        &assembled,
+        &manifest_text,
+        &conversation_text,
+    );
+
+    let (answer_body, citations, model_label, latency_ms, fallback_note) = match llm_outcome {
+        Ok((result, provenance)) => {
+            let citations: Vec<String> = result
+                .valid_citations
+                .iter()
+                .filter_map(|key| citation_manifest.entries.get(key))
+                .map(|entry| entry.label.clone())
+                .collect();
+            (
+                result.body,
+                citations,
+                Some(provenance.model),
+                Some(provenance.latency_ms),
+                None,
+            )
+        }
+        Err(err) => (
+            format!(
+                "> **LLM unavailable:** {err}\n\n\
+                 Question recorded in session `{session_id}`. Re-run when a backend is available.\n",
+            ),
+            Vec::new(),
+            None,
+            None,
+            Some(format!("LLM unavailable: {err}")),
+        ),
+    };
+
+    // Step 4: append both turns and persist.
+    sess.push_turn(session::Turn {
+        role: session::TurnRole::User,
+        text: raw_question.to_string(),
+        retrieved_ids: retrieved_ids.clone(),
+        citations: Vec::new(),
+    })?;
+    sess.push_turn(session::Turn {
+        role: session::TurnRole::Assistant,
+        text: answer_body.clone(),
+        retrieved_ids: Vec::new(),
+        citations: citations.clone(),
+    })?;
+    session::save(root, &sess)?;
+
+    // Step 5: present.
+    let path = session::session_path(root, session_id);
+    if json {
+        emit_json(
+            "ask",
+            serde_json::json!({
+                "session_id": session_id,
+                "session_path": path,
+                "rewritten_query": retrieval_query,
+                "retrieved_ids": retrieved_ids,
+                "citations": citations,
+                "answer": answer_body,
+                "turn_count": sess.turns.len(),
+                "fallback_reason": fallback_note,
+            }),
+        )?;
+    } else {
+        let render_body = !quiet && !no_render;
+        if render_body {
+            if std::io::stdout().is_terminal() {
+                termimad::print_text(&answer_body);
+            } else {
+                print!("{answer_body}");
+                if !answer_body.ends_with('\n') {
+                    println!();
+                }
+            }
+            println!();
+        }
+        println!("Session: {} ({} turns)", session_id, sess.turns.len());
+        if !citations.is_empty() {
+            println!("Citations: {}", citations.join(", "));
+        }
+        if let (Some(model), Some(latency)) = (model_label.as_deref(), latency_ms) {
+            println!("Model: {model} ({latency}ms)");
+        } else {
+            println!("LLM backend unavailable — placeholder turn recorded.");
+        }
+    }
+    Ok(())
+}
+
+/// Render the conversation transcript that goes into the rewrite and
+/// answer prompts. Keeps the most recent `max_turns` turns and drops
+/// older ones — the oldest turns rarely matter for "what about X?"
+/// follow-ups, and trimming keeps the prompt budget under control.
+fn render_conversation_for_prompt(turns: &[session::Turn], max_turns: usize) -> String {
+    if turns.is_empty() {
+        return String::new();
+    }
+    let start = turns.len().saturating_sub(max_turns);
+    let mut out = String::new();
+    for turn in &turns[start..] {
+        let role = match turn.role {
+            session::TurnRole::User => "user",
+            session::TurnRole::Assistant => "assistant",
+        };
+        // Indent each turn's text so multi-paragraph answers stay
+        // readable inside the rendered prompt.
+        out.push('[');
+        out.push_str(role);
+        out.push_str("] ");
+        out.push_str(turn.text.trim());
+        out.push_str("\n\n");
+    }
+    out
+}
+
+/// Ask the LLM to rewrite `new_question` into a standalone retrieval
+/// query given the recent session history. Uses the bundled
+/// `rewrite_query.md` template so the prompt lives next to the other
+/// adapter prompts.
+fn rewrite_query_with_history(
+    cfg: &Config,
+    root: &Path,
+    new_question: &str,
+    sess: &session::Session,
+) -> Result<String> {
+    let adapter = create_ask_adapter(cfg, root)?;
+    let history = render_conversation_for_prompt(&sess.turns, SESSION_REWRITE_HISTORY_TURNS);
+    let request = kb_llm::AnswerQuestionRequest {
+        question: new_question.to_string(),
+        // The rewrite template uses `{{sources}}` for the conversation
+        // block to keep the placeholder set the adapter already
+        // populates — no need to grow the context map for one prompt.
+        context: vec![history],
+        format: Some(String::new()),
+        template_name: Some("rewrite_query.md".to_string()),
+        output_path: None,
+        image_paths: Vec::new(),
+        structured_output: false,
+        conversation: String::new(),
+    };
+    let (response, _provenance) = adapter
+        .answer_question(request)
+        .map_err(|err| anyhow!("rewrite query: {err}"))?;
+    // Models sometimes wrap the rewrite in quotes or fenced blocks even
+    // though the prompt asks for a bare line — strip those defensively.
+    let cleaned = response
+        .answer
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .trim_matches(|c: char| c == '"' || c == '\'' || c == '`')
+        .to_string();
+    Ok(cleaned)
+}
+
+/// Send the session-aware answer prompt to the LLM. Mirrors the shape
+/// of `try_generate_answer` but uses `ask_session.md` and threads the
+/// rendered conversation through the new `conversation` field.
+fn try_generate_session_answer(
+    cfg: &Config,
+    root: &Path,
+    question: &str,
+    assembled: &kb_query::AssembledContext,
+    manifest_text: &str,
+    conversation_text: &str,
+) -> Result<(kb_query::ArtifactResult, kb_llm::ProvenanceRecord)> {
+    let adapter = create_ask_adapter(cfg, root)?;
+    let request = kb_llm::AnswerQuestionRequest {
+        question: question.to_string(),
+        context: vec![assembled.text.clone()],
+        format: Some(manifest_text.to_string()),
+        template_name: Some("ask_session.md".to_string()),
+        output_path: None,
+        image_paths: Vec::new(),
+        structured_output: false,
+        conversation: conversation_text.to_string(),
+    };
+    let (response, provenance) = adapter
+        .answer_question(request)
+        .map_err(|err| anyhow!("{err}"))?;
+    let citation_manifest = kb_query::build_citation_manifest(assembled);
+    let result = kb_query::postprocess_answer(&response.answer, &citation_manifest, assembled);
+    Ok((result, provenance))
+}
+
+/// Dispatch `kb session list | show | new`.
+#[allow(clippy::too_many_lines)]
+fn run_session_subcommand(
+    root: &Path,
+    action: SessionAction,
+    json: bool,
+) -> Result<()> {
+    match action {
+        SessionAction::List => {
+            let entries = session::list(root)?;
+            if json {
+                let payload: Vec<_> = entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id,
+                            "updated_at_millis": e.updated_at_millis,
+                            "turn_count": e.turn_count,
+                        })
+                    })
+                    .collect();
+                emit_json(
+                    "session list",
+                    serde_json::json!({ "sessions": payload }),
+                )?;
+            } else if entries.is_empty() {
+                println!("(no sessions yet — start one with `kb ask --session <id> \"...\"`)");
+            } else {
+                println!("{:<24}  {:>6}  UPDATED", "ID", "TURNS");
+                for e in &entries {
+                    println!(
+                        "{:<24}  {:>6}  {}",
+                        e.id,
+                        e.turn_count,
+                        format_millis_iso8601(e.updated_at_millis)
+                    );
+                }
+            }
+            Ok(())
+        }
+        SessionAction::Show { id } => {
+            session::validate_session_id(&id)
+                .map_err(|err| ValidationError::new(format!("{err}")))?;
+            let Some(sess) = session::load(root, &id)? else {
+                return Err(ValidationError::new(format!(
+                    "no such session: {id} (sessions live under .kb/sessions/<id>.json)"
+                ))
+                .into());
+            };
+            if json {
+                emit_json("session show", &sess)?;
+            } else {
+                println!("# Session {} ({} turns)", sess.id, sess.turns.len());
+                println!(
+                    "Created: {}  Updated: {}",
+                    format_millis_iso8601(sess.created_at_millis),
+                    format_millis_iso8601(sess.updated_at_millis)
+                );
+                println!();
+                for (i, turn) in sess.turns.iter().enumerate() {
+                    let role = match turn.role {
+                        session::TurnRole::User => "user",
+                        session::TurnRole::Assistant => "assistant",
+                    };
+                    println!("## Turn {} [{}]", i + 1, role);
+                    println!();
+                    println!("{}", turn.text.trim());
+                    println!();
+                    if !turn.retrieved_ids.is_empty() {
+                        println!("retrieved: {}", turn.retrieved_ids.join(", "));
+                    }
+                    if !turn.citations.is_empty() {
+                        println!("citations: {}", turn.citations.join(", "));
+                    }
+                    println!();
+                }
+            }
+            Ok(())
+        }
+        SessionAction::New { id } => {
+            let id = match id {
+                Some(custom) => {
+                    session::validate_session_id(&custom)
+                        .map_err(|err| ValidationError::new(format!("{err}")))?;
+                    custom
+                }
+                None => session::generate_session_id(root),
+            };
+            if session::load(root, &id)?.is_some() {
+                return Err(ValidationError::new(format!(
+                    "session `{id}` already exists; pick a different id or run `kb session show {id}`"
+                ))
+                .into());
+            }
+            let sess = session::Session::new(&id)?;
+            session::save(root, &sess)?;
+            if json {
+                emit_json(
+                    "session new",
+                    serde_json::json!({
+                        "id": id,
+                        "session_path": session::session_path(root, &id),
+                    }),
+                )?;
+            } else {
+                println!("Created session: {id}");
+                println!(
+                    "Add the first turn with: kb ask --session {id} \"your question\""
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Format a wall-clock millisecond timestamp as a relative "N units ago"
+/// string anchored at the current time. Picks the largest unit that
+/// renders to at least 1 (seconds → minutes → hours → days). Falls back
+/// to the raw epoch-millis for dates in the future or before the epoch.
+fn format_millis_iso8601(millis: i64) -> String {
+    let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+        return format!("(t={millis})");
+    };
+    let Ok(now_ms) = i64::try_from(now.as_millis()) else {
+        return format!("(t={millis})");
+    };
+    if millis <= 0 || millis > now_ms {
+        return format!("(t={millis})");
+    }
+    let delta_secs = (now_ms - millis) / 1000;
+    if delta_secs < 60 {
+        format!("{delta_secs}s ago")
+    } else if delta_secs < 3600 {
+        format!("{}m ago", delta_secs / 60)
+    } else if delta_secs < 86_400 {
+        format!("{}h ago", delta_secs / 3600)
+    } else {
+        format!("{}d ago", delta_secs / 86_400)
+    }
+}
+
 // bn-3dkw: `image_paths` brings the arity to 8. The helper only has one caller
 // (`run_ask`) and each param is a distinct concern, so bundling them into a
 // struct is more ceremony than the site is worth.
@@ -2973,6 +3623,7 @@ fn try_generate_answer(
         output_path: output_path.map(str::to_string),
         image_paths: image_paths.to_vec(),
         structured_output,
+        conversation: String::new(),
     };
 
     let (llm_response, provenance) = adapter

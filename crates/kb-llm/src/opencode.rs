@@ -650,6 +650,10 @@ impl LlmAdapter for OpencodeAdapter {
         if let Some(path) = request.output_path.as_ref() {
             context.insert("output_path".to_string(), path.clone());
         }
+        // bn-o6wv: rendered prior-turn transcript for `--session` runs.
+        // Single-shot callers leave it empty; the rewrite + answer prompts
+        // for sessions place it in `{{conversation}}`.
+        context.insert("conversation".to_string(), request.conversation.clone());
 
         let rendered = template
             .render(&context)
@@ -1491,10 +1495,8 @@ mod tests {
                 question: "what does the diagram show?".to_string(),
                 context: vec!["source body with ![d](pic.png)".to_string()],
                 format: Some(String::new()),
-                template_name: None,
-                output_path: None,
                 image_paths: vec![image_one.clone(), image_two.clone()],
-                structured_output: false,
+                ..Default::default()
             })
             .expect("answer");
 
@@ -1535,10 +1537,7 @@ mod tests {
                 question: "text-only?".to_string(),
                 context: vec!["plain source text".to_string()],
                 format: Some(String::new()),
-                template_name: None,
-                output_path: None,
-                image_paths: Vec::new(),
-                structured_output: false,
+                ..Default::default()
             })
             .expect("answer");
 
@@ -1843,10 +1842,8 @@ mod tests {
                 question: "render a chart".to_string(),
                 context: vec!["source".to_string()],
                 format: Some(String::new()),
-                template_name: None,
-                output_path: None,
-                image_paths: Vec::new(),
                 structured_output: true,
+                ..Default::default()
             })
             .expect("answer");
 
@@ -1889,10 +1886,7 @@ mod tests {
                 question: "regular question".to_string(),
                 context: vec!["source".to_string()],
                 format: Some(String::new()),
-                template_name: None,
-                output_path: None,
-                image_paths: Vec::new(),
-                structured_output: false,
+                ..Default::default()
             })
             .expect("answer");
 

@@ -287,6 +287,12 @@ pub struct AnswerQuestionRequest {
     /// contract. Defaults to `false` so existing callers are unaffected.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub structured_output: bool,
+    /// Optional rendered prior-conversation transcript (bn-o6wv). When set,
+    /// adapters substitute it into the prompt's `{{conversation}}`
+    /// placeholder. Defaults to empty so single-shot callers (the historical
+    /// `kb ask` path) are unaffected.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub conversation: String,
 }
 
 /// Response containing the answer to a question.

@@ -54,6 +54,8 @@ impl Template {
             "ask_excalidraw.md" => {
                 Ok(include_str!("../prompts/ask_excalidraw.md").to_string())
             }
+            "ask_session.md" => Ok(include_str!("../prompts/ask_session.md").to_string()),
+            "rewrite_query.md" => Ok(include_str!("../prompts/rewrite_query.md").to_string()),
             "compile.md" => Ok(include_str!("../prompts/compile.md").to_string()),
             "summarize_document.md" => {
                 Ok(include_str!("../prompts/summarize_document.md").to_string())

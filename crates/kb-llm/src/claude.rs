@@ -507,6 +507,8 @@ impl LlmAdapter for ClaudeCliAdapter {
         if let Some(path) = request.output_path.as_ref() {
             context.insert("output_path".to_string(), path.clone());
         }
+        // bn-o6wv: rendered prior-turn transcript for `--session` runs.
+        context.insert("conversation".to_string(), request.conversation.clone());
 
         let rendered = template
             .render(&context)
@@ -1622,10 +1624,8 @@ mod tests {
                 question: "describe the diagram".to_string(),
                 context: vec!["source".to_string()],
                 format: Some(String::new()),
-                template_name: None,
-                output_path: None,
                 image_paths: vec![img],
-                structured_output: false,
+                ..Default::default()
             })
             .expect("answer");
         assert_eq!(response.answer, "ok");

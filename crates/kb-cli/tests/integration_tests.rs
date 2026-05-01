@@ -8631,3 +8631,337 @@ expected_sources = ["src-billing"]
         "list should mark a latest entry: {stdout}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// bn-o6wv: conversational `kb ask --session` and `kb session ...`
+// ---------------------------------------------------------------------------
+
+/// Fake opencode that records the *last* prompt it was given to a sentinel
+/// file under `<root>/.kb/state/last-prompt.txt` and emits a deterministic
+/// answer that depends on whether the prompt looks like a rewrite call or
+/// an answer call. We need both branches to behave differently for the
+/// turn-2-uses-prior-context assertion to be meaningful.
+fn install_fake_session_harness(root: &Path) -> PathBuf {
+    let bin_dir = root.join("fake-session-bin");
+    fs::create_dir_all(&bin_dir).expect("create fake session bin dir");
+    // Pre-create the state dir so the sentinel write doesn't race the
+    // first `kb` invocation.
+    fs::create_dir_all(root.join(".kb").join("state"))
+        .expect("create state dir for sentinel");
+
+    let prompt_path = root.join(".kb").join("state").join("last-prompt.txt");
+    let prompt_path_str = prompt_path.to_string_lossy().into_owned();
+
+    let script_template = "#!/bin/sh\n\
+# Drain stdin into the sentinel so the test can assert what the prompt\n\
+# actually looked like.\n\
+prompt_path=__PROMPT_PATH__\n\
+tmp=$(mktemp)\n\
+cat >\"$tmp\"\n\
+cp \"$tmp\" \"$prompt_path\"\n\
+\n\
+# Rewrite calls end with the literal 'Rewritten retrieval query' header.\n\
+# Answer calls go through ask.md or ask_session.md and start with the\n\
+# question banner.\n\
+if grep -q 'Rewritten retrieval query' \"$tmp\" >/dev/null 2>&1; then\n\
+    if grep -q 'consensus' \"$tmp\" >/dev/null 2>&1; then\n\
+        printf 'consensus algorithm raft differences from paxos\\n'\n\
+    else\n\
+        printf 'rewritten retrieval query placeholder\\n'\n\
+    fi\n\
+else\n\
+    # Answer call. When the prompt has any role-tagged turn ('[user]' or\n\
+    # '[assistant]') in the conversation block, the session run is on\n\
+    # turn 2+; emit an answer that proves we considered the prior turn.\n\
+    if grep -qE '\\[(user|assistant)\\]' \"$tmp\" >/dev/null 2>&1; then\n\
+        printf 'Building on the earlier turn about Paxos, Raft achieves consensus through leader election [1].\\n'\n\
+    else\n\
+        printf 'Consensus is the problem of agreeing on a single value across distributed nodes [1].\\n'\n\
+    fi\n\
+fi\n";
+    let script = script_template.replace(
+        "__PROMPT_PATH__",
+        &shell_quote_single(&prompt_path_str),
+    );
+    write_executable(bin_dir.join("opencode").as_path(), &script);
+    write_executable(
+        bin_dir.join("claude").as_path(),
+        "#!/bin/sh\nprintf '{\"result\":\"OK\"}'",
+    );
+    bin_dir
+}
+
+/// Shell-quote `s` with single quotes for safe inclusion in `/bin/sh` heredocs.
+fn shell_quote_single(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for ch in s.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+#[test]
+fn session_first_turn_creates_session_file_with_two_turns() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_source_page(
+        &kb_root,
+        "paxos",
+        "Paxos",
+        "Paxos is a family of protocols for solving consensus.",
+    );
+
+    let fake_bin = install_fake_session_harness(&kb_root);
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--session")
+        .arg("s-test")
+        .arg("what is consensus?");
+    let output = cmd.output().expect("kb ask --session");
+    assert!(
+        output.status.success(),
+        "kb ask --session failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Session file must exist with two turns (user + assistant).
+    let session_path = kb_root.join(".kb/sessions/s-test.json");
+    assert!(
+        session_path.is_file(),
+        "session file should exist at {}",
+        session_path.display()
+    );
+    let raw = fs::read_to_string(&session_path).expect("read session file");
+    let parsed: Value = serde_json::from_str(&raw).expect("parse session json");
+    assert_eq!(parsed["id"], "s-test");
+    let turns = parsed["turns"].as_array().expect("turns array");
+    assert_eq!(turns.len(), 2, "expected 2 turns after first ask, got {turns:?}");
+    assert_eq!(turns[0]["role"], "user");
+    assert_eq!(turns[0]["text"], "what is consensus?");
+    assert_eq!(turns[1]["role"], "assistant");
+    assert!(
+        turns[1]["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("Consensus is")),
+        "first-turn answer should be the canned consensus reply, got {}",
+        turns[1]["text"]
+    );
+
+    // The JSON envelope echoes the session metadata.
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json envelope");
+    assert_eq!(envelope["data"]["session_id"], "s-test");
+    assert_eq!(envelope["data"]["turn_count"], 2);
+}
+
+#[test]
+fn session_second_turn_uses_prior_context_via_rewrite() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    // Sources for both consensus and Paxos so retrieval has something to
+    // pull on each turn — the rewrite injects "consensus" into turn 2's
+    // retrieval query, which finds the Paxos page.
+    write_source_page(
+        &kb_root,
+        "paxos",
+        "Paxos",
+        "Paxos is the canonical consensus algorithm.",
+    );
+    write_source_page(
+        &kb_root,
+        "raft",
+        "Raft",
+        "Raft is an alternative consensus algorithm to Paxos.",
+    );
+
+    let fake_bin = install_fake_session_harness(&kb_root);
+
+    // Turn 1: seed the session.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("ask")
+        .arg("--session")
+        .arg("s-multi")
+        .arg("what is consensus?");
+    let output = cmd.output().expect("kb ask --session turn 1");
+    assert!(
+        output.status.success(),
+        "turn 1 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Turn 2: a follow-up question. The rewrite step should rewrite
+    // "what about raft?" against the prior turn's "consensus" context.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("--json")
+        .arg("ask")
+        .arg("--session")
+        .arg("s-multi")
+        .arg("what about raft?");
+    let output = cmd.output().expect("kb ask --session turn 2");
+    assert!(
+        output.status.success(),
+        "turn 2 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // After turn 2 the file must hold 4 turns.
+    let session_path = kb_root.join(".kb/sessions/s-multi.json");
+    let raw = fs::read_to_string(&session_path).expect("read session file");
+    let parsed: Value = serde_json::from_str(&raw).expect("parse session json");
+    let turns = parsed["turns"].as_array().expect("turns array");
+    assert_eq!(turns.len(), 4, "expected 4 turns after two asks, got {}", turns.len());
+    assert_eq!(turns[2]["role"], "user");
+    assert_eq!(turns[2]["text"], "what about raft?");
+    let retrieved_ids = turns[2]["retrieved_ids"]
+        .as_array()
+        .expect("retrieved_ids array");
+    assert!(
+        !retrieved_ids.is_empty(),
+        "turn 2 user retrieved_ids must reflect the rewrite-driven retrieval"
+    );
+
+    // The JSON envelope from turn 2 also echoes the rewritten query.
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse envelope");
+    let rewritten = envelope["data"]["rewritten_query"]
+        .as_str()
+        .expect("rewritten_query string");
+    assert!(
+        rewritten.to_lowercase().contains("consensus")
+            || rewritten.to_lowercase().contains("paxos"),
+        "rewritten query should pull in prior-turn context, got {rewritten:?}"
+    );
+
+    // Turn 2's answer should reference the prior-turn topic ("Building
+    // on the earlier turn about Paxos") because the answer prompt
+    // includes the conversation history.
+    let answer = turns[3]["text"].as_str().expect("turn 3 text");
+    assert!(
+        answer.contains("Building on the earlier turn"),
+        "turn 2 answer should include prior-context reference, got {answer:?}"
+    );
+
+    // The answer prompt that was fed to the LLM must include the
+    // conversation transcript section.
+    let prompt = fs::read_to_string(kb_root.join(".kb/state/last-prompt.txt"))
+        .expect("read last-prompt sentinel");
+    assert!(
+        prompt.contains("Conversation so far"),
+        "answer prompt must include the conversation block, got:\n{prompt}"
+    );
+    assert!(
+        prompt.contains("[user]") && prompt.contains("[assistant]"),
+        "conversation block must list role-tagged turns, got:\n{prompt}"
+    );
+}
+
+#[test]
+fn session_list_and_show_inspect_a_session() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+    write_source_page(&kb_root, "paxos", "Paxos", "Paxos is consensus.");
+    let fake_bin = install_fake_session_harness(&kb_root);
+
+    // Add one turn so a session file lands on disk.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.env("PATH", prepend_path(&fake_bin));
+    cmd.arg("ask").arg("--session").arg("s-inspect").arg("what is consensus?");
+    let output = cmd.output().expect("kb ask --session");
+    assert!(
+        output.status.success(),
+        "kb ask failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // `kb session list` should mention the session.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("session").arg("list");
+    let output = cmd.output().expect("kb session list");
+    assert!(
+        output.status.success(),
+        "kb session list failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("s-inspect"), "list should mention session: {stdout}");
+
+    // `kb session show <id>` should print the transcript with both turns.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("session").arg("show").arg("s-inspect");
+    let output = cmd.output().expect("kb session show");
+    assert!(
+        output.status.success(),
+        "kb session show failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("what is consensus?"),
+        "show should include the user turn: {stdout}"
+    );
+    assert!(
+        stdout.contains("[user]") && stdout.contains("[assistant]"),
+        "show should label both roles: {stdout}"
+    );
+}
+
+#[test]
+fn session_new_creates_empty_session() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("session").arg("new").arg("custom-id");
+    let output = cmd.output().expect("kb session new");
+    assert!(
+        output.status.success(),
+        "kb session new failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let session_path = kb_root.join(".kb/sessions/custom-id.json");
+    assert!(session_path.is_file(), "session file should exist");
+
+    let raw = fs::read_to_string(&session_path).expect("read session file");
+    let parsed: Value = serde_json::from_str(&raw).expect("parse json");
+    assert_eq!(parsed["id"], "custom-id");
+    assert_eq!(
+        parsed["turns"].as_array().map_or(99, Vec::len),
+        0,
+        "fresh session must start with no turns"
+    );
+
+    // Re-running with the same id must error rather than clobber.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("session").arg("new").arg("custom-id");
+    let output = cmd.output().expect("kb session new dup");
+    assert!(
+        !output.status.success(),
+        "second `session new` with same id should fail"
+    );
+}
+
+#[test]
+fn session_rejects_path_escape_in_id() {
+    let (_temp, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("ask")
+        .arg("--session")
+        .arg("../escape")
+        .arg("what is consensus?");
+    let output = cmd.output().expect("kb ask --session ../escape");
+    assert!(
+        !output.status.success(),
+        "session id with path-escape characters must be rejected"
+    );
+}
