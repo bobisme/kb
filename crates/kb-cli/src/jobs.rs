@@ -604,7 +604,7 @@ pub fn recent_jobs(root: &Path, limit: usize) -> Result<Vec<JobRun>> {
         }
     }
 
-    jobs.sort_by(|a, b| b.started_at_millis.cmp(&a.started_at_millis));
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.started_at_millis));
     jobs.truncate(limit);
 
     Ok(jobs)

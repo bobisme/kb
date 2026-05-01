@@ -208,7 +208,7 @@ pub struct CompileOptions {
     pub reporter: Option<Arc<dyn ProgressReporter>>,
     /// Backend used by the embedding-sync pass. Defaults to the
     /// always-available hash backend; `kb-cli` fills this from
-    /// `kb.toml [semantic]` so a user-selected MiniLM backend is honored.
+    /// `kb.toml [semantic]` so a user-selected `MiniLM` backend is honored.
     /// bn-1rww.
     pub semantic_backend: kb_query::SemanticBackendConfig,
 }
@@ -656,13 +656,10 @@ pub fn run_compile_with_llm(
         let new_merge_fingerprint = compute_concept_merge_fingerprint(root).ok();
         let candidates_dir = crate::concept_extraction::concept_candidates_dir(root);
         let has_candidates = candidates_dir.exists()
-            && std::fs::read_dir(&candidates_dir)
-                .map(|it| {
-                    it.flatten().any(|e| {
-                        e.path().extension().and_then(|s| s.to_str()) == Some("json")
-                    })
-                })
-                .unwrap_or(false);
+            && std::fs::read_dir(&candidates_dir).is_ok_and(|it| {
+                it.flatten()
+                    .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json"))
+            });
         let fingerprint_matches = !options.force
             && has_candidates
             && match (&new_merge_fingerprint, &previous_merge_fingerprint) {

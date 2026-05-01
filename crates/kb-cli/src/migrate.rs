@@ -207,7 +207,7 @@ fn rename_sources_and_questions(root: &Path) -> Result<Vec<RenameRecord>> {
             let entry =
                 entry.with_context(|| format!("read entry in {}", sources_dir.display()))?;
             let path = entry.path();
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
             if path.extension().and_then(|s| s.to_str()) != Some("md") {
@@ -266,7 +266,7 @@ fn rename_sources_and_questions(root: &Path) -> Result<Vec<RenameRecord>> {
             let entry =
                 entry.with_context(|| format!("read entry in {}", questions_dir.display()))?;
             let path = entry.path();
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
@@ -339,7 +339,7 @@ fn fix_double_id_filenames(root: &Path) -> Result<Vec<RenameRecord>> {
             let entry =
                 entry.with_context(|| format!("read entry in {}", sources_dir.display()))?;
             let path = entry.path();
-            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            if !entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
             if path.extension().and_then(|s| s.to_str()) != Some("md") {
@@ -389,7 +389,7 @@ fn fix_double_id_filenames(root: &Path) -> Result<Vec<RenameRecord>> {
             let entry =
                 entry.with_context(|| format!("read entry in {}", questions_dir.display()))?;
             let path = entry.path();
-            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|s| s.to_str()) else {

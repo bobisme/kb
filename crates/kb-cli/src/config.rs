@@ -424,7 +424,7 @@ impl Default for LockConfig {
 /// optional (bn-2xbd) — when unset, the floors come from the active
 /// semantic backend's calibrated defaults (see
 /// [`kb_query::SemanticBackendKind::default_min_semantic_score`]). Hash and
-/// MiniLM live in different cosine score regimes, so a single global floor
+/// `MiniLM` live in different cosine score regimes, so a single global floor
 /// either lets noise through (low) or filters real matches (high).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", default)]
@@ -753,7 +753,7 @@ token_budget = 12000
     }
 
     #[test]
-    fn semantic_section_defaults_match_platform() -> Result<()> {
+    fn semantic_section_defaults_match_platform() {
         let cfg = Config::default();
         let expected_cfg_kind = if cfg!(target_os = "windows") {
             SemanticBackendKindConfig::Hash
@@ -768,7 +768,6 @@ token_budget = 12000
         assert_eq!(cfg.semantic.backend, expected_cfg_kind);
         let backend = cfg.semantic.to_backend_config();
         assert_eq!(backend.kind, expected_runtime_kind);
-        Ok(())
     }
 
     #[test]

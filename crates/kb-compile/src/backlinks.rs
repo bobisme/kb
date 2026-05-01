@@ -178,7 +178,7 @@ fn build_anchor_to_source_docs(root: &Path) -> Result<BTreeMap<String, Vec<Strin
         .with_context(|| format!("read normalized dir {}", normalized_root.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("walk {}", normalized_root.display()))?;
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let source_doc_id = entry.file_name().to_string_lossy().into_owned();
@@ -481,7 +481,7 @@ fn collect_mention_backlinks(
         .with_context(|| format!("read normalized dir {}", normalized_root.display()))?;
     for entry in entries {
         let entry = entry.with_context(|| format!("walk {}", normalized_root.display()))?;
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let src_id = entry.file_name().to_string_lossy().into_owned();

@@ -1845,8 +1845,7 @@ fn today_yyyy_mm_dd() -> String {
     // Avoid pulling in chrono just for today's date — derive from epoch.
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs() as i64);
     // Days since epoch.
     let days = secs.div_euclid(86_400);
     let (y, m, d) = days_to_ymd(days);
@@ -3392,9 +3391,7 @@ fn now_millis() -> Result<u64> {
 fn generate_question_id(root: &Path, timestamp_ms: u64, query: &str) -> String {
     let questions_dir = root.join("outputs/questions");
     let item_count = if questions_dir.exists() {
-        fs::read_dir(&questions_dir)
-            .map(|rd| rd.filter_map(Result::ok).count())
-            .unwrap_or(0)
+        fs::read_dir(&questions_dir).map_or(0, |rd| rd.filter_map(Result::ok).count())
     } else {
         0
     };

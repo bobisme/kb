@@ -2620,8 +2620,8 @@ fn check_missing_concepts_raw(
     }
 
     let mut hits: Vec<ConceptCandidateHit> = tally
-        .into_iter()
-        .filter_map(|(_key, agg)| {
+        .into_values()
+        .filter_map(|agg| {
             let source_count = agg.source_ids.len();
             if source_count < config.min_sources {
                 return None;

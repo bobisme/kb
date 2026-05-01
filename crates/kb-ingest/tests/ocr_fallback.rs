@@ -206,8 +206,7 @@ fn ocr_disabled_skips_fallback_and_pdf_is_dropped() {
     assert!(
         !kb_root.path().join(".kb/cache/ocr").exists()
             || fs::read_dir(kb_root.path().join(".kb/cache/ocr"))
-                .map(std::iter::Iterator::count)
-                .unwrap_or(0)
+                .map_or(0, std::iter::Iterator::count)
                 == 0,
         "OCR cache must not be populated when OCR is disabled"
     );

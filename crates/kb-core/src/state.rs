@@ -109,7 +109,7 @@ pub fn list_review_items(root: &Path) -> Result<Vec<ReviewItem>> {
             }
         }
     }
-    items.sort_by(|a, b| b.created_at_millis.cmp(&a.created_at_millis));
+    items.sort_by_key(|item| std::cmp::Reverse(item.created_at_millis));
     Ok(items)
 }
 
