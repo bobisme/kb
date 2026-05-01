@@ -111,6 +111,11 @@ impl Default for HybridOptions {
 /// `.kb/state/embeddings.db` (when present). When `KB_SEMANTIC=0` is set,
 /// behaves identically to a pure-lexical search.
 ///
+/// Callers wired to `kb.toml [semantic]` (the kb-cli binary, kb-compile)
+/// should use [`hybrid_search_with_backend`] instead so the configured
+/// backend is used to embed the query — otherwise stored `MiniLM` vectors
+/// would be queried with hash-embed coordinates and similarity collapses.
+///
 /// # Errors
 ///
 /// Returns an error when the lexical index cannot be loaded. Semantic
@@ -122,6 +127,10 @@ pub fn hybrid_search(root: &Path, query: &str, limit: usize) -> Result<Vec<Hybri
 /// Run hybrid retrieval with explicit options. Tests and config-driven
 /// callers use this to tweak `min_semantic_score` or short-circuit
 /// semantic search without touching env vars.
+///
+/// Uses the always-available hash backend to embed the query. Callers
+/// wired to `kb.toml [semantic]` should prefer [`hybrid_search_with_backend`]
+/// so the query embedding matches the stored corpus vectors.
 ///
 /// # Errors
 ///
@@ -136,9 +145,11 @@ pub fn hybrid_search_with_options(
     hybrid_search_with_index(root, &lexical_index, query, limit, options)
 }
 
-/// Hybrid retrieval that reuses a caller-owned lexical index. Used by
-/// long-lived processes (`kb serve`) that load the lexical index once at
-/// startup.
+/// Hybrid retrieval that reuses a caller-owned lexical index.
+///
+/// Used by long-lived processes (`kb serve`) that load the lexical index
+/// once at startup. Embeds the query with [`HashEmbedBackend`] — see
+/// [`hybrid_search_with_index_and_backend`] for the config-aware variant.
 ///
 /// # Errors
 ///
@@ -151,6 +162,44 @@ pub fn hybrid_search_with_index(
     limit: usize,
     options: HybridOptions,
 ) -> Result<Vec<HybridResult>> {
+    let backend = HashEmbedBackend::new();
+    hybrid_search_with_index_and_backend(root, lexical_index, query, limit, options, &backend)
+}
+
+/// Hybrid retrieval honoring a caller-provided embedding backend.
+///
+/// `kb-cli` and `kb-compile` build a [`super::semantic::SemanticBackend`]
+/// from `kb.toml [semantic]` and pass it through here; the backend used to
+/// embed the corpus at compile time must match the backend used to embed
+/// the query, otherwise the cosine space is incoherent.
+///
+/// # Errors
+///
+/// Returns an error when the lexical index cannot be loaded.
+pub fn hybrid_search_with_backend(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    options: HybridOptions,
+    backend: &dyn EmbeddingBackend,
+) -> Result<Vec<HybridResult>> {
+    let lexical_index = LexicalIndex::load(root).context("load lexical index")?;
+    hybrid_search_with_index_and_backend(root, &lexical_index, query, limit, options, backend)
+}
+
+/// Caller-owned-index variant of [`hybrid_search_with_backend`].
+///
+/// # Errors
+///
+/// Returns an error when the semantic store cannot be opened.
+pub fn hybrid_search_with_index_and_backend(
+    root: &Path,
+    lexical_index: &LexicalIndex,
+    query: &str,
+    limit: usize,
+    options: HybridOptions,
+    backend: &dyn EmbeddingBackend,
+) -> Result<Vec<HybridResult>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -159,7 +208,7 @@ pub fn hybrid_search_with_index(
 
     let semantic_enabled = options.semantic_enabled && semantic_env_enabled();
     let semantic_hits = if semantic_enabled {
-        match run_semantic(root, query, limit) {
+        match run_semantic(root, query, limit, backend) {
             Ok(hits) => hits,
             Err(err) => {
                 if !SEMANTIC_DEGRADED_WARNED.swap(true, Ordering::SeqCst) {
@@ -186,14 +235,18 @@ pub fn hybrid_search_with_index(
     ))
 }
 
-fn run_semantic(root: &Path, query: &str, limit: usize) -> Result<Vec<SemanticHit>> {
+fn run_semantic(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    backend: &dyn EmbeddingBackend,
+) -> Result<Vec<SemanticHit>> {
     let db_path = embedding_db_path(root);
     if !db_path.exists() {
         return Ok(Vec::new());
     }
     let conn = Connection::open(&db_path)
         .with_context(|| format!("open embedding db {}", db_path.display()))?;
-    let backend = HashEmbedBackend::new();
     let qvec = backend
         .embed(query)
         .context("embed query for semantic search")?;
@@ -353,6 +406,25 @@ pub fn plan_retrieval_hybrid(
     token_budget: u32,
     options: HybridOptions,
 ) -> Result<RetrievalPlan> {
+    let backend = HashEmbedBackend::new();
+    plan_retrieval_hybrid_with_backend(root, query, token_budget, options, &backend)
+}
+
+/// Same as [`plan_retrieval_hybrid`] but with a caller-provided backend.
+///
+/// Use this when you've built a [`super::semantic::SemanticBackend`] from
+/// `kb.toml [semantic]` so the query embedding matches the corpus.
+///
+/// # Errors
+///
+/// Returns an error when the lexical index cannot be loaded.
+pub fn plan_retrieval_hybrid_with_backend(
+    root: &Path,
+    query: &str,
+    token_budget: u32,
+    options: HybridOptions,
+    backend: &dyn EmbeddingBackend,
+) -> Result<RetrievalPlan> {
     let lexical_index = LexicalIndex::load(root).context("load lexical index")?;
     let mut plan = lexical_index.plan_retrieval(query, token_budget, root);
 
@@ -369,7 +441,7 @@ pub fn plan_retrieval_hybrid(
         .len()
         .max(crate::lexical::DEFAULT_RETRIEVAL_TOP_K_FOR_HYBRID);
 
-    let semantic_hits = match run_semantic(root, query, semantic_limit) {
+    let semantic_hits = match run_semantic(root, query, semantic_limit, backend) {
         Ok(hits) => filter_semantic(
             hits,
             plan.candidates.is_empty(),

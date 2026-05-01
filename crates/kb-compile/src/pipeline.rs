@@ -206,6 +206,11 @@ pub struct CompileOptions {
     /// etc.) *instead of* the default built from `progress`. Leave `None` to
     /// preserve the legacy `progress: bool` branch.
     pub reporter: Option<Arc<dyn ProgressReporter>>,
+    /// Backend used by the embedding-sync pass. Defaults to the
+    /// always-available hash backend; `kb-cli` fills this from
+    /// `kb.toml [semantic]` so a user-selected MiniLM backend is honored.
+    /// bn-1rww.
+    pub semantic_backend: kb_query::SemanticBackendConfig,
 }
 
 impl std::fmt::Debug for CompileOptions {
@@ -219,6 +224,7 @@ impl std::fmt::Debug for CompileOptions {
                 "reporter",
                 &self.reporter.as_ref().map(|_| "<ProgressReporter>"),
             )
+            .field("semantic_backend", &self.semantic_backend.kind)
             .finish()
     }
 }
@@ -790,7 +796,9 @@ pub fn run_compile_with_llm(
     // logged but does not fail the compile: the lexical index is the
     // primary signal and hybrid retrieval degrades cleanly when the
     // embedding store is missing or partial.
-    match kb_query::sync_embeddings(root, &kb_query::HashEmbedBackend::new()) {
+    match kb_query::SemanticBackend::from_config(&options.semantic_backend)
+        .and_then(|backend| kb_query::sync_embeddings(root, &backend))
+    {
         Ok(stats) => {
             passes.push((
                 "embedding_sync".to_string(),
@@ -1696,6 +1704,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("compile");
@@ -1721,6 +1730,7 @@ mod tests {
                 progress: true,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("compile with progress");
@@ -1743,6 +1753,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("compile");
@@ -1774,6 +1785,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("compile");
@@ -1799,6 +1811,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("first compile");
@@ -1811,6 +1824,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("second compile");
@@ -1836,6 +1850,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("first compile");
@@ -1851,6 +1866,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("second compile");
@@ -1875,6 +1891,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("first compile");
@@ -1887,6 +1904,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("force compile");
@@ -1911,6 +1929,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("dry run");
@@ -1976,6 +1995,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             Some(&adapter),
         )
@@ -2056,6 +2076,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             None::<&dyn LlmAdapter>,
         )
@@ -2108,6 +2129,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("first compile");
@@ -2120,6 +2142,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("dry run with clean state");
@@ -2150,6 +2173,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("dry run");
@@ -2162,6 +2186,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("live run");
@@ -2223,6 +2248,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("first compile");
@@ -2235,6 +2261,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("second compile — no changes");
@@ -2257,6 +2284,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("third compile — template changed");
@@ -2401,6 +2429,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             Some(&adapter),
         )
@@ -2459,6 +2488,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             Some(&adapter),
         )
@@ -2495,6 +2525,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             Some(&adapter),
         )
@@ -2522,6 +2553,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             Some(&adapter),
         )
@@ -2562,6 +2594,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             Some(&adapter),
         )
@@ -2640,6 +2673,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
         )
         .expect("compile");
@@ -2760,6 +2794,7 @@ mod tests {
             progress: false,
             log_sink: Some(Arc::new(sink.clone())),
             reporter: None,
+            semantic_backend: kb_query::SemanticBackendConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile");
 
@@ -2821,6 +2856,7 @@ mod tests {
             progress: false,
             log_sink: Some(Arc::new(sink.clone())),
             reporter: None,
+            semantic_backend: kb_query::SemanticBackendConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile succeeds (failures logged, not bubbled)");
 
@@ -2911,6 +2947,7 @@ mod tests {
             progress: false,
             log_sink: Some(Arc::new(sink.clone())),
             reporter: Some(Arc::new(reporter.clone())),
+            semantic_backend: kb_query::SemanticBackendConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -2999,6 +3036,7 @@ mod tests {
                 path: fake_path.clone(),
             })),
             reporter: Some(Arc::new(reporter.clone())),
+            semantic_backend: kb_query::SemanticBackendConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3035,6 +3073,7 @@ mod tests {
             progress: false,
             log_sink: None,
             reporter: Some(Arc::new(reporter.clone())),
+            semantic_backend: kb_query::SemanticBackendConfig::default(),
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -3110,6 +3149,7 @@ mod tests {
             progress: false,
             log_sink: Some(Arc::new(MemorySink::default())),
             reporter: None,
+            semantic_backend: kb_query::SemanticBackendConfig::default(),
         };
         let rendered = format!("{with_sink:?}");
         assert!(rendered.contains("Some(\"<LogSink>\")"), "got {rendered}");
@@ -3368,6 +3408,7 @@ mod tests {
                 progress: false,
                 log_sink: None,
                 reporter: None,
+                semantic_backend: kb_query::SemanticBackendConfig::default(),
             },
             Some(&adapter),
         )

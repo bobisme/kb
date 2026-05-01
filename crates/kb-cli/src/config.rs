@@ -22,6 +22,7 @@ pub struct Config {
     pub lock: LockConfig,
     pub ingest: IngestConfig,
     pub retrieval: RetrievalConfig,
+    pub semantic: SemanticConfig,
 }
 
 impl Config {
@@ -451,6 +452,78 @@ impl RetrievalConfig {
     }
 }
 
+/// `[semantic]` section of `kb.toml`. Selects the embedding backend that
+/// `kb compile` writes into the corpus and that `kb ask` / `kb search` use
+/// to embed queries. bn-1rww.
+///
+/// `backend = "hash"` (default) keeps the always-available zero-dependency
+/// hash n-gram backend. `backend = "minilm"` switches to the ONNX-backed
+/// MiniLM-L6-v2 sentence transformer (384-dim) and only works when the
+/// binary was built with `--features semantic-ort`.
+///
+/// `model_path` and `tokenizer_path` are honored only by the `minilm`
+/// backend and override the default cache convention
+/// (`~/.cache/kb/models/`); leave them unset to let kb auto-download from
+/// Hugging Face on first compile.
+///
+/// Backend changes are detected by `kb compile`'s embedding-sync pass —
+/// the on-disk vector store is wiped and rebuilt automatically when the
+/// stored `backend_id` no longer matches the active backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case", default)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticConfig {
+    pub backend: SemanticBackendKindConfig,
+    pub model_path: Option<String>,
+    pub tokenizer_path: Option<String>,
+}
+
+/// Mirror of [`kb_query::SemanticBackendKind`] kept here so `kb-query`
+/// stays free of `serde`/`toml` plumbing. The two enums must agree —
+/// see [`SemanticConfig::to_backend_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticBackendKindConfig {
+    #[default]
+    Hash,
+    Minilm,
+}
+
+impl From<SemanticBackendKindConfig> for kb_query::SemanticBackendKind {
+    fn from(value: SemanticBackendKindConfig) -> Self {
+        match value {
+            SemanticBackendKindConfig::Hash => Self::Hash,
+            SemanticBackendKindConfig::Minilm => Self::Minilm,
+        }
+    }
+}
+
+impl SemanticConfig {
+    /// Translate the parsed config into the runtime
+    /// [`kb_query::SemanticBackendConfig`] the `kb-query` factory consumes.
+    /// `~`-prefixed paths are expanded against the user's home directory so
+    /// agent users don't have to hand-type absolute paths.
+    #[must_use]
+    pub fn to_backend_config(&self) -> kb_query::SemanticBackendConfig {
+        kb_query::SemanticBackendConfig {
+            kind: self.backend.into(),
+            model_path: self.model_path.as_deref().map(expand_user_path),
+            tokenizer_path: self.tokenizer_path.as_deref().map(expand_user_path),
+        }
+    }
+}
+
+fn expand_user_path(raw: &str) -> std::path::PathBuf {
+    if let Some(stripped) = raw.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            let mut path = std::path::PathBuf::from(home);
+            path.push(stripped);
+            return path;
+        }
+    }
+    std::path::PathBuf::from(raw)
+}
+
 /// `[ingest]` section of `kb.toml`. Bundles per-stage knobs: the markitdown
 /// preprocessor and the OCR fallback that fires when markitdown's extraction
 /// is empty/short for a scanned PDF.
@@ -645,6 +718,39 @@ token_budget = 12000
         let rendered = cfg.to_toml_string()?;
         let parsed = Config::from_toml(&rendered)?;
         assert_eq!(cfg, parsed);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_section_defaults_to_hash_backend() -> Result<()> {
+        let cfg = Config::default();
+        assert_eq!(cfg.semantic.backend, SemanticBackendKindConfig::Hash);
+        let backend = cfg.semantic.to_backend_config();
+        assert_eq!(backend.kind, kb_query::SemanticBackendKind::Hash);
+        Ok(())
+    }
+
+    #[test]
+    fn semantic_minilm_with_paths_round_trips() -> Result<()> {
+        let toml = r#"
+[semantic]
+backend = "minilm"
+model_path = "~/.cache/kb/models/minilm-l6-v2-int8.onnx"
+tokenizer_path = "~/.cache/kb/models/minilm-l6-v2-tokenizer.json"
+"#;
+        let parsed = Config::from_toml(toml)?;
+        assert_eq!(parsed.semantic.backend, SemanticBackendKindConfig::Minilm);
+        let backend = parsed.semantic.to_backend_config();
+        assert_eq!(backend.kind, kb_query::SemanticBackendKind::Minilm);
+        // ~/ should expand. We don't assert against $HOME because tests can
+        // run on hosts where it's set to something exotic; just confirm the
+        // tilde was stripped.
+        assert!(
+            backend
+                .model_path
+                .as_deref()
+                .is_some_and(|p| !p.to_string_lossy().starts_with('~'))
+        );
         Ok(())
     }
 

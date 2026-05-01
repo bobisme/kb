@@ -1,28 +1,51 @@
-//! Embedding backend trait and the always-available hash-embed implementation.
+//! Embedding backend trait and the available implementations.
 //!
-//! kb v1 ships a single backend: [`HashEmbedBackend`]. It hashes 3-to-5
-//! character n-grams plus whitespace-delimited word tokens into a 256-dim
-//! vector via FNV-1a, then L2-normalizes. No ML model, no extra deps. The
-//! quality is intentionally weak — it catches morphological similarity
-//! ("authentication" / "authn") and rephrased queries, but not full
-//! conceptual paraphrases. That's Phase 2.
+//! kb v1 ships two backends:
 //!
-//! Pattern lifted from `bones-search`'s `hash_embed.rs`.
+//! - [`HashEmbedBackend`] — always available, zero new dependencies.
+//!   Hashes 3..=5 character n-grams plus whitespace tokens into a 256-dim
+//!   vector via FNV-1a, then L2-normalizes. Catches morphological similarity
+//!   (`authentication` / `authn`) and rephrased queries, but not full
+//!   conceptual paraphrases.
+//!
+//! - [`MiniLmBackend`] — feature-gated behind `semantic-ort`. Wraps the
+//!   Sentence-Transformers all-MiniLM-L6-v2 ONNX model (384-dim, mean-pool +
+//!   L2 norm). Closes the lexical/semantic gap; bn-1rww. The model file is
+//!   cached under [`MiniLmBackend::cache_root`] and auto-downloaded from
+//!   Hugging Face on first use unless `KB_SEMANTIC_AUTO_DOWNLOAD=0`.
+//!
+//! Hash-pattern lifted from `bones-search`'s `hash_embed.rs`; ORT-pattern
+//! lifted from `bones-search`'s `semantic/model.rs`.
 
+use std::path::PathBuf;
+
+#[cfg(feature = "semantic-ort")]
+use anyhow::Context;
 use anyhow::Result;
+#[cfg(not(feature = "semantic-ort"))]
+use anyhow::bail;
+use serde::{Deserialize, Serialize};
 
-/// Default embedding dimension.
+#[cfg(feature = "semantic-ort")]
+use super::minilm::MiniLmBackend;
+
+/// Default embedding dimension for the always-available hash backend.
 pub const HASH_DIM: usize = 256;
 
-/// Stable identifier for the active backend. Stored in `semantic_meta` so
+/// Stable identifier for the hash backend. Stored in `semantic_meta` so
 /// changing backends triggers a re-embed of the corpus on the next compile.
 pub const HASH_BACKEND_ID: &str = "hash-embed-256";
+
+/// Stable identifier for the ORT `MiniLM` backend.
+pub const MINILM_BACKEND_ID: &str = "ort-minilm-384";
+
+/// Output dimensionality of the MiniLM-L6-v2 backend.
+pub const MINILM_DIM: usize = 384;
 
 const NGRAM_MIN: usize = 3;
 const NGRAM_MAX: usize = 5;
 
-/// Trait for embedding backends. v1 has a single impl; Phase 2 may add
-/// ONNX-backed and model2vec-backed implementations behind feature flags.
+/// Trait for embedding backends.
 pub trait EmbeddingBackend {
     /// Stable identifier persisted in `semantic_meta.backend_id`.
     fn backend_id(&self) -> &'static str;
@@ -35,8 +58,8 @@ pub trait EmbeddingBackend {
     /// # Errors
     ///
     /// Returns an error when inference fails. The hash backend never fails
-    /// in practice; the trait method allows Phase 2 backends to surface
-    /// runtime errors uniformly.
+    /// in practice; the trait method allows ML backends to surface runtime
+    /// errors uniformly.
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
 }
 
@@ -75,6 +98,124 @@ impl EmbeddingBackend for HashEmbedBackend {
 
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         Ok(hash_embed(text, self.dimensions))
+    }
+}
+
+/// Backend selector parsed from `kb.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticBackendKind {
+    /// Always-available hash n-gram backend ([`HashEmbedBackend`]).
+    #[default]
+    Hash,
+    /// ONNX MiniLM-L6-v2 (`semantic-ort` feature).
+    Minilm,
+}
+
+/// Configuration bag for [`SemanticBackend::from_config`].
+///
+/// `model_path` and `tokenizer_path` are only consulted by
+/// [`SemanticBackendKind::Minilm`]. When `None`, the OS cache convention
+/// applies — the file is fetched from Hugging Face on first run.
+#[derive(Debug, Clone, Default)]
+pub struct SemanticBackendConfig {
+    pub kind: SemanticBackendKind,
+    pub model_path: Option<PathBuf>,
+    pub tokenizer_path: Option<PathBuf>,
+}
+
+/// Runtime-dispatched embedding backend.
+///
+/// Produced by [`SemanticBackend::from_config`]. Implements
+/// [`EmbeddingBackend`] by delegating to the wrapped concrete backend, so it
+/// drops into [`super::embed::sync_embeddings`] and the hybrid query path
+/// without further plumbing.
+///
+/// The `MiniLm` variant is large (it holds an ONNX session and tokenizer)
+/// but a process only ever owns one `SemanticBackend` at a time, so the
+/// size disparity between variants doesn't materially affect memory use —
+/// only one `Box` allocation would be saved by indirection. We follow
+/// `bones-search` here and accept the warning rather than add the heap
+/// indirection.
+#[allow(clippy::large_enum_variant)]
+pub enum SemanticBackend {
+    Hash(HashEmbedBackend),
+    #[cfg(feature = "semantic-ort")]
+    MiniLm(MiniLmBackend),
+}
+
+impl std::fmt::Debug for SemanticBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hash(b) => f.debug_tuple("SemanticBackend::Hash").field(b).finish(),
+            #[cfg(feature = "semantic-ort")]
+            Self::MiniLm(_) => f
+                .debug_struct("SemanticBackend::MiniLm")
+                .field("backend_id", &MINILM_BACKEND_ID)
+                .field("dim", &MINILM_DIM)
+                .finish(),
+        }
+    }
+}
+
+impl SemanticBackend {
+    /// Construct a backend from the parsed config.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `kind = Minilm` is requested but the
+    /// `semantic-ort` feature is not compiled in, or when the underlying
+    /// model/tokenizer cannot be loaded.
+    pub fn from_config(config: &SemanticBackendConfig) -> Result<Self> {
+        match config.kind {
+            SemanticBackendKind::Hash => Ok(Self::Hash(HashEmbedBackend::new())),
+            SemanticBackendKind::Minilm => Self::load_minilm(config),
+        }
+    }
+
+    #[cfg(feature = "semantic-ort")]
+    fn load_minilm(config: &SemanticBackendConfig) -> Result<Self> {
+        let backend = MiniLmBackend::load(
+            config.model_path.as_deref(),
+            config.tokenizer_path.as_deref(),
+        )
+        .context("load MiniLM-L6-v2 backend")?;
+        Ok(Self::MiniLm(backend))
+    }
+
+    #[cfg(not(feature = "semantic-ort"))]
+    fn load_minilm(_config: &SemanticBackendConfig) -> Result<Self> {
+        bail!(
+            "kb.toml requests semantic backend `minilm` but this kb binary was built without \
+             the `semantic-ort` feature. Rebuild with `cargo build --features semantic-ort` \
+             (or `just install --features semantic-ort`) to enable the ONNX MiniLM backend."
+        )
+    }
+}
+
+impl EmbeddingBackend for SemanticBackend {
+    fn backend_id(&self) -> &'static str {
+        match self {
+            Self::Hash(b) => b.backend_id(),
+            #[cfg(feature = "semantic-ort")]
+            Self::MiniLm(b) => b.backend_id(),
+        }
+    }
+
+    fn dimensions(&self) -> usize {
+        match self {
+            Self::Hash(b) => b.dimensions(),
+            #[cfg(feature = "semantic-ort")]
+            Self::MiniLm(b) => b.dimensions(),
+        }
+    }
+
+    fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        match self {
+            Self::Hash(b) => b.embed(text),
+            #[cfg(feature = "semantic-ort")]
+            Self::MiniLm(b) => b.embed(text),
+        }
     }
 }
 
@@ -191,6 +332,31 @@ mod tests {
         let backend = HashEmbedBackend::new();
         assert_eq!(backend.backend_id(), "hash-embed-256");
         assert_eq!(backend.dimensions(), HASH_DIM);
+    }
+
+    #[test]
+    fn semantic_backend_dispatches_to_hash_by_default() {
+        let backend = SemanticBackend::from_config(&SemanticBackendConfig::default())
+            .expect("hash backend always loads");
+        assert_eq!(backend.backend_id(), HASH_BACKEND_ID);
+        assert_eq!(backend.dimensions(), HASH_DIM);
+        let v = backend.embed("hello").expect("embed");
+        assert_eq!(v.len(), HASH_DIM);
+    }
+
+    #[cfg(not(feature = "semantic-ort"))]
+    #[test]
+    fn minilm_kind_errors_without_feature() {
+        let cfg = SemanticBackendConfig {
+            kind: SemanticBackendKind::Minilm,
+            ..SemanticBackendConfig::default()
+        };
+        let err = SemanticBackend::from_config(&cfg).expect_err("must fail without feature");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("semantic-ort"),
+            "error should point at the feature flag, got: {msg}"
+        );
     }
 
     fn dot(a: &[f32], b: &[f32]) -> f32 {

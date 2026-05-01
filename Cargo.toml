@@ -45,6 +45,12 @@ tempfile = "3"
 terseid = "0.1"
 url = "2"
 
+# Optional ML backend (kb-query semantic-ort feature)
+ort = "2.0.0-rc.10"
+tokenizers = "0.19"
+ureq = "2.10"
+dirs = "5"
+
 kb-core = { path = "crates/kb-core" }
 kb-llm = { path = "crates/kb-llm" }
 kb-ingest = { path = "crates/kb-ingest" }

@@ -10,7 +10,9 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use kb_query::{HybridOptions, HybridResult, LexicalIndex};
+use kb_query::{
+    HybridOptions, HybridResult, LexicalIndex, SemanticBackend, SemanticBackendConfig,
+};
 use serde::Deserialize;
 
 use crate::markdown;
@@ -30,10 +32,15 @@ pub struct WebState {
 struct WebStateInner {
     root: PathBuf,
     index: LexicalIndex,
+    /// Embedding backend used to embed inbound search queries. Loaded once
+    /// at server start so the ONNX session (when `MiniLM` is configured) is
+    /// reused across requests rather than rebuilt per query. bn-1rww.
+    backend: SemanticBackend,
 }
 
 impl WebState {
-    /// Build a state from a kb root path.
+    /// Build a state from a kb root path using the always-available hash
+    /// embedding backend.
     ///
     /// # Errors
     ///
@@ -41,10 +48,29 @@ impl WebState {
     /// exists but cannot be parsed. A missing index is not an error — search
     /// simply returns no results until `kb compile` is run.
     pub fn new(root: PathBuf) -> Result<Self> {
+        Self::with_backend_config(root, &SemanticBackendConfig::default())
+    }
+
+    /// Build a state with an explicit embedding backend config. The kb-cli
+    /// `Command::Serve` path uses this so `kb.toml [semantic]` selections
+    /// are honored — otherwise queries embedded with hash-embed against
+    /// MiniLM-stored vectors would produce nonsense rankings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lexical index cannot be parsed or the
+    /// configured backend fails to load.
+    pub fn with_backend_config(root: PathBuf, backend: &SemanticBackendConfig) -> Result<Self> {
         let index = LexicalIndex::load(&root)
             .with_context(|| format!("load lexical index at {}", root.display()))?;
+        let backend = SemanticBackend::from_config(backend)
+            .context("load semantic backend for kb-web")?;
         Ok(Self {
-            inner: Arc::new(WebStateInner { root, index }),
+            inner: Arc::new(WebStateInner {
+                root,
+                index,
+                backend,
+            }),
         })
     }
 
@@ -54,6 +80,10 @@ impl WebState {
 
     fn index(&self) -> &LexicalIndex {
         &self.inner.index
+    }
+
+    fn backend(&self) -> &SemanticBackend {
+        &self.inner.backend
     }
 }
 
@@ -198,12 +228,13 @@ async fn search_handler(
         return axum::Json(SearchResponse { results: Vec::new() }).into_response();
     }
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
-    let results = match kb_query::hybrid_search_with_index(
+    let results = match kb_query::hybrid_search_with_index_and_backend(
         state.root(),
         state.index(),
         &query,
         limit,
         HybridOptions::default(),
+        state.backend(),
     ) {
         Ok(hits) => hits,
         Err(err) => {

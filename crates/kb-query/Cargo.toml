@@ -8,6 +8,13 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# ONNX-runtime-backed MiniLM-L6-v2 embedding backend (bn-1rww). Off by default
+# so plain `cargo build` doesn't pull ort into the dependency graph; opt in
+# with `--features semantic-ort` to ship the higher-quality backend.
+semantic-ort = ["dep:ort", "dep:tokenizers", "dep:ureq", "dep:dirs"]
+
 [dependencies]
 anyhow.workspace = true
 blake3.workspace = true
@@ -22,6 +29,12 @@ serde_yaml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# semantic-ort feature
+ort = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+ureq = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

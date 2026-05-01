@@ -18,6 +18,12 @@ default = []
 # CUDA toolkit on the build host. Builds a non-portable binary; default
 # CPU build remains the supported distribution.
 cuda = ["kb-ingest-audio/cuda"]
+# Enable the ONNX MiniLM-L6-v2 semantic backend (bn-1rww). Pulls in the
+# `ort`, `tokenizers`, and `ureq` dependencies. Off by default so a plain
+# `cargo install --path crates/kb-cli` keeps the lighter dependency footprint.
+# Activate with `cargo install --path crates/kb-cli --features semantic-ort`
+# (or `just install-semantic-ort`).
+semantic-ort = ["kb-query/semantic-ort"]
 
 [dependencies]
 anyhow.workspace = true

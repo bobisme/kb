@@ -738,11 +738,15 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
-            let results = kb_query::hybrid_search_with_options(
+            let backend = kb_query::SemanticBackend::from_config(
+                &cfg.semantic.to_backend_config(),
+            )?;
+            let results = kb_query::hybrid_search_with_backend(
                 search_root,
                 &query,
                 limit,
                 cfg.retrieval.to_hybrid_options(),
+                &backend,
             )?;
             if cli.json {
                 emit_json("search", &results)?;
@@ -935,7 +939,10 @@ fn run(cli: Cli) -> Result<()> {
             // lock. The request handlers read the lexical index and wiki
             // tree directly; concurrent `kb compile` runs will not be
             // reflected until restart.
-            let state = kb_web::WebState::new(serve_root)?;
+            let semantic_backend = Config::load_from_root(&serve_root, None)
+                .map(|cfg| cfg.semantic.to_backend_config())
+                .unwrap_or_default();
+            let state = kb_web::WebState::with_backend_config(serve_root, &semantic_backend)?;
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -2143,11 +2150,13 @@ fn run_ask(
         .into());
     }
 
-    let retrieval_plan = kb_query::plan_retrieval_hybrid(
+    let backend = kb_query::SemanticBackend::from_config(&cfg.semantic.to_backend_config())?;
+    let retrieval_plan = kb_query::plan_retrieval_hybrid_with_backend(
         root,
         query,
         cfg.ask.token_budget,
         cfg.retrieval.to_hybrid_options(),
+        &backend,
     )?;
 
     if dry_run {
@@ -3007,6 +3016,15 @@ fn run_compile_action(
             std::sync::Arc::new(kb_compile::progress::LineLogReporter::new())
         };
 
+    // Pull `[semantic]` so the embedding-sync pass writes the user-selected
+    // backend's vectors. A broken kb.toml would already have been rejected by
+    // the validity check at the top of `main`, so falling back to defaults on
+    // a load error here is intentional — the typical cause is that the file
+    // is missing entirely (legacy or freshly-init'd vault).
+    let semantic_backend = Config::load_from_root(compile_root, None)
+        .map(|cfg| cfg.semantic.to_backend_config())
+        .unwrap_or_default();
+
     let options = kb_compile::pipeline::CompileOptions {
         force,
         dry_run,
@@ -3017,6 +3035,7 @@ fn run_compile_action(
         progress: !json && !quiet,
         log_sink,
         reporter: Some(reporter),
+        semantic_backend,
     };
 
     // Dry-run does not call the LLM; skip adapter construction so users can
