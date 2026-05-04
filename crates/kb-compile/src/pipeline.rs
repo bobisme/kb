@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1342,6 +1342,26 @@ fn run_per_document_passes(
     let summary_template_hash = single_template_hash(root, "summarize_document.md");
     let extract_template_hash = single_template_hash(root, "extract_concepts.md");
 
+    // bn-17t0: dispatch every per-doc LLM call (source_summary +
+    // concept_extraction) in parallel before entering the serial
+    // post-pass loop. Both calls per doc remain sequential within the
+    // worker (concept_extraction reads source_summary's output text)
+    // but cross-doc the work is fully independent. Cache decisions
+    // and file/state writes stay in the serial loop below for
+    // determinism; the worker is purely "make LLM calls, return
+    // artifacts". On the /tmp/kb-shake fixture this lifts compile
+    // wallclock from ~6 minutes to roughly summary-step + max
+    // (concept-extract-step) instead of N × (summary + extract).
+    let prefetched_llm = prefetch_per_doc_llm(
+        adapter,
+        root,
+        stale_doc_ids,
+        options.force,
+        &summary_template_hash,
+        &extract_template_hash,
+        state_conn,
+    );
+
     for doc_id in stale_doc_ids {
         let mut doc = read_normalized_document(root, doc_id)
             .with_context(|| format!("read normalized document {doc_id}"))?;
@@ -1457,16 +1477,29 @@ fn run_per_document_passes(
 
         reporter.pass_item_start("source_summary", doc_id);
         log_message(options, &format!("  [run] source_summary: {doc_id}..."));
-        let summary_started = Instant::now();
-        let summary_artifact = match crate::source_summary::run_source_summary_pass(
-            adapter,
-            &doc,
-            &title,
-            120,
-            &page_id,
-            &page_path,
-            existing_body.as_deref(),
-        ) {
+        // bn-17t0: pull the prefetched result. A `None` means the
+        // worker pool didn't dispatch this doc (cache hit upstream)
+        // — but in that case we'd have hit the both-cache-hit branch
+        // above and `continue`d, so reaching here with `None` is a
+        // logic bug. We tolerate it by falling back to an inline call
+        // rather than panicking, on the principle that a slower
+        // compile is better than a crashed compile.
+        let (summary_outcome, summary_elapsed) = prefetched_llm
+            .take_summary(doc_id)
+            .unwrap_or_else(|| {
+                let started = Instant::now();
+                let outcome = crate::source_summary::run_source_summary_pass(
+                    adapter,
+                    &doc,
+                    &title,
+                    120,
+                    &page_id,
+                    &page_path,
+                    existing_body.as_deref(),
+                );
+                (outcome, started.elapsed())
+            });
+        let summary_artifact = match summary_outcome {
             Ok(artifact) => artifact,
             Err(err) => {
                 tracing::warn!("source_summary failed for {doc_id}: {err}");
@@ -1477,7 +1510,7 @@ fn run_per_document_passes(
                 let log_path = log_path_from_options(options);
                 let (terminal_line, log_line) = format_pass_err(
                     &format!("source_summary: {doc_id}"),
-                    summary_started.elapsed().as_secs_f64(),
+                    summary_elapsed.as_secs_f64(),
                     &err,
                     log_path.as_deref(),
                 );
@@ -1488,12 +1521,11 @@ fn run_per_document_passes(
                 reporter.pass_item_done(
                     "source_summary",
                     doc_id,
-                    summary_started.elapsed(),
+                    summary_elapsed,
                 );
                 continue;
             }
         };
-        let summary_elapsed = summary_started.elapsed();
         reporter.pass_item_done("source_summary", doc_id, summary_elapsed);
         log_message(
             options,
@@ -1634,15 +1666,23 @@ fn run_per_document_passes(
 
         reporter.pass_item_start("concept_extraction", doc_id);
         log_message(options, &format!("  [run] concept_extraction: {doc_id}..."));
-        let extract_started = Instant::now();
-        match crate::concept_extraction::run_concept_extraction_pass(
-            adapter,
-            &doc,
-            &title,
-            Some(&summary_artifact.summary),
-            Some(20),
-            &candidates_path,
-        ) {
+        // bn-17t0: pull the prefetched concept_extraction result.
+        // Same fallback semantics as the summary pass above.
+        let (extract_outcome, extract_elapsed) = prefetched_llm
+            .take_extract(doc_id)
+            .unwrap_or_else(|| {
+                let started = Instant::now();
+                let outcome = crate::concept_extraction::run_concept_extraction_pass(
+                    adapter,
+                    &doc,
+                    &title,
+                    Some(&summary_artifact.summary),
+                    Some(20),
+                    &candidates_path,
+                );
+                (outcome, started.elapsed())
+            });
+        match extract_outcome {
             Ok(artifact) => {
                 crate::concept_extraction::persist_concept_candidates(
                     &artifact.output_path,
@@ -1654,13 +1694,12 @@ fn run_per_document_passes(
                 candidate_files_written += 1;
                 build_records_emitted += 1;
                 concept_extraction_affected += 1;
-                let elapsed = extract_started.elapsed();
-                reporter.pass_item_done("concept_extraction", doc_id, elapsed);
+                reporter.pass_item_done("concept_extraction", doc_id, extract_elapsed);
                 log_message(
                     options,
                     &format!(
                         "  [ok]  concept_extraction: {doc_id} ({:.1}s)",
-                        elapsed.as_secs_f64(),
+                        extract_elapsed.as_secs_f64(),
                     ),
                 );
                 // bn-2n7l: re-fingerprint with the model id from this
@@ -1697,7 +1736,7 @@ fn run_per_document_passes(
                 let log_path = log_path_from_options(options);
                 let (terminal_line, log_line) = format_pass_err(
                     &format!("concept_extraction: {doc_id}"),
-                    extract_started.elapsed().as_secs_f64(),
+                    extract_elapsed.as_secs_f64(),
                     &err,
                     log_path.as_deref(),
                 );
@@ -1706,7 +1745,7 @@ fn run_per_document_passes(
                 reporter.pass_item_done(
                     "concept_extraction",
                     doc_id,
-                    extract_started.elapsed(),
+                    extract_elapsed,
                 );
             }
         }
@@ -2109,6 +2148,306 @@ fn split_body_from_frontmatter(markdown: &str) -> Option<String> {
         offset += line.len();
     }
     None
+}
+
+// ── bn-17t0: parallel per-doc LLM prefetch ──────────────────────────────
+//
+// `run_per_document_passes` used to call `source_summary` and
+// `concept_extraction` inline inside its per-doc loop, which made the
+// stage's wallclock equal to N × (summary-call + extract-call). For
+// even small kbs this dominated total compile time — on a 7-source
+// fixture, ~110s of the ~352s compile was the concept_extraction
+// stage alone, all spent waiting on serial LLM I/O.
+//
+// `prefetch_per_doc_llm` runs the LLM calls upstream of the loop in a
+// scoped thread pool, capped at `MAX_PER_DOC_PARALLELISM`. Each
+// worker handles one doc's `summary` followed by its `extract`
+// (the latter feeds on the former). Cross-doc the calls are
+// independent.
+//
+// The loop downstream is unchanged in shape — it still does cache
+// decisions, file writes, build-record saves, and `state_conn`
+// upserts serially. It just pulls the LLM artifact + elapsed pair
+// out of `PrefetchedLlm` instead of calling the pass functions
+// directly. If the prefetch missed a doc (e.g., the worker pool
+// ran out of slots, or a future code path falls through), the loop
+// silently re-runs the call inline — slow path, but always correct.
+
+const MAX_PER_DOC_PARALLELISM: usize = 8;
+
+type SummarySlot = Option<(
+    Result<crate::source_summary::SourceSummaryArtifact, crate::source_summary::SourceSummaryError>,
+    Duration,
+)>;
+type ExtractSlot = Option<(
+    Result<
+        crate::concept_extraction::ConceptExtractionArtifact,
+        crate::concept_extraction::ConceptExtractionError,
+    >,
+    Duration,
+)>;
+
+#[derive(Default)]
+struct PrefetchedLlm {
+    summaries: std::sync::Mutex<HashMap<String, SummarySlot>>,
+    extracts: std::sync::Mutex<HashMap<String, ExtractSlot>>,
+}
+
+impl PrefetchedLlm {
+    fn take_summary(&self, doc_id: &str) -> SummarySlot {
+        self.summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(doc_id)
+            .flatten()
+    }
+
+    fn take_extract(&self, doc_id: &str) -> ExtractSlot {
+        self.extracts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(doc_id)
+            .flatten()
+    }
+}
+
+/// Inputs to one parallel worker's per-doc LLM calls.
+struct DocLlmJob {
+    doc_id: String,
+    doc: kb_core::NormalizedDocument,
+    title: String,
+    page_id: String,
+    page_path: PathBuf,
+    existing_body: Option<String>,
+    candidates_path: PathBuf,
+    /// Whether to dispatch `source_summary`. False when the cache
+    /// hit AND extract also hit (in which case the loop
+    /// short-circuits before even looking at the prefetch).
+    run_summary: bool,
+    /// Whether to dispatch `concept_extraction`. True whenever the
+    /// extract cache missed; this implies `run_summary = true`
+    /// because extract takes summary's output text as input.
+    run_extract: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prefetch_per_doc_llm(
+    adapter: &(dyn LlmAdapter + '_),
+    root: &Path,
+    stale_doc_ids: &[String],
+    force: bool,
+    summary_template_hash: &str,
+    extract_template_hash: &str,
+    state_conn: Option<&rusqlite::Connection>,
+) -> PrefetchedLlm {
+    let prefetched = PrefetchedLlm::default();
+    let jobs: Vec<DocLlmJob> = stale_doc_ids
+        .iter()
+        .filter_map(|doc_id| {
+            build_doc_llm_job(
+                root,
+                doc_id,
+                force,
+                summary_template_hash,
+                extract_template_hash,
+                state_conn,
+            )
+        })
+        .collect();
+
+    if jobs.is_empty() {
+        return prefetched;
+    }
+
+    // Warm the runner with one serial call before fanning out. Opencode
+    // (the v1 default runner) initializes a per-process SQLite database
+    // on first invocation and races on `PRAGMA journal_mode = WAL` when
+    // multiple processes start at exactly the same instant — observed
+    // empirically as 3-of-7 calls failing fast (~1.5s) with a startup
+    // error when prefetch dispatched all jobs simultaneously. Running
+    // the first job alone gives the runner time to settle its on-disk
+    // state; subsequent parallel calls reuse the already-initialized
+    // DB without contending for the WAL setup. Also tracks the actual
+    // first-call elapsed against the same job slot the post-pass loop
+    // will read, so timings stay accurate.
+    run_one_doc_llm_job(adapter, &jobs[0], &prefetched);
+
+    if jobs.len() == 1 {
+        return prefetched;
+    }
+
+    let parallelism = std::cmp::min(jobs.len() - 1, MAX_PER_DOC_PARALLELISM);
+    // Index counter starts at 1 to skip the warmed-up first job.
+    let next = std::sync::atomic::AtomicUsize::new(1);
+    std::thread::scope(|scope| {
+        for _ in 0..parallelism {
+            let jobs = &jobs;
+            let next = &next;
+            let prefetched = &prefetched;
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= jobs.len() {
+                        break;
+                    }
+                    run_one_doc_llm_job(adapter, &jobs[i], prefetched);
+                }
+            });
+        }
+    });
+
+    prefetched
+}
+
+/// Build the per-doc job description, mirroring the cache-decision
+/// logic the post-pass loop will compute again. Returns `None` for
+/// docs that hit both stages' caches — those will be handled by the
+/// loop's existing both-cache-hit short-circuit, no LLM call needed.
+fn build_doc_llm_job(
+    root: &Path,
+    doc_id: &str,
+    force: bool,
+    summary_template_hash: &str,
+    extract_template_hash: &str,
+    state_conn: Option<&rusqlite::Connection>,
+) -> Option<DocLlmJob> {
+    let mut doc = read_normalized_document(root, doc_id).ok()?;
+    let stable_location = read_stable_location(root, doc_id);
+    if stable_location
+        .as_deref()
+        .is_some_and(crate::source_summary::is_transcript_stable_location)
+    {
+        doc.heading_ids = crate::source_summary::extract_transcript_heading_ids(&doc.canonical_text);
+    }
+    let stem_fallback = stable_location
+        .as_deref()
+        .and_then(kb_core::file_stem_from_stable_location);
+    let title = derive_title(&doc.canonical_text, stem_fallback.as_deref(), doc_id);
+    let page_path = crate::source_page::source_page_path_for(doc_id, &title);
+    let existing_page_abs = crate::source_page::resolve_source_page_path(root, doc_id)
+        .unwrap_or_else(|| root.join(&page_path));
+    let existing_markdown = std::fs::read_to_string(&existing_page_abs).ok();
+    let existing_body = existing_markdown
+        .as_deref()
+        .and_then(split_body_from_frontmatter);
+    let page_id = format!("wiki-source-{}", slug_from_title(doc_id));
+    let candidates_path = crate::concept_extraction::concept_candidates_path(root, doc_id);
+
+    let body_hash = hash_bytes(doc.canonical_text.as_bytes()).to_hex();
+    let prior_summary_model =
+        previous_model_for(root, "source-summary", doc_id).unwrap_or_default();
+    let summary_input_hash = fingerprint_inputs(&[
+        b"v1",
+        body_hash.as_bytes(),
+        summary_template_hash.as_bytes(),
+        prior_summary_model.as_bytes(),
+        page_path.to_string_lossy().as_bytes(),
+    ]);
+    let prior_extract_model =
+        previous_model_for(root, "extract-concepts", doc_id).unwrap_or_default();
+    let extract_input_hash = fingerprint_inputs(&[
+        b"v1",
+        body_hash.as_bytes(),
+        extract_template_hash.as_bytes(),
+        prior_extract_model.as_bytes(),
+    ]);
+
+    let summary_cache_hit = !force
+        && state_conn
+            .and_then(|conn| state::lookup_stage(conn, STAGE_SOURCE_SUMMARY, doc_id).ok())
+            .flatten()
+            .is_some_and(|row| row.input_hash == summary_input_hash);
+    let extract_cache_hit = !force
+        && candidates_path.exists()
+        && state_conn
+            .and_then(|conn| state::lookup_stage(conn, STAGE_CONCEPT_EXTRACTION, doc_id).ok())
+            .flatten()
+            .is_some_and(|row| row.input_hash == extract_input_hash);
+
+    if summary_cache_hit && extract_cache_hit {
+        return None;
+    }
+
+    // If extract missed, summary's output text is needed to feed
+    // extract — re-run summary even when its own cache hit. This
+    // mirrors the existing "rare path" at the equivalent point in the
+    // serial loop.
+    let run_extract = !extract_cache_hit;
+    let run_summary = !summary_cache_hit || run_extract;
+
+    Some(DocLlmJob {
+        doc_id: doc_id.to_string(),
+        doc,
+        title,
+        page_id,
+        page_path,
+        existing_body,
+        candidates_path,
+        run_summary,
+        run_extract,
+    })
+}
+
+fn run_one_doc_llm_job(
+    adapter: &(dyn LlmAdapter + '_),
+    job: &DocLlmJob,
+    prefetched: &PrefetchedLlm,
+) {
+    if job.run_summary {
+        let started = Instant::now();
+        let summary_outcome = crate::source_summary::run_source_summary_pass(
+            adapter,
+            &job.doc,
+            &job.title,
+            120,
+            &job.page_id,
+            &job.page_path,
+            job.existing_body.as_deref(),
+        );
+        let elapsed = started.elapsed();
+
+        // If summary failed, leave extract un-dispatched: the post-pass
+        // loop hits the summary error path and `continue`s without
+        // entering extract.
+        let summary_ok = summary_outcome.is_ok();
+        prefetched
+            .summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(job.doc_id.clone(), Some((summary_outcome, elapsed)));
+
+        if job.run_extract && summary_ok {
+            // Re-fetch the summary text from the slot we just wrote so we
+            // can hand it to the extract call. This is awkward but lets
+            // us keep `summary_outcome` moved into the slot rather than
+            // cloning it just to feed extract here.
+            let summary_text: Option<String> = prefetched
+                .summaries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&job.doc_id)
+                .and_then(|opt| opt.as_ref())
+                .and_then(|(res, _)| res.as_ref().ok().map(|a| a.summary.clone()));
+
+            if let Some(summary_text) = summary_text {
+                let started = Instant::now();
+                let extract_outcome = crate::concept_extraction::run_concept_extraction_pass(
+                    adapter,
+                    &job.doc,
+                    &job.title,
+                    Some(&summary_text),
+                    Some(20),
+                    &job.candidates_path,
+                );
+                let elapsed = started.elapsed();
+                prefetched
+                    .extracts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(job.doc_id.clone(), Some((extract_outcome, elapsed)));
+            }
+        }
+    }
 }
 
 #[cfg(test)]
