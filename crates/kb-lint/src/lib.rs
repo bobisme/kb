@@ -705,7 +705,20 @@ fn normalize_page_reference(raw_path: &str, current_page_id: &str) -> Option<Str
     };
 
     let normalized = resolved.to_string_lossy().replace('\\', "/");
-    (!normalized.is_empty()).then_some(normalized)
+    if normalized.is_empty() {
+        return None;
+    }
+    // bn-22m7: only treat targets inside the wiki tree as "wiki page
+    // links" subject to broken-links validation. Paths that resolve to
+    // `.kb/normalized/...` (the auto-generated source-citation block
+    // points there) or anywhere else outside `wiki/` are file-system
+    // links to non-wiki assets — skip them rather than flagging them as
+    // unresolved wiki page targets. The lint registry only knows wiki
+    // pages, so it has nothing useful to say about these anyway.
+    if !normalized.starts_with(&format!("{WIKI_DIR}/")) && normalized != WIKI_DIR {
+        return None;
+    }
+    Some(normalized)
 }
 
 fn clean_relative_path(path: &Path) -> PathBuf {
@@ -1734,6 +1747,53 @@ mod tests {
 
         let report = run_lint(root, LintRule::BrokenLinks).expect("run lint");
         assert!(report.is_clean(), "expected no lint issues: {report:?}");
+    }
+
+    /// bn-22m7: every freshly compiled `wiki/sources/<id>.md` page
+    /// includes a `## Citations` block whose entries point at
+    /// `../../.kb/normalized/<src-id>/source.md#<anchor>`. These are
+    /// real file-system links to the normalized layer, not wiki page
+    /// targets — broken-links must skip them rather than flag every
+    /// source page on every compiled kb.
+    #[test]
+    fn broken_links_ignores_dotkb_normalized_citation_target() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("wiki/sources")).expect("mkdir");
+        fs::create_dir_all(root.join(".kb/normalized/src-abc"))
+            .expect("mkdir normalized");
+        // The actual citation target need not exist for this test —
+        // the lint should not even attempt to look it up.
+        fs::write(
+            root.join("wiki/sources/src-abc-foo.md"),
+            "---\nid: wiki-source-src-abc\n---\n# Source\n## Citations\n- [foo](../../.kb/normalized/src-abc/source.md#foo)\n",
+        )
+        .expect("write source page");
+
+        let report = run_lint(root, LintRule::BrokenLinks).expect("run lint");
+        assert!(
+            report.is_clean(),
+            "auto-generated .kb/normalized/... citation must not flag broken-links: {report:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_page_reference_returns_none_for_non_wiki_paths() {
+        // A page in wiki/sources/ linking to ../../.kb/normalized/...
+        // resolves outside the wiki tree, so the lint has nothing
+        // useful to say about it.
+        assert_eq!(
+            normalize_page_reference(
+                "../../.kb/normalized/src-abc/source",
+                "wiki/sources/src-abc-foo",
+            ),
+            None,
+        );
+        // Also rejects absolute escapes that resolve to top-level files.
+        assert_eq!(
+            normalize_page_reference("../../README", "wiki/sources/src-abc-foo"),
+            None,
+        );
     }
 
     #[test]

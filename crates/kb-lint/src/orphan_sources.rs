@@ -162,9 +162,25 @@ fn parse_src_id_from_stem(stem: &str) -> Option<String> {
     Some(format!("src-{}", &rest[..token_end]))
 }
 
-/// Walk `wiki/concepts/**/*.md` and harvest every src-id mentioned in a
-/// citation. Concept pages may use the bracket form, paren form, or
-/// `[src-id#section]` — the parser handles all three.
+/// Walk `wiki/concepts/**/*.md` and harvest every src-id a concept
+/// references in any supported form. The kb compile pipeline produces
+/// concept pages that point at sources in **three** distinct ways, all
+/// of which should rescue a source from orphan status (bn-3jdo):
+///
+/// 1. Inline citation syntax in the body — `[src-id]`, `[src-id#sec]`,
+///    or `(src-id)`. Used when a concept page is hand-edited to add
+///    quotes from a source.
+/// 2. The `source_document_ids:` list in YAML frontmatter, populated by
+///    the `concept_extraction` and `concept_merge` passes. This is the
+///    canonical machine-readable backlink and is present on every
+///    auto-generated concept.
+/// 3. `[[wiki/sources/<stem>]]` wiki-links in the managed `## Backlinks`
+///    block, populated by the `backlinks` compile pass. These are what
+///    a human reader actually clicks on.
+///
+/// Before bn-3jdo only form (1) was checked, so every freshly compiled
+/// kb reported every source as orphan because concept pages don't use
+/// bracket-citation syntax in their bodies.
 fn collect_concept_citations(root: &Path) -> Result<BTreeSet<String>> {
     let concepts_dir = root.join(WIKI_CONCEPTS_DIR);
     if !concepts_dir.exists() {
@@ -174,11 +190,100 @@ fn collect_concept_citations(root: &Path) -> Result<BTreeSet<String>> {
     for path in markdown_files_under(&concepts_dir)? {
         let body = fs::read_to_string(&path)
             .with_context(|| format!("read concept page {}", path.display()))?;
+        // Form 1: inline [src-id] / (src-id) / [src-id#sec] citations.
         for r in extract_src_id_references(&body) {
             ids.insert(r.src_id);
         }
+        // Form 2: frontmatter `source_document_ids:` list.
+        for id in parse_frontmatter_source_ids(&body) {
+            ids.insert(id);
+        }
+        // Form 3: [[wiki/sources/<stem>]] wiki-links anywhere in the body.
+        for id in extract_src_ids_from_wiki_links(&body) {
+            ids.insert(id);
+        }
     }
     Ok(ids)
+}
+
+/// Parse the YAML frontmatter and return the `source_document_ids` list
+/// entries, if any. We don't pull in a YAML parser — the format the
+/// compile pipeline emits is a flat sequence of `- <id>` lines, which is
+/// trivial to recognize without parsing the whole document.
+fn parse_frontmatter_source_ids(body: &str) -> Vec<String> {
+    let trimmed = body.trim_start();
+    if !trimmed.starts_with("---") {
+        return Vec::new();
+    }
+    let Some(after_first) = trimmed.strip_prefix("---") else {
+        return Vec::new();
+    };
+    let after_first = after_first.trim_start_matches('\n').trim_start_matches('\r');
+    let Some(close_idx) = after_first.find("\n---") else {
+        return Vec::new();
+    };
+    let frontmatter = &after_first[..close_idx];
+
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in frontmatter.lines() {
+        let trimmed = line.trim_end();
+        if let Some(rest) = trimmed.strip_prefix("source_document_ids:") {
+            // Inline form: `source_document_ids: [src-a, src-b]` is rare
+            // but tolerated — best-effort parse.
+            in_section = true;
+            let rest = rest.trim();
+            if rest.starts_with('[') && rest.ends_with(']') {
+                for part in rest.trim_matches(['[', ']']).split(',') {
+                    let id = part.trim().trim_matches('"').trim_matches('\'');
+                    if id.starts_with("src-") {
+                        out.push(id.to_string());
+                    }
+                }
+                in_section = false;
+            }
+            continue;
+        }
+        if in_section {
+            // List entries: `  - src-abc` or `- src-abc`. Anything else
+            // ends the section.
+            let l = line.trim_start();
+            if let Some(item) = l.strip_prefix("- ") {
+                let id = item.trim().trim_matches('"').trim_matches('\'');
+                if id.starts_with("src-") {
+                    out.push(id.to_string());
+                }
+                continue;
+            }
+            // Non-list line at top level closes the block.
+            if !line.starts_with(' ') && !line.starts_with('\t') {
+                in_section = false;
+            }
+        }
+    }
+    out
+}
+
+/// Collect src-ids referenced via `[[wiki/sources/<stem>]]` wiki-links
+/// anywhere in the body. The stem may be the bare src-id (`src-abc`)
+/// or the slugged form (`src-abc-some-title`); both resolve to the
+/// same source after stripping the slug suffix.
+fn extract_src_ids_from_wiki_links(body: &str) -> Vec<String> {
+    let re = wiki_link_regex();
+    let mut out = Vec::new();
+    for cap in re.captures_iter(body) {
+        let Some(target) = cap.get(1) else { continue };
+        let raw = target.as_str().trim();
+        let no_anchor = raw.split('#').next().unwrap_or(raw);
+        let stripped = no_anchor.trim_end_matches(".md").trim_end_matches('/');
+        let Some(stem) = stripped.strip_prefix("wiki/sources/") else {
+            continue;
+        };
+        if let Some(id) = parse_src_id_from_stem(stem) {
+            out.push(id);
+        }
+    }
+    out
 }
 
 /// Walk every source page and collect the *relative paths* of any other
@@ -400,5 +505,73 @@ mod tests {
         let err = build_exempt_set(&bad).expect_err("expected glob parse error");
         let msg = format!("{err:#}");
         assert!(msg.contains("invalid glob"), "got: {msg}");
+    }
+
+    // ── bn-3jdo: concepts that reference sources via frontmatter or
+    //    wiki-links must rescue them from orphan status, mirroring how
+    //    the compile pipeline emits backlinks.
+
+    #[test]
+    fn concept_frontmatter_source_document_ids_rescues_source() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write(root, "wiki/sources/src-abc-some-title.md", "# Source\n");
+        write(
+            root,
+            "wiki/concepts/foo.md",
+            "---\nname: Foo\nsource_document_ids:\n- src-abc\n---\n# Foo\nA concept.\n",
+        );
+        let issues =
+            detect_orphan_sources(root, &OrphanSourcesConfig::default()).expect("run");
+        assert!(
+            issues.is_empty(),
+            "frontmatter source_document_ids must rescue the source: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn concept_backlinks_wiki_link_rescues_source() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path();
+        write(root, "wiki/sources/src-abc-some-title.md", "# Source\n");
+        write(
+            root,
+            "wiki/concepts/foo.md",
+            "# Foo\nA concept.\n## Backlinks\n- [[wiki/sources/src-abc-some-title]]\n",
+        );
+        let issues =
+            detect_orphan_sources(root, &OrphanSourcesConfig::default()).expect("run");
+        assert!(
+            issues.is_empty(),
+            "[[wiki/sources/...]] wiki-links must rescue the source: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn parse_frontmatter_source_ids_handles_block_form() {
+        let body = "---\nname: Foo\nsource_document_ids:\n- src-abc\n- src-def\nother: 1\n---\nbody";
+        let ids = parse_frontmatter_source_ids(body);
+        assert_eq!(ids, vec!["src-abc".to_string(), "src-def".to_string()]);
+    }
+
+    #[test]
+    fn parse_frontmatter_source_ids_handles_inline_form() {
+        let body = "---\nsource_document_ids: [src-abc, src-def]\n---\nbody";
+        let ids = parse_frontmatter_source_ids(body);
+        assert_eq!(ids, vec!["src-abc".to_string(), "src-def".to_string()]);
+    }
+
+    #[test]
+    fn parse_frontmatter_source_ids_returns_empty_without_frontmatter() {
+        let body = "# Title\nbody";
+        assert!(parse_frontmatter_source_ids(body).is_empty());
+    }
+
+    #[test]
+    fn extract_src_ids_from_wiki_links_handles_slugged_stems() {
+        let body = "see [[wiki/sources/src-abc-some-slug]] and [[wiki/sources/src-xyz]]";
+        let mut ids = extract_src_ids_from_wiki_links(body);
+        ids.sort();
+        assert_eq!(ids, vec!["src-abc".to_string(), "src-xyz".to_string()]);
     }
 }
