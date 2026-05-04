@@ -138,7 +138,7 @@ pub fn run_concept_merge_pass_with_origins<A, S>(
 ) -> Result<ConceptMergeArtifact, ConceptMergeError>
 where
     A: LlmAdapter + ?Sized,
-    S: std::hash::BuildHasher,
+    S: std::hash::BuildHasher + Sync,
 {
     candidates.sort_unstable_by(|a, b| a.name.cmp(&b.name));
 
@@ -165,6 +165,21 @@ where
     })
 }
 
+/// Render every confident concept page produced by the merge step.
+///
+/// bn-3hgs: each `render_concept_page` makes one independent LLM call
+/// to `generate_concept_body`, so on a corpus that produces N
+/// concepts the previous serial implementation cost roughly N × call
+/// latency. On a 7-source kb that turned compile's `concept_merge`
+/// stage into a ~4-minute wait. The calls have no inter-group dependencies,
+/// so we dispatch them concurrently in a scoped thread pool.
+///
+/// `LlmAdapter` requires `Send + Sync`, which makes the `&A` reference
+/// safe to share across scoped threads. We cap fan-out at
+/// `MAX_CONCEPT_BODY_PARALLELISM` to avoid hammering the runner with
+/// dozens of simultaneous CLI processes — opencode in particular
+/// spawns a per-call subprocess and the local box can't service 30 of
+/// them at once without thrashing.
 fn build_concept_pages<A, S>(
     adapter: &A,
     response: &MergeConceptCandidatesResponse,
@@ -173,15 +188,54 @@ fn build_concept_pages<A, S>(
 ) -> Result<Vec<ConceptPage>, ConceptMergeError>
 where
     A: LlmAdapter + ?Sized,
-    S: std::hash::BuildHasher,
+    S: std::hash::BuildHasher + Sync,
 {
-    response
-        .groups
-        .iter()
-        .filter(|g| g.confident)
-        .map(|group| render_concept_page(adapter, group, root, candidate_origins))
+    let groups: Vec<&MergeGroup> = response.groups.iter().filter(|g| g.confident).collect();
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parallelism = std::cmp::min(groups.len(), MAX_CONCEPT_BODY_PARALLELISM);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut results: Vec<Option<Result<ConceptPage, ConceptMergeError>>> =
+        (0..groups.len()).map(|_| None).collect();
+    let results_slots: Vec<std::sync::Mutex<&mut Option<Result<ConceptPage, ConceptMergeError>>>> =
+        results.iter_mut().map(std::sync::Mutex::new).collect();
+
+    std::thread::scope(|scope| {
+        for _ in 0..parallelism {
+            let groups = &groups;
+            let next = &next;
+            let results_slots = &results_slots;
+            scope.spawn(move || {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= groups.len() {
+                        break;
+                    }
+                    let result = render_concept_page(adapter, groups[i], root, candidate_origins);
+                    let mut slot = results_slots[i]
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    **slot = Some(result);
+                }
+            });
+        }
+    });
+
+    results
+        .into_iter()
+        .map(|slot| slot.expect("every group slot is filled by a worker"))
         .collect()
 }
+
+/// Cap on simultaneous concept-body LLM calls. The merge pass would
+/// otherwise spawn one runner subprocess per concept, which on
+/// opencode means dozens of concurrent CLI invocations — fast on the
+/// model side but the local box drowns in process overhead. Eight is
+/// roughly the sweet spot on a 16-thread workstation, and big enough
+/// to give meaningful speedups on small kbs without saturating CPU.
+const MAX_CONCEPT_BODY_PARALLELISM: usize = 8;
 
 /// Synthesize the general-scope body for a canonical concept via a dedicated
 /// LLM call. bn-1w5: running body generation as a separate, strictly-scoped
