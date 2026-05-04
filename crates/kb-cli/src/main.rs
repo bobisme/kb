@@ -6554,9 +6554,6 @@ fn lookup_source_origin(root: &Path, src_id: &str) -> Option<String> {
 
 #[allow(clippy::too_many_lines)]
 fn print_status(status: &StatusPayload) {
-    println!("kb status");
-    println!();
-
     println!("ingested sources: {}", status.normalized_source_count);
     if status.sources.total == 0 {
         println!("wiki source pages: 0    (run 'kb compile' to generate)");
