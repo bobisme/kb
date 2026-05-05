@@ -1,11 +1,42 @@
+use std::collections::HashMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use kb_core::{KB_DIR, Manifest};
 
-use crate::config::Config;
+use crate::config::{Config, LlmConfig, LlmRunnerConfig};
+
+/// bn-1xlz: when configuring runners at init time, kb prefers `pi` for
+/// non-Claude work, then falls back to `opencode` if pi isn't on
+/// PATH, then `claude` as the final option. Pi was designed for
+/// non-interactive agent use and doesn't suffer the `SQLite` WAL race
+/// opencode hits under parallel invocation (bn-17t0). Opencode stays
+/// supported as a fallback so existing kbs that built up around it
+/// keep working — this only affects `kb init` on fresh roots.
+const RUNNER_PRIORITY: &[&str] = &["pi", "opencode", "claude"];
+
+/// Default model written into a fresh kb.toml when `pi` is the
+/// detected default runner. `openai-codex/gpt-5.5` matches pi's own
+/// shipped default and the slug pi expects after `pi` OAuth login. If
+/// the user authenticates a different provider they edit kb.toml; we
+/// don't try to read pi's `~/.pi/agent/settings.json` because that
+/// couples kb to pi's internal config layout.
+const PI_DEFAULT_MODEL: &str = "openai-codex/gpt-5.5";
+
+/// Default model when `opencode` is the chosen runner. Mirrors the
+/// pre-bn-1xlz behaviour and matches what every existing kb's
+/// `default_model` already says, so opencode-on-PATH systems keep
+/// the slug they had before this change.
+const OPENCODE_DEFAULT_MODEL: &str = "openai/gpt-5.4";
+
+/// Default model when `claude` is the only runner found. Anthropic's
+/// terms require Claude models to route via Claude Code (the `claude`
+/// CLI), so when claude is the fallback default the model has to be
+/// claude-family.
+const CLAUDE_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
 const KBIGNORE_CONTENT: &str = "\
 # kb: directories and files the ingest walker should skip.
@@ -75,7 +106,15 @@ pub fn init(
             println!("kb.toml preserved");
         }
     } else {
-        let default_config = Config::default();
+        // bn-1xlz: pick the runner block + default_runner/default_model
+        // based on what's actually on PATH right now. Falls back to the
+        // pre-bn-1xlz static default when nothing is detected (so
+        // pre-existing tests and CI environments without any runner
+        // still get a parseable kb.toml).
+        let default_config = Config {
+            llm: detect_llm_config(env::var_os("PATH").as_deref()),
+            ..Config::default()
+        };
         let toml = default_config.to_toml_string()?;
         fs::write(&config_path, toml)
             .with_context(|| format!("failed to write {}", config_path.display()))?;
@@ -157,4 +196,256 @@ pub fn init(
     }
 
     Ok(())
+}
+
+/// Inspect `PATH` and return an [`LlmConfig`] tuned to what's actually
+/// installed (bn-1xlz).
+///
+/// Detection walks `path_var` once and asks: which of `pi`,
+/// `opencode`, `claude` are present? The first match in
+/// [`RUNNER_PRIORITY`] becomes `default_runner`; the corresponding
+/// model slug becomes `default_model`. Every detected runner gets a
+/// `[llm.runners.<name>]` section in the generated kb.toml so the
+/// router can fall back per model — claude-family slugs always route
+/// to the claude runner when it's present.
+///
+/// When `path_var` is `None` or no runners are found, returns the
+/// static `LlmConfig::default()` so init still produces a parseable
+/// kb.toml on bare CI machines.
+#[must_use]
+pub fn detect_llm_config(path_var: Option<&OsStr>) -> LlmConfig {
+    let detected: Vec<&'static str> = RUNNER_PRIORITY
+        .iter()
+        .copied()
+        .filter(|cmd| is_command_on_path(cmd, path_var))
+        .collect();
+
+    if detected.is_empty() {
+        return LlmConfig::default();
+    }
+
+    let default_runner = detected[0];
+    let default_model = match default_runner {
+        "pi" => PI_DEFAULT_MODEL,
+        "claude" => CLAUDE_DEFAULT_MODEL,
+        _ => OPENCODE_DEFAULT_MODEL,
+    }
+    .to_string();
+
+    let mut runners = HashMap::new();
+    for &name in &detected {
+        runners.insert(name.to_string(), runner_config_for(name));
+    }
+
+    LlmConfig {
+        default_runner: default_runner.to_string(),
+        default_model,
+        runners,
+    }
+}
+
+/// Build the `[llm.runners.<name>]` section appropriate for one
+/// detected runner.
+///
+/// The four boolean tool flags (`tools_*`) describe what kb's
+/// compile-time prompts are *allowed* to do. Pi's adapter translates
+/// them into pi's `--tools` allowlist; opencode and claude consume
+/// them directly. We default to read-only across runners — kb's
+/// compile-time LLM calls only need to read the rendered prompt; they
+/// never legitimately edit the user's tree.
+fn runner_config_for(name: &str) -> LlmRunnerConfig {
+    match name {
+        "pi" => LlmRunnerConfig {
+            command: "pi".to_string(),
+            model: None,
+            permission_mode: None,
+            tools_read: true,
+            tools_write: false,
+            tools_edit: false,
+            tools_bash: false,
+            timeout_seconds: Some(900),
+        },
+        "claude" => LlmRunnerConfig {
+            command: "claude".to_string(),
+            model: None,
+            permission_mode: Some("default".to_string()),
+            tools_read: true,
+            tools_write: true,
+            tools_edit: true,
+            tools_bash: true,
+            timeout_seconds: Some(900),
+        },
+        // opencode (and any future fallback name)
+        _ => LlmRunnerConfig {
+            command: "opencode run".to_string(),
+            model: None,
+            permission_mode: None,
+            tools_read: true,
+            tools_write: true,
+            tools_edit: true,
+            tools_bash: true,
+            timeout_seconds: Some(900),
+        },
+    }
+}
+
+/// Return `true` when `cmd` resolves to an executable on the supplied
+/// PATH. Lightweight reimplementation of `which::which` so init
+/// doesn't pull in a new direct dependency for one call site.
+///
+/// Skips empty PATH entries (POSIX implicitly treats them as `.`,
+/// which is dangerous; we don't honour that). On Unix the executable
+/// bit is checked via `metadata().permissions().mode() & 0o111`; on
+/// other platforms we accept any regular file present at
+/// `<dir>/<cmd>`.
+fn is_command_on_path(cmd: &str, path_var: Option<&OsStr>) -> bool {
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    for dir in env::split_paths(path_var) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        let candidate = dir.join(cmd);
+        if is_executable_file(&candidate) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|m| m.is_file() && (m.permissions().mode() & 0o111) != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|m| m.is_file())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use tempfile::TempDir;
+
+    /// Create a fake executable named `name` in `dir` with mode 755.
+    fn write_fake_executable(dir: &Path, name: &str) {
+        let path = dir.join(name);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("write fake binary");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path).expect("metadata").permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms).expect("chmod 755");
+        }
+    }
+
+    fn path_var_from(dirs: &[&Path]) -> OsString {
+        env::join_paths(dirs.iter().copied()).expect("join_paths")
+    }
+
+    #[test]
+    fn prefers_pi_when_pi_and_opencode_both_present() {
+        let dir = TempDir::new().unwrap();
+        write_fake_executable(dir.path(), "pi");
+        write_fake_executable(dir.path(), "opencode");
+
+        let cfg = detect_llm_config(Some(&path_var_from(&[dir.path()])));
+        assert_eq!(cfg.default_runner, "pi");
+        assert_eq!(cfg.default_model, PI_DEFAULT_MODEL);
+        assert!(cfg.runners.contains_key("pi"));
+        assert!(cfg.runners.contains_key("opencode"));
+    }
+
+    #[test]
+    fn falls_back_to_opencode_when_pi_absent() {
+        let dir = TempDir::new().unwrap();
+        write_fake_executable(dir.path(), "opencode");
+
+        let cfg = detect_llm_config(Some(&path_var_from(&[dir.path()])));
+        assert_eq!(cfg.default_runner, "opencode");
+        assert_eq!(cfg.default_model, OPENCODE_DEFAULT_MODEL);
+        assert!(cfg.runners.contains_key("opencode"));
+        assert!(!cfg.runners.contains_key("pi"));
+    }
+
+    #[test]
+    fn falls_back_to_claude_when_only_claude_present() {
+        let dir = TempDir::new().unwrap();
+        write_fake_executable(dir.path(), "claude");
+
+        let cfg = detect_llm_config(Some(&path_var_from(&[dir.path()])));
+        assert_eq!(cfg.default_runner, "claude");
+        assert_eq!(cfg.default_model, CLAUDE_DEFAULT_MODEL);
+        assert!(cfg.runners.contains_key("claude"));
+        assert!(!cfg.runners.contains_key("pi"));
+        assert!(!cfg.runners.contains_key("opencode"));
+    }
+
+    #[test]
+    fn returns_static_default_when_no_runners_detected() {
+        let dir = TempDir::new().unwrap();
+        // Empty dir — no runners.
+        let cfg = detect_llm_config(Some(&path_var_from(&[dir.path()])));
+        assert_eq!(cfg, LlmConfig::default());
+    }
+
+    #[test]
+    fn returns_static_default_when_path_is_unset() {
+        let cfg = detect_llm_config(None);
+        assert_eq!(cfg, LlmConfig::default());
+    }
+
+    #[test]
+    fn includes_every_detected_runner_in_generated_section() {
+        // All three present — the generated config should carry
+        // sections for each so the router can fall back per model.
+        let dir = TempDir::new().unwrap();
+        write_fake_executable(dir.path(), "pi");
+        write_fake_executable(dir.path(), "opencode");
+        write_fake_executable(dir.path(), "claude");
+
+        let cfg = detect_llm_config(Some(&path_var_from(&[dir.path()])));
+        assert_eq!(cfg.default_runner, "pi");
+        assert_eq!(cfg.runners.len(), 3);
+        for name in ["pi", "opencode", "claude"] {
+            assert!(
+                cfg.runners.contains_key(name),
+                "expected {name} runner section in detected config"
+            );
+        }
+    }
+
+    #[test]
+    fn ignores_empty_path_entries() {
+        // POSIX treats `::` as the cwd — kb's detection should NOT
+        // honour that (it would let a malicious cwd shadow real
+        // binaries on first init).
+        let dir = TempDir::new().unwrap();
+        write_fake_executable(dir.path(), "pi");
+        let path = format!("{}::", dir.path().display());
+        let cfg = detect_llm_config(Some(OsStr::new(&path)));
+        // pi still found in the explicit dir; no panic from the empty
+        // entry.
+        assert_eq!(cfg.default_runner, "pi");
+    }
+
+    #[test]
+    fn pi_runner_section_is_read_only_by_default() {
+        let dir = TempDir::new().unwrap();
+        write_fake_executable(dir.path(), "pi");
+        let cfg = detect_llm_config(Some(&path_var_from(&[dir.path()])));
+        let pi = cfg.runners.get("pi").expect("pi section");
+        assert_eq!(pi.command, "pi");
+        assert!(pi.tools_read);
+        assert!(!pi.tools_write);
+        assert!(!pi.tools_edit);
+        assert!(!pi.tools_bash);
+        assert_eq!(pi.timeout_seconds, Some(900));
+    }
 }
