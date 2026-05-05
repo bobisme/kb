@@ -331,11 +331,24 @@ async fn ask_get_handler(
 }
 
 fn parse_ask_body(body: &str) -> String {
-    // Try JSON first.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body)
-        && let Some(q) = v.get("q").and_then(|s| s.as_str())
-    {
-        return q.to_string();
+    // Try JSON first. Accept `q` (the historic short key) and `question`
+    // (the natural long key — common when callers think of the request as
+    // an API rather than a form). bn-gn9u: previously, a JSON body with
+    // {"question": "..."} parsed cleanly but found no `q` key and fell
+    // through to the plain-text branch, sending the entire JSON object
+    // to the model as the question.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(q) = v.get("q").and_then(|s| s.as_str()) {
+            return q.to_string();
+        }
+        if let Some(q) = v.get("question").and_then(|s| s.as_str()) {
+            return q.to_string();
+        }
+        // The body is valid JSON but doesn't carry a question under any
+        // recognized key. Return empty so run_ask_and_respond surfaces a
+        // 400 error instead of asking the model about a serialized JSON
+        // object (bn-gn9u).
+        return String::new();
     }
     // Form-encoded: `q=hello+world&other=ignored`.
     for pair in body.split('&') {
@@ -658,6 +671,36 @@ mod tests {
     #[test]
     fn parse_ask_body_json() {
         assert_eq!(parse_ask_body(r#"{"q":"hi there"}"#), "hi there");
+    }
+
+    /// bn-gn9u: JSON bodies using the natural `question` key must work
+    /// the same as the historic `q` key — previously they fell through
+    /// to plain-text and sent the entire JSON object to the model.
+    #[test]
+    fn parse_ask_body_json_accepts_question_key() {
+        assert_eq!(
+            parse_ask_body(r#"{"question":"How should launch expand?"}"#),
+            "How should launch expand?",
+        );
+    }
+
+    /// bn-gn9u: when `q` is present, prefer it (historic shape stays
+    /// authoritative). The `question` fallback only kicks in when `q`
+    /// is absent or not a string.
+    #[test]
+    fn parse_ask_body_json_prefers_q_over_question() {
+        assert_eq!(
+            parse_ask_body(r#"{"q":"first","question":"second"}"#),
+            "first",
+        );
+    }
+
+    /// bn-gn9u: a valid JSON body that doesn't carry a recognized key
+    /// must return empty so `run_ask_and_respond` emits a clean 400 — we
+    /// never want the model to be asked a serialized JSON object.
+    #[test]
+    fn parse_ask_body_unknown_json_shape_returns_empty() {
+        assert_eq!(parse_ask_body(r#"{"prompt":"hi","mode":"chat"}"#), "");
     }
 
     #[test]
