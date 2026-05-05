@@ -4031,7 +4031,7 @@ fn create_ask_adapter(
                 project_root: Some(root.to_path_buf()),
             })))
         }
-        kb_llm::Backend::Opencode | kb_llm::Backend::Pi => {
+        kb_llm::Backend::Opencode => {
             let command = normalize_binary_command(&runner.command);
             Ok(Box::new(OpencodeAdapter::new(OpencodeConfig {
                 command,
@@ -4045,7 +4045,57 @@ fn create_ask_adapter(
                 ..Default::default()
             })))
         }
+        kb_llm::Backend::Pi => {
+            // bn-1s8y: route Pi requests through the dedicated adapter
+            // (pi --print --no-extensions --no-skills ...) instead of
+            // falling through to OpencodeAdapter. Tool selection mirrors
+            // the kb runner config's four boolean flags so users have
+            // the same allowlist surface across runners.
+            let command = normalize_binary_command(&runner.command);
+            let tools = pi_tools_from_runner(runner);
+            Ok(Box::new(kb_llm::PiAdapter::new(kb_llm::PiConfig {
+                command,
+                model,
+                provider: None,
+                tools,
+                thinking: None,
+                session_dir: None,
+                timeout: Duration::from_secs(runner.timeout_seconds.unwrap_or(900)),
+                project_root: Some(root.to_path_buf()),
+            })?))
+        }
     }
+}
+
+/// Translate kb's four-boolean tool-permission surface into pi's
+/// comma-separated `--tools` allowlist (bn-1s8y).
+///
+/// Read-only tools (`read`, `grep`, `find`, `ls`) come along whenever
+/// `tools_read = true` so the model can locate and inspect files —
+/// these are pi's read-side primitives and chief's runner template
+/// pulls them in together by default. Write/edit/bash gate the
+/// corresponding mutating tools individually.
+fn pi_tools_from_runner(runner: &config::LlmRunnerConfig) -> String {
+    let mut tools: Vec<&str> = Vec::new();
+    if runner.tools_read {
+        tools.extend(["read", "grep", "find", "ls"]);
+    }
+    if runner.tools_write {
+        tools.push("write");
+    }
+    if runner.tools_edit {
+        tools.push("edit");
+    }
+    if runner.tools_bash {
+        tools.push("bash");
+    }
+    if tools.is_empty() {
+        // Always at least let the model read; an empty `--tools` flag
+        // pi-side disables every built-in tool which renders the agent
+        // unable to inspect kb's prompts as references.
+        tools.push("read");
+    }
+    tools.join(",")
 }
 
 fn resolve_query(query: Option<String>, editor: bool) -> Result<String> {

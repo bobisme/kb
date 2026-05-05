@@ -1019,7 +1019,7 @@ fn strip_ansi_header(text: &str) -> String {
 
 /// Format an alias list for the `concept_body.md` prompt.
 /// Empty list renders as "(none)" so the template line "Aliases: " stays grammatical.
-fn format_aliases_for_prompt(aliases: &[String]) -> String {
+pub(crate) fn format_aliases_for_prompt(aliases: &[String]) -> String {
     if aliases.is_empty() {
         "(none)".to_string()
     } else {
@@ -1030,7 +1030,7 @@ fn format_aliases_for_prompt(aliases: &[String]) -> String {
 /// Format candidate quotes as bullet lines for the `concept_body.md` prompt.
 /// Empty list renders as a single "(no quotes available)" line so the prompt
 /// still parses cleanly without dangling whitespace.
-fn format_quotes_for_prompt(quotes: &[String]) -> String {
+pub(crate) fn format_quotes_for_prompt(quotes: &[String]) -> String {
     if quotes.is_empty() {
         "- (no quotes available)".to_string()
     } else {
@@ -1046,7 +1046,7 @@ fn format_quotes_for_prompt(quotes: &[String]) -> String {
 /// adapter's helper — numbered zero-based entries with source labels so the
 /// model's `conflicting_quotes: [index, …]` output can be mapped back to the
 /// input list.
-fn format_contradiction_quotes_for_prompt(
+pub(crate) fn format_contradiction_quotes_for_prompt(
     quotes: &[crate::adapter::ContradictionQuote],
 ) -> String {
     if quotes.is_empty() {
@@ -1069,7 +1069,7 @@ fn format_contradiction_quotes_for_prompt(
 /// Format candidate snippets as bullet lines for the
 /// `generate_concept_from_candidate.md` prompt. Empty list renders as
 /// a single "(no snippets available)" line so the prompt still parses cleanly.
-fn format_candidate_snippets_for_prompt(
+pub(crate) fn format_candidate_snippets_for_prompt(
     snippets: &[crate::adapter::CandidateSourceSnippet],
 ) -> String {
     if snippets.is_empty() {
@@ -1085,7 +1085,7 @@ fn format_candidate_snippets_for_prompt(
 /// Format the list of existing category tags for the
 /// `generate_concept_from_candidate.md` prompt. Empty list renders as
 /// "(none)" so the prompt stays grammatical.
-fn format_existing_categories_for_prompt(categories: &[String]) -> String {
+pub(crate) fn format_existing_categories_for_prompt(categories: &[String]) -> String {
     if categories.is_empty() {
         "(none)".to_string()
     } else {
@@ -1101,7 +1101,7 @@ fn format_existing_categories_for_prompt(categories: &[String]) -> String {
 /// Strip wrapping code fences from a plain-text LLM response. Defensive —
 /// the prompt tells the model to return plain text, but models occasionally
 /// wrap short bodies in triple backticks anyway.
-fn strip_plain_text_wrappers(text: &str) -> String {
+pub(crate) fn strip_plain_text_wrappers(text: &str) -> String {
     let trimmed = text.trim();
     let without_fence = trimmed.strip_prefix("```").map_or(trimmed, |rest| {
         let after_header = rest.split_once('\n').map_or(rest, |(_, body)| body);
@@ -1118,13 +1118,13 @@ fn strip_plain_text_wrappers(text: &str) -> String {
 /// `kb doctor` shouldn't hang for 900s on a misconfigured harness, but a cold
 /// `opencode` invocation can take 10-15s on first call due to mise/TS bootup.
 /// The `[30s, 60s]` range keeps doctor snappy while tolerating cold starts.
-fn health_check_timeout(configured: Duration) -> Duration {
+pub(crate) fn health_check_timeout(configured: Duration) -> Duration {
     configured
         .min(Duration::from_secs(60))
         .max(Duration::from_secs(30))
 }
 
-fn unix_time_ms() -> Result<u64, LlmAdapterError> {
+pub(crate) fn unix_time_ms() -> Result<u64, LlmAdapterError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|err| LlmAdapterError::Other(format!("system clock before unix epoch: {err}")))?;

@@ -112,7 +112,13 @@ impl Router {
     }
 }
 
-fn is_claude_model(model: &str) -> bool {
+/// Return `true` when `model` belongs to Anthropic's Claude family.
+///
+/// Used by the router to enforce the "Claude-family models route only
+/// to `Backend::ClaudeCode`" invariant (Anthropic subscription terms),
+/// and re-exported as `pub(crate)` so individual adapters can apply
+/// the same check defensively in their own constructors.
+pub(crate) fn is_claude_model(model: &str) -> bool {
     let model = model.trim().to_ascii_lowercase();
 
     if model.is_empty() {
