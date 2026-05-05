@@ -520,6 +520,27 @@ pub fn run_compile(root: &Path, options: &CompileOptions) -> Result<CompileRepor
     run_compile_with_llm(root, options, None::<&dyn LlmAdapter>)
 }
 
+/// Compile with a separate captions adapter (bn-1ure).
+///
+/// Same as [`run_compile_with_llm`] but accepts a separate vision-capable
+/// adapter for the bn-2qda captions pass. Pass `None` for
+/// `captions_adapter` to fall back to the compile-wide `adapter`. Use this
+/// variant when `[compile.captions]` in `kb.toml` specifies a runner/model
+/// that differs from the global `[llm]` default — e.g. main compile on
+/// `pi`/openai-codex (no vision) and captions routed to claude-haiku.
+///
+/// # Errors
+///
+/// Same error surface as [`run_compile_with_llm`].
+pub fn run_compile_with_captions_llm(
+    root: &Path,
+    options: &CompileOptions,
+    adapter: Option<&(dyn LlmAdapter + '_)>,
+    captions_adapter: Option<&(dyn LlmAdapter + '_)>,
+) -> Result<CompileReport> {
+    run_compile_inner(root, options, adapter, captions_adapter)
+}
+
 /// Run the full compile pipeline with incremental stale detection and an
 /// optional LLM adapter for per-document passes.
 ///
@@ -536,11 +557,20 @@ pub fn run_compile(root: &Path, options: &CompileOptions) -> Result<CompileRepor
 ///
 /// Returns an error when normalized documents cannot be read, passes fail,
 /// or state files cannot be persisted.
-#[allow(clippy::too_many_lines)]
 pub fn run_compile_with_llm(
     root: &Path,
     options: &CompileOptions,
     adapter: Option<&(dyn LlmAdapter + '_)>,
+) -> Result<CompileReport> {
+    run_compile_inner(root, options, adapter, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_compile_inner(
+    root: &Path,
+    options: &CompileOptions,
+    adapter: Option<&(dyn LlmAdapter + '_)>,
+    captions_adapter: Option<&(dyn LlmAdapter + '_)>,
 ) -> Result<CompileReport> {
     let doc_ids = discover_normalized_ids(root)?;
     let total_sources = doc_ids.len();
@@ -926,7 +956,13 @@ pub fn run_compile_with_llm(
     //   - `[compile.captions] enabled = false`
     if let Some(adapter) = adapter {
         if options.captions.enabled {
-            match run_captions_pass(root, adapter, &options.captions) {
+            // bn-1ure: honor `[compile.captions].runner/model` by
+            // routing the captions pass through a vision-capable adapter
+            // built from that section in kb-cli, falling back to the
+            // compile-wide adapter when the user didn't override.
+            let captions_dispatch_adapter: &dyn LlmAdapter =
+                captions_adapter.unwrap_or(adapter);
+            match run_captions_pass(root, captions_dispatch_adapter, &options.captions) {
                 Ok(stats) => {
                     let line = format!(
                         "  [ok] captions ({} captioned, {} cached, {} skipped)",

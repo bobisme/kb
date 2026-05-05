@@ -4100,11 +4100,27 @@ fn run_compile_action(
         kb_compile::pipeline::run_compile(compile_root, &options)?
     } else {
         match build_compile_adapter(compile_root, cli_model) {
-            Ok(adapter) => kb_compile::pipeline::run_compile_with_llm(
-                compile_root,
-                &options,
-                Some(adapter.as_ref()),
-            )?,
+            Ok(adapter) => {
+                // bn-1ure: when [compile.captions] specifies a runner/model
+                // that differs from the global default, build a separate
+                // adapter for the captions pass and route the captions
+                // dispatch to it. Falling back to the compile-wide adapter
+                // when the user didn't override.
+                let captions_adapter =
+                    build_captions_adapter(compile_root, cli_model, loaded_config.as_ref())
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(
+                                "[compile.captions] adapter unavailable, falling back to default runner: {err}"
+                            );
+                            None
+                        });
+                kb_compile::pipeline::run_compile_with_captions_llm(
+                    compile_root,
+                    &options,
+                    Some(adapter.as_ref()),
+                    captions_adapter.as_deref(),
+                )?
+            }
             Err(err) => {
                 tracing::warn!(
                     "LLM adapter unavailable — running compile without per-document passes: {err}"
@@ -4164,21 +4180,91 @@ fn build_compile_adapter(
     create_ask_adapter(&cfg, root)
 }
 
+/// Build a vision-capable adapter from `[compile.captions]` (bn-1ure).
+///
+/// Returns:
+/// - `Ok(None)` when the captions config matches the default runner/model
+///   that `build_compile_adapter` already produced — the captions pass
+///   reuses the compile-wide adapter (no second-adapter cost).
+/// - `Ok(Some(adapter))` when `[compile.captions].runner` or `model`
+///   differs, so the captions pass dispatches through this adapter
+///   instead of the default. Honors the same routing logic as the main
+///   compile adapter (claude→ClaudeCli, opencode→Opencode, pi→Pi).
+/// - `Err(_)` when the named runner is missing from `[llm.runners]` or
+///   the adapter could not be constructed. The caller logs and falls
+///   back to the compile-wide adapter so users still get *some* captions
+///   even on a misconfigured `[compile.captions]` block.
+fn build_captions_adapter(
+    root: &Path,
+    cli_model: Option<&str>,
+    cached_cfg: Option<&Config>,
+) -> Result<Option<Box<dyn kb_llm::LlmAdapter>>> {
+    // Reuse the cfg already loaded by run_compile_action when available
+    // so we don't pay the toml parse cost twice. Fall back to a fresh
+    // load — the cli_model override only matters for the main adapter,
+    // not for [compile.captions], which carries its own model.
+    let owned;
+    let cfg = if let Some(cfg) = cached_cfg {
+        cfg
+    } else {
+        owned = Config::load_from_root(root, cli_model)?;
+        &owned
+    };
+    let captions = &cfg.compile.captions;
+    if !captions.enabled {
+        return Ok(None);
+    }
+    // No-op fast path: when the captions block names the same runner and
+    // model the compile adapter is already configured with, building a
+    // second adapter just spins up an identical PI/Claude/opencode
+    // process. Skip it and let the captions pass reuse the default.
+    let default_runner = cfg.llm.default_runner.as_str();
+    let default_model = cfg
+        .llm
+        .runners
+        .get(default_runner)
+        .and_then(|r| r.model.clone())
+        .unwrap_or_else(|| cfg.llm.default_model.clone());
+    if captions.runner == default_runner && captions.model == default_model {
+        return Ok(None);
+    }
+    let adapter = create_adapter_for_runner(cfg, root, &captions.runner, Some(&captions.model))?;
+    Ok(Some(adapter))
+}
+
 fn create_ask_adapter(
     cfg: &Config,
     root: &Path,
 ) -> Result<Box<dyn kb_llm::LlmAdapter>> {
-    let runner_name = &cfg.llm.default_runner;
+    create_adapter_for_runner(cfg, root, &cfg.llm.default_runner, None)
+}
+
+/// Build an adapter for the named `[llm.runners.<runner_name>]` block,
+/// optionally overriding the model. Used by `create_ask_adapter` for the
+/// compile-wide adapter, and by `build_captions_adapter` (bn-1ure) when
+/// `[compile.captions]` specifies its own runner/model that may differ
+/// from the global default.
+fn create_adapter_for_runner(
+    cfg: &Config,
+    root: &Path,
+    runner_name: &str,
+    model_override: Option<&str>,
+) -> Result<Box<dyn kb_llm::LlmAdapter>> {
     let runner = cfg
         .llm
         .runners
         .get(runner_name)
         .ok_or_else(|| anyhow::anyhow!("configured runner '{runner_name}' not found in kb.toml"))?;
 
-    let model = runner
-        .model
-        .clone()
-        .unwrap_or_else(|| cfg.llm.default_model.clone());
+    let model = model_override.map_or_else(
+        || {
+            runner
+                .model
+                .clone()
+                .unwrap_or_else(|| cfg.llm.default_model.clone())
+        },
+        str::to_string,
+    );
 
     // Build a router that reflects every configured runner, so claude models route
     // to ClaudeCode even when `default_runner = "opencode"`.
@@ -4190,7 +4276,7 @@ fn create_ask_adapter(
             _ => configured.push(kb_llm::Backend::Opencode),
         }
     }
-    let default_backend = match runner_name.as_str() {
+    let default_backend = match runner_name {
         "claude" => kb_llm::Backend::ClaudeCode,
         "pi" => kb_llm::Backend::Pi,
         _ => kb_llm::Backend::Opencode,
