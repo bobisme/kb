@@ -4893,13 +4893,44 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
     let mut report = build_inspect_report_for_target(root, target)?;
 
     if trace {
-        if let Some(graph_data) = &report.graph {
-            let _ = graph_data;
+        // bn-238c: trace combines two sources of truth.
+        //
+        // 1. The build-record dependency graph (state/graph.json) — provenance,
+        //    "what passes produced this from what inputs". Always queried; empty
+        //    when the report is a file report (graph_data = None) or when the
+        //    resolved node has no inputs.
+        // 2. The citation/link graph (state/graph.db) — content connections,
+        //    "what other pages does this page cite or wikilink to". Populated
+        //    from wiki/* on every compile by the structural pass; previously
+        //    completely ignored by inspect.
+        let mut combined = if report.graph.is_some() {
             let graph = Graph::load_from(root)?;
-            report.trace = Some(build_trace(&graph, &report.resolved_id, &mut std::collections::BTreeSet::new()));
+            build_trace(
+                &graph,
+                &report.resolved_id,
+                &mut std::collections::BTreeSet::new(),
+            )
         } else {
-            report.trace = Some(Vec::new());
+            Vec::new()
+        };
+        if let Some(page_path) = resolved_id_to_page_path(&report.resolved_id)
+            && let Ok(citation_graph) = kb_query::load_graph(root)
+        {
+            let mut visited = std::collections::BTreeSet::new();
+            visited.insert(page_path.clone());
+            let citation_nodes =
+                build_citation_trace(&citation_graph, &page_path, &mut visited);
+            // De-duplicate by id so a page that's both a build-record input
+            // AND a citation neighbor only appears once.
+            let mut seen: std::collections::BTreeSet<String> =
+                combined.iter().map(|n| n.id.clone()).collect();
+            for node in citation_nodes {
+                if seen.insert(node.id.clone()) {
+                    combined.push(node);
+                }
+            }
         }
+        report.trace = Some(combined);
     }
 
     if json {
@@ -5585,6 +5616,72 @@ fn build_trace(
             }
         })
         .collect()
+}
+
+/// Map an inspect `resolved_id` to the repo-relative wiki-page path that
+/// graph.db's [`kb_query::CitationGraph`] uses as its node id.
+///
+/// The build-record graph and the citation graph use different naming
+/// conventions: build-record nodes are prefixed (`concept-foo`,
+/// `wiki-page-bar`) while citation-graph nodes are paths
+/// (`wiki/concepts/foo.md`, `wiki/sources/bar.md`). This converter lets
+/// inspect look up the same logical page in graph.db (bn-238c).
+///
+/// Returns `None` for ids that don't map to a wiki page (e.g.
+/// `source-document-<id>`, build record ids, job ids).
+fn resolved_id_to_page_path(id: &str) -> Option<String> {
+    if id.starts_with("wiki/")
+        && std::path::Path::new(id)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        return Some(id.to_string());
+    }
+    if let Some(slug) = id.strip_prefix("concept-") {
+        return Some(format!("wiki/concepts/{slug}.md"));
+    }
+    if let Some(slug) = id.strip_prefix("wiki-page-") {
+        return Some(format!("wiki/sources/{slug}.md"));
+    }
+    None
+}
+
+/// Walk forward edges in `citation_graph` from `page_path`, building an
+/// [`InspectTraceNode`] tree (bn-238c). Each neighbor's `kind` is
+/// `concept` for `wiki/concepts/*.md` paths, `wiki_page` for
+/// `wiki/sources/*.md` paths, and `citation` otherwise. The `visited`
+/// set prevents cycles when two pages cite each other.
+fn build_citation_trace(
+    citation_graph: &kb_query::CitationGraph,
+    page_path: &str,
+    visited: &mut std::collections::BTreeSet<String>,
+) -> Vec<InspectTraceNode> {
+    citation_graph
+        .neighbors(page_path)
+        .iter()
+        .map(|neighbor| {
+            let inputs = if visited.insert(neighbor.clone()) {
+                build_citation_trace(citation_graph, neighbor, visited)
+            } else {
+                Vec::new()
+            };
+            InspectTraceNode {
+                id: neighbor.clone(),
+                kind: citation_neighbor_kind(neighbor),
+                inputs,
+            }
+        })
+        .collect()
+}
+
+fn citation_neighbor_kind(page_path: &str) -> String {
+    if page_path.starts_with("wiki/concepts/") {
+        "concept".to_string()
+    } else if page_path.starts_with("wiki/sources/") {
+        "wiki_page".to_string()
+    } else {
+        "citation".to_string()
+    }
 }
 
 fn render_inspect_report(report: &InspectReport) -> String {
@@ -7121,6 +7218,92 @@ mod tests {
     fn write_kb_config(root: &Path) {
         fs::create_dir_all(root).expect("create kb root");
         fs::write(root.join(Config::FILE_NAME), "\n").expect("write kb config");
+    }
+
+    // ── bn-238c: inspect --trace + graph.db plumbing ────────────────
+
+    #[test]
+    fn resolved_id_to_page_path_handles_all_known_shapes() {
+        // Path-shaped resolved ids (file reports) round-trip verbatim.
+        assert_eq!(
+            resolved_id_to_page_path("wiki/concepts/operational-telemetry.md"),
+            Some("wiki/concepts/operational-telemetry.md".to_string()),
+        );
+        assert_eq!(
+            resolved_id_to_page_path("wiki/sources/src-76i-runway-release-playbook.md"),
+            Some("wiki/sources/src-76i-runway-release-playbook.md".to_string()),
+        );
+        // Build-record graph node ids map onto the same paths the
+        // citation graph (graph.db) stores under.
+        assert_eq!(
+            resolved_id_to_page_path("concept-operational-telemetry"),
+            Some("wiki/concepts/operational-telemetry.md".to_string()),
+        );
+        assert_eq!(
+            resolved_id_to_page_path("wiki-page-runway-release"),
+            Some("wiki/sources/runway-release.md".to_string()),
+        );
+        // Source-document and unrelated ids don't have a wiki-page form.
+        assert_eq!(
+            resolved_id_to_page_path("source-document-src-abc"),
+            None,
+        );
+        assert_eq!(resolved_id_to_page_path("art-7q1"), None);
+    }
+
+    #[test]
+    fn citation_neighbor_kind_classifies_by_directory() {
+        assert_eq!(
+            citation_neighbor_kind("wiki/concepts/foo.md"),
+            "concept",
+        );
+        assert_eq!(
+            citation_neighbor_kind("wiki/sources/bar.md"),
+            "wiki_page",
+        );
+        assert_eq!(
+            citation_neighbor_kind("outputs/questions/q-x/answer.md"),
+            "citation",
+        );
+    }
+
+    /// bn-238c: a citation graph with two pages that cite each other
+    /// must produce a finite trace — the visited set short-circuits
+    /// the cycle so we don't recurse forever or emit duplicate inputs.
+    #[test]
+    fn build_citation_trace_handles_cycles() {
+        let mut forward: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        forward.insert(
+            "wiki/concepts/a.md".to_string(),
+            vec!["wiki/concepts/b.md".to_string()],
+        );
+        forward.insert(
+            "wiki/concepts/b.md".to_string(),
+            vec!["wiki/concepts/a.md".to_string()],
+        );
+        let mut nodes = std::collections::BTreeSet::new();
+        nodes.insert("wiki/concepts/a.md".to_string());
+        nodes.insert("wiki/concepts/b.md".to_string());
+        let citation_graph = kb_query::CitationGraph { forward, nodes };
+
+        let mut visited = std::collections::BTreeSet::new();
+        visited.insert("wiki/concepts/a.md".to_string());
+        let trace =
+            build_citation_trace(&citation_graph, "wiki/concepts/a.md", &mut visited);
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].id, "wiki/concepts/b.md");
+        assert_eq!(trace[0].kind, "concept");
+        // b cites a back, but the visited set short-circuits the
+        // recursion: the back-edge creates a leaf (id present, inputs
+        // empty) rather than another full subtree. Same pattern as
+        // build_trace's cycle protection.
+        assert_eq!(trace[0].inputs.len(), 1);
+        assert_eq!(trace[0].inputs[0].id, "wiki/concepts/a.md");
+        assert!(
+            trace[0].inputs[0].inputs.is_empty(),
+            "back-edge must terminate at the leaf, not recurse forever"
+        );
     }
 
     // ── bn-mml0: model_slug_matches_runner heuristic ────────────────
