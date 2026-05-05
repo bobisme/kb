@@ -104,10 +104,17 @@ pub struct ForgetOutcome {
     /// removing the source page. Dry-run skips this pass.
     pub backlinks_refreshed: bool,
     /// Whether each of the three post-trash layout refreshes ran
-    /// successfully (bn-i5r: index pages, frontmatter scrub, lexical index).
-    /// Dry-run always reports `false` since nothing is executed.
+    /// successfully on a live run (bn-i5r: index pages, frontmatter scrub,
+    /// lexical index). Skipped on dry-run, which surfaces a sibling
+    /// [`CascadeRefreshPreview`] under `cascade_preview` instead.
     #[serde(default, skip_serializing_if = "CascadeRefresh::is_noop")]
     pub cascade_refresh: CascadeRefresh,
+    /// Preview of the cascade refresh that a live execute *would* perform
+    /// (bn-1ptp). Populated only on `--dry-run` paths; uses preview-tense
+    /// field names so machine-readable output cannot be misread as
+    /// already-applied mutation state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade_preview: Option<CascadeRefreshPreview>,
 }
 
 /// Accounting for the three structural refreshes that run after the trash
@@ -146,7 +153,43 @@ impl CascadeRefresh {
             && !self.lexical_index_refreshed
             && self.graph_nodes_pruned == 0
     }
+
+    /// Reinterpret a live-shaped `CascadeRefresh` as a preview (bn-1ptp).
+    /// `preview_refresh` historically returned the live struct with the
+    /// fields populated as if execution had run; this helper renames the
+    /// fields for the JSON dry-run path so machine consumers don't see
+    /// past-tense names on previewed work.
+    #[must_use]
+    pub const fn as_preview(&self) -> CascadeRefreshPreview {
+        CascadeRefreshPreview {
+            would_refresh_index_pages: self.index_pages_refreshed,
+            would_scrub_frontmatter: self.frontmatter_scrubbed,
+            would_refresh_lexical_index: self.lexical_index_refreshed,
+            would_prune_graph_nodes: self.graph_nodes_pruned,
+        }
+    }
 }
+
+/// Preview of the structural refreshes a live `forget` would run, with
+/// preview-tense names so `--dry-run --json` doesn't look like work that
+/// already happened (bn-1ptp). Mirrors [`CascadeRefresh`] field-for-field
+/// — same booleans, same counts — only the names change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[allow(clippy::struct_field_names)]
+pub struct CascadeRefreshPreview {
+    /// Live execute would regenerate `wiki/index.md`, `wiki/sources/index.md`,
+    /// and `wiki/concepts/index.md` from the post-trash layout.
+    pub would_refresh_index_pages: bool,
+    /// Number of surviving concept pages whose frontmatter
+    /// `source_document_ids` would be rewritten to drop the forgotten src-id.
+    pub would_scrub_frontmatter: usize,
+    /// Live execute would rebuild `state/indexes/lexical.json`.
+    pub would_refresh_lexical_index: bool,
+    /// Number of dependency-graph nodes a live execute would surgically
+    /// remove from `state/graph.json`.
+    pub would_prune_graph_nodes: usize,
+}
+
 
 /// Resolve `<target>` to a concrete `src-<hex>` id.
 ///
@@ -1484,6 +1527,83 @@ mod tests {
         // Survivor remains indexed.
         assert!(lexical_json.contains("wiki/concepts/survivor.md"),
             "lexical index must retain survivor page");
+    }
+
+    #[test]
+    fn dry_run_json_uses_preview_tense_field_names() {
+        // bn-1ptp: the dry-run forget JSON must use preview-tense field
+        // names (`would_*`) instead of past-tense ones, so consumers can't
+        // mistake the values for already-applied mutation state.
+        let outcome = ForgetOutcome {
+            plan: ForgetPlan {
+                src_id: "src-test".to_string(),
+                origin: None,
+                trash_dir: PathBuf::from("/tmp/kb-trash/whatever"),
+                moves: Vec::new(),
+                cascade: CascadePlan::default(),
+            },
+            dry_run: true,
+            backlinks_refreshed: false,
+            cascade_refresh: CascadeRefresh::default(),
+            cascade_preview: Some(CascadeRefreshPreview {
+                would_refresh_index_pages: true,
+                would_scrub_frontmatter: 2,
+                would_refresh_lexical_index: true,
+                would_prune_graph_nodes: 3,
+            }),
+        };
+        let json = serde_json::to_value(&outcome).expect("serialize ForgetOutcome");
+        // Past-tense names must NOT appear at the cascade level (that
+        // sub-object is skip_serialized when default).
+        assert!(json.get("cascade_refresh").is_none(),
+            "cascade_refresh should be omitted on dry-run: {json}");
+        let preview = json.get("cascade_preview")
+            .expect("cascade_preview present on dry-run");
+        assert_eq!(preview["would_refresh_index_pages"], serde_json::json!(true));
+        assert_eq!(preview["would_scrub_frontmatter"], serde_json::json!(2));
+        assert_eq!(preview["would_refresh_lexical_index"], serde_json::json!(true));
+        assert_eq!(preview["would_prune_graph_nodes"], serde_json::json!(3));
+        assert!(preview.get("index_pages_refreshed").is_none(),
+            "preview must not expose past-tense names");
+        assert!(preview.get("lexical_index_refreshed").is_none(),
+            "preview must not expose past-tense names");
+        assert!(preview.get("frontmatter_scrubbed").is_none(),
+            "preview must not expose past-tense names");
+        assert!(preview.get("graph_nodes_pruned").is_none(),
+            "preview must not expose past-tense names");
+    }
+
+    #[test]
+    fn live_run_json_keeps_past_tense_field_names() {
+        // The live (non-dry-run) JSON keeps past-tense names because the
+        // values describe work that actually happened — and the dry-run
+        // sibling is omitted via skip_serializing_if.
+        let outcome = ForgetOutcome {
+            plan: ForgetPlan {
+                src_id: "src-test".to_string(),
+                origin: None,
+                trash_dir: PathBuf::from("/tmp/kb-trash/whatever"),
+                moves: Vec::new(),
+                cascade: CascadePlan::default(),
+            },
+            dry_run: false,
+            backlinks_refreshed: true,
+            cascade_refresh: CascadeRefresh {
+                index_pages_refreshed: true,
+                frontmatter_scrubbed: 4,
+                lexical_index_refreshed: true,
+                graph_nodes_pruned: 5,
+            },
+            cascade_preview: None,
+        };
+        let json = serde_json::to_value(&outcome).expect("serialize ForgetOutcome");
+        assert!(json.get("cascade_preview").is_none(),
+            "cascade_preview must not appear on live runs");
+        let live = json.get("cascade_refresh").expect("cascade_refresh present");
+        assert_eq!(live["index_pages_refreshed"], serde_json::json!(true));
+        assert_eq!(live["frontmatter_scrubbed"], serde_json::json!(4));
+        assert_eq!(live["lexical_index_refreshed"], serde_json::json!(true));
+        assert_eq!(live["graph_nodes_pruned"], serde_json::json!(5));
     }
 
     #[test]

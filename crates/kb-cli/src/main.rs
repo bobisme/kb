@@ -1903,13 +1903,18 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
         // execution would do beyond the trash moves.
         let preview = forget::preview_refresh(root, &plan.src_id).unwrap_or_default();
         if flags.json {
+            // bn-1ptp: surface the dry-run cascade under a preview-tense
+            // sibling field so JSON consumers can't misread the values as
+            // already-applied mutation state. cascade_refresh stays at its
+            // default and skip-serializes.
             emit_json(
                 "forget",
                 forget::ForgetOutcome {
                     plan,
                     dry_run: true,
                     backlinks_refreshed: false,
-                    cascade_refresh: preview,
+                    cascade_refresh: forget::CascadeRefresh::default(),
+                    cascade_preview: Some(preview.as_preview()),
                 },
             )?;
         } else {
@@ -1931,6 +1936,7 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
                     dry_run: false,
                     backlinks_refreshed: false,
                     cascade_refresh: forget::CascadeRefresh::default(),
+                    cascade_preview: None,
                 },
             )?;
         } else {
@@ -1963,6 +1969,7 @@ fn run_forget(root: &Path, target: &str, flags: ForgetFlags) -> Result<()> {
                 dry_run: false,
                 backlinks_refreshed: outcome.backlinks_refreshed,
                 cascade_refresh: outcome.cascade_refresh,
+                cascade_preview: None,
             },
         )?;
     } else {
