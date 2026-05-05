@@ -184,7 +184,8 @@ fn log_path_from_options(options: &CompileOptions) -> Option<PathBuf> {
         .and_then(|sink| sink.log_path().map(Path::to_path_buf))
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct CompileOptions {
     pub force: bool,
     pub dry_run: bool,
@@ -220,6 +221,36 @@ pub struct CompileOptions {
     /// Configuration for the bn-13zx concept-suggestions pass. Defaults match
     /// `[compile.concept_suggestions]` in `kb.toml`.
     pub concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions,
+    // -- end of fields the user wires up via kb.toml --
+
+    /// Whether the LLM runner needs a serial first call before parallel
+    /// fan-out (bn-mml0). Opencode initialises a per-process `SQLite`
+    /// database on first invocation and races on `PRAGMA journal_mode = WAL`
+    /// when several processes start at exactly the same instant; running
+    /// one job alone first lets it settle the WAL setup. Pi has no such
+    /// fragility, so when pi is the runner we skip the warmup tax (one
+    /// LLM-call's worth of latency on every compile). Defaults to `true`
+    /// — strictly safer for unknown runners; `kb-cli` flips it to false
+    /// when the configured `default_runner` is `pi`.
+    pub runner_serializes_init: bool,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self {
+        Self {
+            force: false,
+            dry_run: false,
+            progress: false,
+            log_sink: None,
+            reporter: None,
+            semantic_backend: kb_query::SemanticBackendConfig::default(),
+            captions: crate::captions::CaptionsConfig::default(),
+            concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+            // Default-safe: assume the runner needs the serial warmup.
+            // kb-cli flips this to false for pi.
+            runner_serializes_init: true,
+        }
+    }
 }
 
 impl std::fmt::Debug for CompileOptions {
@@ -239,6 +270,7 @@ impl std::fmt::Debug for CompileOptions {
                 "concept_suggestions_enabled",
                 &self.concept_suggestions.enabled,
             )
+            .field("runner_serializes_init", &self.runner_serializes_init)
             .finish()
     }
 }
@@ -1360,6 +1392,7 @@ fn run_per_document_passes(
         &summary_template_hash,
         &extract_template_hash,
         state_conn,
+        options.runner_serializes_init,
     );
 
     for doc_id in stale_doc_ids {
@@ -2239,6 +2272,7 @@ fn prefetch_per_doc_llm(
     summary_template_hash: &str,
     extract_template_hash: &str,
     state_conn: Option<&rusqlite::Connection>,
+    runner_serializes_init: bool,
 ) -> PrefetchedLlm {
     let prefetched = PrefetchedLlm::default();
     let jobs: Vec<DocLlmJob> = stale_doc_ids
@@ -2259,26 +2293,32 @@ fn prefetch_per_doc_llm(
         return prefetched;
     }
 
-    // Warm the runner with one serial call before fanning out. Opencode
-    // (the v1 default runner) initializes a per-process SQLite database
-    // on first invocation and races on `PRAGMA journal_mode = WAL` when
-    // multiple processes start at exactly the same instant — observed
-    // empirically as 3-of-7 calls failing fast (~1.5s) with a startup
-    // error when prefetch dispatched all jobs simultaneously. Running
-    // the first job alone gives the runner time to settle its on-disk
-    // state; subsequent parallel calls reuse the already-initialized
-    // DB without contending for the WAL setup. Also tracks the actual
-    // first-call elapsed against the same job slot the post-pass loop
-    // will read, so timings stay accurate.
-    run_one_doc_llm_job(adapter, &jobs[0], &prefetched);
+    // bn-17t0 + bn-mml0: opencode initialises a per-process SQLite
+    // database on first invocation and races on `PRAGMA journal_mode = WAL`
+    // when several processes start at exactly the same instant —
+    // observed empirically as 3-of-7 calls failing fast with a startup
+    // error when the prefetch dispatched all jobs at once. The fix is
+    // to run the first job alone so opencode settles its WAL setup
+    // before the rest fan out.
+    //
+    // Pi (the bn-1xlz default) doesn't have this fragility. When the
+    // configured runner doesn't serialise its first call, skip the
+    // warmup and dispatch every job in parallel — that's worth ~one
+    // LLM-call's worth of latency on every compile (5-10s for a
+    // 7-source kb).
+    let pool_first_index = if runner_serializes_init {
+        run_one_doc_llm_job(adapter, &jobs[0], &prefetched);
+        if jobs.len() == 1 {
+            return prefetched;
+        }
+        1
+    } else {
+        0
+    };
 
-    if jobs.len() == 1 {
-        return prefetched;
-    }
-
-    let parallelism = std::cmp::min(jobs.len() - 1, MAX_PER_DOC_PARALLELISM);
-    // Index counter starts at 1 to skip the warmed-up first job.
-    let next = std::sync::atomic::AtomicUsize::new(1);
+    let remaining = jobs.len().saturating_sub(pool_first_index);
+    let parallelism = std::cmp::min(remaining, MAX_PER_DOC_PARALLELISM);
+    let next = std::sync::atomic::AtomicUsize::new(pool_first_index);
     std::thread::scope(|scope| {
         for _ in 0..parallelism {
             let jobs = &jobs;
@@ -2576,6 +2616,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("compile");
@@ -2604,6 +2645,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("compile with progress");
@@ -2629,6 +2671,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("compile");
@@ -2663,6 +2706,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("compile");
@@ -2691,6 +2735,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("first compile");
@@ -2706,6 +2751,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("second compile");
@@ -2734,6 +2780,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("first compile");
@@ -2752,6 +2799,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("second compile");
@@ -2779,6 +2827,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("first compile");
@@ -2794,6 +2843,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("force compile");
@@ -2821,6 +2871,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("dry run");
@@ -2889,6 +2940,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -2972,6 +3024,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             None::<&dyn LlmAdapter>,
         )
@@ -3027,6 +3080,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("first compile");
@@ -3042,6 +3096,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("dry run with clean state");
@@ -3075,6 +3130,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("dry run");
@@ -3090,6 +3146,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("live run");
@@ -3154,6 +3211,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("first compile");
@@ -3169,6 +3227,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("second compile — no changes");
@@ -3194,6 +3253,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("third compile — template changed");
@@ -3341,6 +3401,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3402,6 +3463,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3445,6 +3507,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3509,6 +3572,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3555,6 +3619,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3602,6 +3667,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3625,6 +3691,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3656,6 +3723,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3694,6 +3762,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3724,6 +3793,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3767,6 +3837,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )
@@ -3848,6 +3919,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
         )
         .expect("compile");
@@ -3971,6 +4043,7 @@ mod tests {
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
             concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+            runner_serializes_init: true,
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile");
 
@@ -4035,6 +4108,7 @@ mod tests {
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
             concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+            runner_serializes_init: true,
         };
         run_compile_with_llm(root, &options, Some(&adapter)).expect("compile succeeds (failures logged, not bubbled)");
 
@@ -4128,6 +4202,7 @@ mod tests {
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
             concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+            runner_serializes_init: true,
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -4219,6 +4294,7 @@ mod tests {
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
             concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+            runner_serializes_init: true,
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -4258,6 +4334,7 @@ mod tests {
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
             concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+            runner_serializes_init: true,
         };
         run_compile_with_llm(root, &options, Some(&adapter))
             .expect("compile succeeds (failures logged, not bubbled)");
@@ -4336,6 +4413,7 @@ mod tests {
             semantic_backend: kb_query::SemanticBackendConfig::default(),
             captions: crate::captions::CaptionsConfig::default(),
             concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+            runner_serializes_init: true,
         };
         let rendered = format!("{with_sink:?}");
         assert!(rendered.contains("Some(\"<LogSink>\")"), "got {rendered}");
@@ -4625,6 +4703,7 @@ mod tests {
                 semantic_backend: kb_query::SemanticBackendConfig::default(),
                 captions: crate::captions::CaptionsConfig::default(),
                 concept_suggestions: crate::concept_suggestions::ConceptSuggestionsOptions::default(),
+                runner_serializes_init: true,
             },
             Some(&adapter),
         )

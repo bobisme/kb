@@ -1257,6 +1257,7 @@ fn run_doctor(root: &Path, json: bool, cli_model: Option<&str>) -> Result<()> {
     if let Some(cfg) = cfg.as_ref() {
         checks.push(check_prompt_template_directory(root, cfg));
         checks.extend(check_prompt_templates_load(root));
+        checks.push(check_model_slug_matches_runner(cfg));
         checks.extend(check_runner_health(root, cfg));
     } else {
         checks.push(DoctorCheck {
@@ -1418,6 +1419,167 @@ fn check_prompt_templates_load(root: &Path) -> Vec<DoctorCheck> {
         },
     )
     .collect()
+}
+
+/// bn-mml0: warn when `default_model` is shaped wrong for the
+/// configured `default_runner`.
+///
+/// `kb init` always writes a model slug that matches the runner it
+/// auto-picked (pi → `openai-codex/...`, opencode → `openai/...`,
+/// claude → `claude-*`). Hand-edited kb.toml files can drift — e.g.
+/// flipping `default_runner = "pi"` while leaving the opencode-shaped
+/// `openai/gpt-5.4` in place. Pi rejects that slug at startup with
+/// `No models match pattern` and the LLM call fails fast with
+/// confusing output. Catching it in doctor turns a cryptic compile
+/// failure into one yellow warning with an actionable hint.
+///
+/// Heuristics, deliberately permissive — the goal is to flag obvious
+/// mismatches, not to enforce a tight schema:
+///
+/// - **claude** runner ↔ Claude-family slug (`claude-*`,
+///   `claude/*`, `anthropic/*`). Anthropic `ToS` requires Claude
+///   models to route through the `claude` CLI, so this is the only
+///   case that actually has to match.
+/// - **pi** runner ↔ pi-shaped slug (`<provider>/<id>` where the
+///   provider is one of pi's supported names). The hard-coded list
+///   covers the providers shipped with pi as of 0.71.0; users on
+///   exotic providers are silently OK because the check is
+///   permissive.
+/// - **opencode** runner ↔ opencode-shaped slug. Opencode accepts
+///   the same `provider/id` form pi does but uses different provider
+///   names, so a pi-shaped slug under an opencode runner is a
+///   mismatch worth flagging.
+///
+/// The check never errors — it's a warning hint. The doctor's
+/// downstream `model_access:<runner>` probe will surface the actual
+/// runtime failure if the user ignores us.
+fn check_model_slug_matches_runner(cfg: &Config) -> DoctorCheck {
+    const NAME: &str = "model_slug_matches_runner";
+    let runner = cfg.llm.default_runner.as_str();
+    let model = cfg.llm.default_model.as_str();
+
+    diagnose_runner_model_mismatch(runner, model).map_or_else(
+        || DoctorCheck {
+            name: NAME.to_string(),
+            status: DoctorSeverity::Ok.as_str(),
+            summary: format!(
+                "default_model `{model}` looks well-shaped for default_runner `{runner}`."
+            ),
+            remediation: None,
+            details: None,
+        },
+        |reason| DoctorCheck {
+            name: NAME.to_string(),
+            status: DoctorSeverity::Warn.as_str(),
+            summary: format!(
+                "default_model `{model}` may not be valid for default_runner `{runner}`."
+            ),
+            remediation: Some(format!(
+                "{reason} Run `kb init --reset-config --force` to regenerate, or hand-edit kb.toml."
+            )),
+            details: None,
+        },
+    )
+}
+
+/// Provider prefixes pi has shipped with through ~0.71.0. Hard-coded
+/// because pi's own provider list isn't exposed via a stable file
+/// contract; on a miss we fall through to "opencode-shaped" to avoid
+/// false positives on legitimate exotic providers.
+const PI_PROVIDERS: &[&str] = &[
+    "openai-codex",
+    "anthropic",
+    "google",
+    "google-gemini-cli",
+    "groq",
+    "deepseek",
+    "ollama",
+    "openrouter",
+    "fireworks",
+    "cerebras",
+    "xai",
+    "mistral",
+    "minimax",
+    "moonshot",
+    "kimi",
+    "zai",
+    "azure",
+    "bedrock",
+    "cloudflare",
+    "ai-gateway",
+    "opencode-go",
+];
+
+/// Opencode's shipped provider names — separate from pi's list.
+/// Anything not on either list still passes (we err on the side of
+/// not nagging users with exotic providers).
+const OPENCODE_PROVIDERS: &[&str] = &[
+    "openai", "anthropic", "google", "groq", "deepseek", "openrouter", "fireworks", "azure",
+    "bedrock", "ollama", "xai",
+];
+
+/// Inspect a `(runner, model)` pair and return `None` when the slug
+/// looks reasonable for the runner, or `Some(reason)` when there is
+/// a clear mismatch. Pulled into a free function so the test suite
+/// can exercise the heuristic without building a full `Config`.
+fn diagnose_runner_model_mismatch(runner: &str, model: &str) -> Option<String> {
+    let model_lower = model.trim().to_ascii_lowercase();
+    if model_lower.is_empty() {
+        return Some(format!(
+            "default_model is empty; runner `{runner}` cannot dispatch a request without one."
+        ));
+    }
+
+    let is_claude_shaped = model_lower.starts_with("claude-")
+        || model_lower.starts_with("claude/")
+        || model_lower.starts_with("anthropic/");
+
+    let provider = model_lower.split_once('/').map_or("?", |(p, _)| p);
+    let pi_shaped = PI_PROVIDERS.contains(&provider);
+    let opencode_shaped = OPENCODE_PROVIDERS.contains(&provider);
+
+    match runner {
+        "claude" => {
+            if is_claude_shaped {
+                None
+            } else {
+                Some(
+                    "Runner `claude` requires a Claude-family slug (`claude-*`, `claude/*`, or `anthropic/*`).".to_string()
+                )
+            }
+        }
+        "pi" => {
+            if is_claude_shaped {
+                Some(
+                    "Runner `pi` cannot run Claude-family models — Claude models must route through the `claude` runner per Anthropic ToS.".to_string()
+                )
+            } else if pi_shaped {
+                None
+            } else if opencode_shaped {
+                Some(format!(
+                    "`{model}` looks opencode-shaped (provider `{provider}`); pi expects pi-shaped slugs like `openai-codex/<id>` or `google/<id>`."
+                ))
+            } else {
+                None
+            }
+        }
+        "opencode" => {
+            if is_claude_shaped {
+                Some(
+                    "Runner `opencode` cannot run Claude-family models — Claude models must route through the `claude` runner per Anthropic ToS.".to_string()
+                )
+            } else if opencode_shaped {
+                None
+            } else if pi_shaped {
+                Some(format!(
+                    "`{model}` looks pi-shaped (provider `{provider}`); opencode expects slugs like `openai/<id>` or `anthropic/<id>`."
+                ))
+            } else {
+                None
+            }
+        }
+        _ => None, // unknown runner — leave model validation to the runner itself
+    }
 }
 
 fn check_runner_health(root: &Path, cfg: &Config) -> Vec<DoctorCheck> {
@@ -3898,6 +4060,17 @@ fn run_compile_action(
         .map(|cfg| cfg.compile.concept_suggestions.to_pipeline_options())
         .unwrap_or_default();
 
+    // bn-mml0: pi handles parallel invocation cleanly, so the bn-17t0
+    // serial-warmup workaround is unnecessary when pi is the configured
+    // default runner. Skipping the warmup saves one LLM-call's worth of
+    // latency per compile (~5-10s on a 7-source fixture). Opencode and
+    // claude still pay the warmup tax — opencode because of its
+    // `PRAGMA journal_mode = WAL` race; claude defensively until we
+    // verify it doesn't suffer a similar startup serialisation issue.
+    let runner_serializes_init = loaded_config
+        .as_ref()
+        .is_none_or(|cfg| cfg.llm.default_runner.as_str() != "pi");
+
     let options = kb_compile::pipeline::CompileOptions {
         force,
         dry_run,
@@ -3911,6 +4084,7 @@ fn run_compile_action(
         semantic_backend,
         captions,
         concept_suggestions,
+        runner_serializes_init,
     };
 
     // Dry-run does not call the LLM; skip adapter construction so users can
@@ -6813,6 +6987,103 @@ mod tests {
     fn write_kb_config(root: &Path) {
         fs::create_dir_all(root).expect("create kb root");
         fs::write(root.join(Config::FILE_NAME), "\n").expect("write kb config");
+    }
+
+    // ── bn-mml0: model_slug_matches_runner heuristic ────────────────
+
+    #[test]
+    fn slug_check_passes_on_well_formed_pi_default() {
+        // The exact tuple `kb init` writes when pi is on PATH.
+        assert!(diagnose_runner_model_mismatch("pi", "openai-codex/gpt-5.5").is_none());
+    }
+
+    #[test]
+    fn slug_check_passes_on_well_formed_opencode_default() {
+        assert!(diagnose_runner_model_mismatch("opencode", "openai/gpt-5.4").is_none());
+    }
+
+    #[test]
+    fn slug_check_passes_on_well_formed_claude_default() {
+        for model in [
+            "claude-sonnet-4-6",
+            "claude-opus-4-7",
+            "claude/sonnet-4",
+            "anthropic/claude-haiku-3",
+        ] {
+            assert!(
+                diagnose_runner_model_mismatch("claude", model).is_none(),
+                "{model} must be accepted as a claude-runner slug"
+            );
+        }
+    }
+
+    #[test]
+    fn slug_check_warns_on_pi_runner_with_opencode_shaped_model() {
+        // The hand-edited drift the bone is filed for.
+        let issue = diagnose_runner_model_mismatch("pi", "openai/gpt-5.4")
+            .expect("opencode-shaped slug under pi runner should warn");
+        assert!(
+            issue.contains("opencode-shaped"),
+            "warning should call out shape mismatch: {issue}"
+        );
+    }
+
+    #[test]
+    fn slug_check_warns_on_opencode_runner_with_pi_shaped_model() {
+        let issue = diagnose_runner_model_mismatch("opencode", "openai-codex/gpt-5.5")
+            .expect("pi-shaped slug under opencode runner should warn");
+        assert!(
+            issue.contains("pi-shaped"),
+            "warning should call out shape mismatch: {issue}"
+        );
+    }
+
+    #[test]
+    fn slug_check_warns_on_pi_or_opencode_running_claude_family() {
+        // Anthropic ToS — neither pi nor opencode may carry Claude
+        // models, regardless of slug shape. The router enforces this
+        // at runtime; doctor catches the misconfiguration earlier.
+        let issue = diagnose_runner_model_mismatch("pi", "claude-sonnet-4-6")
+            .expect("pi cannot run claude-* per ToS");
+        assert!(
+            issue.to_lowercase().contains("claude"),
+            "warning must mention Claude routing rule: {issue}"
+        );
+        let issue = diagnose_runner_model_mismatch("opencode", "anthropic/claude-haiku-3")
+            .expect("opencode cannot run claude per ToS");
+        assert!(
+            issue.to_lowercase().contains("claude"),
+            "warning must mention Claude routing rule: {issue}"
+        );
+    }
+
+    #[test]
+    fn slug_check_warns_on_claude_runner_with_non_claude_model() {
+        let issue = diagnose_runner_model_mismatch("claude", "openai/gpt-5.4")
+            .expect("claude runner needs claude-family slug");
+        assert!(
+            issue.contains("Claude-family"),
+            "warning should explain the requirement: {issue}"
+        );
+    }
+
+    #[test]
+    fn slug_check_warns_on_empty_model() {
+        let issue = diagnose_runner_model_mismatch("pi", "")
+            .expect("empty model must warn");
+        assert!(
+            issue.contains("empty"),
+            "warning should call out emptiness: {issue}"
+        );
+    }
+
+    #[test]
+    fn slug_check_quiet_on_unknown_runner() {
+        // A user who configured `default_runner = "myrunner"` is on
+        // their own — doctor doesn't try to second-guess. The check
+        // returns None and lets the downstream model_access probe
+        // surface any real failure.
+        assert!(diagnose_runner_model_mismatch("myrunner", "weird/slug").is_none());
     }
 
     #[test]
