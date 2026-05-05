@@ -4020,7 +4020,7 @@ fn run_compile_explain(compile_root: &Path, json: bool) -> Result<()> {
 ///
 /// `log_sink` is `Some` only for real compiles (streamed into the job's
 /// on-disk log); dry-run passes `None`.
-#[allow(clippy::fn_params_excessive_bools)]
+#[allow(clippy::fn_params_excessive_bools, clippy::too_many_lines)]
 fn run_compile_action(
     compile_root: &Path,
     force: bool,
@@ -4147,6 +4147,20 @@ fn run_compile_action(
     };
 
     if json {
+        // bn-6mqt: surface per-pass details under `passes` so machine
+        // consumers see the same per-stage breakdown that humans get
+        // from `report.render()`. Each entry is `{ name, status }`,
+        // where `status` is the internally-tagged PassStatus variant.
+        let passes_json: Vec<serde_json::Value> = report
+            .passes
+            .iter()
+            .map(|(name, status)| {
+                serde_json::json!({
+                    "name": name,
+                    "status": status,
+                })
+            })
+            .collect();
         emit_json(
             "compile",
             serde_json::json!({
@@ -4155,6 +4169,7 @@ fn run_compile_action(
                 "build_records_emitted": report.build_records_emitted,
                 "duplicate_review_items": duplicate_review_items,
                 "dry_run": dry_run,
+                "passes": passes_json,
             }),
         )?;
     } else {

@@ -301,7 +301,7 @@ fn log_message(options: &CompileOptions, message: &str) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct CompileReport {
     pub total_sources: usize,
     pub stale_sources: usize,
@@ -309,7 +309,13 @@ pub struct CompileReport {
     pub passes: Vec<(String, PassStatus)>,
 }
 
-#[derive(Debug, Clone)]
+/// Per-pass outcome surfaced in `CompileReport.passes`.
+///
+/// Also serialized into `kb compile --json` (bn-6mqt). The JSON shape is
+/// internally tagged so consumers can match on `kind` and read the
+/// variant-specific fields without sniffing for keys.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PassStatus {
     Executed { affected: usize },
     Skipped { reason: String },
@@ -2531,6 +2537,34 @@ mod tests {
     use super::*;
     use kb_core::{EntityMetadata, NormalizedDocument, Status, write_normalized_document};
     use tempfile::tempdir;
+
+    /// bn-6mqt: serialized `PassStatus` must use the internally-tagged
+    /// `kind` discriminator and expose the variant's payload field by
+    /// name, so JSON consumers don't have to sniff for keys.
+    #[test]
+    fn pass_status_serialized_shape_is_kind_tagged() {
+        let executed =
+            serde_json::to_value(PassStatus::Executed { affected: 7 }).expect("executed json");
+        assert_eq!(executed["kind"], serde_json::json!("executed"));
+        assert_eq!(executed["affected"], serde_json::json!(7));
+
+        let skipped = serde_json::to_value(PassStatus::Skipped {
+            reason: "no LLM adapter".to_string(),
+        })
+        .expect("skipped json");
+        assert_eq!(skipped["kind"], serde_json::json!("skipped"));
+        assert_eq!(skipped["reason"], serde_json::json!("no LLM adapter"));
+
+        let dry_run = serde_json::to_value(PassStatus::DryRun {
+            would_process: vec!["normalized/src-aaa".to_string()],
+        })
+        .expect("dry_run json");
+        assert_eq!(dry_run["kind"], serde_json::json!("dry_run"));
+        assert_eq!(
+            dry_run["would_process"],
+            serde_json::json!(["normalized/src-aaa"])
+        );
+    }
 
     fn test_doc(id: &str, content: &str) -> NormalizedDocument {
         NormalizedDocument {
