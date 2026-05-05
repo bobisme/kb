@@ -6211,9 +6211,25 @@ struct MissingOrigin {
     origin: String,
 }
 
+/// Per-source counts surfaced under the JSON `sources` field. Distinguishes
+/// what's been ingested from what's been compiled so a freshly ingested
+/// kb (where `total_sources = 3` but no wiki pages exist yet) doesn't
+/// look internally inconsistent (bn-pze3).
 #[derive(Debug, Serialize)]
 struct SourceCounts {
+    /// Wiki source pages on disk under `wiki/sources/*.md`. The
+    /// **compiled** view: zero before the first successful compile.
     total: usize,
+    /// Source documents discovered under `normalized/<id>/`. The
+    /// **ingested** view: independent of compile state and always
+    /// equal to the top-level `total_sources` (bn-pze3).
+    ingested: usize,
+    /// Ingested sources whose wiki page hasn't been generated yet —
+    /// `max(ingested - total, 0)`. Non-zero precisely when there's
+    /// work for `kb compile` to do (bn-pze3).
+    pending_compile: usize,
+    /// Breakdown of compiled wiki source pages by kind. Empty until
+    /// the first compile populates `wiki/sources/`.
     by_kind: std::collections::BTreeMap<String, usize>,
 }
 
@@ -6277,7 +6293,13 @@ fn gather_status(root: &Path) -> Result<StatusPayload> {
     // `wiki/sources/*.md` files are already visible on disk. A disk walk
     // is O(<few hundred files) for realistic KBs and gives users an
     // always-truthful count. See bn-1iw / l-status-stale.
-    let source_counts = count_wiki_source_pages(root)?;
+    let mut source_counts = count_wiki_source_pages(root)?;
+    // bn-pze3: cross-link the ingested-vs-compiled views inside the
+    // `sources` payload so JSON consumers see one coherent model.
+    // Pre-compile, `total = 0` and `pending_compile = ingested`; after a
+    // clean compile, `total = ingested` and `pending_compile = 0`.
+    source_counts.ingested = normalized_source_count;
+    source_counts.pending_compile = normalized_source_count.saturating_sub(source_counts.total);
     // `wiki_pages` in the JSON payload is the same set — one wiki page per
     // source — so we keep it in lockstep with the disk-walked total.
     let wiki_pages = source_counts.total;
@@ -6504,6 +6526,8 @@ fn count_normalized_sources(root: &Path) -> Result<usize> {
 fn count_wiki_source_pages(root: &Path) -> Result<SourceCounts> {
     let mut counts = SourceCounts {
         total: 0,
+        ingested: 0,
+        pending_compile: 0,
         by_kind: std::collections::BTreeMap::new(),
     };
     let dir = root.join("wiki/sources");
@@ -7156,6 +7180,60 @@ mod tests {
 
         let status = gather_status(&root).expect("gather status");
         assert_eq!(status.normalized_source_count, 1);
+    }
+
+    /// bn-pze3: pre-compile, the JSON `sources` block must surface the
+    /// gap between ingest and compile explicitly so `total_sources: 3`
+    /// alongside `sources.total: 0` no longer looks contradictory.
+    #[test]
+    fn gather_status_pre_compile_sources_block_is_self_consistent() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+        let normalized = normalized_dir(&root);
+        fs::create_dir_all(normalized.join("src-aaaa")).expect("src-aaaa");
+        fs::create_dir_all(normalized.join("src-bbbb")).expect("src-bbbb");
+        fs::create_dir_all(normalized.join("src-cccc")).expect("src-cccc");
+        // No wiki/sources/ yet — fresh kb that hasn't been compiled.
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(status.total_sources, 3);
+        assert_eq!(status.sources.total, 0, "no compiled wiki pages yet");
+        assert_eq!(status.sources.ingested, 3,
+            "sources.ingested must equal top-level total_sources");
+        assert_eq!(status.sources.pending_compile, 3,
+            "all ingested sources still pending compile");
+    }
+
+    /// bn-pze3: after compile, `pending_compile` collapses to 0 and
+    /// `ingested` matches `total`.
+    #[test]
+    fn gather_status_post_compile_sources_block_zeros_pending() {
+        let dir = tempdir().expect("tempdir");
+        let root = dir.path().join("kb");
+        write_kb_config(&root);
+        let normalized = normalized_dir(&root);
+        fs::create_dir_all(normalized.join("src-aaaa")).expect("src-aaaa");
+        fs::create_dir_all(normalized.join("src-bbbb")).expect("src-bbbb");
+        let sources_dir = root.join("wiki/sources");
+        fs::create_dir_all(&sources_dir).expect("create wiki/sources");
+        fs::write(
+            sources_dir.join("src-aaaa.md"),
+            "---\nid: wiki-source-a\n---\n\n# body\n",
+        )
+        .expect("write a");
+        fs::write(
+            sources_dir.join("src-bbbb.md"),
+            "---\nid: wiki-source-b\n---\n\n# body\n",
+        )
+        .expect("write b");
+
+        let status = gather_status(&root).expect("gather status");
+        assert_eq!(status.total_sources, 2);
+        assert_eq!(status.sources.total, 2, "compiled wiki pages match");
+        assert_eq!(status.sources.ingested, 2);
+        assert_eq!(status.sources.pending_compile, 0,
+            "compile is caught up: nothing pending");
     }
 
     /// Regression test for bn-1iw: `kb status` must count wiki source pages
