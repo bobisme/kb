@@ -1302,6 +1302,13 @@ fn build_graph_from_state(root: &Path) -> Result<Graph> {
 /// Map a build-record identifier (node id, wiki path, or source id) onto the
 /// prefixed graph node format used by status/inspect. Returns `None` when the
 /// identifier does not correspond to one of the prefixed node kinds.
+///
+/// bn-36hw: also handles absolute filesystem paths that contain a
+/// `wiki/sources/` or `wiki/concepts/` segment (the merge stage records
+/// `output_ids` as `p.path.display().to_string()`, which expands to e.g.
+/// `/tmp/kb-root/wiki/concepts/foo.md`), and concept candidate names
+/// (`input_ids` on the merge build record) that map to concepts after
+/// slugification.
 fn graph_node_for_id(
     id: &str,
     doc_ids: &BTreeSet<String>,
@@ -1315,8 +1322,11 @@ fn graph_node_for_id(
         return Some(id.to_string());
     }
 
-    // Wiki source/concept markdown paths emitted by build records.
-    if let Some(rest) = id.strip_prefix("wiki/sources/") {
+    // Wiki source/concept markdown paths emitted by build records. Accept
+    // both root-relative (`wiki/sources/foo.md`, the historic shape) and
+    // absolute (`/tmp/kb-root/wiki/sources/foo.md`, what the merge stage
+    // actually emits via `path.display().to_string()`) — bn-36hw.
+    if let Some(rest) = strip_to_wiki_segment(id, "wiki/sources/") {
         let stem = std::path::Path::new(rest)
             .file_stem()
             .and_then(|s| s.to_str())?;
@@ -1325,7 +1335,7 @@ fn graph_node_for_id(
         }
         return Some(format!("wiki-page-{stem}"));
     }
-    if let Some(rest) = id.strip_prefix("wiki/concepts/") {
+    if let Some(rest) = strip_to_wiki_segment(id, "wiki/concepts/") {
         let stem = std::path::Path::new(rest)
             .file_stem()
             .and_then(|s| s.to_str())?;
@@ -1357,7 +1367,29 @@ fn graph_node_for_id(
         return Some(format!("concept-{id}"));
     }
 
+    // bn-36hw: concept candidate names appear in the merge build record's
+    // `input_ids` as raw strings ("Operational Telemetry"), not slugs.
+    // Slugify and re-match against the known concept set so source →
+    // concept edges exist after merge.
+    let slugified = slug_from_title(id);
+    if !slugified.is_empty() && concept_slugs.contains(&slugified) {
+        return Some(format!("concept-{slugified}"));
+    }
+
     None
+}
+
+/// Strip `id` down to the substring that follows `marker` when `id`
+/// either starts with `marker` (root-relative) or contains `/<marker>`
+/// (absolute path with the marker as a directory segment). Used by
+/// `graph_node_for_id` to handle both shapes uniformly (bn-36hw).
+fn strip_to_wiki_segment<'a>(id: &'a str, marker: &str) -> Option<&'a str> {
+    if let Some(rest) = id.strip_prefix(marker) {
+        return Some(rest);
+    }
+    let with_sep = format!("/{marker}");
+    let position = id.find(&with_sep)?;
+    Some(&id[position + with_sep.len()..])
 }
 
 struct PerDocumentReport {
@@ -2537,6 +2569,83 @@ mod tests {
     use super::*;
     use kb_core::{EntityMetadata, NormalizedDocument, Status, write_normalized_document};
     use tempfile::tempdir;
+
+    /// bn-36hw: build-record `output_ids` that look like absolute paths
+    /// (`/tmp/kb-root/wiki/concepts/foo.md`) or candidate names
+    /// (`Operational Telemetry`) must resolve to graph nodes — they
+    /// previously dropped through to `None`, leaving `inspect --trace`
+    /// reporting empty graphs after compile.
+    #[test]
+    fn graph_node_for_id_handles_absolute_wiki_paths_and_candidate_names() {
+        let doc_ids: BTreeSet<String> = std::iter::once("src-abc").map(str::to_string).collect();
+        let wiki_page_slugs: BTreeSet<String> =
+            std::iter::once("paxos").map(str::to_string).collect();
+        let concept_slugs: BTreeSet<String> = ["operational-telemetry", "borrow-checker"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+
+        // Absolute path under wiki/sources/.
+        assert_eq!(
+            graph_node_for_id(
+                "/tmp/kb-root/wiki/sources/paxos.md",
+                &doc_ids,
+                &wiki_page_slugs,
+                &concept_slugs,
+            ),
+            Some("wiki-page-paxos".to_string()),
+        );
+        // Absolute path under wiki/concepts/.
+        assert_eq!(
+            graph_node_for_id(
+                "/var/tmp/kb-review.WbXylN/wiki/concepts/operational-telemetry.md",
+                &doc_ids,
+                &wiki_page_slugs,
+                &concept_slugs,
+            ),
+            Some("concept-operational-telemetry".to_string()),
+        );
+        // Candidate name (Title Case with spaces) → slugified concept.
+        assert_eq!(
+            graph_node_for_id(
+                "Operational Telemetry",
+                &doc_ids,
+                &wiki_page_slugs,
+                &concept_slugs,
+            ),
+            Some("concept-operational-telemetry".to_string()),
+        );
+        // Existing root-relative shape still works.
+        assert_eq!(
+            graph_node_for_id(
+                "wiki/sources/paxos.md",
+                &doc_ids,
+                &wiki_page_slugs,
+                &concept_slugs,
+            ),
+            Some("wiki-page-paxos".to_string()),
+        );
+        // Unknown name returns None — slugifier doesn't invent edges.
+        assert_eq!(
+            graph_node_for_id(
+                "Unknown Concept",
+                &doc_ids,
+                &wiki_page_slugs,
+                &concept_slugs,
+            ),
+            None,
+        );
+        // Index pages are excluded.
+        assert_eq!(
+            graph_node_for_id(
+                "/tmp/kb-root/wiki/concepts/index.md",
+                &doc_ids,
+                &wiki_page_slugs,
+                &concept_slugs,
+            ),
+            None,
+        );
+    }
 
     /// bn-6mqt: serialized `PassStatus` must use the internally-tagged
     /// `kind` discriminator and expose the variant's payload field by
