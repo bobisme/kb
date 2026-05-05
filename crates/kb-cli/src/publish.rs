@@ -93,7 +93,10 @@ pub fn run_publish(
     };
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        // bn-2dzn: route through the shared CLI envelope so publish JSON
+        // matches the `schema_version`/`command`/`data` shape every other
+        // command emits.
+        crate::emit_json("publish", &report)?;
     } else if report.files.is_empty() {
         println!(
             "publish[{target_name}]: no files matched filter '{filter}' — nothing to publish"
