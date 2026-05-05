@@ -430,12 +430,14 @@ enum EvalAction {
 
 #[derive(clap::Subcommand)]
 enum JobsAction {
-    /// List job runs filtered by status, with log paths.
+    /// List job runs with log paths. With no filter flags, shows every
+    /// recent run (succeeded, running, interrupted, failed) — the natural
+    /// discovery view. Specifying one or both flags narrows the output.
     List {
-        /// Show interrupted job runs.
+        /// Restrict to interrupted job runs.
         #[arg(long)]
         interrupted: bool,
-        /// Show failed job runs.
+        /// Restrict to failed job runs.
         #[arg(long)]
         failed: bool,
         /// Page size (default: 50).

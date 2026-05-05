@@ -4826,6 +4826,50 @@ fn jobs_list_interrupted_reports_ids_and_log_paths() {
     }
 }
 
+/// bn-1isq: `kb jobs list` with no filter flags must not error — it's
+/// the natural discovery command for job observability and should
+/// surface every recent run regardless of status.
+#[test]
+fn jobs_list_no_filters_returns_all_recent_statuses() {
+    let (_temp_dir, kb_root) = make_temp_kb();
+    init_kb(&kb_root);
+
+    seed_interrupted_job(&kb_root, "intr-no-filter", 1_000);
+    seed_failed_job(&kb_root, "fail-no-filter", 2_000);
+
+    // Text path: the no-filter list must succeed and surface both seeded
+    // job ids, regardless of their status.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("jobs").arg("list");
+    let output = cmd.output().expect("run kb jobs list");
+    assert!(
+        output.status.success(),
+        "kb jobs list (no filters) must succeed; stderr: {}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("intr-no-filter"),
+        "no-filter list must include interrupted job; got: {stdout}"
+    );
+    assert!(
+        stdout.contains("fail-no-filter"),
+        "no-filter list must include failed job; got: {stdout}"
+    );
+
+    // JSON path: same behavior, total ≥ 2.
+    let mut cmd = kb_cmd(&kb_root);
+    cmd.arg("--json").arg("jobs").arg("list");
+    let output = cmd.output().expect("run kb --json jobs list");
+    assert!(output.status.success());
+    let envelope: Value = serde_json::from_slice(&output.stdout).expect("parse json");
+    let total = envelope["data"]["total"].as_u64().expect("total is u64");
+    assert!(
+        total >= 2,
+        "no-filter JSON list must include all seeded jobs; got total={total}"
+    );
+}
+
 /// ST3 negative: with fewer than 10 failures the "more" hint must not
 /// appear — we don't want a dangling "... and 0 more" line.
 #[test]

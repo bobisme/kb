@@ -71,7 +71,11 @@ struct ListPayload {
     jobs: Vec<JobListEntry>,
 }
 
-/// `kb jobs list --interrupted|--failed`.
+/// `kb jobs list [--interrupted] [--failed]`.
+///
+/// With no flags, returns the full recent-jobs feed (Succeeded, Running,
+/// Interrupted, Failed) — the natural discovery view. Specifying one or
+/// both flags narrows to only those statuses (bn-1isq).
 pub fn run_list(
     root: &Path,
     interrupted: bool,
@@ -80,16 +84,20 @@ pub fn run_list(
     page_size: usize,
     json: bool,
 ) -> Result<()> {
-    if !interrupted && !failed {
-        bail!(
-            "kb jobs list: specify at least one of --interrupted, --failed"
-        );
-    }
     if page == 0 || page_size == 0 {
         bail!("kb jobs list: --page and --page-size must be >= 1");
     }
 
-    let statuses = selected_statuses(interrupted, failed, false);
+    // bn-1isq: with neither --interrupted nor --failed, default to "show
+    // every job run" so `kb jobs list` works as the discovery command
+    // for job observability rather than a strict filter that errors out.
+    let no_filter = !interrupted && !failed;
+    let (interrupted_effective, failed_effective) = if no_filter {
+        (true, true)
+    } else {
+        (interrupted, failed)
+    };
+    let statuses = selected_statuses(interrupted_effective, failed_effective, no_filter);
     let all = jobs::recent_jobs(root, MAX_SCAN)?
         .into_iter()
         .filter(|j| statuses.contains(&j.status))
