@@ -394,6 +394,7 @@ struct AskResponse {
     error: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_ask_and_respond(root: &Path, question: &str) -> Response {
     let question = question.trim();
     if question.is_empty() {
@@ -414,6 +415,10 @@ async fn run_ask_and_respond(root: &Path, question: &str) -> Response {
     // tokio::process would be nicer but this keeps the blocking I/O off the
     // reactor thread via `spawn_blocking`.
     let question_for_closure = question_owned.clone();
+    // bn-1j4l: keep `root` here so we can resolve relative artifact_path
+    // values returned by `kb ask --json` against the served KB root after
+    // the blocking task finishes.
+    let root_for_artifact = root.clone();
     let join = tokio::task::spawn_blocking(move || {
         std::process::Command::new(kb_binary())
             .arg("--root")
@@ -481,10 +486,36 @@ async fn run_ask_and_respond(root: &Path, question: &str) -> Response {
         .pointer("/data/artifact_path")
         .and_then(|v| v.as_str())
         .map(str::to_string);
-    let answer_body = artifact_path
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default();
+    // bn-1j4l: `kb ask --json` reports artifact_path as a root-relative
+    // path (e.g. "outputs/questions/<id>/answer.md"). Resolve it against
+    // the served KB root before reading. Surface a real error if the
+    // file isn't readable instead of returning a successful empty answer.
+    let answer_body = match artifact_path.as_deref() {
+        Some(rel) => {
+            let candidate = std::path::Path::new(rel);
+            let resolved = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                root_for_artifact.join(candidate)
+            };
+            match std::fs::read_to_string(&resolved) {
+                Ok(body) => body,
+                Err(e) => {
+                    return axum::Json(AskResponse {
+                        question: question_owned,
+                        answer: String::new(),
+                        artifact_path,
+                        error: Some(format!(
+                            "failed to read artifact {}: {e}",
+                            resolved.display(),
+                        )),
+                    })
+                    .into_response();
+                }
+            }
+        }
+        None => String::new(),
+    };
     // Artifact files written by `kb ask` open with a YAML frontmatter block
     // (`---\nid: art-…\ngenerated_at: …\n---\n\n<body>`). The web UI surfaces
     // the body only — the metadata belongs in `artifact_path`, not the

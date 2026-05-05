@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -10,6 +11,22 @@ use http_body_util::BodyExt;
 use kb_web::{WebState, router};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+/// Process-global mutex serializing every test that mutates `KB_BIN`. The
+/// /ask handler reads the env var to find the kb binary, and Rust runs
+/// integration tests in parallel by default — without this, two `KB_BIN`
+/// writers race and one test's fake binary is observed by another's
+/// request. bn-1j4l added two more /ask tests, making serialization
+/// load-bearing rather than nice-to-have. We hold the `std::sync::Mutex`
+/// across `.await` points; tokio's current-thread runtime under
+/// `#[tokio::test]` keeps that race-free here, and an async-aware mutex
+/// would only matter under a multi-threaded runtime.
+fn ask_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn write(path: &Path, contents: &str) {
     if let Some(parent) = path.parent() {
@@ -268,11 +285,13 @@ async fn search_empty_query_returns_empty_results() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn ask_strips_frontmatter_from_answer_field() {
     // Regression test for bn-1hyu: the /ask handler reads the artifact file
     // written by `kb ask` (which opens with a YAML frontmatter block) and
     // returns its contents as the `answer` JSON field. Frontmatter metadata
     // must be stripped before surfacing the body to the UI.
+    let _guard = ask_test_lock();
     let tmp = fixture();
     let root = tmp.path();
 
@@ -372,6 +391,148 @@ async fn ask_strips_frontmatter_from_answer_field() {
     // And the artifact_path is surfaced so the UI can link to the file.
     assert_eq!(json["artifact_path"].as_str(), Some(artifact_str));
     assert!(json["error"].is_null());
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn ask_resolves_root_relative_artifact_path_against_kb_root() {
+    // bn-1j4l: `kb ask --json` reports artifact_path as a root-relative
+    // path (e.g. "outputs/questions/<id>/answer.md"). The /ask handler
+    // used to call std::fs::read_to_string on that string verbatim from
+    // the server's cwd, swallow the failure, and return success with an
+    // empty answer. Resolve relative paths against the served KB root.
+    let _guard = ask_test_lock();
+    let tmp = fixture();
+    let root = tmp.path();
+
+    let rel_artifact = "outputs/questions/q-rel/answer.md";
+    let artifact_abs = root.join(rel_artifact);
+    let body = "# Memo: Relative path test\n\nThe body.\n";
+    let with_fm = format!(
+        "---\n\
+         id: art-rel\n\
+         generated_at: 2026-05-05T00:00:00Z\n\
+         ---\n\n\
+         {body}"
+    );
+    write(&artifact_abs, &with_fm);
+
+    let fake_kb = tmp.path().join("fake-kb-rel.sh");
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "data": { "artifact_path": rel_artifact },
+    });
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' '{}'\n",
+        serde_json::to_string(&envelope).expect("serialize envelope"),
+    );
+    fs::write(&fake_kb, script).expect("write fake kb");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&fake_kb).expect("meta").permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&fake_kb, perm).expect("chmod");
+    }
+
+    unsafe {
+        std::env::set_var("KB_BIN", &fake_kb);
+    }
+
+    let app = make_app(&tmp);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("q=anything"))
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    unsafe {
+        std::env::remove_var("KB_BIN");
+    }
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body_str = body_string(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&body_str).expect("json");
+    let answer = json["answer"].as_str().expect("answer is a string");
+    assert!(
+        answer.contains("# Memo: Relative path test"),
+        "answer should contain heading from root-relative artifact: {answer:?}"
+    );
+    assert!(
+        answer.contains("The body."),
+        "answer should contain body from root-relative artifact: {answer:?}"
+    );
+    assert_eq!(json["artifact_path"].as_str(), Some(rel_artifact));
+    assert!(
+        json["error"].is_null(),
+        "no error expected on successful resolve, got: {json:?}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn ask_returns_explicit_error_when_artifact_unreadable() {
+    // bn-1j4l: when the resolved artifact path cannot be read, the API
+    // must surface an error rather than masquerading as a successful
+    // empty answer.
+    let _guard = ask_test_lock();
+    let tmp = fixture();
+
+    let fake_kb = tmp.path().join("fake-kb-missing.sh");
+    let envelope = serde_json::json!({
+        "schema_version": 1,
+        "data": { "artifact_path": "outputs/questions/q-gone/answer.md" },
+    });
+    let script = format!(
+        "#!/bin/sh\nprintf '%s' '{}'\n",
+        serde_json::to_string(&envelope).expect("serialize envelope"),
+    );
+    fs::write(&fake_kb, script).expect("write fake kb");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&fake_kb).expect("meta").permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&fake_kb, perm).expect("chmod");
+    }
+
+    unsafe {
+        std::env::set_var("KB_BIN", &fake_kb);
+    }
+
+    let app = make_app(&tmp);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/ask")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from("q=x"))
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    unsafe {
+        std::env::remove_var("KB_BIN");
+    }
+
+    let body_str = body_string(resp).await;
+    let json: serde_json::Value = serde_json::from_str(&body_str).expect("json");
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("failed to read artifact"),
+        "expected explicit read-error in response, got: {json:?}"
+    );
+    assert_eq!(json["answer"].as_str(), Some(""));
 }
 
 #[tokio::test]
