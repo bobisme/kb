@@ -259,17 +259,17 @@ through their referring markdown file.
 
 ## Supported inputs
 
-| Type                              | Status                                                                                |
-| --------------------------------- | ------------------------------------------------------------------------------------- |
-| Markdown (.md, .txt, .rst)        | ✅                                                                                    |
-| Plain text                        | ✅                                                                                    |
-| URLs                              | ✅ (text extracted)                                                                   |
-| Images referenced from markdown   | ✅ (copied, vision-LLM auto-captioned during compile)                                 |
+| Type                              | Status                                                                                 |
+| --------------------------------- | -------------------------------------------------------------------------------------- |
+| Markdown (.md, .txt, .rst)        | ✅                                                                                     |
+| Plain text                        | ✅                                                                                     |
+| URLs                              | ✅ (text extracted)                                                                    |
+| Images referenced from markdown   | ✅ (copied, vision-LLM auto-captioned during compile)                                  |
 | PDF                               | ✅ (text extracted; OCR fallback via tesseract for scan-only PDFs; per-page citations) |
-| Word, Excel, PowerPoint, etc.     | ✅ via [markitdown](https://github.com/microsoft/markitdown) preprocessing            |
-| Git repos (`kb ingest <git-url>`) | ✅ (clones, walks docs, supports `--branch` / `--include` / `--exclude`)              |
-| Audio (`.m4a`/`.mp3`/`.wav`/...)  | ✅ (whisper transcription + pyannote speaker diarization → kbtx transcripts)          |
-| Standalone images                 | ❌ (binary rejection)                                                                 |
+| Word, Excel, PowerPoint, etc.     | ✅ via [markitdown](https://github.com/microsoft/markitdown) preprocessing             |
+| Git repos (`kb ingest <git-url>`) | ✅ (clones, walks docs, supports `--branch` / `--include` / `--exclude`)               |
+| Audio (`.m4a`/`.mp3`/`.wav`/...)  | ✅ (whisper transcription + pyannote speaker diarization → kbtx transcripts)           |
+| Standalone images                 | ❌ (binary rejection)                                                                  |
 
 ## LLM backends
 
@@ -343,7 +343,3 @@ just install      # reinstall ~/.cargo/bin/kb (locked)
 Tests in `crates/*/src/**` (unit) and `crates/kb-cli/tests/` (integration).
 LLM-dependent integration tests use stub adapters; no network needed for `just
 test`.
-
-## License
-
-TBD.
