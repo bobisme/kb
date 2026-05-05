@@ -7,7 +7,8 @@ markdown — open it in Obsidian, push it to a static site, grep it from the
 terminal.
 
 kb is a single Rust binary. The LLM work happens through an existing subscription
-agent — **opencode** (default) or **Claude Code**. No API keys in your shell.
+agent — **pi** (preferred default), **opencode**, or **Claude Code**. No API
+keys go in `kb.toml` or your shell.
 
 ## Why
 
@@ -19,15 +20,22 @@ that need judgment (summaries, concept extraction, grounded answers).
 ## Install
 
 ```sh
-cargo install --locked --path crates/kb-cli
+cargo install --locked --path crates/kb-cli   # or `just install`
 ```
 
 Requires Rust 1.93+. Verify with `kb --version`.
 
-You also need one of:
+You also need a runner agent on your PATH. `kb init` auto-detects which is
+installed and picks one as the default — preference order is
+**pi → opencode → claude**:
 
-- [opencode](https://github.com/sst/opencode) on your PATH — default, routes `openai/gpt-5.4` and compatible models
-- [Claude Code](https://claude.com/product/claude-code) on your PATH — required for any `claude-*` model
+- [pi](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) — preferred default. Designed
+  for non-interactive concurrent use; handles kb's parallel compile cleanly.
+- [opencode](https://github.com/sst/opencode) — supported alternative.
+- [Claude Code](https://claude.com/product/claude-code) — required for any
+  `claude-*` model (per Anthropic ToS, Claude models must route through the
+  `claude` CLI). kb routes Claude-family slugs to it automatically when a
+  `[llm.runners.claude]` section is configured.
 
 Run `kb doctor` to verify the backend is reachable.
 
@@ -35,14 +43,16 @@ Run `kb doctor` to verify the backend is reachable.
 
 ```sh
 mkdir ~/notes/kb && cd ~/notes/kb
-kb init                         # scaffold kb.toml + dirs
+kb init                         # scaffold kb.toml + dirs (auto-picks pi/opencode/claude)
 kb doctor                       # verify LLM backend
-kb ingest ~/notes/sources       # walks a dir of markdown recursively
-kb compile                      # ~1-2 min per source (LLM summaries + concepts)
+kb ingest ~/notes/sources       # walks a dir of markdown / PDFs / audio / repos recursively
+kb compile                      # parallel LLM passes (summaries + concepts + merge)
 
 kb ask "how does X work?"       # grounded memo with citations
-kb chat                         # interactive session against the wiki
-kb search "raft"                # lexical, explainable ranking
+kb ask --session work "..."     # multi-turn session: subsequent turns reuse retrieval context
+kb search "raft"                # hybrid lexical + semantic + structural ranking
+kb eval run                     # score retrieval against evals/golden.toml
+kb serve                        # local read-only web UI
 ```
 
 Open `~/notes/kb/wiki/` in Obsidian or your editor and browse the generated
@@ -75,12 +85,22 @@ concept + source + question pages.
    re-ingesting unchanged files is a no-op; re-ingesting a modified file
    produces a new revision.
 2. **Compile** runs LLM passes: source summaries, concept extraction, concept
-   merge, backlinks (both frontmatter-sourced and corpus mention-scanning with
-   plural-aware matching), a lexical search index, and wiki index pages. Each
-   pass is hash-gated — nothing re-runs if inputs didn't change.
-3. **Ask** builds a retrieval plan from the lexical index, calls the LLM with
-   the selected candidates, writes a grounded markdown memo under
-   `outputs/questions/q-<id>/`. Citations point at real wiki pages.
+   merge (with parallel body generation), captions for undescribed images,
+   concept-suggestion candidates from RAKE keyphrases, backlinks (both
+   frontmatter-sourced and corpus mention-scanning with plural-aware
+   matching), per-chunk semantic embeddings, a lexical search index, a
+   citation-graph for structural retrieval, and wiki index pages. Each pass
+   is hash-gated — nothing re-runs if inputs didn't change. Per-doc LLM
+   calls fan out across a worker pool for ~50% wallclock reduction on
+   small kbs.
+3. **Ask** builds a retrieval plan via three-tier hybrid retrieval —
+   lexical + semantic (MiniLM embeddings) + structural (citation-graph
+   personalized PageRank) — fused with reciprocal rank fusion and
+   optionally re-ranked by a cross-encoder when the tiers disagree on the
+   top hit. Calls the LLM with the selected candidates, writes a grounded
+   markdown memo under `outputs/questions/q-<id>/`. Citations point at
+   real wiki pages and source-page anchors. Use `--session <id>` to
+   thread multi-turn conversations.
 4. **Review queue** collects things that need human judgment: duplicate
    concepts, promotion candidates, proposed merges. `kb review approve`
    applies them.
@@ -90,24 +110,31 @@ concept + source + question pages.
 ## Commands
 
 ```
-kb init                      scaffold a new KB
+kb init                      scaffold a new KB (auto-picks pi/opencode/claude)
 kb doctor                    health check (LLM backend, config, templates)
-kb ingest <path|url>...      add documents
-kb compile [--dry-run]       build the wiki (incremental, progress bars on TTY)
+kb ingest <path|url|repo>... add documents (markdown, text, URLs, PDFs, audio, git repos)
+kb compile [--dry-run]       build the wiki (incremental, parallel LLM passes, progress bars on TTY)
 kb status                    counts, stale inputs, recent jobs
+kb ls                        tree-list non-hidden files known to this KB
 kb ask [QUERY]               grounded Q&A (reedline editor if no arg on TTY)
 kb ask --editor              compose in $VISUAL / $EDITOR / vi
+kb ask --session <id>        multi-turn session (transcripts under .kb/sessions/<id>.json)
 kb ask --format={md,marp,json}
 kb ask --promote             queue the answer for wiki/questions/
-kb chat                      interactive opencode session with read-only KB agent
-kb search <term>             lexical search with explainable scoring
+kb session new|list|show     manage multi-turn ask sessions
+kb chat                      interactive runner session with read-only KB agent
+kb search <term>             hybrid retrieval (lexical + semantic + structural) with explainable scoring
 kb inspect <id|path>         show metadata, citations, build records
 kb resolve <kb-uri>          resolve kb:// artifact references for tools
-kb lint [--strict]           broken-links, orphans, stale-revision, missing-citations, duplicate-concepts
+kb lint [--strict]           broken-links, orphans, stale-revision, missing-citations, duplicate-concepts,
+                             missing-concepts, drift, citation-verification (quote in source)
 kb review list|show|approve|reject
 kb forget <src-id>           remove a source (cascade: concepts, indexes, graph, lexical)
 kb jobs list|prune           manage state/jobs/ manifests
+kb eval run|list             golden Q/A retrieval-eval harness (P@K, MRR, nDCG@K)
 kb publish <target>          copy the wiki tree (+ referenced image assets) elsewhere
+kb serve                     local read-only web UI
+kb migrate                   migrate a pre-`.kb/` layout into the current layout
 ```
 
 Prefix matching is supported on `inspect` and `forget`: `kb inspect src-a7`
@@ -146,12 +173,18 @@ grows.
 
 ## Configuration
 
-`kb.toml` (written by `kb init`):
+`kb.toml` (written by `kb init` — exact contents depend on which runners
+were detected on PATH):
 
 ```toml
 [llm]
-default_runner = "opencode"
-default_model  = "openai/gpt-5.4"
+default_runner = "pi"                        # auto-picked: pi > opencode > claude
+default_model  = "openai-codex/gpt-5.5"      # pi-shaped slug; matches the chosen runner
+
+[llm.runners.pi]
+command = "pi"
+tools_read = true                            # read-only by default for compile/ask
+timeout_seconds = 900
 
 [llm.runners.opencode]
 command = "opencode run"
@@ -172,6 +205,17 @@ token_budget = 25000
 [ask]
 token_budget = 20000
 artifact_default_format = "markdown"
+
+[semantic]
+backend = "minilm"                           # ONNX MiniLM-L6 (default on Linux/macOS); falls back to "hash" on Windows
+
+[semantic.rerank]
+enabled = true                               # cross-encoder rerank, gated on lex/sem disagreement
+top_k = 30
+keep = 8
+
+[semantic.structural]
+enabled = true                               # citation-graph personalized PageRank tier
 
 [lint]
 require_citations = true
@@ -215,29 +259,39 @@ through their referring markdown file.
 
 ## Supported inputs
 
-| Type                              | Status                                                                          |
-| --------------------------------- | ------------------------------------------------------------------------------- |
-| Markdown (.md, .txt, .rst)        | ✅                                                                              |
-| Plain text                        | ✅                                                                              |
-| URLs                              | ✅ (text extracted)                                                             |
-| Images referenced from markdown   | ✅ (copied, multimodal consumption planned)                                     |
-| PDF, Word, Excel                  | planned via [markitdown](https://github.com/microsoft/markitdown) preprocessing |
-| Git repos (`kb ingest <git-url>`) | planned                                                                         |
-| Standalone images                 | ❌ (binary rejection)                                                           |
+| Type                              | Status                                                                                |
+| --------------------------------- | ------------------------------------------------------------------------------------- |
+| Markdown (.md, .txt, .rst)        | ✅                                                                                    |
+| Plain text                        | ✅                                                                                    |
+| URLs                              | ✅ (text extracted)                                                                   |
+| Images referenced from markdown   | ✅ (copied, vision-LLM auto-captioned during compile)                                 |
+| PDF                               | ✅ (text extracted; OCR fallback via tesseract for scan-only PDFs; per-page citations) |
+| Word, Excel, PowerPoint, etc.     | ✅ via [markitdown](https://github.com/microsoft/markitdown) preprocessing            |
+| Git repos (`kb ingest <git-url>`) | ✅ (clones, walks docs, supports `--branch` / `--include` / `--exclude`)              |
+| Audio (`.m4a`/`.mp3`/`.wav`/...)  | ✅ (whisper transcription + pyannote speaker diarization → kbtx transcripts)          |
+| Standalone images                 | ❌ (binary rejection)                                                                 |
 
 ## LLM backends
 
 kb talks to LLMs through existing subscription-based agents. No API keys go
 in `kb.toml` or your shell.
 
-- **opencode** (default): any model opencode supports. Default is
-  `openai/gpt-5.4`.
-- **Claude Code**: required routing for any Claude model (per Anthropic ToS).
-  `kb ask --model claude-sonnet-4-6 "..."` routes through the `claude` CLI.
+- **pi** (preferred default): multi-provider non-interactive agent CLI.
+  Used for any non-Claude model. Better behaviour under parallel
+  invocation than opencode (no SQLite WAL race when multiple processes
+  start simultaneously), which lets kb fan out per-doc LLM calls
+  cleanly. Default model slug `openai-codex/gpt-5.5`.
+- **opencode**: alternative runner for non-Claude models. Same
+  capability surface as pi for kb's purposes; older kbs configured
+  around it keep working unchanged. Default model slug `openai/gpt-5.4`.
+- **Claude Code**: required routing for any Claude model (per Anthropic
+  ToS). `kb ask --model claude-sonnet-4-6 "..."` routes through the
+  `claude` CLI. Both the router (`crate::router`) and `PiAdapter::new`
+  refuse to send Claude-family slugs to anything except this runner.
 
-Both runners support read + bash + (optionally) edit/write tools; kb's default
-configuration keeps them read-only for the ask/compile paths and gives `kb
-chat` a read-only agent.
+All three runners support read + (optionally) edit/write/bash tools;
+kb's default configuration keeps them read-only for the ask/compile
+paths and gives `kb chat` a read-only agent.
 
 ## State, locking, recovery
 
@@ -258,26 +312,23 @@ truly deleted.
 ## Limitations
 
 - Single-writer only — no distributed ops.
-- No multimodal ask yet (image references pass through as text).
-- No repo / PDF / Word ingestion yet. Markdown and text only.
-- No Obsidian plugin. The wiki tree is Obsidian-compatible but there's no
-  editor integration.
-- No chart/visualization output from queries.
-- Concept linting covers structural issues (orphans, stale revisions,
-  duplicates) but not semantic ones (contradictions, missing articles,
-  web-search imputation) — those are on the roadmap.
+- Multimodal ask is text-only — image references in retrieved
+  context flow through as paths, not pixels. Vision-LLM auto-captions
+  produced at compile time go into the source page, so the model can
+  read what an image shows even though it can't see it directly.
+- No Obsidian plugin yet. The wiki tree is Obsidian-compatible but
+  there's no editor integration. (`plugin-obsidian/` is a stub.)
+- No chart/visualization output from queries (`--format=marp` exists
+  for slide decks).
 
 ## Roadmap (high-value, not yet built)
 
 - Obsidian plugin that wraps `kb` commands (ask, ingest, compile, promote)
-- markitdown-backed preprocessing for PDF / Word / Excel / images-with-OCR
-- `kb ingest <git-url>` for repos (README, docs, source-code comments)
-- Multimodal retrieval so the LLM can actually see images
+- True multimodal retrieval so the LLM can see images, not just their captions
 - `--format=chart` that asks the LLM to produce matplotlib via its bash tool
-- Concept categories / hierarchical index
-- `kb lint --impute` that uses the LLM's web tool to backfill gaps
-- Missing-concept and contradiction detection
-- Optional `kb serve` local web UI
+- Hierarchical concept index / category tree
+- More aggressive `kb lint --impute` that uses the LLM's web tool to
+  backfill gaps in concept pages
 
 ## Dev
 
