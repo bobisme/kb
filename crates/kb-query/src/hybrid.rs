@@ -89,12 +89,17 @@ pub struct HybridResult {
     /// bn-32od.
     #[serde(default)]
     pub structural_score: f32,
-    /// 1-indexed lexical rank (or `usize::MAX` when absent).
+    /// 1-indexed lexical rank. Internally stored as `usize::MAX` when
+    /// absent; serialized to JSON as `null` (bn-17ba).
+    #[serde(serialize_with = "serialize_rank")]
     pub lexical_rank: usize,
-    /// 1-indexed semantic rank (or `usize::MAX` when absent).
+    /// 1-indexed semantic rank. Internally stored as `usize::MAX` when
+    /// absent; serialized to JSON as `null` (bn-17ba).
+    #[serde(serialize_with = "serialize_rank")]
     pub semantic_rank: usize,
-    /// 1-indexed structural rank (or `usize::MAX` when absent). bn-32od.
-    #[serde(default)]
+    /// 1-indexed structural rank. Internally stored as `usize::MAX` when
+    /// absent; serialized to JSON as `null` (bn-17ba). bn-32od.
+    #[serde(default, serialize_with = "serialize_rank")]
     pub structural_rank: usize,
     /// Underlying lexical scoring score, copied from the lexical search
     /// result for explanation. 0 when absent.
@@ -673,6 +678,22 @@ fn rank_to_score(rank: usize, k: usize) -> f32 {
         0.0
     } else {
         1.0 / (k as f32 + rank as f32)
+    }
+}
+
+/// Serialize a 1-indexed rank as `null` when the internal `usize::MAX`
+/// sentinel is set, instead of leaking `18446744073709551615` into JSON
+/// output (bn-17ba). Takes `&usize` because serde's `serialize_with`
+/// signature requires a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_rank<S>(rank: &usize, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    if *rank == usize::MAX {
+        serializer.serialize_none()
+    } else {
+        serializer.serialize_some(rank)
     }
 }
 
@@ -1438,6 +1459,31 @@ mod tests {
             MIN_SEMANTIC_TOP_SCORE_NO_LEXICAL,
         );
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn missing_ranks_serialize_as_null_not_usize_max() {
+        // bn-17ba: HybridResult uses `usize::MAX` internally as the "rank
+        // absent in this tier" sentinel. JSON consumers should see `null`
+        // instead of the `18446744073709551615` literal.
+        let lexical = vec![lex("only-lex", 9)];
+        let semantic = vec![sem("only-sem", 0.9)];
+        let fused = fuse(&lexical, &semantic, &[], 4, 60);
+
+        let lex_only = fused
+            .iter()
+            .find(|h| h.item_id == "only-lex")
+            .expect("lex hit present");
+        let json = serde_json::to_value(lex_only).expect("serialize HybridResult");
+        assert!(json["semantic_rank"].is_null(), "semantic_rank should be null when absent: {json}");
+        assert!(json["structural_rank"].is_null(), "structural_rank should be null when absent: {json}");
+        assert_eq!(json["lexical_rank"], serde_json::json!(1));
+        // Sanity: no usize::MAX literal anywhere.
+        let serialized = serde_json::to_string(lex_only).expect("serialize HybridResult");
+        assert!(
+            !serialized.contains("18446744073709551615"),
+            "usize::MAX leaked into JSON: {serialized}"
+        );
     }
 
     #[test]
