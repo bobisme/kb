@@ -4678,6 +4678,13 @@ struct InspectJob {
 struct InspectTraceNode {
     id: String,
     kind: String,
+    /// Edge label connecting this node to its parent. `None` for the
+    /// build-record dependency graph (provenance edges are unlabeled).
+    /// `Some("cites")` or `Some("links")` for citation-graph edges so
+    /// consumers can distinguish citation provenance from wikilink
+    /// navigation (bn-3qy6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    edge_type: Option<String>,
     inputs: Vec<Self>,
 }
 
@@ -4892,6 +4899,38 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
 
     let mut report = build_inspect_report_for_target(root, target)?;
 
+    // bn-3qy6: when the build-record graph has nothing for this target
+    // (typical for path-based file reports), backfill `report.graph` from
+    // the citation graph so the JSON contract isn't a confusing
+    // "graph: null" next to a non-empty trace. Direct outputs are pages
+    // this page cites/links; direct inputs are pages that cite/link
+    // back to this page.
+    if report.graph.is_none()
+        && let Some(page_path) = resolved_id_to_page_path(&report.resolved_id)
+        && let Ok(citation_graph) = kb_query::load_graph(root)
+    {
+        let direct_outputs: Vec<String> = citation_graph.neighbors(&page_path).to_vec();
+        // Reverse adjacency: scan forward map for entries pointing
+        // at page_path. Cheap because the in-memory adjacency is
+        // small (a few hundred edges typical).
+        let mut direct_inputs: Vec<String> = citation_graph
+            .forward
+            .iter()
+            .filter(|(_, dsts)| dsts.contains(&page_path))
+            .map(|(src, _)| src.clone())
+            .collect();
+        direct_inputs.sort();
+        direct_inputs.dedup();
+        if !direct_inputs.is_empty() || !direct_outputs.is_empty() {
+            report.graph = Some(InspectGraph {
+                direct_inputs: direct_inputs.clone(),
+                direct_outputs: direct_outputs.clone(),
+                upstream: direct_inputs,
+                downstream: direct_outputs,
+            });
+        }
+    }
+
     if trace {
         // bn-238c: trace combines two sources of truth.
         //
@@ -4903,32 +4942,29 @@ fn run_inspect(root: &Path, target: &str, json: bool, trace: bool) -> Result<()>
         //    "what other pages does this page cite or wikilink to". Populated
         //    from wiki/* on every compile by the structural pass; previously
         //    completely ignored by inspect.
-        let mut combined = if report.graph.is_some() {
-            let graph = Graph::load_from(root)?;
-            build_trace(
-                &graph,
-                &report.resolved_id,
-                &mut std::collections::BTreeSet::new(),
-            )
-        } else {
-            Vec::new()
-        };
+        let graph = Graph::load_from(root)?;
+        let mut combined = build_trace(
+            &graph,
+            &report.resolved_id,
+            &mut std::collections::BTreeSet::new(),
+        );
         if let Some(page_path) = resolved_id_to_page_path(&report.resolved_id)
             && let Ok(citation_graph) = kb_query::load_graph(root)
         {
+            let edge_types = load_citation_edge_types(root);
             let mut visited = std::collections::BTreeSet::new();
             visited.insert(page_path.clone());
-            let citation_nodes =
-                build_citation_trace(&citation_graph, &page_path, &mut visited);
-            // De-duplicate by id so a page that's both a build-record input
-            // AND a citation neighbor only appears once.
-            let mut seen: std::collections::BTreeSet<String> =
-                combined.iter().map(|n| n.id.clone()).collect();
-            for node in citation_nodes {
-                if seen.insert(node.id.clone()) {
-                    combined.push(node);
-                }
-            }
+            // Seed visited with build-record trace nodes too so the
+            // citation walk doesn't re-emit the same ids the build-record
+            // trace already covered.
+            seed_visited_with_trace_ids(&combined, &mut visited);
+            let citation_nodes = build_citation_trace(
+                &citation_graph,
+                edge_types.as_ref(),
+                &page_path,
+                &mut visited,
+            );
+            combined.extend(citation_nodes);
         }
         report.trace = Some(combined);
     }
@@ -5601,19 +5637,24 @@ fn build_trace(
         return Vec::new();
     };
 
+    // bn-3qy6: skip already-visited inputs entirely instead of emitting a
+    // leaf placeholder for them. The visited set previously short-circuited
+    // recursion but still produced an InspectTraceNode with empty inputs
+    // for every back-edge, which made cyclic graphs render as confusing
+    // ghost trees in `kb inspect --trace --json`.
     node.inputs
         .iter()
-        .map(|input| {
-            let inputs = if visited.insert(input.clone()) {
-                build_trace(graph, input, visited)
-            } else {
-                Vec::new()
-            };
-            InspectTraceNode {
+        .filter_map(|input| {
+            if !visited.insert(input.clone()) {
+                return None;
+            }
+            let nested = build_trace(graph, input, visited);
+            Some(InspectTraceNode {
                 id: input.clone(),
                 kind: inspect_kind(input),
-                inputs,
-            }
+                edge_type: None,
+                inputs: nested,
+            })
         })
         .collect()
 }
@@ -5649,29 +5690,118 @@ fn resolved_id_to_page_path(id: &str) -> Option<String> {
 /// Walk forward edges in `citation_graph` from `page_path`, building an
 /// [`InspectTraceNode`] tree (bn-238c). Each neighbor's `kind` is
 /// `concept` for `wiki/concepts/*.md` paths, `wiki_page` for
-/// `wiki/sources/*.md` paths, and `citation` otherwise. The `visited`
-/// set prevents cycles when two pages cite each other.
+/// `wiki/sources/*.md` paths, and `citation` otherwise.
+///
+/// bn-3qy6 hardening:
+/// - Already-visited neighbors are skipped entirely (no ghost leaf
+///   placeholders for back-edges, so the JSON tree stops looking
+///   recursive when two pages cite each other).
+/// - When `edge_types` is `Some`, each node carries its `edge_type`
+///   label (`cites` / `links` from graph.db), letting consumers tell
+///   citation provenance from wikilink navigation.
 fn build_citation_trace(
     citation_graph: &kb_query::CitationGraph,
+    edge_types: Option<&CitationEdgeTypes>,
     page_path: &str,
     visited: &mut std::collections::BTreeSet<String>,
 ) -> Vec<InspectTraceNode> {
     citation_graph
         .neighbors(page_path)
         .iter()
-        .map(|neighbor| {
-            let inputs = if visited.insert(neighbor.clone()) {
-                build_citation_trace(citation_graph, neighbor, visited)
-            } else {
-                Vec::new()
-            };
-            InspectTraceNode {
+        .filter_map(|neighbor| {
+            if !visited.insert(neighbor.clone()) {
+                return None;
+            }
+            let nested =
+                build_citation_trace(citation_graph, edge_types, neighbor, visited);
+            Some(InspectTraceNode {
                 id: neighbor.clone(),
                 kind: citation_neighbor_kind(neighbor),
-                inputs,
-            }
+                edge_type: edge_types.and_then(|types| {
+                    types.label_between(page_path, neighbor)
+                }),
+                inputs: nested,
+            })
         })
         .collect()
+}
+
+/// Edge-type index loaded from `state/graph.db` (bn-3qy6). Keyed on
+/// `(src_id, dst_id)` and joined to a single label — `cites,links`
+/// when both edge types exist between the same pair, otherwise just
+/// `cites` or `links`. Built once per inspect call so the trace walker
+/// can attach a label without re-querying the DB per neighbor.
+struct CitationEdgeTypes {
+    forward: std::collections::BTreeMap<(String, String), String>,
+}
+
+impl CitationEdgeTypes {
+    fn label_between(&self, src: &str, dst: &str) -> Option<String> {
+        self.forward
+            .get(&(src.to_string(), dst.to_string()))
+            .cloned()
+    }
+}
+
+/// Open `state/graph.db` and group every `(src_id, dst_id)` row's
+/// `edge_type` value into a single comma-joined label. Returns an
+/// empty index when the DB doesn't exist or can't be opened — the
+/// inspect path falls through to plain trace nodes without edge
+/// labels rather than failing the whole command (bn-3qy6).
+fn load_citation_edge_types(root: &Path) -> Option<CitationEdgeTypes> {
+    use kb_query::graph_db_path;
+    use rusqlite::Connection;
+    let db_path = graph_db_path(root);
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = Connection::open(&db_path).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT src_id, dst_id, edge_type FROM edges ORDER BY src_id, dst_id, edge_type")
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ok()?;
+    let mut grouped: std::collections::BTreeMap<(String, String), Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in rows.flatten() {
+        let (src, dst, kind) = row;
+        let entry = grouped.entry((src, dst)).or_default();
+        if !entry.contains(&kind) {
+            entry.push(kind);
+        }
+    }
+    let forward: std::collections::BTreeMap<(String, String), String> = grouped
+        .into_iter()
+        .map(|(key, kinds)| (key, kinds.join(",")))
+        .collect();
+    Some(CitationEdgeTypes { forward })
+}
+
+/// Walk an existing trace tree and add every node's id to `visited` so
+/// the citation walk afterwards skips entities that the build-record
+/// trace already surfaced (bn-3qy6). Without this seeding, a page
+/// reachable through both graphs appears under both subtrees.
+fn seed_visited_with_trace_ids(
+    nodes: &[InspectTraceNode],
+    visited: &mut std::collections::BTreeSet<String>,
+) {
+    for node in nodes {
+        visited.insert(node.id.clone());
+        // Also map node-id form back to path-form so the citation walk
+        // recognizes `concept-foo` as the same entity as
+        // `wiki/concepts/foo.md`.
+        if let Some(page_path) = resolved_id_to_page_path(&node.id) {
+            visited.insert(page_path);
+        }
+        seed_visited_with_trace_ids(&node.inputs, visited);
+    }
 }
 
 fn citation_neighbor_kind(page_path: &str) -> String {
@@ -7267,11 +7397,13 @@ mod tests {
         );
     }
 
-    /// bn-238c: a citation graph with two pages that cite each other
-    /// must produce a finite trace — the visited set short-circuits
-    /// the cycle so we don't recurse forever or emit duplicate inputs.
+    /// bn-3qy6: a two-page cycle must collapse to a single forward
+    /// edge — the back-edge is dropped entirely, not emitted as a leaf
+    /// placeholder. Previously the visited set still produced an
+    /// `InspectTraceNode` for the already-visited target, which made the
+    /// JSON tree look recursive.
     #[test]
-    fn build_citation_trace_handles_cycles() {
+    fn build_citation_trace_skips_back_edges_entirely() {
         let mut forward: std::collections::BTreeMap<String, Vec<String>> =
             std::collections::BTreeMap::new();
         forward.insert(
@@ -7289,21 +7421,80 @@ mod tests {
 
         let mut visited = std::collections::BTreeSet::new();
         visited.insert("wiki/concepts/a.md".to_string());
-        let trace =
-            build_citation_trace(&citation_graph, "wiki/concepts/a.md", &mut visited);
+        let trace = build_citation_trace(
+            &citation_graph,
+            None,
+            "wiki/concepts/a.md",
+            &mut visited,
+        );
         assert_eq!(trace.len(), 1);
         assert_eq!(trace[0].id, "wiki/concepts/b.md");
         assert_eq!(trace[0].kind, "concept");
-        // b cites a back, but the visited set short-circuits the
-        // recursion: the back-edge creates a leaf (id present, inputs
-        // empty) rather than another full subtree. Same pattern as
-        // build_trace's cycle protection.
-        assert_eq!(trace[0].inputs.len(), 1);
-        assert_eq!(trace[0].inputs[0].id, "wiki/concepts/a.md");
+        // The b -> a back-edge must NOT appear as a child of b.
+        // Previously the visited set still emitted a leaf for it.
         assert!(
-            trace[0].inputs[0].inputs.is_empty(),
-            "back-edge must terminate at the leaf, not recurse forever"
+            trace[0].inputs.is_empty(),
+            "back-edge to already-visited 'a' must be dropped, not leafed: {:?}",
+            trace[0].inputs,
         );
+    }
+
+    /// bn-3qy6: when an edge-type index is provided, each trace node
+    /// carries the joined `cites,links` label so consumers can
+    /// distinguish citation provenance from wikilink navigation.
+    #[test]
+    fn build_citation_trace_attaches_edge_type_when_index_provided() {
+        let mut forward: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        forward.insert(
+            "wiki/concepts/a.md".to_string(),
+            vec!["wiki/concepts/b.md".to_string()],
+        );
+        let mut nodes = std::collections::BTreeSet::new();
+        nodes.insert("wiki/concepts/a.md".to_string());
+        nodes.insert("wiki/concepts/b.md".to_string());
+        let citation_graph = kb_query::CitationGraph { forward, nodes };
+
+        let mut edge_forward = std::collections::BTreeMap::new();
+        edge_forward.insert(
+            (
+                "wiki/concepts/a.md".to_string(),
+                "wiki/concepts/b.md".to_string(),
+            ),
+            "cites,links".to_string(),
+        );
+        let edge_types = CitationEdgeTypes {
+            forward: edge_forward,
+        };
+
+        let mut visited = std::collections::BTreeSet::new();
+        visited.insert("wiki/concepts/a.md".to_string());
+        let trace = build_citation_trace(
+            &citation_graph,
+            Some(&edge_types),
+            "wiki/concepts/a.md",
+            &mut visited,
+        );
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].edge_type.as_deref(), Some("cites,links"));
+    }
+
+    /// bn-3qy6: build-record (graph.json) trace nodes never carry an
+    /// `edge_type` — the field stays `None` and is skipped on serialize.
+    #[test]
+    fn build_record_trace_serializes_without_edge_type_field() {
+        let node = InspectTraceNode {
+            id: "concept-foo".to_string(),
+            kind: "concept".to_string(),
+            edge_type: None,
+            inputs: Vec::new(),
+        };
+        let json = serde_json::to_value(&node).expect("serialize");
+        assert!(
+            json.get("edge_type").is_none(),
+            "edge_type must be omitted when None: {json}"
+        );
+        assert_eq!(json["id"], "concept-foo");
     }
 
     // ── bn-mml0: model_slug_matches_runner heuristic ────────────────
