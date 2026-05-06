@@ -13,14 +13,50 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use kb_core::state_dir;
+use serde::Serialize;
 use serde_json::json;
 
 use crate::ValidationError;
 use crate::config::{Config, LlmRunnerConfig};
 
+/// Per-runner inputs the chat session would launch with — emitted by
+/// `kb chat --dry-run` so the user (or an agent driving the CLI) can
+/// see exactly what `opencode --agent kb-chat` would be invoked with
+/// without actually spawning the TUI (bn-1588).
+#[derive(Debug, Serialize)]
+pub struct ChatDryRunReport {
+    pub runner: &'static str,
+    pub model: String,
+    pub program: String,
+    pub args: Vec<String>,
+    pub opencode_config_path: PathBuf,
+    pub system_prompt_path: PathBuf,
+    pub tools: ChatDryRunTools,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ChatDryRunTools {
+    pub read: bool,
+    pub write: bool,
+    pub edit: bool,
+    pub bash: bool,
+}
+
 /// Entry point wired from `main::run()`. Validates the runner, builds the
-/// prompt + opencode config, spawns the TUI, and cleans up afterwards.
-pub fn run_chat(root: &Path, model_override: Option<&str>) -> Result<()> {
+/// prompt + opencode config, spawns the TUI (or, with `dry_run`, prints
+/// the planned invocation), and cleans up afterwards.
+///
+/// bn-1588: when `dry_run` is true, the function builds the system
+/// prompt and opencode config (so users can inspect them) but skips the
+/// `opencode --agent kb-chat` spawn. With `json`, the report rides
+/// under the standard CLI JSON envelope.
+pub fn run_chat(
+    root: &Path,
+    model_override: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
     let cfg = Config::load_from_root(root, None)?;
 
     let Some(opencode) = cfg.llm.runners.get("opencode") else {
@@ -39,12 +75,75 @@ pub fn run_chat(root: &Path, model_override: Option<&str>) -> Result<()> {
     let prompt_path = write_system_prompt(root)?;
     let oc_config_path = generate_opencode_config(root, &prompt_path, &model, opencode)?;
 
+    if dry_run {
+        let report = build_dry_run_report(opencode, &model, &oc_config_path, &prompt_path);
+        if json {
+            crate::emit_json("chat", &report)?;
+        } else {
+            print_dry_run_report(&report);
+        }
+        // Same cleanup discipline as the live path.
+        let _ = std::fs::remove_file(&prompt_path);
+        return Ok(());
+    }
+
     let spawn_result = spawn_interactive(opencode, &oc_config_path, root);
 
     // Always try to clean up the temp prompt file, even on error.
     let _ = std::fs::remove_file(&prompt_path);
 
     spawn_result
+}
+
+/// Build the planned-invocation report for `--dry-run`. Mirrors the
+/// argv splitting that `spawn_interactive` performs (drop trailing
+/// `run`, prepend `--agent kb-chat`) so the JSON exactly describes
+/// what the live path would have spawned.
+fn build_dry_run_report(
+    runner: &LlmRunnerConfig,
+    model: &str,
+    oc_config_path: &Path,
+    prompt_path: &Path,
+) -> ChatDryRunReport {
+    let mut parts = runner.command.split_whitespace();
+    let program = parts.next().unwrap_or("opencode").to_string();
+    let mut args: Vec<String> = parts
+        .filter(|arg| *arg != "run")
+        .map(str::to_owned)
+        .collect();
+    args.push("--agent".to_string());
+    args.push("kb-chat".to_string());
+    ChatDryRunReport {
+        runner: "opencode",
+        model: model.to_string(),
+        program,
+        args,
+        opencode_config_path: oc_config_path.to_path_buf(),
+        system_prompt_path: prompt_path.to_path_buf(),
+        tools: ChatDryRunTools {
+            read: runner.tools_read,
+            write: false,
+            edit: false,
+            bash: runner.tools_bash,
+        },
+    }
+}
+
+fn print_dry_run_report(report: &ChatDryRunReport) {
+    println!("kb chat (dry run): would launch the opencode TUI without spawning it.");
+    println!("  runner:   {}", report.runner);
+    println!("  model:    {}", report.model);
+    println!(
+        "  command:  {} {}",
+        report.program,
+        report.args.join(" ")
+    );
+    println!("  config:   {}", report.opencode_config_path.display());
+    println!("  prompt:   {}", report.system_prompt_path.display());
+    println!(
+        "  tools:    read={} write={} edit={} bash={}",
+        report.tools.read, report.tools.write, report.tools.edit, report.tools.bash,
+    );
 }
 
 /// Returns the content of the system prompt injected into the chat agent.
@@ -279,6 +378,76 @@ mod tests {
         );
     }
 
+    /// bn-1588: --dry-run must NOT spawn opencode. The command should
+    /// succeed and the temp system-prompt file must be cleaned up,
+    /// matching the live path's cleanup discipline.
+    #[test]
+    fn run_chat_dry_run_does_not_spawn_and_cleans_up_prompt() {
+        let tmp = TempDir::new().expect("create tempdir");
+
+        // A kb.toml with an opencode runner that points at a nonexistent
+        // binary — if dry-run accidentally spawned, the test would fail
+        // with a "failed to launch opencode" error.
+        let toml = r#"
+[llm]
+default_runner = "opencode"
+default_model = "openai/gpt-5.4"
+
+[llm.runners.opencode]
+command = "/nonexistent/opencode-binary"
+tools_read = true
+tools_write = false
+tools_edit = false
+tools_bash = false
+"#;
+        std::fs::write(tmp.path().join("kb.toml"), toml).expect("write kb.toml");
+
+        run_chat(tmp.path(), None, true, false).expect("dry-run should succeed");
+
+        // Prompt file must be cleaned up — same invariant the live path
+        // promises. The chat dir may still exist; the prompt itself
+        // (system-prompt-*.md) must not.
+        let chat_dir = state_dir(tmp.path()).join("chat");
+        if chat_dir.exists() {
+            for entry in std::fs::read_dir(&chat_dir).expect("read chat dir") {
+                let entry = entry.expect("entry");
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                assert!(
+                    !name_str.starts_with("system-prompt-"),
+                    "dry-run must clean up the temp prompt file, found: {name_str}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_dry_run_report_strips_trailing_run_and_appends_agent_flag() {
+        let runner = LlmRunnerConfig {
+            command: "opencode run".to_string(),
+            tools_read: true,
+            tools_bash: true,
+            ..LlmRunnerConfig::default()
+        };
+        let report = build_dry_run_report(
+            &runner,
+            "openai/gpt-5.4",
+            Path::new("/kb/.kb/opencode.json"),
+            Path::new("/kb/.kb/state/chat/system-prompt-x.md"),
+        );
+        assert_eq!(report.program, "opencode");
+        // 'run' is stripped; --agent kb-chat is appended.
+        assert_eq!(report.args, vec!["--agent".to_string(), "kb-chat".to_string()]);
+        assert_eq!(report.model, "openai/gpt-5.4");
+        assert_eq!(report.runner, "opencode");
+        // Defense-in-depth: write/edit always false in the chat agent's
+        // tool surface, regardless of what the runner config says.
+        assert!(!report.tools.write);
+        assert!(!report.tools.edit);
+        assert!(report.tools.read);
+        assert!(report.tools.bash);
+    }
+
     #[test]
     fn run_chat_errors_cleanly_when_opencode_runner_missing() {
         let tmp = TempDir::new().expect("create tempdir");
@@ -300,7 +469,8 @@ tools_bash = false
 "#;
         std::fs::write(tmp.path().join("kb.toml"), toml).expect("write kb.toml");
 
-        let err = run_chat(tmp.path(), None).expect_err("expected missing-runner error");
+        let err =
+            run_chat(tmp.path(), None, false, false).expect_err("expected missing-runner error");
         // It must be a ValidationError so bn-1jx's failed-jobs filter
         // leaves it alone.
         let validation = err

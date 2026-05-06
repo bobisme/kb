@@ -1087,8 +1087,23 @@ fn run(cli: Cli) -> Result<()> {
             // so it can't mutate KB state even if the user asks it to.
             // --model CLI flag wins over --model subcommand flag; either
             // threads through to the opencode agent config.
+            //
+            // bn-1588: --dry-run skips the opencode spawn and prints the
+            // planned config/prompt/command instead. --json without
+            // --dry-run is rejected outright — the interactive TUI takes
+            // over the terminal, so there's no envelope to emit. With
+            // --dry-run --json, the planned-command report rides under
+            // the standard CLI JSON envelope.
             let model_override = model.as_deref().or(cli.model.as_deref());
-            chat::run_chat(chat_root, model_override)
+            if cli.json && !cli.dry_run {
+                return Err(ValidationError::new(
+                    "kb chat is an interactive TUI and cannot emit JSON. \
+                     Pass --dry-run to print the planned opencode invocation \
+                     in JSON instead, or drop --json to launch the TUI.",
+                )
+                .into());
+            }
+            chat::run_chat(chat_root, model_override, cli.dry_run, cli.json)
         }
         Some(Command::Serve { host, port }) => {
             let serve_root = root
