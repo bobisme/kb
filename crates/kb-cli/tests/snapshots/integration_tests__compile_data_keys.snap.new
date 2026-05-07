@@ -1,0 +1,6 @@
+---
+source: crates/kb-cli/tests/integration_tests.rs
+assertion_line: 3721
+expression: "sorted_object_keys(&envelope[\"data\"])"
+---
+build_records_emitted, dry_run, duplicate_review_items, passes, stale_sources, total_sources
