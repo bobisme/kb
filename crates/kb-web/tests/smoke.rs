@@ -63,6 +63,16 @@ fn fixture() -> TempDir {
          # ARIES\n\n\
          ARIES is a recovery algorithm.\n",
     );
+    write(
+        &root.join(".kb/normalized/src-talk/source.md"),
+        "# Transcript\n\n## @speaker_00 [00:00:01 → 00:00:03]\n\nHello.\n\n![slide](assets/slide.png)\n",
+    );
+    fs::create_dir_all(root.join(".kb/normalized/src-talk/assets")).expect("mkdir assets");
+    fs::write(
+        root.join(".kb/normalized/src-talk/assets/slide.png"),
+        b"fake-png",
+    )
+    .expect("write asset");
 
     // Hand-build a lexical index so /search returns something deterministic
     // without needing to run `kb compile`.
@@ -120,6 +130,149 @@ async fn root_renders_wiki_index() {
     assert!(html.contains("<title>kb — kb</title>"));
     assert!(html.contains("Knowledge Base"));
     assert!(html.contains("Welcome to kb"));
+    assert!(html.contains("<base href=\"/wiki/\">"));
+}
+
+#[tokio::test]
+async fn normalized_source_renders_with_citation_anchors() {
+    let tmp = fixture();
+    let app = make_app(&tmp);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/.kb/normalized/src-talk/source.md")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    assert!(
+        resp.headers()["content-security-policy"]
+            .to_str()
+            .expect("CSP text")
+            .contains("script-src 'none'")
+    );
+    let html = body_string(resp).await;
+    assert!(html.contains("<h1 id=\"transcript\">Transcript</h1>"));
+    assert!(html.contains("id=\"speaker_00-00-00-01\""));
+    assert!(html.contains("src=\"assets/slide.png\""));
+}
+
+#[tokio::test]
+async fn normalized_asset_is_served_with_safe_headers() {
+    let tmp = fixture();
+    let app = make_app(&tmp);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/.kb/normalized/src-talk/assets/slide.png")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-type"], "image/png");
+    assert_eq!(resp.headers()["x-content-type-options"], "nosniff");
+    let body = resp.into_body().collect().await.expect("body").to_bytes();
+    assert_eq!(&body[..], b"fake-png");
+}
+
+#[tokio::test]
+async fn normalized_route_rejects_non_source_internal_files_and_traversal() {
+    let tmp = fixture();
+    write(
+        &tmp.path().join(".kb/normalized/src-talk/metadata.json"),
+        "{}",
+    );
+    let app = make_app(&tmp);
+
+    let metadata = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/.kb/normalized/src-talk/metadata.json")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+    assert_eq!(metadata.status(), StatusCode::NOT_FOUND);
+
+    let traversal = app
+        .oneshot(
+            Request::builder()
+                .uri("/.kb/normalized/src-talk/assets/..%2Fmetadata.json")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+    assert_eq!(traversal.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn normalized_route_rejects_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = fixture();
+    symlink(
+        tmp.path().join("kb.toml"),
+        tmp.path()
+            .join(".kb/normalized/src-talk/assets/escaped.txt"),
+    )
+    .expect("create symlink");
+    let app = make_app(&tmp);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/.kb/normalized/src-talk/assets/escaped.txt")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn normalized_route_rejects_asset_symlink_to_internal_metadata() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = fixture();
+    write(
+        &tmp.path().join(".kb/normalized/src-talk/metadata.json"),
+        "secret metadata",
+    );
+    symlink(
+        tmp.path().join(".kb/normalized/src-talk/metadata.json"),
+        tmp.path()
+            .join(".kb/normalized/src-talk/assets/metadata.txt"),
+    )
+    .expect("create symlink");
+    let app = make_app(&tmp);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/.kb/normalized/src-talk/assets/metadata.txt")
+                .body(Body::empty())
+                .expect("req"),
+        )
+        .await
+        .expect("serve");
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -139,7 +292,7 @@ async fn wiki_page_renders_markdown() {
 
     assert_eq!(resp.status(), StatusCode::OK);
     let html = body_string(resp).await;
-    assert!(html.contains("<h1>Rust</h1>"));
+    assert!(html.contains("<h1 id=\"rust\">Rust</h1>"));
     assert!(html.contains("systems programming language"));
 }
 
@@ -163,7 +316,7 @@ async fn wiki_page_strips_yaml_frontmatter() {
     assert_eq!(resp.status(), StatusCode::OK);
     let html = body_string(resp).await;
     // The real body must render.
-    assert!(html.contains("<h1>ARIES</h1>"));
+    assert!(html.contains("<h1 id=\"aries\">ARIES</h1>"));
     assert!(html.contains("recovery algorithm"));
     // But the frontmatter keys must not appear anywhere in the response.
     assert!(

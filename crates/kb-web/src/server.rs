@@ -6,12 +6,13 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
+use axum::body::Body;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use kb_query::{
-    HybridOptions, HybridResult, LexicalIndex, Reranker, RerankSettings, SemanticBackend,
+    HybridOptions, HybridResult, LexicalIndex, RerankSettings, Reranker, SemanticBackend,
     SemanticBackendConfig, SemanticBackendKind,
 };
 use serde::Deserialize;
@@ -100,8 +101,8 @@ impl WebState {
     ) -> Result<Self> {
         let index = LexicalIndex::load(&root)
             .with_context(|| format!("load lexical index at {}", root.display()))?;
-        let backend = SemanticBackend::from_config(backend)
-            .context("load semantic backend for kb-web")?;
+        let backend =
+            SemanticBackend::from_config(backend).context("load semantic backend for kb-web")?;
         Ok(Self {
             inner: Arc::new(WebStateInner {
                 root,
@@ -139,6 +140,7 @@ pub fn router(state: WebState) -> Router {
     Router::new()
         .route("/", get(index_handler))
         .route("/wiki/{*path}", get(wiki_handler))
+        .route("/.kb/normalized/{*path}", get(normalized_handler))
         .route("/search", get(search_handler))
         .route("/ask", post(ask_handler).get(ask_get_handler))
         .route("/static/style.css", get(style_handler))
@@ -188,13 +190,10 @@ async fn index_handler(State(state): State<WebState>) -> Response {
          Run <code>kb compile</code> to generate one.</p>"
             .to_string()
     };
-    Html(shell("kb", &body, "/")).into_response()
+    Html(shell_with_base("kb", &body, "/", Some("/wiki/"))).into_response()
 }
 
-async fn wiki_handler(
-    State(state): State<WebState>,
-    AxumPath(rel): AxumPath<String>,
-) -> Response {
+async fn wiki_handler(State(state): State<WebState>, AxumPath(rel): AxumPath<String>) -> Response {
     // Only files under `<root>/wiki/` are served. We sanitize by refusing
     // any path component that is `..` or absolute, then verify the final
     // resolved path still starts with `<root>/wiki/`.
@@ -255,6 +254,174 @@ async fn wiki_handler(
     }
 }
 
+/// Render canonical normalized Markdown and serve its referenced assets.
+///
+/// Generated wiki citations intentionally use filesystem-relative links such
+/// as `../../.kb/normalized/src-abc/source.md#section` so they work in
+/// Obsidian and plain Markdown readers. Browsers resolve those links to this
+/// route. Only `source.md` and descendants of `assets/` are exposed; metadata,
+/// state databases, and every other `.kb` path remain unreachable.
+async fn normalized_handler(
+    State(state): State<WebState>,
+    AxumPath(rel): AxumPath<String>,
+) -> Response {
+    let rel_path = PathBuf::from(&rel);
+    if !is_safe_relative(&rel_path) {
+        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    }
+
+    let Some(kind) = normalized_path_kind(&rel_path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let normalized_root = kb_core::normalized_dir(state.root());
+    let target_canon = match resolve_normalized_target(&normalized_root, &rel_path, kind) {
+        Ok(target) => target,
+        Err(status) => return status.into_response(),
+    };
+
+    match kind {
+        NormalizedPathKind::Source => match std::fs::read_to_string(&target_canon) {
+            Ok(md) => {
+                let title = rel_path
+                    .components()
+                    .next()
+                    .and_then(|component| component.as_os_str().to_str())
+                    .unwrap_or("source");
+                let body = markdown::render(&md);
+                (
+                    [
+                        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                        (
+                            header::CONTENT_SECURITY_POLICY,
+                            "default-src 'self'; script-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; img-src 'self' data: https:",
+                        ),
+                    ],
+                    Html(shell(title, &body, "/")),
+                )
+                    .into_response()
+            }
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read {}: {err}", target_canon.display()),
+            )
+                .into_response(),
+        },
+        NormalizedPathKind::Asset => match std::fs::read(&target_canon) {
+            Ok(bytes) => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, asset_content_type(&target_canon))
+                .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+                .header(
+                    header::CONTENT_SECURITY_POLICY,
+                    "sandbox; default-src 'none'",
+                )
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+            Err(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("read {}: {err}", target_canon.display()),
+            )
+                .into_response(),
+        },
+    }
+}
+
+#[derive(Clone, Copy)]
+enum NormalizedPathKind {
+    Source,
+    Asset,
+}
+
+fn resolve_normalized_target(
+    normalized_root: &Path,
+    rel_path: &Path,
+    kind: NormalizedPathKind,
+) -> Result<PathBuf, StatusCode> {
+    let source_id = rel_path
+        .components()
+        .next()
+        .expect("validated normalized path has a source id")
+        .as_os_str();
+    let source_root = normalized_root.join(source_id);
+    let target = normalized_root.join(rel_path);
+    let normalized_canon = normalized_root
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    let source_metadata =
+        std::fs::symlink_metadata(&source_root).map_err(|_| StatusCode::NOT_FOUND)?;
+    let source_canon = source_root
+        .canonicalize()
+        .map_err(|_| StatusCode::NOT_FOUND)?;
+    if source_metadata.file_type().is_symlink()
+        || !source_canon.starts_with(&normalized_canon)
+        || !source_canon.is_dir()
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let target_canon = target.canonicalize().map_err(|_| StatusCode::NOT_FOUND)?;
+    let contained = match kind {
+        NormalizedPathKind::Source => {
+            std::fs::symlink_metadata(&target)
+                .is_ok_and(|metadata| !metadata.file_type().is_symlink())
+                && target_canon.starts_with(&source_canon)
+        }
+        NormalizedPathKind::Asset => {
+            let asset_root = source_root.join("assets");
+            let asset_metadata =
+                std::fs::symlink_metadata(&asset_root).map_err(|_| StatusCode::NOT_FOUND)?;
+            let asset_canon = asset_root
+                .canonicalize()
+                .map_err(|_| StatusCode::NOT_FOUND)?;
+            !asset_metadata.file_type().is_symlink()
+                && asset_canon.starts_with(&source_canon)
+                && asset_canon.is_dir()
+                && target_canon.starts_with(&asset_canon)
+        }
+    };
+    if !contained || !target_canon.is_file() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(target_canon)
+}
+
+fn normalized_path_kind(path: &Path) -> Option<NormalizedPathKind> {
+    let components: Vec<_> = path.components().collect();
+    match components.as_slice() {
+        [Component::Normal(source_id), Component::Normal(file)]
+            if !source_id.is_empty() && *file == "source.md" =>
+        {
+            Some(NormalizedPathKind::Source)
+        }
+        [
+            Component::Normal(source_id),
+            Component::Normal(assets),
+            rest @ ..,
+        ] if !source_id.is_empty() && *assets == "assets" && !rest.is_empty() => {
+            Some(NormalizedPathKind::Asset)
+        }
+        _ => None,
+    }
+}
+
+fn asset_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("avif") => "image/avif",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct SearchQuery {
     q: Option<String>,
@@ -266,17 +433,17 @@ struct SearchQuery {
 ///
 /// Returns JSON. A missing or whitespace-only `q` returns `{ "results": [] }`
 /// with status 200 — the UI uses this to clear stale results.
-async fn search_handler(
-    State(state): State<WebState>,
-    Query(q): Query<SearchQuery>,
-) -> Response {
+async fn search_handler(State(state): State<WebState>, Query(q): Query<SearchQuery>) -> Response {
     let query = q.q.unwrap_or_default();
     if query.trim().is_empty() || kb_query::query_reduced_to_stopwords(&query) {
-        return axum::Json(SearchResponse { results: Vec::new() }).into_response();
+        return axum::Json(SearchResponse {
+            results: Vec::new(),
+        })
+        .into_response();
     }
     let limit = q.limit.unwrap_or(10).clamp(1, 100);
-    let options = HybridOptions::for_backend(state.backend().kind())
-        .with_rerank(state.rerank_settings());
+    let options =
+        HybridOptions::for_backend(state.backend().kind()).with_rerank(state.rerank_settings());
     let results = match kb_query::hybrid_search_with_index_and_backend_and_reranker(
         state.root(),
         state.index(),
@@ -322,10 +489,7 @@ async fn ask_handler(State(state): State<WebState>, body: String) -> Response {
     run_ask_and_respond(state.root(), &question).await
 }
 
-async fn ask_get_handler(
-    State(state): State<WebState>,
-    Query(q): Query<AskForm>,
-) -> Response {
+async fn ask_get_handler(State(state): State<WebState>, Query(q): Query<AskForm>) -> Response {
     let question = q.q.unwrap_or_default();
     run_ask_and_respond(state.root(), &question).await
 }
@@ -563,13 +727,20 @@ async fn style_handler() -> Response {
 // ---------------------------------------------------------------------------
 
 fn shell(title: &str, body_html: &str, home: &str) -> String {
+    shell_with_base(title, body_html, home, None)
+}
+
+fn shell_with_base(title: &str, body_html: &str, home: &str, base: Option<&str>) -> String {
+    let base = base.map_or_else(String::new, |href| {
+        format!("<base href=\"{}\">\n", escape_html(href))
+    });
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title} — kb</title>
+{base}<title>{title} — kb</title>
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -624,6 +795,7 @@ function escapeHtml(s) {{
 </html>
 "#,
         title = escape_html(title),
+        base = base,
         home = escape_html(home),
         body = body_html,
     )

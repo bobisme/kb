@@ -5,8 +5,11 @@
 //! The output is assumed to be rendered inside the wiki shell template, so
 //! this function returns only the rendered `<article>`-style body.
 
+use std::collections::HashMap;
+
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, html};
 
+use kb_core::slug_from_title;
 use kb_core::transcript;
 
 /// Render a markdown string into an HTML fragment.
@@ -29,40 +32,61 @@ pub fn render(source: &str) -> String {
     options.insert(Options::ENABLE_TASKLISTS);
 
     let events: Vec<Event> = Parser::new_ext(source, options).collect();
-    let events = inject_turn_anchors(events);
+    let events = inject_heading_anchors(events);
 
     let mut out = String::with_capacity(source.len() * 2);
     html::push_html(&mut out, events.into_iter());
     out
 }
 
-/// Walk the event stream and, for each H2 whose text matches a kbtx turn
-/// heading, replace the heading tag with one that has `id="<anchor>"` set.
-/// Non-matching headings are passed through unchanged.
-fn inject_turn_anchors(mut events: Vec<Event<'_>>) -> Vec<Event<'_>> {
+/// Add stable anchors to rendered headings.
+///
+/// Ordinary headings use the same slug and duplicate-suffix rules as the
+/// ingest pipeline, so a citation ending in `#transcript` lands on a rendered
+/// `# Transcript` heading. Kbtx speaker-turn H2s retain their richer
+/// speaker-and-timestamp anchors.
+fn inject_heading_anchors(mut events: Vec<Event<'_>>) -> Vec<Event<'_>> {
     let len = events.len();
     let mut i = 0;
+    let mut counts: HashMap<String, u32> = HashMap::new();
     while i < len {
-        let is_h2_start = matches!(
-            &events[i],
-            Event::Start(Tag::Heading { level: HeadingLevel::H2, id: None, .. })
-        );
-        if !is_h2_start {
+        let level = match &events[i] {
+            Event::Start(Tag::Heading {
+                level, id: None, ..
+            }) => Some(*level),
+            _ => None,
+        };
+        let Some(level) = level else {
             i += 1;
             continue;
-        }
+        };
         // Find the matching end event and collect heading text.
         let mut j = i + 1;
         let mut text = String::new();
         while j < len {
             match &events[j] {
-                Event::End(pulldown_cmark::TagEnd::Heading(HeadingLevel::H2)) => break,
+                Event::End(pulldown_cmark::TagEnd::Heading(end_level)) if *end_level == level => {
+                    break;
+                }
                 Event::Text(t) | Event::Code(t) => text.push_str(t),
                 _ => {}
             }
             j += 1;
         }
-        if let Some(anchor) = parse_turn_heading_anchor(&text) {
+        let anchor = if level == HeadingLevel::H2 {
+            parse_turn_heading_anchor(&text)
+        } else {
+            None
+        }
+        .or_else(|| {
+            matches!(
+                level,
+                HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3
+            )
+            .then(|| ordinary_heading_anchor(&text, &mut counts))
+            .flatten()
+        });
+        if let Some(anchor) = anchor {
             // Replace the start tag with one that carries the id.
             if let Event::Start(Tag::Heading {
                 level,
@@ -82,6 +106,20 @@ fn inject_turn_anchors(mut events: Vec<Event<'_>>) -> Vec<Event<'_>> {
         i = j + 1;
     }
     events
+}
+
+fn ordinary_heading_anchor(text: &str, counts: &mut HashMap<String, u32>) -> Option<String> {
+    let slug = slug_from_title(text.trim());
+    if slug.is_empty() {
+        return None;
+    }
+    let count = counts.entry(slug.clone()).or_insert(0);
+    *count += 1;
+    if *count == 1 {
+        Some(slug)
+    } else {
+        Some(format!("{slug}-{count}"))
+    }
 }
 
 /// If `text` matches `@<id> [HH:MM:SS → HH:MM:SS]` (or the ASCII `->` fallback),
@@ -138,9 +176,7 @@ pub fn strip_frontmatter(source: &str) -> &str {
     let base = source.len() - rest.len();
     let mut cursor = 0usize;
     while cursor <= rest.len() {
-        let line_end = rest[cursor..]
-            .find('\n')
-            .map_or(rest.len(), |i| cursor + i);
+        let line_end = rest[cursor..].find('\n').map_or(rest.len(), |i| cursor + i);
         let line = &rest[cursor..line_end];
         let trimmed = line.trim_end_matches('\r').trim_end();
         if trimmed == "---" {
@@ -171,8 +207,16 @@ mod tests {
     #[test]
     fn renders_headings_and_emphasis() {
         let html = render("# Hello\n\n**world**\n");
-        assert!(html.contains("<h1>Hello</h1>"));
+        assert!(html.contains("<h1 id=\"hello\">Hello</h1>"));
         assert!(html.contains("<strong>world</strong>"));
+    }
+
+    #[test]
+    fn ordinary_heading_anchors_match_ingest_slugs_and_dedupe() {
+        let html = render("# Transcript\n\n## Details\n\n## Details\n");
+        assert!(html.contains("<h1 id=\"transcript\">Transcript</h1>"));
+        assert!(html.contains("<h2 id=\"details\">Details</h2>"));
+        assert!(html.contains("<h2 id=\"details-2\">Details</h2>"));
     }
 
     #[test]
@@ -191,12 +235,13 @@ mod tests {
 
     #[test]
     fn strips_frontmatter_before_render() {
-        let src = "---\nid: concept:aries\nname: ARIES\naliases:\n  - a\n  - b\n---\n# Body\n\ntext\n";
+        let src =
+            "---\nid: concept:aries\nname: ARIES\naliases:\n  - a\n  - b\n---\n# Body\n\ntext\n";
         let html = render(src);
         assert!(!html.contains("id: concept:aries"));
         assert!(!html.contains("name: ARIES"));
         assert!(!html.contains("aliases"));
-        assert!(html.contains("<h1>Body</h1>"));
+        assert!(html.contains("<h1 id=\"body\">Body</h1>"));
         assert!(html.contains("text"));
     }
 
@@ -220,7 +265,7 @@ mod tests {
         let src = "---\n---\n# Body\n";
         assert_eq!(strip_frontmatter(src), "# Body\n");
         let html = render(src);
-        assert!(html.contains("<h1>Body</h1>"));
+        assert!(html.contains("<h1 id=\"body\">Body</h1>"));
         assert!(!html.contains("---"));
     }
 
@@ -268,10 +313,12 @@ mod tests {
     }
 
     #[test]
-    fn non_transcript_h2_unchanged() {
+    fn non_transcript_h2_gets_ordinary_anchor() {
         let src = "## Summary\n\nbody.\n";
         let html = render(src);
-        assert!(html.contains("<h2>Summary</h2>"), "got: {html}");
-        assert!(!html.contains(r#"id=""#), "should not have an id");
+        assert!(
+            html.contains("<h2 id=\"summary\">Summary</h2>"),
+            "got: {html}"
+        );
     }
 }
