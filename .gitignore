@@ -6,3 +6,7 @@ debug/
 *.swo
 *~
 .DS_Store
+# maw admin tree (consolidated layout) — runtime/admin only
+/.maw/
+/.manifold/
+/repo.git/
